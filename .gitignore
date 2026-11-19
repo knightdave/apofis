@@ -1,0 +1,14 @@
+.claude/
+.superpowers/
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+*.jks
+*.keystore
+*.apk
+*.aab
+result
