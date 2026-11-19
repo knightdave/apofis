@@ -11,9 +11,11 @@
         config.allowUnfree = true;
         config.android_sdk.accept_license = true;
       };
-      buildToolsVersion = "37.0.0";
+      # SDK pins come from the version catalog, shared with Gradle and CI.
+      v = (builtins.fromTOML (builtins.readFile ./gradle/libs.versions.toml)).versions;
+      buildToolsVersion = v.buildTools;
       android = pkgs.androidenv.composeAndroidPackages {
-        platformVersions = [ "37.2" ];
+        platformVersions = [ "${v.compileSdk}.${v.compileSdkMinor}" ];
         buildToolsVersions = [ buildToolsVersion ];
         includeEmulator = false;
         includeSystemImages = false;

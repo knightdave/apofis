@@ -1,4 +1,11 @@
 [versions]
+# Android SDK levels. Single source of truth: Gradle reads these via `libs`,
+# flake.nix via builtins.fromTOML and CI via scripts/sdk-packages.sh.
+minSdk = "31"
+compileSdk = "37"
+compileSdkMinor = "2"
+targetSdk = "37"
+buildTools = "37.0.0"
 agp = "9.5.1"
 kotlin = "2.4.21"
 composeBom = "2026.11.01"
