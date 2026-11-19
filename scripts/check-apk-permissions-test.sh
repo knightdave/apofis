@@ -26,5 +26,9 @@ expect 1 camera-max-sdk "uses-permission: name='android.permission.CAMERA' maxSd
 expect 1 unparsable "uses-permission: name='android.permission.INTERNET'
 uses-permission-something CAMERA"
 expect 1 empty "package: xyz.rycerz.apofis"
+expect 1 only-unparsable "uses-permission CAMERA"
+expect 1 unknown-line "uses-permission: name='android.permission.INTERNET'
+uses-library: name='foo'"
+expect 1 no-internet "uses-permission: name='xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'"
 
 exit "$fail"
