@@ -2,12 +2,20 @@
 # Usage: check-apk-permissions.sh <aapt2> <apk>
 # Rule: the app requests no platform permission other than INTERNET. The only other
 # allowed entry is AndroidX's app-private signature permission that guards
-# non-exported dynamic receivers.
+# non-exported dynamic receivers. Every requesting tag counts (uses-permission,
+# uses-permission-sdk-23, ...); a requesting line that cannot be parsed fails.
 set -eu
 allowed="android.permission.INTERNET
 xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
-requested="$("$1" dump permissions "$2" | sed -n "s/^uses-permission: name='\(.*\)'.*/\1/p")"
-[ -n "$requested" ] || { echo "No permissions found in $2" >&2; exit 1; }
+dump="$("$1" dump permissions "$2")"
+lines="$(printf '%s\n' "$dump" | grep '^uses-' || true)"
+[ -n "$lines" ] || { echo "No permissions found in $2" >&2; exit 1; }
+requested="$(printf '%s\n' "$lines" | sed -n "s/^uses-permission[a-z0-9-]*: name='\([^']*\)'.*/\1/p")"
+if [ "$(printf '%s\n' "$lines" | wc -l)" -ne "$(printf '%s\n' "$requested" | wc -l)" ]; then
+    echo "Unrecognised permission lines in $2:" >&2
+    printf '%s\n' "$lines" >&2
+    exit 1
+fi
 extra="$(printf '%s\n' "$requested" | grep -vxF "$allowed" || true)"
 if [ -n "$extra" ]; then
     echo "Disallowed permissions in $2:" >&2
@@ -15,4 +23,4 @@ if [ -n "$extra" ]; then
     exit 1
 fi
 echo "Permissions OK:"
-echo "$requested"
+printf '%s\n' "$lines"

@@ -23,6 +23,7 @@ jobs:
           packages: ${{ steps.sdk.outputs.packages }}
       - uses: gradle/actions/setup-gradle@v6
       - run: ./gradlew lintDebug testDebugUnitTest assembleDebug
+      - run: scripts/check-apk-permissions-test.sh
       - run: scripts/check-apk-permissions.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/aapt2" app/build/outputs/apk/debug/app-debug.apk
 
   release:
@@ -30,9 +31,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # One publisher at a time across main and tags, so versionCode only grows.
+      actions: read
+    # Main pushes share one group, so a newer pending main run may replace an older
+    # pending one (fine for pre-releases). Each tag gets its own group, so a tag
+    # release is never cancelled. Ordering across groups is enforced by the
+    # "Wait for older publishers" and "Reject stale versionCode" steps.
     concurrency:
-      group: publish
+      group: publish-${{ github.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
@@ -91,16 +96,34 @@ jobs:
       - name: Check permissions
         run: scripts/check-apk-permissions.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/aapt2" app/build/outputs/apk/release/app-release.apk
 
+      - name: Wait for older publishers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Publish in run-number order: wait until every older push run of this workflow
+          # has finished. Older runs never wait for newer ones, so this cannot deadlock.
+          for _ in $(seq 120); do
+            older=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=push&per_page=100" \
+              --jq "[.workflow_runs[] | select(.status != \"completed\" and .run_number < $APOFIS_VERSION_CODE) | .run_number] | join(\" \")")
+            [ -z "$older" ] && exit 0
+            echo "Waiting for older runs: $older"
+            sleep 30
+          done
+          echo "::error::Older runs still unfinished after 60 minutes: $older"
+          exit 1
+
       - name: Reject stale versionCode
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # versionCode is the run number: pre-N tags carry it, other releases record it in their notes.
-          newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[] |
+          # versionCode is the run number: pre-N tags carry it, other releases record it in
+          # their notes. A failed lookup fails this step (assignment keeps gh's exit status).
+          codes=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[] |
             (.tag_name | capture("^pre-(?<n>[0-9]+)$").n) //
-            ((.body // "") | capture("versionCode: (?<n>[0-9]+)").n) // empty' | sort -n | tail -1)
-          if [ -n "$newest" ] && [ "$newest" -gt "$APOFIS_VERSION_CODE" ]; then
-            echo "::error::A release with versionCode $newest already exists; refusing to publish $APOFIS_VERSION_CODE."
+            ((.body // "") | capture("versionCode: (?<n>[0-9]+)").n) // empty')
+          newest=$(printf '%s\n' "$codes" | sort -n | tail -1)
+          if [ -n "$newest" ] && [ "$newest" -ge "$APOFIS_VERSION_CODE" ]; then
+            echo "::error::A release with versionCode $newest exists; refusing to publish $APOFIS_VERSION_CODE."
             exit 1
           fi
 
