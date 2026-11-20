@@ -135,6 +135,13 @@ interface PendingSendDao {
 
     @Query("DELETE FROM PendingSendEntity WHERE idempotencyKey = :idempotencyKey")
     suspend fun delete(idempotencyKey: String): Int
+
+    /**
+     * The send that started the run and the steers delivered to it. Failed steers have no run id, and a steer cut off
+     * mid-request (still `steering`) may not have been delivered, so both stay.
+     */
+    @Query("DELETE FROM PendingSendEntity WHERE runId = :runId AND state IN ('sending', 'steered')")
+    suspend fun deleteForRun(runId: String): Int
 }
 
 @Dao
@@ -153,6 +160,13 @@ interface ActiveRunDao {
 
     @Query("DELETE FROM ActiveRunEntity WHERE runId = :runId")
     suspend fun delete(runId: String)
+
+    /** Never moves backwards and never recreates a finished run's row. */
+    @Query("UPDATE ActiveRunEntity SET lastSeq = :seq WHERE runId = :runId AND (lastSeq IS NULL OR lastSeq < :seq)")
+    suspend fun updateLastSeq(runId: String, seq: Long)
+
+    @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId")
+    suspend fun setStatus(runId: String, status: String)
 }
 
 @Dao

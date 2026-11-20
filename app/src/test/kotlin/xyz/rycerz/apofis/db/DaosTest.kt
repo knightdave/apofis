@@ -200,4 +200,34 @@ class DaosTest {
         assertEquals(listOf("pinnedOld", "new", "mid", "old"), dao.observe(archived = false).first().map { it.key })
         assertEquals(listOf("arch"), dao.observe(archived = true).first().map { it.key })
     }
+
+    @Test
+    fun deleteForRunKeepsOtherRows() = runTest {
+        val dao = db.pendingSendDao()
+        fun send(key: String, state: String, runId: String?) = PendingSendEntity(key, "s", "t", "{}", 1L, state, runId, null)
+        dao.upsert(send("started", "sending", "run_1"))
+        dao.upsert(send("steered", "steered", "run_1"))
+        dao.upsert(send("failedSteer", "failed", null))
+        dao.upsert(send("otherRun", "sending", "run_2"))
+        dao.upsert(send("cutOffSteer", "steering", "run_1"))
+
+        assertEquals(2, dao.deleteForRun("run_1"))
+        assertEquals(listOf("cutOffSteer", "failedSteer", "otherRun"), dao.observe("s").first().map { it.idempotencyKey }.sorted())
+    }
+
+    @Test
+    fun activeRunUpdatesNeverRecreateOrRewind() = runTest {
+        val dao = db.activeRunDao()
+        dao.updateLastSeq("gone", 5)
+        dao.setStatus("gone", "stopping")
+        assertTrue(dao.all().isEmpty())
+
+        dao.upsert(ActiveRunEntity("run_1", "s", null, "running", 1L))
+        dao.updateLastSeq("run_1", 7)
+        dao.updateLastSeq("run_1", 3)
+        dao.setStatus("run_1", "stopping")
+        val row = dao.all().single()
+        assertEquals(7L, row.lastSeq)
+        assertEquals("stopping", row.status)
+    }
 }

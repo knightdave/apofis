@@ -37,6 +37,7 @@ data class ToolStep(
     val resultTruncated: Boolean,
     val error: Boolean,
     val running: Boolean,
+    val durationSeconds: Double? = null, // live steps only: the stored transcript has no timing
 ) : Step
 
 enum class ReplyOutcome { STOPPED, FAILED, INTERRUPTED }
