@@ -126,11 +126,22 @@ hermes() {
   esac
 }
 requests() { [ -e "$t/server-calls" ] && grep -c . "$t/server-calls" || echo 0; }
-sessions_case() { # <mode> <passed scenarios> <journal lines...>: a verified results file listing them, and the journal
-  local sc
+# The am instrument -r report of the result rows on stdin ("Class.method PASS|FAIL"), ending normally.
+instrument_for() {
+  local row c m v
+  while read -r row v; do
+    c=${row%%.*} m=${row#*.}
+    printf 'INSTRUMENTATION_STATUS: class=xyz.rycerz.apofis.e2e.%s\nINSTRUMENTATION_STATUS: test=%s\nINSTRUMENTATION_STATUS_CODE: 1\n' "$c" "$m"
+    printf 'INSTRUMENTATION_STATUS: class=xyz.rycerz.apofis.e2e.%s\nINSTRUMENTATION_STATUS: test=%s\nINSTRUMENTATION_STATUS_CODE: %s\n' "$c" "$m" "$([ "$v" = PASS ] && echo 0 || echo -2)"
+  done
+  printf 'INSTRUMENTATION_CODE: -1\n'
+}
+sessions_case() { # <mode> <passed scenarios> <journal lines...>: a verified results file listing them, the matching
+  local sc        # instrumentation report, and the journal
   mode=$1 key_sent_local=1 sessions_state=ok published=1 run_id=sess
   mkdir -p "$E2E_OUT/sess"
   { echo SmokeE2eTest.connectViaLoopback PASS; for sc in $2; do echo "SurvivalE2eTest.$sc PASS"; done; } >"$E2E_OUT/sess/results.txt"
+  instrument_for <"$E2E_OUT/sess/results.txt" >"$E2E_OUT/sess/instrument.txt"
   shift 2
   journal=("$@")
   rm -f "$t/server-calls" "$t/deleted"
@@ -158,6 +169,23 @@ sessions_case scenario connectAndChat "send $K1 connectAndChat" "chat connectAnd
 check "a complete, matched entry: proved, deleted and checked gone; passes" '[ "$rc" = 0 ] && [ "$(cat "$t/server-calls")" = "$(printf "GET api/sessions/%s\nDELETE api/sessions/%s\nGET api/sessions/%s" "$K1" "$K1" "$K1")" ]'
 sessions_case smoke ''
 check "nothing sent (smoke): complete and empty journal passes, no request" '[ "$rc" = 0 ] && has "$o" "complete and empty" && [ "$(requests)" = 0 ]'
+sessions_case smoke ''
+printf 'SmokeE2eTest.connectViaLoopback PASS\nSurvivalE2eTest.connectAndChat PASS\n' | instrument_for >"$E2E_OUT/sess/instrument.txt"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+check "results file omits a scenario the instrumentation reported passing, empty journal: fails, no request" '[ "$rc" = 1 ] && has "$o" "does not match what the instrumentation reported" && has "$o" "may remain" && lacks "$o" "complete and empty" && [ "$(requests)" = 0 ]'
+sessions_case smoke ''
+printf 'SmokeE2eTest.connectViaLoopback FAIL\n' | instrument_for >"$E2E_OUT/sess/instrument.txt"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+check "results file says PASS where the instrumentation reported a failure: fails, no request" '[ "$rc" = 1 ] && has "$o" "does not match" && [ "$(requests)" = 0 ]'
+sessions_case smoke ''
+rm -f "$E2E_OUT/sess/instrument.txt"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+check "no instrumentation report to reconcile with: fails, no request" '[ "$rc" = 1 ] && has "$o" "does not match" && [ "$(requests)" = 0 ]'
+sessions_case scenario connectAndChat "send $K1 connectAndChat" "chat connectAndChat $K1 $K1"
+printf 'SmokeE2eTest.connectViaLoopback PASS\nSurvivalE2eTest.connectAndChat PASS\nSurvivalE2eTest.stopDuringRun PASS\n' | instrument_for >"$E2E_OUT/sess/instrument.txt"
+rm -f "$t/server-calls" "$t/deleted"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+check "mismatch with a complete entry: fails, still proves and deletes only the journaled session" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(cat "$t/server-calls")" = "$(printf "GET api/sessions/%s\nDELETE api/sessions/%s\nGET api/sessions/%s" "$K1" "$K1" "$K1")" ]'
 sessions_case scenario ''
 published=''
 rc=0; o=$(check_sessions 2>&1) || rc=$?
@@ -185,7 +213,7 @@ sessions_case smoke ''
 # shellcheck disable=SC2329 # the row validator fails (exit 2) on a well-formed file; every other grep is real
 rc=0; o=$(grep() { if [ "$1" = -qvE ]; then return 2; fi; command grep "$@"; }; check_sessions 2>&1) || rc=$?
 check "results validator error (grep exit 2): fails, no verified results, no request" '[ "$rc" = 1 ] && has "$o" "no verified results file" && [ "$(requests)" = 0 ]'
-rm -f "$E2E_OUT/sess/results.txt"
+rm -f "$E2E_OUT/sess/results.txt" "$E2E_OUT/sess/instrument.txt"
 rmdir "$E2E_OUT/sess"
 key_sent_local='' sessions_state='' journal=() published=''
 rm -f "$t/server-calls"

@@ -610,7 +610,8 @@ STEER_JQ='
 steer_ok_json() { jq -e --arg id "$1" --arg text "$2" --arg end $'\n[/OUT-OF-BAND USER MESSAGE]' "$STEER_JQ" "$3" >/dev/null 2>&1; }
 
 # Checks and deletes the sessions the journal names; reads nothing on the server that is not a complete, matched
-# journal entry. Completeness is decided first: the verified results file must exist and list the tests; every
+# journal entry. Completeness is decided first: the verified results file must exist, list the tests and match the
+# instrumentation's own report; every
 # scenario that passed must have sent; every scenario that sent
 # (one chat key) must have exactly one chat line for that key with server ids; a chat line needs its send. Anything
 # else fails the run with "sessions may remain", and only the complete entries are checked and deleted. Each of their
@@ -631,6 +632,12 @@ check_sessions() {
   if [ -n "$published" ] && [ -f "$rf" ] && [ -r "$rf" ] && [ -s "$rf" ] &&
     { grep -qvE '^[A-Za-z0-9]+\.[A-Za-z0-9]+ (PASS|FAIL)$' "$rf"; [ "$?" = 1 ]; }; then # 1: no malformed row; 2: grep failed
     passed=$(sed -n 's/^SurvivalE2eTest\.\([A-Za-z]*\) PASS$/\1/p' "$rf") || { passed=''; bad=1; }
+    # The list must be exactly what the instrumentation itself reported, from the same verified copy: a list that
+    # disagrees proves nothing about which scenarios sent. No server id is ever inferred from a test name.
+    if ! reported_rows "$E2E_OUT/$run_id/instrument.txt" | cmp -s - <(sort -u "$rf"); then
+      log "FAILED: the results file does not match what the instrumentation reported, so it is unknown which scenarios sent"
+      passed='' bad=1
+    fi
   else
     log "FAILED: no verified results file, so it is unknown which scenarios sent"
     bad=1
@@ -1069,6 +1076,14 @@ results() {
     /^INSTRUMENTATION_STATUS: test=/ { t = substr($0, index($0, "=") + 1) }
     /^INSTRUMENTATION_STATUS_CODE: / { if ($2 != 1) print c "#" t, $2 }
     /^INSTRUMENTATION_CODE: / { print "INSTRUMENTATION_CODE", $2 }'
+}
+
+# The result rows the tests should have written, from the instrumentation's own report: "Class.method PASS|FAIL" for
+# every test that passed (0) or failed (-1, -2); an ignored test (-3) or a failed assumption (-4) writes none.
+reported_rows() {
+  [ -f "$1" ] && [ -r "$1" ] || return 1
+  results "$1" | awk '$1 != "INSTRUMENTATION_CODE" && ($2 == 0 || $2 == -1 || $2 == -2) {
+    sub("#", ".", $1); print $1, ($2 == 0 ? "PASS" : "FAIL") }' | sort -u
 }
 
 # Requires every expected test to have run and passed with its evidence, and every test that ran to have passed.
