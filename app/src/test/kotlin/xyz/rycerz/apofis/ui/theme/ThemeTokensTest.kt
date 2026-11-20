@@ -83,6 +83,8 @@ class ThemeTokensTest {
             floor("codeLabel", c.codeLabel, c.codeHeaderFill, 4.5)
             floor("expandIcon", c.expandIcon, page, 3.0)
             floor("actionIcon", c.actionIcon, page, 3.0)
+            floor("warning", c.warning, page, 3.0)
+            floor("warning on cardFill", c.warning, c.cardFill, 3.0)
         }
         assertEquals(emptyList<String>(), failures)
     }

@@ -80,7 +80,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             ) { Text(stringResource(R.string.chat_approval_deny)) }
             if (command != null) {
                 val once = remember { MutableInteractionSource() }
-                Button(onClick = { choose(ApprovalChoice.ONCE) }, Modifier.wash(once, ButtonDefaults.shape), enabled = !answering, interactionSource = once) {
+                Button(onClick = { choose(ApprovalChoice.ONCE) }, Modifier.wash(once, ButtonDefaults.shape, ring = MaterialTheme.colorScheme.onPrimary), enabled = !answering, interactionSource = once) {
                     Text(stringResource(R.string.chat_approval_once))
                 }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }

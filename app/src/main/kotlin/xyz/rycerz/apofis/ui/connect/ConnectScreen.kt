@@ -188,7 +188,7 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
             Button(
                 onClick = { vm.connect() },
                 enabled = !testing,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).wash(connect, ButtonDefaults.shape),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).wash(connect, ButtonDefaults.shape, ring = MaterialTheme.colorScheme.onPrimary),
                 interactionSource = connect,
             ) {
                 if (testing) {

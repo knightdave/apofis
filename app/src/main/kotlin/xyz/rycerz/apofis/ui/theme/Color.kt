@@ -138,6 +138,9 @@ internal fun deriveScheme(base: ColorScheme, dark: Boolean, page: Color): ColorS
     }
 }
 
+/** The disabled send fill: translucent on purpose (allowed by the token rules), over whatever is behind it. */
+internal val ColorScheme.disabledFill: Color get() = onSurface.copy(alpha = 0.12f)
+
 /** Extra tokens over the page of a derived [scheme]. */
 internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
     val page = scheme.surface
@@ -146,12 +149,15 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
     val timelineFill = scheme.primaryContainer.at(if (dark) 0.25f else 0.30f, page)
     val timelineBody = scheme.secondary.at(if (dark) 0.7f else 0.9f, timelineFill)
     val codeHeaderFill = scheme.surfaceContainerHighest.at(0.8f, page)
+    val cardFill = White.at(if (dark) 0.10f else 0.96f, page)
+    // The warning glyph is a non-text icon: shifted toward onSurface until it reaches 3:1 on the page and on cards.
+    val warning = if (dark) Color(0xFFFFB74D) else Color(0xFFF57C00)
     return ApofisColors(
-        cardFill = White.at(if (dark) 0.10f else 0.96f, page),
+        cardFill = cardFill,
         hairline = if (dark) White.at(0.08f, page) else Black.at(0.06f, page),
         hairlineStrong = if (dark) White.at(0.26f, page) else Black.at(0.38f, page),
         success = if (dark) Color(0xFF81C784) else Color(0xFF2E7D32),
-        warning = if (dark) Color(0xFFFFB74D) else Color(0xFFF57C00),
+        warning = readableOn(readableOn(warning, page, on, 3.0), cardFill, on, 3.0),
         muted = muted,
         subtitle = muted,
         sectionTitle = on.at(0.8f, page),

@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.theme.disabledFill
 
 // Test tags (end-to-end tests find the buttons by these ids).
 internal const val SEND_TAG = "composer.send"
@@ -96,26 +97,25 @@ internal fun Composer(
 @Composable
 private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, tag: String, filled: Boolean = true, onClick: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
-    // Disabled: the button's own 0.38 content alpha makes these the fill onSurface 0.12 and the glyph onSurface 0.38.
-    val fill = when {
-        !enabled -> scheme.onSurface.copy(alpha = 0.12f / 0.38f)
-        filled -> scheme.primary
-        else -> Color.Transparent
-    }
+    val fill = if (enabled && filled) scheme.primary else Color.Transparent
+    // Disabled: the button fades the opaque glyph to 0.38, drawn over the 0.12 fill behind it (outside that fade).
     val glyph = when {
         !enabled -> scheme.onSurface
         filled -> scheme.onPrimary
         else -> scheme.primary
     }
-    ApofisIconButton(onClick = onClick, contentDescription = stringResource(label), Modifier.testTag(tag), enabled = enabled, visualSize = 32.dp) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(fill, CircleShape)
-                .then(if (filled) Modifier else Modifier.border(1.5.dp, scheme.primary, CircleShape)),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(painterResource(icon), contentDescription = null, Modifier.size(18.dp), tint = glyph)
+    Box(contentAlignment = Alignment.Center) {
+        if (!enabled) Box(Modifier.size(32.dp).background(scheme.disabledFill, CircleShape))
+        ApofisIconButton(onClick = onClick, contentDescription = stringResource(label), Modifier.testTag(tag), enabled = enabled, visualSize = 32.dp) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(fill, CircleShape)
+                    .then(if (filled) Modifier else Modifier.border(1.5.dp, scheme.primary, CircleShape)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(painterResource(icon), contentDescription = null, Modifier.size(18.dp), tint = glyph)
+            }
         }
     }
 }

@@ -23,13 +23,14 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.takeOrElse
+import androidx.compose.ui.graphics.drawOutline
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.inset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.node.CompositionLocalConsumerModifierNode
 import androidx.compose.ui.node.DelegatableNode
@@ -41,6 +42,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /** The keyboard focus ring color, provided by [ApofisTheme]. */
@@ -74,7 +76,7 @@ fun ApofisIconButton(
     Box(
         modifier
             .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
-            .clickable(source, FocusRingIndication, enabled = enabled, role = Role.Button, onClick = onClick)
+            .clickable(source, focusRing, enabled = enabled, role = Role.Button, onClick = onClick)
             .semantics { if (contentDescription != null) this.contentDescription = contentDescription },
         contentAlignment = Alignment.Center,
     ) {
@@ -83,24 +85,24 @@ fun ApofisIconButton(
 }
 
 /** Rows and cards: pressed washes toward onSurface over [Motion.WASH] ms; focused draws a 2 dp primary ring. */
-internal object WashIndication : IndicationNodeFactory {
-    override fun create(interactionSource: InteractionSource): DelegatableNode = PressNode(interactionSource, wash = true)
-    override fun equals(other: Any?) = other === this
-    override fun hashCode() = 1
-}
+internal val WashIndication: IndicationNodeFactory = PressIndication(wash = true, RectangleShape, Color.Unspecified)
 
 /** Focus ring only: [ApofisIconButton] shows its press by fading the content. */
-private object FocusRingIndication : IndicationNodeFactory {
-    override fun create(interactionSource: InteractionSource): DelegatableNode = PressNode(interactionSource, wash = false)
-    override fun equals(other: Any?) = other === this
-    override fun hashCode() = 2
+private val focusRing = PressIndication(wash = false, RectangleShape, Color.Unspecified)
+
+/**
+ * The wash on a Material component that installs its own (disabled) ripple: pass it the same [interactionSource].
+ * The focus ring follows [shape]; on a filled control pass a [ring] that contrasts with its fill (onPrimary on primary).
+ */
+fun Modifier.wash(interactionSource: InteractionSource, shape: Shape = RectangleShape, ring: Color = Color.Unspecified): Modifier =
+    clip(shape).indication(interactionSource, PressIndication(wash = true, shape, ring))
+
+/** [ring] Unspecified: the theme's primary. */
+private data class PressIndication(val wash: Boolean, val shape: Shape, val ring: Color) : IndicationNodeFactory {
+    override fun create(interactionSource: InteractionSource): DelegatableNode = PressNode(interactionSource, this)
 }
 
-/** The wash on a Material component that installs its own (disabled) ripple: pass it the same [interactionSource]. */
-fun Modifier.wash(interactionSource: InteractionSource, shape: Shape = RectangleShape): Modifier =
-    clip(shape).indication(interactionSource, WashIndication)
-
-private class PressNode(private val source: InteractionSource, private val wash: Boolean) :
+private class PressNode(private val source: InteractionSource, private val style: PressIndication) :
     Modifier.Node(), DrawModifierNode, CompositionLocalConsumerModifierNode {
     private val washAlpha = Animatable(0f)
     private var focused by mutableStateOf(false)
@@ -109,6 +111,8 @@ private class PressNode(private val source: InteractionSource, private val wash:
         coroutineScope.launch {
             val presses = mutableListOf<PressInteraction.Press>()
             val focuses = mutableListOf<FocusInteraction.Focus>()
+            var pressed = false // decided here, synchronously, so a release in the same frame as its press always wins
+            var animation: Job? = null
             source.interactions.collect { interaction ->
                 when (interaction) {
                     is PressInteraction.Press -> presses += interaction
@@ -121,8 +125,12 @@ private class PressNode(private val source: InteractionSource, private val wash:
                     focused = focuses.isNotEmpty()
                     invalidateDraw()
                 }
-                val target = if (wash && presses.isNotEmpty()) 1f else 0f
-                if (washAlpha.targetValue != target) launch { washAlpha.animateTo(target, tween(Motion.WASH, easing = EaseOutCubic)) }
+                if (style.wash && pressed != presses.isNotEmpty()) {
+                    pressed = presses.isNotEmpty()
+                    val target = if (pressed) 1f else 0f
+                    animation?.cancel()
+                    animation = launch { washAlpha.animateTo(target, tween(Motion.WASH, easing = EaseOutCubic)) }
+                }
             }
         }
     }
@@ -133,13 +141,8 @@ private class PressNode(private val source: InteractionSource, private val wash:
         if (alpha > 0f) drawRect(currentValueOf(LocalApofisColors).pressWash, alpha = alpha)
         if (focused) {
             val stroke = 2.dp.toPx()
-            val inset = 1.dp.toPx() + stroke / 2
-            drawRect(
-                currentValueOf(LocalFocusRing),
-                topLeft = Offset(inset, inset),
-                size = Size(size.width - 2 * inset, size.height - 2 * inset),
-                style = Stroke(stroke),
-            )
+            val color = style.ring.takeOrElse { currentValueOf(LocalFocusRing) }
+            inset(1.dp.toPx() + stroke / 2) { drawOutline(style.shape.createOutline(size, layoutDirection, this), color, style = Stroke(stroke)) }
         }
     }
 }
