@@ -48,7 +48,8 @@ data class ChatUiState(
     val sending: Boolean = false, // a send is being stored; the send button is disabled meanwhile
     val confirmCancel: String? = null, // the idempotency key of the unsent message the user asked to remove
     val unsent: UnsentText? = null, // text a send could not store, in its own notice above the composer
-    val confirmDiscard: String? = null, // the unsent text the user asked to discard, while that is still the unsent text
+    val confirmDiscard: UnsentText? = null, // the unsent entry the user asked to discard, while it is still the one shown
+    val draftRevision: Long = 0, // the draft's revision: an edit is applied only on the revision it was typed on
 )
 
 /** A request Hermes waits on, by id and execution generation: a new generation is a different request. */
@@ -71,7 +72,8 @@ enum class ComposerNote {
 
 /** Everything the chat screen can ask for; no-ops by default so previews and screenshots need no view model. */
 interface ChatActions {
-    fun onDraftChange(text: String) {}
+    /** [basedOnRevision]: [ChatUiState.draftRevision] of the state the field showed. */
+    fun onDraftChange(text: String, basedOnRevision: Long) {}
 
     /** Sends the current draft; ignored while a send is being stored. */
     fun onSendClick() {}
@@ -93,8 +95,8 @@ interface ChatActions {
     /** Asks before discarding the unsent text ([ChatUiState.confirmDiscard]). */
     fun onDiscardUnsent() {}
 
-    /** [text]: the unsent text the dialog showed; discarded only if it is still exactly that. */
-    fun onConfirmDiscard(text: String) {}
+    /** [id]: the unsent entry the dialog showed; discarded only if it is still that entry. */
+    fun onConfirmDiscard(id: Long) {}
     fun onDismissDiscard() {}
 
     /** Answers the request the block was drawing, by its own ids. */
@@ -112,7 +114,7 @@ private data class Local(
     val confirmRetry: UserMessage? = null,
     val composerNote: ComposerNote? = null,
     val confirmCancel: String? = null,
-    val confirmDiscard: String? = null,
+    val confirmDiscard: Long? = null,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean)
@@ -168,13 +170,14 @@ class ChatViewModel(
             sending = c.sending,
             confirmCancel = l.confirmCancel,
             unsent = c.unsent,
-            confirmDiscard = l.confirmDiscard?.takeIf { it == c.unsent?.text },
+            confirmDiscard = c.unsent?.takeIf { it.id == l.confirmDiscard },
+            draftRevision = c.revision,
         )
     }.stateIn(
         viewModelScope,
         SharingStarted.Eagerly,
         composer.current(sessionKey).let {
-            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent)
+            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision)
         },
     )
 
@@ -194,8 +197,8 @@ class ChatViewModel(
         }
     }
 
-    override fun onDraftChange(text: String) {
-        composer.edit(sessionKey, text)
+    override fun onDraftChange(text: String, basedOnRevision: Long) {
+        composer.edit(sessionKey, text, basedOnRevision)
         if (local.value.composerNote != null) local.update { it.copy(composerNote = null) }
     }
 
@@ -230,12 +233,12 @@ class ChatViewModel(
     override fun onPutBack() = composer.putBack(sessionKey)
 
     override fun onDiscardUnsent() {
-        val text = composer.current(sessionKey).unsent?.text ?: return
-        local.update { it.copy(confirmDiscard = text) }
+        val id = composer.current(sessionKey).unsent?.id ?: return
+        local.update { it.copy(confirmDiscard = id) }
     }
 
-    override fun onConfirmDiscard(text: String) {
-        composer.discard(sessionKey, text)
+    override fun onConfirmDiscard(id: Long) {
+        composer.discard(sessionKey, id)
         onDismissDiscard()
     }
 

@@ -100,7 +100,7 @@ fun ChatScreen(
                 Composer(
                     state.draft,
                     if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
-                    actions::onDraftChange,
+                    { actions.onDraftChange(it, state.draftRevision) },
                     onSend = {
                         actions.onSendClick()
                         scope.launch { listState.scrollToItem(0) }
@@ -176,15 +176,15 @@ fun ChatScreen(
             }
         }
     }
-    state.confirmDiscard?.let { text ->
-        key(text) {
+    state.confirmDiscard?.let { unsent ->
+        key(unsent.id) {
             ConfirmDialog(
                 title = R.string.chat_discard_title,
                 text = R.string.chat_discard_text,
-                quote = text,
+                quote = unsent.text,
                 confirm = R.string.chat_unsent_discard,
                 dismiss = R.string.chat_keep,
-                onConfirm = { actions.onConfirmDiscard(text) },
+                onConfirm = { actions.onConfirmDiscard(unsent.id) },
                 onDismiss = actions::onDismissDiscard,
             )
         }

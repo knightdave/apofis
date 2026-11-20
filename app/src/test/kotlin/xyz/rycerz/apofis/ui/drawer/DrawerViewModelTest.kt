@@ -18,6 +18,7 @@ import kotlinx.coroutines.awaitAll
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.launch
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.api.fixture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -150,6 +151,8 @@ class DrawerViewModelTest {
         )
 
     private fun List<DrawerRow>.chats() = filterIsInstance<DrawerRow.Chat>()
+
+    private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
     private fun sessionsListed() = requests.count { it.target.startsWith("/api/sessions?") }
 

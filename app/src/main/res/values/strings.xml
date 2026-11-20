@@ -28,7 +28,7 @@
     <string name="connect_error_key_rejected">Key rejected</string>
     <string name="connect_error_save_failed">Could not save the connection. Try again.</string>
     <string name="server_change_title">Switch server?</string>
-    <string name="server_change_text">Cached chats will be removed from this phone and unsent messages will be deleted. The chats stay on the old server.</string>
+    <string name="server_change_text">Cached chats will be removed from this phone, and unsent messages and drafts will be deleted. The chats stay on the old server.</string>
     <string name="server_change_confirm">Switch</string>
 
     <string name="chat_new_title">New chat</string>

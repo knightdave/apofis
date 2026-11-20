@@ -23,6 +23,7 @@ import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import kotlinx.coroutines.test.runTest
@@ -87,6 +88,8 @@ class AppContainerTest {
             assertEquals("closed", e.message)
         }
     }
+
+    private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
     private suspend fun expectFailure(c: Credentials) {
         try {
@@ -227,14 +230,23 @@ class AppContainerTest {
         assertEquals("not stored", now.composer.current("apofis-b").unsent?.text)
     }
 
-    @Test
-    fun failedSwitchLeavesNoJobOfADiscardedComposer() = runTest {
+    /** A switch to B whose commit of [failPut] or removal of [failRemove] fails, after the tables were cleared. */
+    private suspend fun failAfterTheClear(failPut: String? = null, failRemove: String? = null) {
         val flaky = FlakyCacheApp(app)
         container = AppContainer(flaky, store) { db }
         container.connect(A)
-        container.connected()!!.composer.edit("apofis-a", "half a thought")
+        val first = container.connected()!!
+        addSession("apofis-a")
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        val release = CompletableDeferred<Unit>()
+        first.composer.edit("apofis-c", "being stored")
+        first.composer.send("apofis-c") { release.await() }!!
+        container.beforeSwitch = { release.complete(Unit) }
         val before = container.scope.coroutineContext.job.children.filter { it.isActive }.toSet()
-        flaky.failPutOf = "cache_base_url" // fails after the new graph was built
+        flaky.failPutOf = failPut
+        flaky.failRemoveOf = failRemove
 
         try {
             container.connect(B)
@@ -242,11 +254,50 @@ class AppContainerTest {
         } catch (_: IllegalStateException) {
         }
 
+        assertTrue(db.sessionDao().all().isEmpty())
+        assertTrue(container.composer.keys.isEmpty()) // cleared with the tables, in the same step
+        assertFalse(container.composer.job.children.any { it.isActive })
         val left = container.scope.coroutineContext.job.children.filter { it.isActive }.toSet()
         assertTrue("jobs left by the failed switch: ${left - before}", (left - before).isEmpty())
         flaky.failPutOf = null
+        flaky.failRemoveOf = null
+    }
+
+    @Test
+    fun ownerCommitFailingAfterTheClearLeavesAnEmptyComposer() = runTest {
+        failAfterTheClear(failPut = "cache_base_url")
+    }
+
+    @Test
+    fun markerCommitFailingAfterTheClearLeavesAnEmptyComposer() = runTest {
+        failAfterTheClear(failRemove = SWITCH_MARKER)
+    }
+
+    @Test
+    fun switchFailingBeforeTheClearKeepsTextUntilAConfirmedSwitch() = runTest {
         container.connect(A)
-        assertEquals("half a thought", container.connected()!!.composer.current("apofis-a").draft) // A's composer stayed
+        val first = container.connected()!!
+        addSession("apofis-a")
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        container.beforeSwitch = { throw IllegalStateException("setup failed") }
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: IllegalStateException) {
+        }
+        container.beforeSwitch = {}
+        assertEquals("half a thought", container.composer.current("apofis-a").draft)
+        assertEquals("not stored", container.composer.current("apofis-b").unsent?.text)
+
+        val c = Credentials("https://c.example/", "key-c")
+        assertTrue(container.willClearCache(c.baseUrl)) // the confirmation is shown for C
+        assertEquals("half a thought", container.composer.current("apofis-a").draft) // and nothing changed before it
+        container.connect(c) // confirmed
+
+        assertTrue(container.composer.keys.isEmpty())
+        assertTrue(db.sessionDao().all().isEmpty())
     }
 
     @Test
@@ -438,6 +489,7 @@ class AppContainerTest {
 private class FlakyCacheApp(base: Application) : Application() {
     @Volatile var failCommits = false
     @Volatile var failPutOf: String? = null // a commit that writes this key throws
+    @Volatile var failRemoveOf: String? = null // a commit that removes this key throws
 
     init {
         attachBaseContext(base)
@@ -450,12 +502,17 @@ private class FlakyCacheApp(base: Application) : Application() {
             override fun edit(): SharedPreferences.Editor {
                 val e = real.edit()
                 var put: String? = null
+                var removed: String? = null
                 return object : SharedPreferences.Editor by e {
                     override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor = also { e.putBoolean(key, value) }
                     override fun putString(key: String, value: String?): SharedPreferences.Editor = also { put = key; e.putString(key, value) }
-                    override fun remove(key: String): SharedPreferences.Editor = also { e.remove(key) }
+                    override fun remove(key: String): SharedPreferences.Editor = also { removed = key; e.remove(key) }
                     override fun commit(): Boolean =
-                        if (failCommits || (put != null && put == failPutOf)) throw IllegalStateException("disk") else e.commit()
+                        if (failCommits || (put != null && put == failPutOf) || (removed != null && removed == failRemoveOf)) {
+                            throw IllegalStateException("disk")
+                        } else {
+                            e.commit()
+                        }
                 }
             }
         }

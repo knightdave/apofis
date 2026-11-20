@@ -53,7 +53,7 @@ import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ComposeError
-import xyz.rycerz.apofis.chat.UnsentText
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Notice
 import xyz.rycerz.apofis.chat.ReasoningStep
@@ -150,6 +150,11 @@ class ChatViewModelTest {
     private var created = 0
 
     private val vms = mutableListOf<ChatViewModel>()
+
+    /** A user edit made on the current state, as the screen does after a redraw. */
+    private fun ChatViewModel.onDraftChange(text: String) = onDraftChange(text, connected.composer.current(KEY).revision)
+
+    private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
     private fun vm(): ChatViewModel = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected, online) } })
         .get("vm${created++}", ChatViewModel::class).also { vms += it }
@@ -383,7 +388,8 @@ class ChatViewModelTest {
 
         val back = vm.await { it.unsent != null && !it.sending }
         assertEquals("second", back.draft) // the text field is never written by a failure
-        assertEquals(UnsentText("first", ComposeError.NOT_STORED), back.unsent)
+        assertEquals("first", back.unsent?.text)
+        assertEquals(ComposeError.NOT_STORED, back.unsent?.error)
         assertEquals(null, back.composerNote)
         assertTrue(db.pendingSendDao().rows(KEY).isEmpty())
 
@@ -399,16 +405,31 @@ class ChatViewModelTest {
         val vm = vm()
         assertEquals("first", vm.state.value.unsent?.text) // the first frame already shows it
         vm.onDiscardUnsent()
-        assertEquals("first", vm.await { it.confirmDiscard != null }.confirmDiscard)
+        assertEquals("first", vm.await { it.confirmDiscard != null }.confirmDiscard?.text)
         vm.onDismissDiscard()
         assertEquals("first", vm.await { it.confirmDiscard == null }.unsent?.text)
 
         vm.onDiscardUnsent()
-        vm.await { it.confirmDiscard != null }
-        vm.onConfirmDiscard("first")
+        vm.onConfirmDiscard(vm.await { it.confirmDiscard != null }.confirmDiscard!!.id)
         val done = vm.await { it.unsent == null }
         assertEquals(null, done.confirmDiscard)
         assertEquals("", done.draft)
+    }
+
+    @Test
+    fun aStaleDiscardConfirmationNeverOpensForANewEntryWithTheSameText() = runTest {
+        connected.composer.edit(KEY, "same")
+        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        val vm = vm()
+        vm.onDiscardUnsent()
+        vm.await { it.confirmDiscard != null }
+        vm.onPutBack() // the entry goes another way while the dialog was open
+        assertEquals(null, vm.await { it.unsent == null }.confirmDiscard)
+
+        vm.onSendClick() // "same" fails again: a new entry with identical text
+        val again = vm.await { it.unsent != null && !it.sending }
+        assertEquals("same", again.unsent?.text)
+        assertEquals(null, again.confirmDiscard)
     }
 
     @Test
@@ -537,8 +558,11 @@ class ChatViewModelTest {
         assertEquals("second", failed.draft)
         again.onDraftChange("second!") // a keystroke from the frame drawn before the failure arrived
         assertEquals("first", connected.composer.current(KEY).unsent?.text)
+        val shown = again.state.value.draftRevision
         again.onPutBack()
         assertEquals("first\nsecond!", again.await { it.unsent == null }.draft)
+        again.onDraftChange("second!?", shown) // a keystroke from the frame before Put back is dropped
+        assertEquals("first\nsecond!", connected.composer.current(KEY).draft)
     }
 
     @Test

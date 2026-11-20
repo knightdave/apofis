@@ -27,7 +27,7 @@
     <string name="connect_error_key_rejected">Klucz odrzucony</string>
     <string name="connect_error_save_failed">Nie udało się zapisać połączenia. Spróbuj ponownie.</string>
     <string name="server_change_title">Zmienić serwer?</string>
-    <string name="server_change_text">Zapisane czaty zostaną usunięte z tego telefonu, a niewysłane wiadomości skasowane. Czaty pozostaną na poprzednim serwerze.</string>
+    <string name="server_change_text">Zapisane czaty zostaną usunięte z tego telefonu, a niewysłane wiadomości i szkice skasowane. Czaty pozostaną na poprzednim serwerze.</string>
     <string name="server_change_confirm">Zmień</string>
 
     <string name="chat_new_title">Nowy czat</string>

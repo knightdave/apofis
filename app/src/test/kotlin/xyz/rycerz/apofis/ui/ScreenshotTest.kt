@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.ui
 
 import android.os.Looper
+import org.junit.Assert.assertEquals
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -37,6 +38,9 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import xyz.rycerz.apofis.api.PendingControl
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
+import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ComposeError
 import xyz.rycerz.apofis.chat.UnsentText
@@ -55,6 +59,7 @@ import xyz.rycerz.apofis.ui.chat.ComposerMode
 import xyz.rycerz.apofis.ui.chat.StatusLine
 import xyz.rycerz.apofis.ui.chat.withLive
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
+import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
@@ -93,6 +98,30 @@ class ScreenshotTest {
         vm.onKeyChange("sk-123")
         vm.connect()?.join()
         shot("connect_error", ThemeMode.LIGHT) { ConnectScreen(vm, onBack = null) }
+    }
+
+    @Test
+    fun connect_server_change() {
+        val server = MockWebServer()
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        server.start()
+        try {
+            val vm = ConnectViewModel(current = null, willClearCache = { true }, save = {})
+            vm.onUrlChange(server.url("/").toString())
+            vm.onKeyChange("sk-123")
+            vm.connect()
+            // The check resumes on the main looper, which runs only when idled here.
+            for (i in 0 until 2000) {
+                shadowOf(Looper.getMainLooper()).idle()
+                if (vm.state == ConnectState.ConfirmServerChange) break
+                Thread.sleep(5)
+            }
+            assertEquals(ConnectState.ConfirmServerChange, vm.state)
+            vm.onUrlChange("https://hermes.example:8642") // a fixed address in the image; the dialog stays open
+            windowShot("connect_server_change") { ConnectScreen(vm, onBack = null) }
+        } finally {
+            server.close()
+        }
     }
 
     @Composable
@@ -238,7 +267,7 @@ class ScreenshotTest {
     fun chat_unsent_notice() = chatShot(
         "chat_unsent_notice",
         chat(listOf(question, answer), composer = ComposerMode.SEND, draft = "And hidden files too?")
-            .copy(unsent = UnsentText("Which of these can I safely delete?", ComposeError.NOT_STORED)),
+            .copy(unsent = UnsentText(1, "Which of these can I safely delete?", ComposeError.NOT_STORED)),
     )
 
     @Test
