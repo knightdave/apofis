@@ -106,7 +106,7 @@ fun ChatScreen(
                         actions.onSendClick()
                         scope.launch { listState.scrollToItem(0) }
                     },
-                    onStop = actions::onStopClick,
+                    onStop = { state.live?.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
                     busy = state.sending,
                 )
             }

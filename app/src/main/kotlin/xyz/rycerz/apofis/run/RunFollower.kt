@@ -160,8 +160,9 @@ class RunFollower(
         if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
     }
 
-    suspend fun stop(sessionKey: String) {
-        stop(db.activeRunDao().forSession(sessionKey) ?: return)
+    /** Stops the run the user saw ([runId] of [sessionKey]); nothing when it is gone, never the run that followed it. */
+    suspend fun stop(sessionKey: String, runId: String) {
+        stop(db.activeRunDao().get(runId)?.takeIf { it.sessionKey == sessionKey } ?: return)
     }
 
     /** Stops every active run of the chat, one request each, in order; the first failure throws and stops the rest. */

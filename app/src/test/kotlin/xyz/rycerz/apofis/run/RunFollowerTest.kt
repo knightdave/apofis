@@ -243,6 +243,20 @@ class RunFollowerTest {
     }
 
     @Test
+    fun stopDrawnForAFinishedRunNeverStopsItsSuccessor() = runTest {
+        val f = follower()
+        f.resumeAll()
+        addSession()
+        addRun("run_2") // the run the user saw ended and the hand-off admitted the next message's run
+        on("/v1/runs/run_2/stop", json(fixture("run_stop.json")))
+
+        f.stop(KEY, RUN) // the tap on the Stop button drawn for the first run
+
+        assertTrue(requestsTo("/v1/runs/run_2/stop").isEmpty())
+        assertFalse(db.activeRunDao().get("run_2")!!.stopRequested)
+    }
+
+    @Test
     fun backgroundWorkerFinishesAnEndedRunThenSendsTheNextMessage() = runTest {
         val f = follower() // never resumed: the app is in the background, so no follower runs
         messages()
@@ -489,7 +503,7 @@ class RunFollowerTest {
         }
         started(f)
 
-        f.stop(KEY)
+        f.stop(KEY, RUN)
         done.await()
 
         assertEquals(1, requestsTo("/v1/runs/$RUN/stop").size)
@@ -872,7 +886,7 @@ class RunFollowerTest {
         awaitUntil { requestsTo(EVENTS).isNotEmpty() }
 
         try {
-            f.stop(KEY)
+            f.stop(KEY, RUN)
             fail("expected Unauthorized")
         } catch (_: ApiError.Unauthorized) {
         }
@@ -1220,7 +1234,7 @@ class RunFollowerTest {
         on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
         heldOpen(f, release)
 
-        f.stop(KEY)
+        f.stop(KEY, RUN)
         val row = db.activeRunDao().forSession(KEY)!!
         assertTrue(row.stopRequested)
         assertEquals("running", row.status) // no status read has said otherwise yet
@@ -1300,7 +1314,7 @@ class RunFollowerTest {
         f.resumeAll()
         addRun(lastSeq = 3) // its chat is not stored, so the resume sync makes no request
         try {
-            f.stop(KEY)
+            f.stop(KEY, RUN)
             fail("expected Unauthorized")
         } catch (_: ApiError.Unauthorized) {
         }
@@ -1435,7 +1449,7 @@ class RunFollowerTest {
         addSession()
         addRun(lastSeq = 3) // the resume syncs the transcript first, with a request that succeeds
         try {
-            f.stop(KEY)
+            f.stop(KEY, RUN)
             fail("expected Unauthorized")
         } catch (_: ApiError.Unauthorized) {
         }
@@ -1561,7 +1575,7 @@ class RunFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done, beforeFinished = {
             try {
-                stop("apofis-b") // another run's request is refused while the drain runs
+                stop("apofis-b", "run_b") // another run's request is refused while the drain runs
                 fail("expected Unauthorized")
             } catch (_: ApiError.Unauthorized) {
             }
@@ -1638,7 +1652,7 @@ class RunFollowerTest {
         f.beforeStatusApply = {
             if (once.compareAndSet(false, true)) {
                 try {
-                    stop("apofis-b") // completes after the status GET returned, before the follower is done with it
+                    stop("apofis-b", "run_b") // completes after the status GET returned, before the follower is done with it
                     fail("expected Unauthorized")
                 } catch (_: ApiError.Unauthorized) {
                 }
@@ -1806,7 +1820,7 @@ class RunFollowerTest {
         heldOpen(f, release)
         val sent = sendWhenShown(f, "stopping")
 
-        f.stop(KEY)
+        f.stop(KEY, RUN)
         sent.await()
         assertTrue(requestsTo(steerPath).isEmpty())
         release.countDown()
@@ -1822,7 +1836,7 @@ class RunFollowerTest {
         heldOpen(f, release)
 
         try {
-            f.stop(KEY)
+            f.stop(KEY, RUN)
             fail("expected the stop's error")
         } catch (e: ApiError.Http) {
             assertEquals(500, e.status)
@@ -1972,9 +1986,9 @@ class RunFollowerTest {
         }
         cancelledOnRelease(f, release)
 
-        val first = backgroundScope.async { runCatching { f.stop(KEY) } }
+        val first = backgroundScope.async { runCatching { f.stop(KEY, RUN) } }
         awaitUntil { requestsTo(stopPath).size == 1 }
-        val second = backgroundScope.async { f.stop(KEY) }
+        val second = backgroundScope.async { f.stop(KEY, RUN) }
         awaitUntil { requestsTo(stopPath).size == 2 }
         firstAnswer.countDown()
         assertTrue(first.await().exceptionOrNull() is ApiError.Http) // failed while the second is in flight
@@ -1999,9 +2013,9 @@ class RunFollowerTest {
         }
         heldOpen(f, release)
 
-        val first = backgroundScope.async { runCatching { f.stop(KEY) } }
+        val first = backgroundScope.async { runCatching { f.stop(KEY, RUN) } }
         awaitUntil { requestsTo(stopPath).size == 1 }
-        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is ApiError.Http) // fails while the first is in flight
+        assertTrue(runCatching { f.stop(KEY, RUN) }.exceptionOrNull() is ApiError.Http) // fails while the first is in flight
         assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
         firstAnswer.countDown()
         assertTrue(first.await().exceptionOrNull() is ApiError.Http)
@@ -2025,10 +2039,10 @@ class RunFollowerTest {
             "CREATE TRIGGER fail_intent BEFORE UPDATE OF stopRequested ON ActiveRunEntity BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
         )
 
-        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is SQLiteException) // the error surfaces
+        assertTrue(runCatching { f.stop(KEY, RUN) }.exceptionOrNull() is SQLiteException) // the error surfaces
         assertTrue(requestsTo(stopPath).isEmpty()) // and nothing was sent without a stored intent
         db.openHelper.writableDatabase.execSQL("DROP TRIGGER fail_intent")
-        val second = backgroundScope.async { f.stop(KEY) }
+        val second = backgroundScope.async { f.stop(KEY, RUN) }
         awaitUntil { requestsTo(stopPath).size == 1 }
         release.countDown() // the run is cancelled before the stop's answer arrives
         done.await()
@@ -2054,10 +2068,10 @@ class RunFollowerTest {
         }
         cancelledOnRelease(f, release)
 
-        val first = backgroundScope.launch { f.stop(KEY) }
+        val first = backgroundScope.launch { f.stop(KEY, RUN) }
         awaitUntil { requestsTo(stopPath).size == 1 }
         first.cancel() // the caller goes away while the server takes the stop
-        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is ApiError.Http) // an overlapping stop fails
+        assertTrue(runCatching { f.stop(KEY, RUN) }.exceptionOrNull() is ApiError.Http) // an overlapping stop fails
         firstAnswer.countDown()
         first.join()
         assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)

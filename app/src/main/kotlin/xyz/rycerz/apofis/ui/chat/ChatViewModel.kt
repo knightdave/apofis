@@ -77,7 +77,8 @@ interface ChatActions {
 
     /** Sends the current draft; ignored while a send is being stored. */
     fun onSendClick() {}
-    fun onStopClick() {}
+    /** [runId]: the run the Stop button was drawn for. */
+    fun onStopClick(runId: String) {}
     fun onRetry(idempotencyKey: String) {}
     fun onConfirmRetry(idempotencyKey: String) {}
     fun onDismissRetry(idempotencyKey: String) {}
@@ -211,7 +212,7 @@ class ChatViewModel(
         if (started != null) local.update { it.copy(composerNote = null) }
     }
 
-    override fun onStopClick() = request { follower.stop(sessionKey) }
+    override fun onStopClick(runId: String) = request { follower.stop(sessionKey, runId) }
 
     override fun onRetry(idempotencyKey: String) = request {
         // NOT_FOUND needs nothing: the transcript already follows the stored rows.
