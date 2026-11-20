@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import androidx.compose.ui.graphics.Color
 import java.time.ZoneId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -11,6 +12,10 @@ import xyz.rycerz.apofis.ui.chat.CHUNK
 import xyz.rycerz.apofis.ui.chat.ChatRows
 import xyz.rycerz.apofis.ui.chat.ReplyText
 import xyz.rycerz.apofis.ui.chat.TextRow
+import xyz.rycerz.apofis.ui.chat.blockIndexOf
+import xyz.rycerz.apofis.ui.chat.blockSource
+import xyz.rycerz.apofis.ui.chat.copySource
+import xyz.rycerz.apofis.ui.chat.replyKeyOf
 import xyz.rycerz.apofis.ui.chat.Work
 import xyz.rycerz.apofis.ui.chat.parseBlocks
 import xyz.rycerz.apofis.ui.chat.replyRows
@@ -561,7 +566,7 @@ class MarkdownRowsTest {
     fun aLongLineDecidesNothingFromItsFirstPartAlone() {
         // An end marker past 20,000 characters still ends the comment: the fence and the bold text after it render.
         val comment = allRows("<!--\n" + "x".repeat(20_000) + "-->\n\n```sh\necho ok\n```\n\n**bold**")
-        assertEquals(DisplayChunk.Code("echo ok", 20_016, first = true, last = true), comment.single { it.kind == BlockKind.CODE }.chunk)
+        assertEquals(DisplayChunk.Code("echo ok", 20_016, first = true, last = true, tokens("echo ok", Lang.SHELL)), comment.single { it.kind == BlockKind.CODE }.chunk)
         assertEquals(DisplayChunk.Blocks(listOf(MdBlock.Paragraph(MdText("bold", listOf(MdSpan(0, 4, SpanKind.STRONG)))))), comment.last().chunk)
         // Backticks, 20,000 spaces and text do not close a fence: the line stays code, verbatim, in the one block.
         val text = "```sh\nkeep\n```" + " ".repeat(20_000) + "not a closer\nstill code\n```"
@@ -616,5 +621,237 @@ class MarkdownRowsTest {
             assertNothingDropped(text)
             assertLongLinesStayContained(text)
         }
+    }
+    // ---- Task 3: code blocks, highlighting and Copy ----
+
+    private val lightColors = syntaxColors(false, Color(0xFFF9F9F9), Color(0xFF202020))
+
+    private fun codeChunks(rows: List<TextRow>) = rows.filter { it.kind == BlockKind.CODE }.map { it.chunk as DisplayChunk.Code }
+
+    /** The color [c] shows at each of its characters (null: the base code color). */
+    private fun colorsOf(c: DisplayChunk.Code): Array<Color?> {
+        val shown = styled(c.highlighted!!, lightColors)
+        val out = arrayOfNulls<Color>(c.text.length)
+        for (r in shown.spanStyles) for (k in r.start until r.end) out[k] = r.item.color
+        return out
+    }
+
+    @Test
+    fun multilineCommentKeepsColorAcrossChunks() {
+        val pre = "val a = 1\n".repeat(130)
+        val comment = "/*\n" + "comment line\n".repeat(40) + "*/"
+        val body = (pre + comment + "\nval b = 2".repeat(400)).take(4000)
+        val text = "```kotlin\n$body\n```"
+        val bodyStart = text.indexOf('\n') + 1
+        val cs = bodyStart + pre.length
+        val ce = cs + comment.length
+        val chunks = codeChunks(replyRows("r1", text))
+        assertEquals(4000, body.length)
+        var crossing = 0
+        for (c in chunks) {
+            val from = maxOf(cs, c.start)
+            val to = minOf(ce, c.start + c.text.length)
+            if (from >= to) continue
+            crossing++
+            val colors = colorsOf(c)
+            for (k in from until to) assertEquals("at $k", lightColors[Tone.COMMENT.ordinal], colors[k - c.start])
+        }
+        assertTrue("the comment crosses a cut: $crossing chunks", crossing >= 2)
+        // The live path slices the same whole-block highlight.
+        assertEquals(replyRows("r1", text), streamed(text, 97))
+    }
+
+    @Test
+    fun openFenceIsPlainThenHighlighted() {
+        val text = "Intro\n\n```py\n" + "x = 'a' # c\n".repeat(300) + "```\n\nafter " + "word ".repeat(200)
+        val close = text.indexOf("```\n\nafter") + 3 // the closing fence is seen from here
+        val live = ReplyText()
+        var highlights = 0L
+        for (end in 1..text.length) {
+            val before = Work.highlights
+            val rows = live.update("r1", text.substring(0, end))
+            highlights += Work.highlights - before
+            assertEquals("at $end", replyRows("r1", text.substring(0, end)), rows)
+            val code = codeChunks(rows)
+            if (end < close) {
+                assertTrue("at $end", code.all { it.highlighted == null })
+                assertEquals("at $end", 0L, highlights)
+            } else {
+                assertTrue("at $end", code.size > 1 && code.all { it.highlighted?.text == it.text })
+                assertEquals("highlighted once, at $end", 1L, highlights)
+            }
+        }
+        // A stored reply whose fence never closed is shown closed: highlighted, with its bottom edge.
+        val stored = ChatRows(ZoneId.of("UTC")).rows(listOf(AssistantReply("r1", emptyList(), text.substring(0, close - 3), 0.0)))
+            .filterIsInstance<TextRow>().filter { it.kind == BlockKind.CODE }
+        assertTrue(stored.last().fenceClosed && stored.all { (it.chunk as DisplayChunk.Code).highlighted != null })
+    }
+
+    @Test
+    fun longUnbrokenCodeLineStaysOneRow() {
+        for (lang in listOf("", "kotlin")) {
+            val line = "x".repeat(5000)
+            val code = codeChunks(replyRows("r1", "```$lang\n$line\n```"))
+            assertEquals(listOf(line), code.map { it.text })
+            assertEquals(lang.isNotEmpty(), code.single().highlighted != null)
+        }
+    }
+
+    @Test
+    fun copySourceIsExact() {
+        val body = (1..400).joinToString("\n") { "val v$it = \"s$it\" // $it" }.take(5000)
+        val table = "| a | b |\n|---|---|\n| 1 | 2 |"
+        val text = "Para one\nline **two**\n\n```kotlin\n$body\n```\n\n$table\n\nend"
+        assertEquals(5000, body.length)
+        assertEquals("Para one\nline **two**", blockSource(text, 0))
+        assertEquals(body, blockSource(text, 1))
+        assertEquals(table, blockSource(text, 2))
+        assertEquals("end", blockSource(text, 3))
+        assertEquals(null, blockSource(text, 4))
+        // Every row of the split code block copies the whole block, through the row key as MessageList does.
+        val items = listOf(AssistantReply("r/b1/c0", emptyList(), text, 0.0))
+        val rows = ChatRows(ZoneId.of("UTC")).rows(items).filterIsInstance<TextRow>()
+        val codeRows = rows.filter { it.kind == BlockKind.CODE }
+        assertTrue(codeRows.size > 1)
+        for (r in codeRows) assertEquals(body, copySource(items, r.key))
+        assertEquals(table, copySource(items, rows.first { it.kind == BlockKind.TABLE }.key))
+        assertEquals("r/b1/c0", replyKeyOf(codeRows[1].key))
+        assertEquals(1, blockIndexOf(codeRows[1].key))
+        assertEquals(-1, blockIndexOf("junk"))
+        // Line endings are LF in the source a block copies.
+        assertEquals("a\nb", blockSource("```\r\na\r\nb\r\n```", 0))
+    }
+
+    /** Code bodies the code path must survive (see HighlightTest for the highlighter alone). */
+    private val codeCorpus: List<String> = listOf(
+        "", " ", "\t \t", "\n\n", "x".repeat(100_000), "ab\n".repeat(50_000), "Zażółć; Привет; 漢字; مرحبا; שלום",
+        "😀👩‍👩‍👧 val 🇵🇱 \"😀\" // 😀", "é vaĺ \"á\"", "\t\tval\tx\t=\t1", "a\u0000b \"\u0000\" // \u0000",
+        ("x".repeat(1498) + "😀\n").repeat(4), "x".repeat(19_999) + "😀" + "y".repeat(10), ("é".repeat(749) + "é\n").repeat(3),
+        "\"", "'", "`", "\"\"\"", "'''", "/*", "#", "\\", "\"a\\\nb\"", "/* /* */ */", "'''\"\"\"'''", "`\${`}`",
+        "/*\"*/\"/*", "#\"\n\"#", "// \"\n\"", "\"a\";".repeat(4000), ";".repeat(19_000), "'a".repeat(5000),
+        "/*\n" + "comment\n".repeat(500), "\"\"\"\n" + "text\n".repeat(500),
+    )
+
+    private val labels = listOf("kt", "py", "sh", "rust", "js", "c", "rb", "php", "nonsense", "", "😀", "a".repeat(40))
+
+    /** The code rows of [rows] join to their block's source exactly, highlighted text equals it, and Copy is exact. */
+    private fun assertCodeExact(text: String, items: List<AssistantReply>, rows: List<TextRow>) {
+        val t = text.replace("\r\n", "\n").replace('\r', '\n')
+        for (b in parseBlocks(t).filter { it.kind == BlockKind.CODE }) {
+            val mine = rows.filter { it.key.startsWith("r1/b${b.index}/") }
+            val chunks = mine.map { it.chunk as DisplayChunk.Code }
+            assertTrue(chunks.isNotEmpty())
+            var at = b.start
+            for (c in chunks) {
+                if (c.start == at + 1) assertEquals('\n', t[at]) else assertEquals(at, c.start) // a cut drops one LF, or none
+                assertEquals(t.substring(c.start, c.start + c.text.length), c.text)
+                c.highlighted?.let { assertEquals(c.text, it.text) }
+                at = c.start + c.text.length
+            }
+            assertEquals(b.end, at)
+            for (r in mine) assertEquals(t.substring(b.start, b.end), copySource(items, r.key))
+        }
+    }
+
+    @Test
+    fun codeRowsShowAndCopyTheirSourceExactly() {
+        val failures = Work.highlightFailures
+        for (body in codeCorpus) for (lang in if (body.length > 30_000) listOf("kt") else labels) {
+            for (closer in listOf("\n```", "")) { // closed, and a fence that never closes
+                val text = "before\n\n```$lang\n$body$closer\n\nafter"
+                val stored = listOf(AssistantReply("r1", emptyList(), text, 0.0))
+                assertCodeExact(text, stored, ChatRows(ZoneId.of("UTC")).rows(stored).filterIsInstance<TextRow>())
+                val live = listOf(AssistantReply("r1", emptyList(), text, 0.0, live = true))
+                assertCodeExact(text, live, ChatRows(ZoneId.of("UTC")).rows(live).filterIsInstance<TextRow>())
+            }
+        }
+        assertEquals("the plain fallback for a failing highlight was never needed", failures, Work.highlightFailures)
+    }
+
+    @Test
+    fun streamedCodeEqualsFreshAtEveryLength() {
+        val text = "Start\n\n```kotlin\nval s = \"\"\"\n/* not a comment */\n\"\"\" // c\n```\n" +
+            "```py\n# c\n'''doc\n```\n\n```nonsense\nx\n```\n```sh\necho 'a\n``` not a closer\n```x\n```\n" +
+            "```rust title=x.rs\nfn f<'a>() {}\n```\n\nend ```kt\n```c\nint x = 1;"
+        val live = ReplyText()
+        for (end in 1..text.length) assertEquals("at $end", replyRows("r1", text.substring(0, end)), live.update("r1", text.substring(0, end)))
+        val code = codeChunks(live.update("r1", text))
+        assertEquals(listOf(true, true, false, true, true, false), code.map { it.highlighted != null })
+    }
+
+    @Test
+    fun highlightingWorkIsBoundedPerUpdate() {
+        val failures = Work.highlightFailures
+        for ((size, expected) in listOf(15_000 to 1L, HIGHLIGHT_MAX_CHARS + 5_000 to 0L)) {
+            val body = "val x = \"s\" // c\n".repeat(size / 17)
+            val text = "```kotlin\n$body```\n\n" + "tail ".repeat(400)
+            val live = ReplyText()
+            val highlights = Work.highlights
+            val steps = Work.highlightSteps
+            var end = 0
+            while (end < text.length) {
+                end = minOf(text.length, end + 7)
+                live.update("r1", text.substring(0, end))
+                assertTrue("at $end", Work.highlights - highlights <= expected)
+            }
+            assertEquals(expected, Work.highlights - highlights)
+            assertTrue(Work.highlightSteps - steps <= 13L * HIGHLIGHT_MAX_CHARS)
+            assertTrue(Work.largestHighlight <= HIGHLIGHT_MAX_CHARS)
+        }
+        // Each closing costs at most one highlight of at most the limit, however often a closer turns out not to be one.
+        val live = ReplyText()
+        val highlights = Work.highlights
+        var text = "```js\nlet a = 1\n"
+        for (k in 1..200) {
+            text += "```"
+            live.update("r1", text)
+            text += "x\nlet b = $k\n"
+            live.update("r1", text)
+        }
+        assertEquals(200L, Work.highlights - highlights)
+        assertEquals(failures, Work.highlightFailures)
+    }
+
+    // ---- fix round 1 ----
+
+    @Test
+    fun copyUsesTheCanonicalLfText() {
+        // Ruled: Copy gives the block in the app's canonical text, line endings LF (Task 2 normalizes at the boundary),
+        // which is what a terminal or editor expects. Offsets are found in that text, so a CRLF before the block is fine.
+        val text = "intro\r\n\r\n```sh\r\na\r\nb\rc\r\n```\r\n\r\n| x | y |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\nend"
+        assertEquals("a\nb\nc", blockSource(text, 1))
+        assertEquals("| x | y |\n|---|---|\n| 1 | 2 |", blockSource(text, 2))
+        val items = listOf(AssistantReply("r1", emptyList(), text, 0.0))
+        val rows = ChatRows(ZoneId.of("UTC")).rows(items).filterIsInstance<TextRow>()
+        assertEquals("a\nb\nc", copySource(items, rows.first { it.kind == BlockKind.CODE }.key))
+        assertEquals("| x | y |\n|---|---|\n| 1 | 2 |", copySource(items, rows.first { it.kind == BlockKind.TABLE }.key))
+    }
+
+    /** Row work of the reviewer's four fence transitions after [lines] lines of a fence; checks every result against fresh. */
+    private fun transitionWork(lines: Int): List<Triple<Long, Long, Long>> {
+        val live = ReplyText()
+        var text = "```kotlin\n" + "0\n".repeat(lines)
+        live.update("r1", text)
+        val snapshots = ArrayList<Pair<String, List<TextRow>>>()
+        val work = ArrayList<Triple<Long, Long, Long>>()
+        for (append in listOf("```", "x", "\n```", "\n")) {
+            text += append
+            val copies = Work.rowCopies
+            val built = Work.rowsBuilt
+            val chunk = Work.chunkSteps
+            val rows = live.update("r1", text)
+            work += Triple(Work.rowCopies - copies, Work.rowsBuilt - built, Work.chunkSteps - chunk)
+            snapshots += text to rows
+        }
+        for ((t, rows) in snapshots) assertEquals("snapshot of ${t.length}", replyRows("r1", t), rows.toList())
+        return work
+    }
+
+    @Test
+    fun fenceTransitionsCostTheSameAtAnyBlockLength() {
+        val small = transitionWork(50_000)
+        val large = transitionWork(500_000)
+        assertEquals(small, large)
+        assertTrue("$small", small.all { it.first <= 2 })
     }
 }

@@ -140,6 +140,11 @@
     <string name="licenses_commonmark">commonmark-java (licencja BSD 2-Clause)</string>
     <string name="md_image">Obraz</string>
     <string name="md_table">Tabela</string>
+    <string name="md_table_copy">Kopiuj tabelę</string>
+    <string name="code_copy">Kopiuj kod</string>
+    <string name="copy_done">Skopiowano</string>
+    <string name="copy_too_large">Za duże, by skopiować</string>
+    <string name="copy_failed">Nie udało się skopiować</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
     <string name="drawer_open">Otwórz listę czatów</string>
     <string name="drawer_new_chat">Nowy czat</string>

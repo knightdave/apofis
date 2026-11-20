@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import android.content.ClipData
+import androidx.annotation.StringRes
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,9 +26,17 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.delay
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.platform.Clipboard
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -44,6 +54,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -70,6 +82,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import xyz.rycerz.apofis.R
+import kotlinx.coroutines.launch
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.scaled
@@ -79,13 +93,19 @@ import xyz.rycerz.apofis.ui.theme.scaled
  * shared by every slice of one table, so they scroll sideways together.
  */
 @Composable
-fun MarkdownChunk(chunk: DisplayChunk, onLink: (String) -> Unit, modifier: Modifier = Modifier, tableScroll: ScrollState = rememberScrollState()) {
+fun MarkdownChunk(
+    chunk: DisplayChunk,
+    onLink: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    tableScroll: ScrollState = rememberScrollState(),
+    source: () -> String? = { null },
+) {
     val body = scaled(ChatText.assistant)
     val link by rememberUpdatedState(onLink)
     val open: (String) -> Unit = { link(it) }
     when (chunk) {
         is DisplayChunk.Blocks -> Blocks(chunk.blocks, body, MaterialTheme.colorScheme.onSurface, false, open, modifier)
-        is DisplayChunk.TableSlice -> Table(chunk.table, chunk.from, chunk.to, chunk.widths, chunk.first, chunk.last, tableScroll, open, modifier)
+        is DisplayChunk.TableSlice -> Table(chunk.table, chunk.from, chunk.to, chunk.widths, chunk.first, chunk.last, tableScroll, open, source, modifier)
         is DisplayChunk.Literal -> Text(chunk.text, modifier.fillMaxWidth(), style = body, color = MaterialTheme.colorScheme.onSurface)
         is DisplayChunk.Code -> Text(
             chunk.text,
@@ -141,7 +161,7 @@ private fun Block(b: MdBlock, body: TextStyle, color: Color, strike: Boolean, on
             )
         }
         is MdBlock.ListBlock -> ListView(b, body, color, strike, onLink)
-        is MdBlock.Table -> Table(b, 0, b.rows.size, remember(b) { tableWidths(b) }, first = true, last = true, rememberScrollState(), onLink)
+        is MdBlock.Table -> Table(b, 0, b.rows.size, remember(b) { tableWidths(b) }, first = true, last = true, rememberScrollState(), onLink, { null }) // unreachable: tables are their own logical blocks
         is MdBlock.Image -> ImageTile(b, onLink)
         MdBlock.Rule -> Box(Modifier.fillMaxWidth().padding(vertical = 12.dp).height(1.dp).background(colors.hairline))
     }
@@ -311,6 +331,7 @@ private fun Table(
     last: Boolean,
     scroll: ScrollState,
     onLink: (String) -> Unit,
+    source: () -> String?,
     modifier: Modifier = Modifier,
 ) {
     val colors = ApofisTheme.colors
@@ -325,15 +346,16 @@ private fun Table(
         val total = width(columns)
         // A narrow table shares the spare width, each column up to the cap; what is left stays outside the frame.
         val fitted = if (total < maxWidth && columns.isNotEmpty()) columns.map { minOf(MaxColumn, it + (maxWidth - total) / columns.size) } else columns
-        Column(Modifier.width(minOf(maxWidth, width(fitted))).tableFrame(first, last, colors.tableBorder)) {
+        Column(Modifier.width(minOf(maxWidth, width(fitted))).blockFrame(first, last, colors.tableBorder, TableRadius)) {
             if (first) {
                 Row(
-                    Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(horizontal = 12.dp),
+                    Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(start = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(painterResource(R.drawable.lucide_table), null, Modifier.size(16.dp), tint = colors.codeLabel)
                     Box(Modifier.width(6.dp))
-                    Text(stringResource(R.string.md_table), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel)
+                    Text(stringResource(R.string.md_table), Modifier.weight(1f), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel, maxLines = 1)
+                    CopyButton(R.string.md_table_copy, source)
                 }
             }
             Column(Modifier.horizontalScroll(scroll)) {
@@ -367,8 +389,8 @@ private fun TableRow(cells: List<MdText>, align: List<Align>, widths: List<Dp>, 
 }
 
 /** Clips to a rounded frame and draws its outline; an edge that continues in the next or previous slice is open. */
-private fun Modifier.tableFrame(first: Boolean, last: Boolean, color: Color) = clipToBounds().drawWithCache {
-    val r = TableRadius.toPx()
+internal fun Modifier.blockFrame(first: Boolean, last: Boolean, color: Color, radius: Dp) = clipToBounds().drawWithCache {
+    val r = radius.toPx()
     val stroke = 1.dp.toPx()
     val top = if (first) 0f else -r
     val bottom = if (last) size.height else size.height + r
@@ -379,5 +401,73 @@ private fun Modifier.tableFrame(first: Boolean, last: Boolean, color: Color) = c
     onDrawWithContent {
         clipPath(clip) { this@onDrawWithContent.drawContent() }
         drawPath(outline, color, style = Stroke(stroke))
+    }
+}
+
+/**
+ * The most text put on the clipboard. ClipData carries text inline through one Binder transaction, whose buffer is
+ * 1 MiB shared by the whole process, as UTF-16 (2 bytes per character): 100,000 characters is about 200 KB, a fifth of
+ * it. Longer text is refused, never cut.
+ */
+internal const val MAX_CLIP_CHARS = 100_000
+
+/** How long the Copy result stays beside the button. */
+internal const val COPY_NOTE_MS = 2000L
+
+internal enum class CopyResult(@StringRes val note: Int) {
+    COPIED(R.string.copy_done),
+    TOO_LARGE(R.string.copy_too_large),
+    FAILED(R.string.copy_failed),
+}
+
+/** Puts [text] on [clipboard] as plain text, whole or not at all; a rejected write (for example by Binder) is caught. */
+internal suspend fun copyText(clipboard: Clipboard, text: String): CopyResult {
+    if (text.length > MAX_CLIP_CHARS) return CopyResult.TOO_LARGE
+    return try {
+        clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(null, text)))
+        CopyResult.COPIED
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        CopyResult.FAILED
+    }
+}
+
+/**
+ * A header action: copies [source] (the raw source of the whole block) to the clipboard, no toast. What happened
+ * (copied, too large, failed) shows beside the button for [COPY_NOTE_MS] and is announced.
+ */
+@Composable
+internal fun CopyButton(@StringRes description: Int, source: () -> String?) {
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    val current by rememberUpdatedState(source)
+    var note by remember { mutableStateOf<CopyResult?>(null) }
+    var taps by remember { mutableIntStateOf(0) }
+    LaunchedEffect(taps) {
+        delay(COPY_NOTE_MS)
+        note = null
+    }
+    note?.let {
+        Text(
+            stringResource(it.note),
+            Modifier.padding(start = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },
+            style = TextStyle(fontSize = 12.sp),
+            color = ApofisTheme.colors.codeLabel,
+            maxLines = 1,
+        )
+    }
+    ApofisIconButton(
+        onClick = {
+            val text = current() ?: return@ApofisIconButton
+            scope.launch {
+                note = copyText(clipboard, text)
+                taps++
+            }
+        },
+        contentDescription = stringResource(description),
+        visualSize = 24.dp,
+    ) {
+        Icon(painterResource(R.drawable.lucide_copy), null, Modifier.size(16.dp), tint = ApofisTheme.colors.codeLabel)
     }
 }

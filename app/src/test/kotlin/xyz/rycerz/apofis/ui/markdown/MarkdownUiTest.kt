@@ -1,5 +1,28 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import android.content.ClipboardManager
+import android.content.Context
+import androidx.compose.foundation.layout.Column
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.test.core.app.ApplicationProvider
+import java.time.ZoneOffset
+import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.ui.chat.ChatRows
+import xyz.rycerz.apofis.ui.chat.TextBlock
+import xyz.rycerz.apofis.ui.chat.TextRow
+import xyz.rycerz.apofis.ui.chat.copySource
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.Clipboard
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import kotlinx.coroutines.test.runTest
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
@@ -93,5 +116,108 @@ class MarkdownUiTest {
         assertEquals(1, rule.onAllNodes(state(ToggleableState.Off) and hasText("open")).fetchSemanticsNodes().size)
         assertEquals(1, rule.onAllNodes(state(ToggleableState.On) and hasText("done")).fetchSemanticsNodes().size)
         assertEquals(0, rule.onAllNodes(hasClickAction(), useUnmergedTree = true).fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun copyButtonsCopyTheWholeBlockAndShowPressAndFocus() {
+        rule.mainClock.autoAdvance = false
+        lateinit var inputMode: InputModeManager
+        val body = (1..300).joinToString("\n") { "val v$it = \"s$it\" // $it" }
+        val table = "| a | b |\n|---|---|\n| 1 | 2 |"
+        val items = listOf(AssistantReply("r1", emptyList(), "```kotlin\n$body\n```\n\n$table", 0.0))
+        val rows = ChatRows(ZoneOffset.UTC).rows(items).filterIsInstance<TextRow>()
+        val code = rows.first { it.kind == BlockKind.CODE }
+        assertTrue(rows.count { it.kind == BlockKind.CODE } > 1) // the block is split, Copy still takes all of it
+        val tableRow = rows.first { it.kind == BlockKind.TABLE }
+        rule.setContent {
+            Themed {
+                inputMode = LocalInputModeManager.current
+                Column {
+                    TextBlock(tableRow, source = { copySource(items, tableRow.key) })
+                    TextBlock(code, source = { copySource(items, code.key) }) // only its header needs to be on screen
+                }
+            }
+        }
+        rule.mainClock.advanceTimeBy(frames)
+        val clipboard = ApplicationProvider.getApplicationContext<Context>().getSystemService(ClipboardManager::class.java)
+        for ((description, expected) in listOf("Copy code" to body, "Copy table" to table)) {
+            val button = rule.onNodeWithContentDescription(description)
+            button.assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button)).assert(hasClickAction())
+            val idle = button.captureToImage()
+            button.performTouchInput { down(center) }
+            rule.mainClock.advanceTimeBy(frames)
+            assertFalse("$description shows no press", same(idle, button.captureToImage()))
+            button.performTouchInput { up() }
+            rule.mainClock.advanceTimeBy(frames)
+            rule.waitForIdle()
+            assertEquals(description, expected, clipboard.primaryClip?.getItemAt(0)?.text?.toString())
+            assertTrue("$description still looks pressed", same(idle, button.captureToImage()))
+            rule.runOnUiThread { inputMode.requestInputMode(InputMode.Keyboard) }
+            button.requestFocus()
+            rule.mainClock.advanceTimeBy(frames)
+            assertFalse("$description shows no focus", same(idle, button.captureToImage()))
+            rule.runOnUiThread { inputMode.requestInputMode(InputMode.Touch) }
+        }
+    }
+
+    // ---- fix round 1: Copy within the clipboard's limits, with a message ----
+
+    /** A clipboard that records what is put on it, or throws like a rejected Binder transaction. */
+    private class FakeClipboard(val fail: Boolean = false) : Clipboard {
+        var clip: String? = "previous"
+        override suspend fun getClipEntry(): ClipEntry? = null
+        override suspend fun setClipEntry(clipEntry: ClipEntry?) {
+            if (fail) throw RuntimeException("android.os.TransactionTooLargeException")
+            clip = clipEntry?.clipData?.getItemAt(0)?.text?.toString()
+        }
+        override val nativeClipboard get() = throw UnsupportedOperationException()
+    }
+
+    @Test
+    fun copyRefusesWhatTheClipboardCannotCarry() = runTest {
+        val ok = FakeClipboard()
+        assertEquals(CopyResult.COPIED, copyText(ok, "x".repeat(MAX_CLIP_CHARS)))
+        assertEquals("x".repeat(MAX_CLIP_CHARS), ok.clip)
+        for (big in listOf("x\n".repeat(524_288), "😀".repeat(MAX_CLIP_CHARS / 2 + 1), "ł".repeat(MAX_CLIP_CHARS + 1))) {
+            val clipboard = FakeClipboard()
+            assertEquals(CopyResult.TOO_LARGE, copyText(clipboard, big))
+            assertEquals("never truncated, the old clip stays", "previous", clipboard.clip)
+        }
+        val failing = FakeClipboard(fail = true)
+        assertEquals(CopyResult.FAILED, copyText(failing, "small"))
+        assertEquals("previous", failing.clip)
+    }
+
+    @Test
+    fun copySaysWhatHappened() {
+        rule.mainClock.autoAdvance = false
+        var clipboard by mutableStateOf(FakeClipboard())
+        var source by mutableStateOf("abc")
+        val row = ChatRows(ZoneOffset.UTC).rows(listOf(AssistantReply("r1", emptyList(), "```kotlin\nval x = 1\n```", 0.0)))
+            .filterIsInstance<TextRow>().single()
+        rule.setContent {
+            Themed { CompositionLocalProvider(LocalClipboard provides clipboard) { TextBlock(row, source = { source }) } }
+        }
+        rule.mainClock.advanceTimeBy(frames)
+        fun tap(): String? {
+            rule.onNodeWithContentDescription("Copy code").performClick()
+            rule.mainClock.advanceTimeBy(frames)
+            rule.waitForIdle()
+            return clipboard.clip
+        }
+        assertEquals("abc", tap())
+        rule.onNodeWithText("Copied").assertExists()
+        rule.mainClock.advanceTimeBy(COPY_NOTE_MS)
+        rule.onNodeWithText("Copied").assertDoesNotExist()
+
+        source = "x".repeat(MAX_CLIP_CHARS + 1)
+        assertEquals("previous", FakeClipboard().also { clipboard = it }.let { tap() })
+        rule.onNodeWithText("Too large to copy").assertExists()
+
+        clipboard = FakeClipboard(fail = true)
+        source = "abc"
+        rule.mainClock.advanceTimeBy(frames)
+        assertEquals("previous", tap())
+        rule.onNodeWithText("Could not copy").assertExists()
     }
 }
