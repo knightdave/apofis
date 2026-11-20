@@ -202,7 +202,7 @@ class DaosTest {
     }
 
     @Test
-    fun deleteForRunKeepsOtherRows() = runTest {
+    fun forRunListsOnlyStartedAndSteeredRows() = runTest {
         val dao = db.pendingSendDao()
         fun send(key: String, state: String, runId: String?) = PendingSendEntity(key, "s", "t", "{}", 1L, state, runId, null)
         dao.upsert(send("started", "sending", "run_1"))
@@ -211,8 +211,15 @@ class DaosTest {
         dao.upsert(send("otherRun", "sending", "run_2"))
         dao.upsert(send("cutOffSteer", "steering", "run_1"))
 
-        assertEquals(2, dao.deleteForRun("run_1"))
-        assertEquals(listOf("cutOffSteer", "failedSteer", "otherRun"), dao.observe("s").first().map { it.idempotencyKey }.sorted())
+        assertEquals(listOf("started", "steered"), dao.forRun("run_1").map { it.idempotencyKey }.sorted())
+    }
+
+    @Test
+    fun userRowsListsOnlyUserMessages() = runTest {
+        val dao = db.messageDao()
+        dao.replaceSession("s", listOf(message("s", 0), message("s", 1).copy(role = "assistant"), message("s", 2)))
+        dao.replaceSession("t", listOf(message("t", 0)))
+        assertEquals(listOf(0, 2), dao.userRows("s").map { it.position })
     }
 
     @Test
@@ -220,14 +227,24 @@ class DaosTest {
         val dao = db.activeRunDao()
         dao.updateLastSeq("gone", 5)
         dao.setStatus("gone", "stopping")
+        dao.updateStatus("gone", "queued")
+        dao.setPolling("gone")
         assertTrue(dao.all().isEmpty())
 
         dao.upsert(ActiveRunEntity("run_1", "s", null, "running", 1L))
         dao.updateLastSeq("run_1", 7)
         dao.updateLastSeq("run_1", 3)
         dao.setStatus("run_1", "stopping")
+        dao.updateStatus("run_1", "running") // a requested stop is never overwritten by a status read
+        dao.setPolling("run_1")
         val row = dao.all().single()
         assertEquals(7L, row.lastSeq)
         assertEquals("stopping", row.status)
+        assertTrue(row.polling)
+
+        dao.upsert(ActiveRunEntity("run_2", "t", null, "running", 1L))
+        dao.updateStatus("run_2", "queued")
+        assertEquals("queued", dao.forSession("t")!!.status)
+        assertEquals(false, dao.forSession("t")!!.polling)
     }
 }

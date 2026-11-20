@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "add08af10c6b1b173053908b466cd34c",
+    "identityHash": "1b59a59c856b955901abf540df6f6b0b",
     "entities": [
       {
         "tableName": "SessionEntity",
@@ -236,7 +236,7 @@
       },
       {
         "tableName": "ActiveRunEntity",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`runId` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `lastSeq` INTEGER, `status` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, PRIMARY KEY(`runId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`runId` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `lastSeq` INTEGER, `status` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, `polling` INTEGER NOT NULL, PRIMARY KEY(`runId`))",
         "fields": [
           {
             "fieldPath": "runId",
@@ -264,6 +264,12 @@
           {
             "fieldPath": "startedAt",
             "columnName": "startedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "polling",
+            "columnName": "polling",
             "affinity": "INTEGER",
             "notNull": true
           }
@@ -314,7 +320,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'add08af10c6b1b173053908b466cd34c')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '1b59a59c856b955901abf540df6f6b0b')"
     ]
   }
 }

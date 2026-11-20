@@ -98,6 +98,9 @@ interface MessageDao {
         insertAll(rows)
     }
 
+    @Query("SELECT * FROM MessageEntity WHERE sessionKey = :sessionKey AND role = 'user' ORDER BY position")
+    suspend fun userRows(sessionKey: String): List<MessageEntity>
+
     @Query("SELECT MAX(id) FROM MessageEntity WHERE sessionKey = :sessionKey")
     suspend fun maxId(sessionKey: String): Long?
 
@@ -138,10 +141,10 @@ interface PendingSendDao {
 
     /**
      * The send that started the run and the steers delivered to it. Failed steers have no run id, and a steer cut off
-     * mid-request (still `steering`) may not have been delivered, so both stay.
+     * mid-request (still `steering`) may not have been delivered, so neither is listed.
      */
-    @Query("DELETE FROM PendingSendEntity WHERE runId = :runId AND state IN ('sending', 'steered')")
-    suspend fun deleteForRun(runId: String): Int
+    @Query("SELECT * FROM PendingSendEntity WHERE runId = :runId AND state IN ('sending', 'steered') ORDER BY createdAt")
+    suspend fun forRun(runId: String): List<PendingSendEntity>
 }
 
 @Dao
@@ -167,6 +170,13 @@ interface ActiveRunDao {
 
     @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId")
     suspend fun setStatus(runId: String, status: String)
+
+    /** A status read from the server; a stop this app requested stays recorded as `stopping`. */
+    @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId AND status != 'stopping'")
+    suspend fun updateStatus(runId: String, status: String)
+
+    @Query("UPDATE ActiveRunEntity SET polling = 1 WHERE runId = :runId")
+    suspend fun setPolling(runId: String)
 }
 
 @Dao

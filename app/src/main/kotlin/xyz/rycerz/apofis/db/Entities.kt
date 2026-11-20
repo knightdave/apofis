@@ -57,6 +57,7 @@ data class ActiveRunEntity(
     val lastSeq: Long?,
     val status: String,
     val startedAt: Long,
+    val polling: Boolean = false, // the event stream is gone for good (truncated or 404): follow by polling only
 )
 
 @Entity(primaryKeys = ["sessionKey", "afterMessageId"])
