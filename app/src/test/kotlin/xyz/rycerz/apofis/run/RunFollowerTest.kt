@@ -91,8 +91,19 @@ class RunFollowerTest {
         repo = ChatRepository(api, db)
     }
 
+    private val gaveUp = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Holds a response until the test opens the gate; a timeout never answers normally and fails the test. */
+    private fun CountDownLatch.hold() {
+        if (!await(10, TimeUnit.SECONDS)) {
+            gaveUp.set(true)
+            throw IllegalStateException("a held response timed out")
+        }
+    }
+
     @After
     fun tearDown() {
+        assertFalse("a held response timed out", gaveUp.get())
         db.close()
         server.close()
     }
@@ -164,7 +175,7 @@ class RunFollowerTest {
     /** Messages that answer only after [gate] opens, so the live state before Finish can be read. */
     private fun gatedMessages(gate: CountDownLatch) {
         routes[MESSAGES] = {
-            gate.await(10, TimeUnit.SECONDS)
+            gate.hold()
             json(messagesBody)()
         }
     }
@@ -206,7 +217,7 @@ class RunFollowerTest {
         val gate = CountDownLatch(1)
         val steer = "[OUT-OF-BAND USER MESSAGE - sent while you were working]\\ntext p2\\n[/OUT-OF-BAND USER MESSAGE]"
         routes[MESSAGES] = {
-            gate.await(10, TimeUnit.SECONDS)
+            gate.hold()
             json(
                 """{"session_id":"$KEY","data":[{"id":10,"role":"user","content":" text p1 ","timestamp":1.0},""" +
                     """{"id":11,"role":"user","display_kind":"steer","content":"$steer","timestamp":1.5},""" +
@@ -400,7 +411,7 @@ class RunFollowerTest {
             json("""{"run_id":"$RUN","status":"stopping"}""")()
         }
         routes[EVENTS] = {
-            stopped.await(10, TimeUnit.SECONDS)
+            stopped.hold()
             sseResponse(delta(0, "a"), terminal(1, "cancelled"))
         }
         started(f)
@@ -453,7 +464,7 @@ class RunFollowerTest {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(delta(0, "a"), frame(1, approvalEvent))
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                release.hold()
                 sseResponse(terminal(2))
             }
         }
@@ -490,7 +501,7 @@ class RunFollowerTest {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(frame(1, approvalEvent))
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                release.hold()
                 sseResponse(terminal(2))
             }
         }
@@ -660,7 +671,7 @@ class RunFollowerTest {
     private suspend fun heldOpen(f: RunFollower, release: CountDownLatch) {
         messages()
         routes[EVENTS] = {
-            release.await(10, TimeUnit.SECONDS)
+            release.hold()
             sseResponse(terminal(5))
         }
         started(f)
@@ -765,7 +776,7 @@ class RunFollowerTest {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(delta(0, "a"), frame(1, approvalEvent), delta(2, "never applied"))
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                release.hold()
                 sseResponse(terminal(9))
             }
         }
@@ -1390,7 +1401,7 @@ class RunFollowerTest {
             when (reads.incrementAndGet()) {
                 1 -> status("waiting_for_approval", pendingControl)()
                 2 -> {
-                    slow.await(10, TimeUnit.SECONDS) // started first, finishes last, and shows nothing pending
+                    slow.hold() // started first, finishes last, and shows nothing pending
                     status("running")()
                 }
                 else -> status("waiting_for_approval", otherControl)()
@@ -1398,7 +1409,7 @@ class RunFollowerTest {
         }
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}"""))
         routes[EVENTS] = {
-            emit.await(10, TimeUnit.SECONDS)
+            emit.hold()
             heldStream(frame(1, approvalEvent))()
         }
         started(f)

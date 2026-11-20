@@ -118,8 +118,19 @@ class ChatViewModelTest {
         connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, f, AtomicBoolean(true), scope)
     }
 
+    private val gaveUp = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Holds a response until the test opens the gate; a timeout never answers normally and fails the test. */
+    private fun CountDownLatch.hold() {
+        if (!await(10, TimeUnit.SECONDS)) {
+            gaveUp.set(true)
+            throw IllegalStateException("a held response timed out")
+        }
+    }
+
     @After
     fun tearDown() {
+        assertFalse("a held response timed out", gaveUp.get())
         latches.forEach { it.countDown() }
         // Every coroutine must end before the next test: the repository and send locks are process-wide, and a
         // view model coroutine left suspended on the reset main dispatcher would hold them for good.
@@ -179,7 +190,7 @@ class ChatViewModelTest {
             if (attaches.incrementAndGet() == 1 && first.isNotEmpty()) {
                 sse(*first.toTypedArray()) // ends without a terminal event: a drop, then a resume
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                release.hold()
                 sse(terminal(99))
             }
         }
@@ -417,6 +428,73 @@ class ChatViewModelTest {
         vm.onConfirmCancel("q1", mayHaveSentShown = true)
         assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, vm.await { it.composerNote != null }.composerNote)
         assertTrue(vm.await { it.items.isEmpty() }.items.isEmpty())
+    }
+
+    @Test
+    fun sendSurvivesLeavingTheChat() = runTest {
+        addSession()
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("Remember the milk")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear() // the user switched chats before the message was stored
+        held.complete(Unit)
+        lock.join()
+
+        awaitTrue { runBlocking { db.pendingSendDao().rows(KEY).isNotEmpty() } }
+        assertEquals(listOf("Remember the milk"), db.pendingSendDao().rows(KEY).map { it.text })
+        assertEquals("", connected.drafts.get(KEY))
+    }
+
+    @Test
+    fun failedSendAfterLeavingGoesBackToTheDraft() = runTest {
+        // No session row: send refuses before storing anything.
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("first")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear()
+        held.complete(Unit)
+        lock.join()
+
+        awaitTrue { connected.drafts.get(KEY).isNotEmpty() }
+        assertEquals("first", connected.drafts.get(KEY))
+        assertEquals("first", vm().state.value.draft) // there when the chat is opened again
+    }
+
+    @Test
+    fun draftIsReadOnceAndWrittenOnlyByEdits() = runTest {
+        addSession()
+        connected.drafts.set(KEY, "half a thought")
+        val vm = vm()
+        assertEquals("half a thought", vm.await { it.title == "Plans" }.draft)
+        store.clear() // opened and left at once: the saved draft stays
+        assertEquals("half a thought", connected.drafts.get(KEY))
+
+        val again = vm()
+        again.onDraftChange("half a thought, finished")
+        assertEquals("half a thought, finished", connected.drafts.get(KEY))
+    }
+
+    @Test
+    fun openingAgainFetchesAStaleChatAndReportsFailure() = runTest {
+        addSession(onServer = true)
+        routes[MESSAGES] = json(serverRows)
+        val vm = vm()
+        awaitTrue { requests.count { it.target.startsWith(MESSAGES) } == 1 }
+        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true))
+        routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
+        vm.onOpened()
+        assertEquals(StatusLine.SERVER_ERROR, vm.await { it.status == StatusLine.SERVER_ERROR }.status)
+        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
     }
 
     @Test

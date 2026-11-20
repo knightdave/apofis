@@ -25,7 +25,6 @@ import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.ApiError
 
 private const val REFRESH_INTERVAL_MS = 30_000L
-private const val MAX_DRAFTS = 20
 const val TITLE_MAX = 120
 
 enum class PromptKind { ACTIONS, RENAME, DELETE }
@@ -57,18 +56,19 @@ private class RunAppeared : Exception()
  * The chat list and the open chat ([selected]). The open chat lives here so the drawer can reuse it for a new chat and
  * replace it when it is deleted, archived or gone after a refresh. New chat, selection and the actions that replace the
  * open chat run one at a time ([ops]). [lastChat] is the chat to restore; [onSelected] stores each new selection.
- * Drafts of chats not on screen are kept here, a few at most, since only the visible chat has a view model.
  */
 class DrawerViewModel(
-    connected: Connected,
+    private val connection: Connected,
     private val lastChat: String? = null,
     private val onSelected: (String) -> Unit = {},
     private val now: () -> Long = System::currentTimeMillis,
     private val zone: () -> ZoneId = ZoneId::systemDefault,
 ) : ViewModel(), DrawerActions, PromptActions {
-    private val repo = connected.repo
-    private val follower = connected.follower
-    private val db = connected.db
+    private val repo = connection.repo
+    private val follower = connection.follower
+    private val sendQueue = connection.sendQueue
+    private val drafts = connection.drafts
+    private val db = connection.db
     private val ops = Mutex()
     private val tokens = AtomicLong()
     private val inFlight = AtomicInteger()
@@ -95,6 +95,14 @@ class DrawerViewModel(
     private val refreshFailedFlow = MutableStateFlow(false)
     val refreshFailed: StateFlow<Boolean> = refreshFailedFlow.asStateFlow()
 
+    /** A tap on the row of the chat already shown; [n] makes every tap a new value. */
+    data class Reopen(val key: String, val n: Long)
+
+    private val reopenedFlow = MutableStateFlow<Reopen?>(null)
+
+    /** The chat on screen was opened again: it should run its "needs history?" check (see ChatViewModel.onOpened). */
+    val reopened: StateFlow<Reopen?> = reopenedFlow.asStateFlow()
+
     private val promptFlow = MutableStateFlow<Prompt?>(null)
     val prompt: StateFlow<Prompt?> = promptFlow.asStateFlow()
 
@@ -111,10 +119,6 @@ class DrawerViewModel(
         s.sortedByDescending { it.lastActiveAt ?: it.startedAt }
             .map { DrawerRow.Chat(it.key, it.title.orEmpty(), selected = false, running = false, needsInput = false).withRuns(r[it.key]) }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
-
-    private val drafts = object : LinkedHashMap<String, String>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > MAX_DRAFTS
-    }
 
     private var lastRefresh: Long? = null
     private var refreshing = false
@@ -134,7 +138,7 @@ class DrawerViewModel(
             try {
                 ops.withLock {
                     if (selectedFlow.value != null) return@withLock
-                    val restored = lastChat?.takeIf { db.sessionDao().get(it) != null }
+                    val restored = lastChat?.takeIf { usable(it) }
                     selectedFlow.value = restored
                         ?: repo.sessions().first().maxByOrNull { it.lastActiveAt ?: it.startedAt }?.key
                         ?: repo.createLocalSession()
@@ -149,12 +153,6 @@ class DrawerViewModel(
 
     fun onQuery(q: String) {
         queryFlow.value = q
-    }
-
-    fun draft(key: String): String = drafts[key].orEmpty()
-
-    fun saveDraft(key: String, text: String) {
-        if (text.isEmpty()) drafts.remove(key) else drafts[key] = text
     }
 
     /** The drawer opened: refreshes the list at most every 30 s, or always while it is empty; a failure keeps it. */
@@ -181,10 +179,30 @@ class DrawerViewModel(
         }
     }
 
-    /** Shows [key]; its chat screen fetches the history when it needs it. */
+    /**
+     * The one way a row opens a chat. A chat gone from this phone or hidden is ignored (a stale row), or replaced by a new
+     * local chat when it is the one shown; a tap on the chat already shown asks it to check its history again.
+     */
     override fun onSelect(key: String) {
-        viewModelScope.launch { ops.withLock { selectedFlow.value = key } }
+        viewModelScope.launch {
+            try {
+                ops.withLock {
+                    when {
+                        !usable(key) -> if (selectedFlow.value == key) openNew()
+                        selectedFlow.value == key -> reopenedFlow.value = Reopen(key, tokens.incrementAndGet())
+                        else -> selectedFlow.value = key
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // closed by a server switch: this view model is about to go away
+            }
+        }
     }
+
+    /** A chat that can be shown: its row exists here and is not hidden. */
+    private suspend fun usable(key: String) = db.sessionDao().get(key)?.hidden == false
 
     /** Reuses the open chat while it is local-only and empty, else creates a local chat (no request) and opens it. */
     suspend fun onNewChat(): String = ops.withLock {
@@ -253,25 +271,31 @@ class DrawerViewModel(
     override fun archive(token: Long, archived: Boolean) = act(token, PromptKind.ACTIONS) { p ->
         ops.withLock {
             repo.setArchived(p.key, archived)
-            if (archived) {
-                drafts.remove(p.key)
-                if (selectedFlow.value == p.key) openNew()
-            }
+            if (archived && selectedFlow.value == p.key) openNew() // its draft stays for when it is unarchived
         }
     }
 
     /**
-     * Deletes the chat of the open delete dialog [token], on the server and here. Its active runs are read again just
-     * before: if one exists that the dialog did not mention, the dialog says so and waits for another confirmation;
-     * otherwise every run is stopped first, and a failed stop deletes nothing.
+     * Deletes the chat of the open delete dialog [token], on the server and here. First the chat stops starting runs
+     * (queued sends wait), then its active runs are read again: one the dialog did not mention turns the dialog into a
+     * new prompt that says so and needs its own confirmation; otherwise every run is stopped, then DELETE is sent. If any
+     * step fails, the chat can send again and what waited goes out.
      */
     override fun confirmDelete(token: Long) = act(token, PromptKind.DELETE) { p ->
         ops.withLock {
-            if (db.activeRunDao().allForSession(p.key).isNotEmpty()) {
-                if (!p.running) throw RunAppeared()
-                follower.stopAll(p.key)
+            repo.beginDelete(p.key)
+            var deleted = false
+            try {
+                if (db.activeRunDao().allForSession(p.key).isNotEmpty()) {
+                    if (!p.running) throw RunAppeared()
+                    follower.stopAll(p.key)
+                }
+                repo.delete(p.key)
+                deleted = true
+            } finally {
+                repo.endDelete(p.key)
+                if (!deleted) connection.launch { sendQueue.drain() }
             }
-            repo.delete(p.key)
             drafts.remove(p.key)
             if (selectedFlow.value == p.key) openNew()
         }
@@ -288,7 +312,7 @@ class DrawerViewModel(
         try {
             ops.withLock {
                 val current = selectedFlow.value ?: return@withLock
-                if (db.sessionDao().get(current) == null) openNew()
+                if (!usable(current)) openNew()
             }
         } catch (e: CancellationException) {
             throw e
@@ -340,7 +364,7 @@ class DrawerViewModel(
                 }
                 val outcome = { p: Prompt ->
                     when {
-                        runAppeared -> p.copy(busy = false, running = true)
+                        runAppeared -> p.copy(busy = false, running = true, token = tokens.incrementAndGet())
                         error != null -> p.copy(busy = false, error = error)
                         else -> null
                     }

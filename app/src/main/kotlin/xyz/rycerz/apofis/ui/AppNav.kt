@@ -50,8 +50,9 @@ import xyz.rycerz.apofis.ui.chat.ChatActions
 import xyz.rycerz.apofis.ui.chat.ChatUiState
 import xyz.rycerz.apofis.ui.chat.ComposerMode
 import xyz.rycerz.apofis.ui.chat.StatusLine
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
 import androidx.compose.foundation.layout.RowScope
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
@@ -135,8 +136,7 @@ fun AppNav(container: AppContainer) {
 }
 
 /**
- * The chat with the drawer. [owner] lives as long as the connection and holds the drawer, which owns the open chat and
- * the drafts of chats not on screen. Only the chat on screen has a view model: switching chats clears the old one.
+ * The chat with the drawer. [owner] lives as long as the connection and holds the drawer, which owns the open chat. Only the chat on screen has a view model: switching chats clears the old one.
  * Choosing never leaves a blank screen: while loading, or after a failure (with Retry), the chat screen itself shows.
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -227,12 +227,10 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
             } else {
                 key(sessionKey) {
                     // Scoped to this chat being on screen: leaving clears the view model, its collectors and its
-                    // connectivity subscription; its draft is handed back to the drawer as it changes.
+                    // connectivity subscription. Its draft lives in the connection's holder, not here.
                     val chatOwner = rememberViewModelStoreOwner()
-                    val vm = viewModel(viewModelStoreOwner = chatOwner) {
-                        ChatViewModel(sessionKey, conn, container.online).also { it.onDraftChange(drawer.draft(sessionKey)) }
-                    }
-                    LaunchedEffect(vm) { vm.state.map { it.draft }.distinctUntilChanged().collect { drawer.saveDraft(sessionKey, it) } }
+                    val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
+                    LaunchedEffect(vm) { drawer.reopened.drop(1).filterNotNull().filter { it.key == sessionKey }.collect { vm.onOpened() } }
                     val state by vm.state.collectAsState()
                     ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton)
                 }

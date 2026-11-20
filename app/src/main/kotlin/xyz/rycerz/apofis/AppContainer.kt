@@ -27,6 +27,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.chat.Drafts
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
@@ -59,7 +60,13 @@ class Connected internal constructor(
     private val liveRepo = repo
     private val liveFollower = follower
 
+    /** Drafts of this server's chats; they go with the connection. */
+    val drafts = Drafts()
+
     val isOpen: Boolean get() = open.get()
+
+    /** Runs [block] in the connection's scope: it outlives any screen and ends with the connection. */
+    internal fun launch(block: suspend CoroutineScope.() -> Unit): Job = scope.launch(block = block)
     val api: HermesApi get() = liveApi.also { checkOpen() }
     val repo: ChatRepository get() = liveRepo.also { checkOpen() }
     val follower: RunFollower get() = liveFollower.also { checkOpen() }

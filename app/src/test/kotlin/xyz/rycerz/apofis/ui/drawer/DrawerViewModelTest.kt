@@ -16,6 +16,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.launch
+import xyz.rycerz.apofis.api.fixture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -96,6 +98,7 @@ class DrawerViewModelTest {
 
     @After
     fun tearDown() {
+        assertFalse("a held response timed out", gaveUp.get())
         store.clear()
         follower.pauseAll()
         runBlocking { withTimeout(10_000) { scope.coroutineContext.job.cancelAndJoin() } }
@@ -105,6 +108,16 @@ class DrawerViewModelTest {
     }
 
     private val saved = CopyOnWriteArrayList<String>()
+
+    private val gaveUp = AtomicBoolean(false)
+
+    /** Holds a response until the test opens the gate; a timeout never answers normally and fails the test. */
+    private fun CountDownLatch.hold() {
+        if (!await(10, TimeUnit.SECONDS)) {
+            gaveUp.set(true)
+            throw IllegalStateException("a held response timed out")
+        }
+    }
 
     private fun vm(lastChat: String? = null): DrawerViewModel = ViewModelProvider.create(
         store,
@@ -190,7 +203,8 @@ class DrawerViewModelTest {
         routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
         val vm = vm()
         vm.selected.await { it == "apofis-a" }
-        vm.saveDraft("apofis-a", "half a thought")
+        vm.rows.await { it.chats().isNotEmpty() }
+        connected.drafts.set("apofis-a", "half a thought")
         vm.onDeleteRequest("apofis-a")
         val prompt = vm.prompt.value!!
         assertEquals(PromptKind.DELETE, prompt.kind)
@@ -200,7 +214,7 @@ class DrawerViewModelTest {
         vm.prompt.await { it == null }
         assertNull(db.sessionDao().get("apofis-a"))
         assertFalse(db.sessionDao().get(next)!!.existsOnServer)
-        assertEquals("", vm.draft("apofis-a"))
+        assertEquals("", connected.drafts.get("apofis-a"))
     }
 
     @Test
@@ -248,6 +262,10 @@ class DrawerViewModelTest {
         vm.confirmDelete(prompt.token)
         val shown = vm.prompt.await { it?.running == true && !it.busy }!!
         assertTrue(requests.isEmpty()) // nothing stopped or deleted before the user saw the warning
+        assertNotEquals(prompt.token, shown.token) // the warning is a new prompt
+        vm.confirmDelete(prompt.token) // the confirmation given before the warning counts for nothing
+        assertEquals(shown, vm.prompt.value)
+        assertTrue(requests.isEmpty())
 
         vm.confirmDelete(shown.token)
         vm.prompt.await { it == null }
@@ -255,6 +273,79 @@ class DrawerViewModelTest {
             listOf("POST /v1/runs/run_a/stop", "POST /v1/runs/run_b/stop", "DELETE /api/sessions/apofis-a"),
             requests.map { "${it.method} ${it.target}" },
         )
+    }
+
+    @Test
+    fun queuedSendWaitsForTheDeleteAndGoesOutWhenItFails() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        db.pendingSendDao().upsert(PendingSendEntity("p1", "apofis-a", "hello", "{}", clock.get(), "queued", null, null))
+        val gate = CountDownLatch(1)
+        routes["DELETE /api/sessions/apofis-a"] = { gate.hold(); MockResponse.Builder().code(500).build() }
+        routes["POST /v1/runs"] = ok("""{"run_id":"run_1","status":"started","replayed":false}""")
+        val vm = vm()
+        vm.rows.await { it.chats().isNotEmpty() }
+        vm.onDeleteRequest("apofis-a")
+        vm.confirmDelete(vm.prompt.value!!.token)
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "DELETE" }) delay(5) } }
+
+        val drain = launch(Dispatchers.IO) { connected.sendQueue.drain() } // a send attempt racing the delete
+        gate.countDown()
+        assertEquals(ActionError.FAILED, vm.prompt.await { it?.error != null }!!.error)
+        withContext(Dispatchers.Default) { withTimeout(10_000) { drain.join() } }
+        // The racing attempt started nothing; the drain after the failed delete sends the waiting message.
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.target == "/v1/runs" }) delay(5) } }
+        val order = requests.map { "${it.method} ${it.target}" }
+        assertTrue(order.indexOf("DELETE /api/sessions/apofis-a") < order.indexOf("POST /v1/runs"))
+        assertEquals(1, order.count { it == "POST /v1/runs" })
+    }
+
+    @Test
+    fun archiveKeepsTheDraft() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        routes["PATCH /api/sessions/apofis-a"] = ok(fixture("session_patch_archived.json"))
+        connected.drafts.set("apofis-a", "pack the charger")
+        val vm = vm()
+        vm.selected.await { it == "apofis-a" }
+        vm.rows.await { it.chats().isNotEmpty() } // the sheet is built from the loaded list
+        vm.onLongPress("apofis-a")
+        vm.archive(vm.prompt.value!!.token, true)
+        vm.selected.await { it != "apofis-a" }
+        assertEquals("pack the charger", connected.drafts.get("apofis-a"))
+    }
+
+    @Test
+    fun selectingAGoneOrHiddenChatIsIgnored() = runTest {
+        addSession("apofis-a", "Open one")
+        addSession("apofis-b", "Evicted", active = clock.get() / 1000.0 - 60)
+        addSession("apofis-c", "Hidden", active = clock.get() / 1000.0 - 120)
+        val vm = vm()
+        vm.selected.await { it == "apofis-a" }
+        db.sessionDao().deleteRow("apofis-b") // removed while its row was still drawn
+        db.sessionDao().upsert(db.sessionDao().get("apofis-c")!!.copy(hidden = true))
+        vm.onSelect("apofis-b")
+        vm.onSelect("apofis-c")
+        vm.onSelect("apofis-a") // serialized after the two above
+        vm.reopened.await { it?.key == "apofis-a" }!!.key
+        assertEquals("apofis-a", vm.selected.value)
+    }
+
+    @Test
+    fun hiddenOpenChatIsReplaced() = runTest {
+        addSession("apofis-a", "Kept for unsent work")
+        val vm = vm()
+        vm.selected.await { it == "apofis-a" }
+        db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(hidden = true))
+        val next = vm.selected.await { it != "apofis-a" }!!
+        assertFalse(db.sessionDao().get(next)!!.existsOnServer)
+    }
+
+    @Test
+    fun tappingTheOpenChatOpensItAgain() = runTest {
+        addSession("apofis-a", "Open one")
+        val vm = vm()
+        vm.selected.await { it == "apofis-a" }
+        vm.onSelect("apofis-a")
+        assertEquals("apofis-a", vm.reopened.await { it?.key == "apofis-a" }!!.key)
     }
 
     @Test
@@ -289,13 +380,14 @@ class DrawerViewModelTest {
         addSession("apofis-a", "Trip to Lisbon")
         addSession("apofis-b", "Bike repair")
         val gate = CountDownLatch(1)
-        routes["PATCH /api/sessions/apofis-a"] = { gate.await(10, TimeUnit.SECONDS); MockResponse.Builder().code(500).build() }
+        routes["PATCH /api/sessions/apofis-a"] = { gate.hold(); MockResponse.Builder().code(500).build() }
         val vm = vm()
         vm.rows.await { it.chats().size == 2 }
         vm.onPin("apofis-a", true) // an accessibility action: runs at once in its own prompt
         withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
         vm.onDeleteRequest("apofis-b")
         val forB = vm.prompt.value!!
+        assertEquals(1, vm.busyActions()) // the pin is still waiting for its answer
         gate.countDown()
         withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.busyActions() > 0) delay(5) } }
         assertEquals(forB, vm.prompt.value)
