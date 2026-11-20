@@ -18,15 +18,15 @@ interface SessionDao {
 
     // instr instead of LIKE: server ids contain '_', which LIKE treats as a wildcard.
     @Query(
-        "SELECT * FROM SessionEntity WHERE `key` = :id OR currentId = :id " +
-            "OR (instr(:id, ',') = 0 AND instr(',' || lineageIds || ',', ',' || :id || ',') > 0) LIMIT 1",
+        "SELECT * FROM SessionEntity WHERE :id != '' AND (`key` = :id OR currentId = :id " +
+            "OR (instr(:id, ',') = 0 AND instr(',' || lineageIds || ',', ',' || :id || ',') > 0)) LIMIT 1",
     )
     suspend fun findByAnyId(id: String): SessionEntity?
 
     @Upsert
     suspend fun upsert(s: SessionEntity)
 
-    /** Deletes the session and everything that belongs to it. */
+    /** User deletion: removes the session and everything that belongs to it, unsent messages included. */
     @Transaction
     suspend fun delete(key: String) {
         deleteRow(key)
@@ -37,21 +37,30 @@ interface SessionDao {
     }
 
     /**
-     * Upserts [rows] and deletes every server-backed session not among them.
-     * Sessions not yet created on the server are kept.
+     * Upserts [rows] and evicts every server-backed session not among them, with its cached
+     * messages and outcomes. Sessions not yet created on the server, and sessions that still
+     * have a pending send or an active run, are kept so a sync never loses unsent messages.
      */
     @Transaction
     suspend fun replaceServerSessions(rows: List<SessionEntity>) {
         upsertAll(rows)
         val keep = rows.mapTo(HashSet()) { it.key }
-        serverKeys().filterNot { it in keep }.forEach { delete(it) }
+        evictableKeys().filterNot { it in keep }.forEach {
+            deleteRow(it)
+            deleteMessages(it)
+            deleteReplyOutcomes(it)
+        }
     }
 
     @Upsert
     suspend fun upsertAll(rows: List<SessionEntity>)
 
-    @Query("SELECT `key` FROM SessionEntity WHERE existsOnServer = 1")
-    suspend fun serverKeys(): List<String>
+    @Query(
+        "SELECT `key` FROM SessionEntity WHERE existsOnServer = 1 " +
+            "AND `key` NOT IN (SELECT sessionKey FROM PendingSendEntity) " +
+            "AND `key` NOT IN (SELECT sessionKey FROM ActiveRunEntity)",
+    )
+    suspend fun evictableKeys(): List<String>
 
     @Query("DELETE FROM SessionEntity WHERE `key` = :key")
     suspend fun deleteRow(key: String)
@@ -76,6 +85,7 @@ interface MessageDao {
 
     @Transaction
     suspend fun replaceSession(sessionKey: String, rows: List<MessageEntity>) {
+        require(rows.all { it.sessionKey == sessionKey }) { "rows must all belong to $sessionKey" }
         deleteSession(sessionKey)
         insertAll(rows)
     }

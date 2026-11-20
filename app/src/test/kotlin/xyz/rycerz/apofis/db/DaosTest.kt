@@ -90,6 +90,63 @@ class DaosTest {
     }
 
     @Test
+    fun replaceServerSessionsKeepsSessionsWithPendingSends() = runTest {
+        val dao = db.sessionDao()
+        val queued = PendingSendEntity("p1", "q", "hello there", """{"input":"hello there"}""", 7L, "queued", null, null)
+        val failed = PendingSendEntity("p2", "f", "retry me", """{"input":"retry me"}""", 8L, "failed", "run-x", "boom")
+        dao.upsert(session("q"))
+        dao.upsert(session("f"))
+        db.pendingSendDao().upsert(queued)
+        db.pendingSendDao().upsert(failed)
+
+        dao.replaceServerSessions(emptyList())
+
+        assertEquals("q", dao.get("q")?.key)
+        assertEquals("f", dao.get("f")?.key)
+        assertEquals(listOf(queued), db.pendingSendDao().observe("q").first())
+        assertEquals(listOf(failed), db.pendingSendDao().observe("f").first())
+    }
+
+    @Test
+    fun replaceServerSessionsKeepsSessionsWithActiveRuns() = runTest {
+        val dao = db.sessionDao()
+        val run = ActiveRunEntity("r1", "running", 4L, "running", 1L)
+        dao.upsert(session("running"))
+        dao.upsert(session("idle"))
+        db.activeRunDao().upsert(run)
+        db.messageDao().replaceSession("idle", listOf(message("idle", 0)))
+        db.replyOutcomeDao().upsert(ReplyOutcomeEntity("idle", 0L, "interrupted", null))
+
+        dao.replaceServerSessions(emptyList())
+
+        assertEquals("running", dao.get("running")?.key)
+        assertEquals(run, db.activeRunDao().forSession("running"))
+        assertNull(dao.get("idle"))
+        assertEquals(emptyList<MessageEntity>(), db.messageDao().observe("idle").first())
+        assertEquals(emptyList<ReplyOutcomeEntity>(), db.replyOutcomeDao().observe("idle").first())
+    }
+
+    @Test
+    fun replaceSessionRejectsForeignRows() = runTest {
+        val dao = db.messageDao()
+        dao.replaceSession("s", listOf(message("s", 0)))
+
+        val result = runCatching { dao.replaceSession("s", listOf(message("s", 1), message("t", 0))) }
+
+        assertTrue(result.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(listOf(0), dao.observe("s").first().map { it.position })
+        assertEquals(emptyList<MessageEntity>(), dao.observe("t").first())
+    }
+
+    @Test
+    fun findByAnyIdIgnoresEmptyId() = runTest {
+        db.sessionDao().upsert(session("k", currentId = "c", lineageIds = ""))
+        db.sessionDao().upsert(session("k2", currentId = "d", lineageIds = "a,,b"))
+
+        assertNull(db.sessionDao().findByAnyId(""))
+    }
+
+    @Test
     fun findByAnyIdMatchesLineage() = runTest {
         val dao = db.sessionDao()
         dao.upsert(session("k1", currentId = "c_3", lineageIds = "a_1,b_2,c_3"))
