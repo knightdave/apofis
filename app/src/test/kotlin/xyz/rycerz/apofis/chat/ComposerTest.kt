@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.After
@@ -135,6 +136,45 @@ class ComposerTest {
         assertEquals("", composer.current("a").draft)
         type("a", "z")
         assertEquals("z", composer.current("a").draft)
+    }
+
+    @Test
+    fun aRemovedKeyUsedAgainGetsANewRevision() {
+        val first = composer.current("a").revision // the empty field of the chat's first life
+        type("a", "old")
+        composer.remove("a")
+
+        val shown = composer.current("a").revision // the same key appears again
+        assertTrue(shown > first)
+        composer.edit("a", "old!", first) // an edit from the earlier life
+        assertEquals("", composer.current("a").draft)
+        composer.edit("a", "n", shown) // the first keystroke on the field drawn now
+        assertEquals("n", composer.current("a").draft)
+    }
+
+    @Test
+    fun theObservedRevisionIsTheOneTheFirstEditIsCheckedAgainst() = runBlocking {
+        val shown = withTimeout(10_000) { composer.state("a").first() }.revision
+        composer.edit("a", "h", shown)
+        assertEquals("h", composer.current("a").draft)
+    }
+
+    @Test
+    fun retainDropsIdleRecordsOfChatsThatNoLongerExist() {
+        repeat(1000) { i ->
+            type("k$i", "x")
+            sendOk("k$i") // idle again, with a revision of its own
+        }
+        fail("kept", "not stored")
+        type("typing", "half")
+        assertEquals(1002, composer.idleKeys.size + composer.keys.size)
+
+        composer.retain(setOf("k0"))
+
+        assertEquals(setOf("k0"), composer.idleKeys)
+        assertEquals(setOf("kept", "typing"), composer.keys) // text is never dropped
+        assertEquals("not stored", composer.current("kept").unsent?.text)
+        assertEquals("half", composer.current("typing").draft)
     }
 
     @Test

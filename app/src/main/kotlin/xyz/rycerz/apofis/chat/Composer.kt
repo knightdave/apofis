@@ -26,39 +26,53 @@ enum class ComposeError { NOT_STORED }
 
 private fun ComposerState.idle() = draft.isEmpty() && !sending && unsent == null
 
+/** A deleted chat whose send is still in flight: no edit applies to it. */
+private val GONE = ComposerState(revision = -1)
+
 /**
- * [rested]: the revision of a chat whose entry went idle and was dropped, kept so the empty field the UI drew stays
- * valid and no older revision applies again; chats in neither map are on [base]. [gone]: deleted chats whose send is
- * still in flight; each is forgotten when that send ends. [counter] issues revisions and entry ids, only ever
- * increasing. [generation] changes when everything is cleared: a send of an older generation changes nothing when it
- * ends.
+ * [rested]: the revision of an idle chat, kept so the empty field the UI drew stays valid. A chat in neither map gets
+ * a fresh revision when it is first observed or changed, so no revision of an earlier life of its key applies again.
+ * [gone]: deleted chats whose send is still in flight; each is forgotten when that send ends. [counter] issues
+ * revisions and entry ids, only ever increasing. [generation] changes when everything is cleared: a send of an older
+ * generation changes nothing when it ends.
  */
 private data class Book(
     val entries: Map<String, ComposerState> = emptyMap(),
     val rested: Map<String, Long> = emptyMap(),
     val gone: Set<String> = emptySet(),
     val counter: Long = 0,
-    val base: Long = 0,
     val generation: Long = 0,
 ) {
-    fun of(sessionKey: String) = entries[sessionKey] ?: ComposerState(revision = rested[sessionKey] ?: base)
+    fun of(sessionKey: String): ComposerState? = entries[sessionKey] ?: rested[sessionKey]?.let { ComposerState(revision = it) }
 }
 
 /**
  * The composer of every chat of the cached server, by session key: the draft, the send being stored and text that
  * could not be stored. One per app, like the cache: emptied only together with the cached tables ([clear]). Sends run
- * in [scope]. Only entries with something to show are kept, so an idle chat takes at most its revision and text is
- * never evicted. Not kept across process death in this milestone.
+ * in [scope]. Only entries with something to show are kept, so an idle chat takes only its revision (dropped by
+ * [retain] once the chat is gone) and text is never evicted. Not kept across process death in this milestone.
  */
 class Composer(private val scope: CoroutineScope) {
     private val book = MutableStateFlow(Book())
 
-    fun state(sessionKey: String): Flow<ComposerState> = book.map { it.of(sessionKey) }.distinctUntilChanged()
+    /** A chat without a record (new, removed, pruned or cleared) is given a fresh revision as soon as it is observed. */
+    fun state(sessionKey: String): Flow<ComposerState> = book.map { it.of(sessionKey) ?: current(sessionKey) }.distinctUntilChanged()
 
-    fun current(sessionKey: String): ComposerState = book.value.of(sessionKey)
+    fun current(sessionKey: String): ComposerState {
+        book.update { b ->
+            if (b.of(sessionKey) != null || sessionKey in b.gone) b else b.copy(rested = b.rested + (sessionKey to b.counter + 1), counter = b.counter + 1)
+        }
+        return book.value.of(sessionKey) ?: GONE
+    }
 
     /** Keys this composer remembers, deleted chats with a send in flight included; for tests. */
     internal val keys: Set<String> get() = book.value.let { it.entries.keys + it.gone }
+
+    /** Chats held only for their revision; for tests. */
+    internal val idleKeys: Set<String> get() = book.value.rested.keys
+
+    /** Forgets the revision of every idle chat not in [sessionKeys]; chats with text or a send in flight stay. */
+    fun retain(sessionKeys: Set<String>) = book.update { b -> b.copy(rested = b.rested.filterKeys { it in sessionKeys }) }
 
     /** The scope's job; for tests. */
     internal val job: Job get() = scope.coroutineContext.job
@@ -128,7 +142,7 @@ class Composer(private val scope: CoroutineScope) {
 
     /** The cached tables are being cleared: every entry goes and every send still in flight is cancelled. */
     internal fun clear() {
-        book.update { Book(counter = it.counter + 1, base = it.counter + 1, generation = it.generation + 1) } // above every revision given out
+        book.update { Book(counter = it.counter, generation = it.generation + 1) }
         job.children.forEach { it.cancel() }
     }
 
@@ -139,9 +153,9 @@ class Composer(private val scope: CoroutineScope) {
     /** [f] gets the entry and a fresh number for a revision or id. */
     private fun Book.with(sessionKey: String, f: (ComposerState, Long) -> ComposerState): Book {
         val tick = counter + 1
-        val next = f(of(sessionKey), tick)
+        val next = f(of(sessionKey) ?: ComposerState(revision = tick), tick) // no record: a revision no edit was based on
         if (!next.idle()) return copy(entries = entries + (sessionKey to next), rested = rested - sessionKey, counter = tick)
         // Idle: dropped, but on the revision it had, so an edit of the field drawn from it still applies.
-        return copy(entries = entries - sessionKey, rested = if (next.revision == base) rested - sessionKey else rested + (sessionKey to next.revision), counter = tick)
+        return copy(entries = entries - sessionKey, rested = rested + (sessionKey to next.revision), counter = tick)
     }
 }

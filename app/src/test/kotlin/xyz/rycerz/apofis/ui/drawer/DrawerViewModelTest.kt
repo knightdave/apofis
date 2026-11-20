@@ -359,6 +359,26 @@ class DrawerViewModelTest {
     }
 
     @Test
+    fun refreshDropsIdleComposerRecordsOfChatsDeletedOnTheServer() = runTest {
+        val gone = List(1000) { "apofis-r$it" }
+        gone.forEach { addSession(it, "Old") }
+        addSession("apofis-kept", "Kept")
+        val composer = connected.composer
+        gone.forEach { composer.current(it) } // each was drawn once: it has an idle record
+        composer.edit("apofis-r0", "not stored")
+        composer.send("apofis-r0") { throw IllegalStateException("not stored") }!!.join()
+        routes["GET /api/sessions"] = listing("apofis-kept")
+        val vm = vm()
+
+        vm.onOpen()
+
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (composer.idleKeys.any { it in gone }) delay(5) } }
+        assertTrue(composer.idleKeys.none { it in gone })
+        assertNull(db.sessionDao().get("apofis-r1"))
+        assertEquals("not stored", composer.current("apofis-r0").unsent?.text) // text is never dropped
+    }
+
+    @Test
     fun archiveKeepsTheDraft() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
         routes["PATCH /api/sessions/apofis-a"] = ok(fixture("session_patch_archived.json"))

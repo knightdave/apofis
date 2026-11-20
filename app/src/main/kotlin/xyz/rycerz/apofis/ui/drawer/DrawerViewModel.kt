@@ -25,6 +25,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.ApiError
+import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private const val REFRESH_INTERVAL_MS = 30_000L
 const val TITLE_MAX = 120
@@ -313,6 +314,8 @@ class DrawerViewModel(
     /** The open chat is gone from this phone (not merely archived): a new local chat replaces it. */
     private suspend fun reconcile() {
         try {
+            // Under the repository lock, so no chat is created between reading the rows and pruning.
+            withRepositoryLock { composer.retain(db.sessionDao().all().mapTo(HashSet()) { it.key }) }
             ops.withLock {
                 val current = selectedFlow.value ?: return@withLock
                 if (!usable(current)) openNew()
