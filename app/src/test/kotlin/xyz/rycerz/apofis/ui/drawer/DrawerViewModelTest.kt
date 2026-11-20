@@ -362,13 +362,14 @@ class DrawerViewModelTest {
     fun refreshDropsIdleComposerRecordsOfChatsDeletedOnTheServer() = runTest {
         val gone = List(1000) { "apofis-r$it" }
         gone.forEach { addSession(it, "Old") }
-        addSession("apofis-kept", "Kept")
+        addSession("apofis-kept", "Kept", active = clock.get() / 1000.0 + 60) // the newest: selected, and still listed
         val composer = connected.composer
         gone.forEach { composer.current(it) } // each was drawn once: it has an idle record
         composer.edit("apofis-r0", "not stored")
         composer.send("apofis-r0") { throw IllegalStateException("not stored") }!!.join()
         routes["GET /api/sessions"] = listing("apofis-kept")
         val vm = vm()
+        vm.selected.await { it == "apofis-kept" }
 
         vm.onOpen()
 

@@ -100,7 +100,8 @@ class ChatRepository(
         }.distinctUntilChanged()
     }
 
-    suspend fun refreshSessions(): Unit = lock.withLock {
+    /** [onCached] gets every cached chat's key once the list is stored, still under the lock, so no chat is created meanwhile. */
+    suspend fun refreshSessions(onCached: (Set<String>) -> Unit = {}): Unit = lock.withLock {
         val listed = mutableListOf<SessionDto>()
         var offset = 0
         for (pages in 1..MAX_PAGES + 1) {
@@ -154,6 +155,7 @@ class ChatRepository(
                 sessionDao.deleteReplyOutcomes(row.key)
             }
         }
+        if (active()) onCached(sessionDao.all().mapTo(HashSet()) { it.key })
     }
 
     /** True when server rows of this chat are cached on the phone. */
