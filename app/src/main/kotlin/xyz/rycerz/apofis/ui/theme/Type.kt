@@ -1,7 +1,10 @@
 package xyz.rycerz.apofis.ui.theme
 
 import androidx.compose.material3.Typography
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.unit.TextUnit
@@ -28,3 +31,21 @@ internal val ApofisTypography = Typography(
     labelMedium = style(13.sp), // message name (medium)
     labelSmall = style(11.sp), // app bar subtitle (medium), timestamps
 )
+
+/** The chat text size setting; applies to the message list only. */
+val LocalChatFontScale = staticCompositionLocalOf { 1f }
+
+/** Message list text styles the Material type table has no slot for. */
+object ChatText {
+    val assistant = style(15.7.sp, lineHeight = 1.5.em).copy(letterSpacing = 0.05.sp)
+    val user = style(15.5.sp, lineHeight = 1.45.em)
+    val code = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 1.5.em)
+    val dialogTitle = style(17.sp, FontWeight.Medium) // declared bold, flattened
+}
+
+/** [style] at the chat text size. */
+@Composable
+fun scaled(style: TextStyle): TextStyle {
+    val scale = LocalChatFontScale.current
+    return if (scale == 1f) style else style.copy(fontSize = style.fontSize * scale)
+}

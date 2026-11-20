@@ -1,5 +1,9 @@
 package xyz.rycerz.apofis.ui.drawer
 
+import androidx.compose.runtime.remember
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import xyz.rycerz.apofis.ui.theme.wash
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -123,11 +127,11 @@ private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            TextButton(onClick = { actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy) {
+            DialogButton({ actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy) {
                 Text(stringResource(R.string.drawer_save))
             }
         },
-        dismissButton = { TextButton(onClick = { actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
+        dismissButton = { DialogButton({ actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
     )
 }
 
@@ -145,12 +149,18 @@ private fun DeleteDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            TextButton(onClick = { actions.confirmDelete(prompt.token) }, enabled = !prompt.busy) {
+            DialogButton({ actions.confirmDelete(prompt.token) }, enabled = !prompt.busy) {
                 Text(stringResource(R.string.drawer_delete), color = if (prompt.busy) Color.Unspecified else scheme.error)
             }
         },
-        dismissButton = { TextButton(onClick = { actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
+        dismissButton = { DialogButton({ actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
     )
+}
+
+@Composable
+private fun DialogButton(onClick: () -> Unit, enabled: Boolean = true, content: @Composable () -> Unit) {
+    val source = remember { MutableInteractionSource() }
+    TextButton(onClick = onClick, Modifier.wash(source, ButtonDefaults.textShape), enabled = enabled, interactionSource = source) { content() }
 }
 
 @Composable

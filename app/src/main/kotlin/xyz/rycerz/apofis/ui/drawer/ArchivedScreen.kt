@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui.drawer
 
+import androidx.compose.foundation.layout.size
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -8,7 +10,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -31,8 +32,8 @@ fun ArchivedScreen(chats: List<DrawerRow.Chat>, actions: DrawerActions, onBack: 
             TopAppBar(
                 title = { Text(stringResource(R.string.archived_title)) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = stringResource(R.string.back))
+                    ApofisIconButton(onClick = onBack, contentDescription = stringResource(R.string.back)) {
+                        Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = null, Modifier.size(20.dp))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),

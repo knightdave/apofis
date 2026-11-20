@@ -61,7 +61,7 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            ApofisTheme(mode, dynamicColor, pureBlack) {
+            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }) {
                 // Test tags become resource ids, so the end-to-end tests find chat items by their opaque keys.
                 Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
             }

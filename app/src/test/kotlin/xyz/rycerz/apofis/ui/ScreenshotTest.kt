@@ -3,8 +3,6 @@ package xyz.rycerz.apofis.ui
 import android.os.Looper
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.MaterialTheme
@@ -12,11 +10,7 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.ui.Modifier
-import com.github.takahirom.roborazzi.captureScreenRoboImage
-import java.time.Duration
-import java.time.LocalDate
 import java.time.ZoneOffset
-import org.robolectric.Robolectric
 import org.robolectric.Shadows.shadowOf
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.ui.drawer.ActionError
@@ -30,8 +24,6 @@ import xyz.rycerz.apofis.ui.drawer.PromptHost
 import xyz.rycerz.apofis.ui.drawer.PromptKind
 import xyz.rycerz.apofis.ui.drawer.groupSessions
 import androidx.compose.runtime.Composable
-import com.github.takahirom.roborazzi.RoborazziOptions
-import com.github.takahirom.roborazzi.captureRoboImage
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -60,21 +52,12 @@ import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
-import xyz.rycerz.apofis.ui.theme.ApofisTheme
-
-// Goldens are recorded on one fixed SDK and device so they are byte-stable; change both only together with a re-record.
-// The small threshold absorbs antialiasing noise between machines, not layout changes.
-private val options = RoborazziOptions(compareOptions = RoborazziOptions.CompareOptions(changeThreshold = 0.01f))
+import xyz.rycerz.apofis.ui.theme.SeedSchemes
 
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
 class ScreenshotTest {
-    private fun shot(name: String, mode: ThemeMode, content: @Composable () -> Unit) =
-        captureRoboImage("src/test/screenshots/$name.png", options) {
-            ApofisTheme(mode = mode, dynamicColor = false, pureBlack = false, content = content)
-        }
-
     private fun connectVm() = ConnectViewModel(current = null, willClearCache = { false }, save = {})
 
     @Test
@@ -133,7 +116,8 @@ class ScreenshotTest {
 
     // ---- chat ----
 
-    private val now = System.currentTimeMillis() / 1000.0 // "Today" in every golden, whatever the recording date
+    private val now = FIXED_NOW
+    private val utc = ZoneOffset.UTC
 
     private val question = UserMessage("u1", "How do I find the largest files in my home directory?", steered = false, timestamp = now)
     private val listing = ToolStep("c1", "terminal", "command=du -ah ~ | sort -rh | head", "4.0G  /home/user", false, error = false, running = false, durationSeconds = 1.3)
@@ -151,13 +135,13 @@ class ScreenshotTest {
         draft: String = "",
         live: LiveReply? = null,
         title: String = "Largest files",
-    ) = ChatUiState("apofis-1", title, status, withLive(items, live), composer, draft, "hermes.example", live)
+    ) = ChatUiState("apofis-1", title, status, withLive(items, live) { now }, composer, draft, "hermes.example", live)
 
     private fun live(text: String = "", steps: List<ToolStep> = emptyList(), status: String = "running", pending: PendingControl? = null) =
         LiveReply("run_1", status, text, steps, pending, Connection.LIVE)
 
-    private fun chatShot(name: String, state: ChatUiState, mode: ThemeMode = ThemeMode.LIGHT) =
-        shot(name, mode) { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}) }
+    private fun chatShot(name: String, state: ChatUiState, mode: ThemeMode = ThemeMode.LIGHT, seed: SeedSchemes? = null) =
+        shot(name, mode, seed) { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY) }
 
     @Test
     fun chat_empty() = chatShot("chat_empty", chat(emptyList(), title = ""))
@@ -173,6 +157,19 @@ class ScreenshotTest {
         "chat_streaming",
         chat(listOf(question), StatusLine.WORKING, ComposerMode.STOP, live = live("Use du and sort. The command below lists the ten")),
     )
+
+    // The conversation under dynamic color, with fixed seeds through the real derivation path.
+    @Test
+    fun chat_seed_purple_light() = chatShot("chat_seed_purple_light", chat(listOf(question, answer)), seed = PurpleSeed)
+
+    @Test
+    fun chat_seed_purple_dark() = chatShot("chat_seed_purple_dark", chat(listOf(question, answer)), ThemeMode.DARK, PurpleSeed)
+
+    @Test
+    fun chat_seed_green_light() = chatShot("chat_seed_green_light", chat(listOf(question, answer)), seed = GreenSeed)
+
+    @Test
+    fun chat_seed_green_dark() = chatShot("chat_seed_green_dark", chat(listOf(question, answer)), ThemeMode.DARK, GreenSeed)
 
     @Test
     fun chat_tool_running() = chatShot(
@@ -261,8 +258,7 @@ class ScreenshotTest {
 
     // ---- drawer ----
 
-    private val today = LocalDate.of(2026, 3, 10) // fixed: the goldens never depend on the recording date or zone
-    private val utc = ZoneOffset.UTC
+    private val today = FIXED_TODAY
 
     private fun at(daysAgo: Long, hour: Int) = today.minusDays(daysAgo).atTime(hour, 0).toEpochSecond(utc).toDouble()
 
@@ -299,16 +295,8 @@ class ScreenshotTest {
             },
             drawerState = rememberDrawerState(DrawerValue.Open),
         ) {
-            ChatScreen(chat(listOf(question, answer)), object : ChatActions {}, onOpenConnection = {})
+            ChatScreen(chat(listOf(question, answer)), object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY)
         }
-    }
-
-    /** Captures every window, so dialogs and bottom sheets are in the image. */
-    private fun windowShot(name: String, mode: ThemeMode = ThemeMode.LIGHT, content: @Composable () -> Unit) {
-        val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
-        activity.setContent { ApofisTheme(mode = mode, dynamicColor = false, pureBlack = false, content = content) }
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2)) // sheet and dialog enter animations end
-        captureScreenRoboImage("src/test/screenshots/$name.png", options)
     }
 
     private fun prompt(kind: PromptKind, running: Boolean = false, error: ActionError? = null) =

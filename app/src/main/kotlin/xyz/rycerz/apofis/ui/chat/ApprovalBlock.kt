@@ -14,11 +14,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -26,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -40,7 +42,10 @@ import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.PendingControl
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.theme.ChatText
+import xyz.rycerz.apofis.ui.theme.wash
 
 /**
  * The command waiting for approval, in full, with Deny and Allow once; the wider grants sit behind an overflow.
@@ -57,7 +62,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                 Text(
                     command,
                     Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
-                    style = codeStyle,
+                    style = ChatText.code,
                     color = MaterialTheme.colorScheme.onSurface,
                     softWrap = false,
                 )
@@ -66,23 +71,34 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             Text(stringResource(R.string.chat_approval_no_command), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = { choose(ApprovalChoice.DENY) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_deny)) }
+            val deny = remember { MutableInteractionSource() }
+            OutlinedButton(
+                onClick = { choose(ApprovalChoice.DENY) },
+                Modifier.wash(deny, ButtonDefaults.outlinedShape),
+                enabled = !answering,
+                interactionSource = deny,
+            ) { Text(stringResource(R.string.chat_approval_deny)) }
             if (command != null) {
-                Button(onClick = { choose(ApprovalChoice.ONCE) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_once)) }
+                val once = remember { MutableInteractionSource() }
+                Button(onClick = { choose(ApprovalChoice.ONCE) }, Modifier.wash(once, ButtonDefaults.shape), enabled = !answering, interactionSource = once) {
+                    Text(stringResource(R.string.chat_approval_once))
+                }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
-                    IconButton(onClick = { menu = true }, enabled = !answering) {
-                        Icon(painterResource(R.drawable.lucide_ellipsis_vertical), stringResource(R.string.chat_approval_more), Modifier.size(20.dp))
+                    ApofisIconButton(onClick = { menu = true }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
+                        Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
                     }
                     DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
+                        val session = remember { MutableInteractionSource() }
                         DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_session)) }, onClick = {
                             menu = false
                             choose(ApprovalChoice.SESSION)
-                        })
+                        }, Modifier.wash(session), interactionSource = session)
+                        val always = remember { MutableInteractionSource() }
                         DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_always)) }, onClick = {
                             menu = false
                             choose(ApprovalChoice.ALWAYS)
-                        })
+                        }, Modifier.wash(always), interactionSource = always)
                     }
                 }
             }
@@ -105,8 +121,12 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
                 maxLines = 5,
                 enabled = !answering,
             )
-            IconButton(onClick = { onAnswer(control.requestId, control.executionGeneration, answer) }, enabled = !answering && answer.isNotBlank()) {
-                Icon(painterResource(R.drawable.lucide_arrow_up), stringResource(R.string.chat_clarify_send), Modifier.size(20.dp))
+            ApofisIconButton(
+                onClick = { onAnswer(control.requestId, control.executionGeneration, answer) },
+                contentDescription = stringResource(R.string.chat_clarify_send),
+                enabled = !answering && answer.isNotBlank(),
+            ) {
+                Icon(painterResource(R.drawable.lucide_arrow_up), null, Modifier.size(20.dp))
             }
         }
     }

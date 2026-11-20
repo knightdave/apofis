@@ -5,13 +5,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
@@ -25,6 +25,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
 // Test tags (end-to-end tests find the buttons by these ids).
@@ -95,25 +96,26 @@ internal fun Composer(
 @Composable
 private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, tag: String, filled: Boolean = true, onClick: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
+    // Disabled: the button's own 0.38 content alpha makes these the fill onSurface 0.12 and the glyph onSurface 0.38.
     val fill = when {
-        !enabled -> scheme.onSurface.copy(alpha = 0.12f)
+        !enabled -> scheme.onSurface.copy(alpha = 0.12f / 0.38f)
         filled -> scheme.primary
         else -> Color.Transparent
     }
     val glyph = when {
-        !enabled -> scheme.onSurface.copy(alpha = 0.38f)
+        !enabled -> scheme.onSurface
         filled -> scheme.onPrimary
         else -> scheme.primary
     }
-    IconButton(onClick = onClick, Modifier.testTag(tag), enabled = enabled) {
+    ApofisIconButton(onClick = onClick, contentDescription = stringResource(label), Modifier.testTag(tag), enabled = enabled, visualSize = 32.dp) {
         Box(
             Modifier
-                .size(32.dp)
+                .fillMaxSize()
                 .background(fill, CircleShape)
                 .then(if (filled) Modifier else Modifier.border(1.5.dp, scheme.primary, CircleShape)),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(painterResource(icon), contentDescription = stringResource(label), Modifier.size(18.dp), tint = glyph)
+            Icon(painterResource(icon), contentDescription = null, Modifier.size(18.dp), tint = glyph)
         }
     }
 }

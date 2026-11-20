@@ -11,49 +11,48 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.graphics.compositeOver
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.em
-import androidx.compose.ui.unit.sp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.sync.SendError
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.theme.ChatText
+import xyz.rycerz.apofis.ui.theme.scaled
+import xyz.rycerz.apofis.ui.theme.wash
 
 private val bubbleShape = RoundedCornerShape(16.dp)
-
-@Composable
-internal fun isDarkSurface() = MaterialTheme.colorScheme.surface.luminance() < 0.5f
 
 /** Right aligned, at most 75 % wide, tinted with primary; unsent messages show their state and controls below. */
 @Composable
 internal fun UserBubble(message: UserMessage, onRetry: (String) -> Unit, onCancel: (UserMessage) -> Unit) {
     val scheme = MaterialTheme.colorScheme
-    val fill = scheme.primary.copy(alpha = if (isDarkSurface()) 0.15f else 0.08f).compositeOver(scheme.surface)
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalAlignment = Alignment.End) {
         Box(Modifier.fillMaxWidth(0.75f), contentAlignment = Alignment.CenterEnd) {
             Text(
                 message.text,
                 Modifier
                     .alpha(if (message.state == SendState.QUEUED) 0.7f else 1f) // 0.7: the contrast floor
-                    .background(fill, bubbleShape)
+                    .background(ApofisTheme.colors.bubbleFill, bubbleShape)
                     .padding(12.dp),
-                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 15.5.sp, lineHeight = 1.45.em),
+                style = scaled(ChatText.user),
                 color = scheme.onSurface,
             )
         }
@@ -84,7 +83,10 @@ internal fun UserBubble(message: UserMessage, onRetry: (String) -> Unit, onCance
                     style = MaterialTheme.typography.labelMedium,
                     color = scheme.error,
                 )
-                TextButton(onClick = { onRetry(key) }) { Text(stringResource(R.string.chat_retry)) }
+                val retry = remember { MutableInteractionSource() }
+                TextButton(onClick = { onRetry(key) }, Modifier.wash(retry, ButtonDefaults.textShape), interactionSource = retry) {
+                    Text(stringResource(R.string.chat_retry))
+                }
                 CancelButton(R.string.chat_remove_failed) { onCancel(message) }
             }
             SendState.SENT -> Unit
@@ -104,13 +106,8 @@ private fun Caption(@StringRes text: Int, padded: Boolean = true) {
 
 @Composable
 private fun CancelButton(@StringRes label: Int, onClick: () -> Unit) {
-    IconButton(onClick = onClick) {
-        Icon(
-            painterResource(R.drawable.lucide_x),
-            contentDescription = stringResource(label),
-            Modifier.size(16.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+    ApofisIconButton(onClick = onClick, contentDescription = stringResource(label)) {
+        Icon(painterResource(R.drawable.lucide_x), contentDescription = null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

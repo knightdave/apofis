@@ -17,7 +17,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -29,6 +28,8 @@ import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.ReasoningStep
 import xyz.rycerz.apofis.chat.Step
 import xyz.rycerz.apofis.chat.ToolStep
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.theme.ChatText
 
 private const val MIN_SHOWN_DURATION_S = 0.1
 
@@ -36,13 +37,11 @@ private const val MIN_SHOWN_DURATION_S = 0.1
 /** [onStep] gets the tapped step's index in [steps]; tool step i is tagged "[tag]:i:<tool name>", a reasoning step "[tag]:i", for the end-to-end tests. */
 @Composable
 internal fun StepList(steps: List<Step>, tag: String = "step", onStep: (Int) -> Unit) {
-    val scheme = MaterialTheme.colorScheme
-    val fill = scheme.primaryContainer.copy(alpha = if (isDarkSurface()) 0.25f else 0.30f).compositeOver(scheme.surface)
     Column(
         Modifier
             .padding(horizontal = 16.dp, vertical = 6.dp)
             .fillMaxWidth()
-            .background(fill, RoundedCornerShape(16.dp))
+            .background(ApofisTheme.colors.timelineFill, RoundedCornerShape(16.dp))
             .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
         steps.forEachIndexed { i, step ->
@@ -68,7 +67,8 @@ private fun ToolRow(step: ToolStep, modifier: Modifier, onClick: () -> Unit) {
 @Composable
 private fun StepRow(step: ToolStep?, title: String, preview: String, trailing: String?, state: String?, modifier: Modifier = Modifier) {
     val scheme = MaterialTheme.colorScheme
-    val strong = scheme.secondary.copy(alpha = 0.9f).compositeOver(scheme.surface) // 0.9: the card's contrast floor
+    val colors = ApofisTheme.colors
+    val strong = colors.timelineStrong
     Row(
         modifier
             .fillMaxWidth()
@@ -89,10 +89,10 @@ private fun StepRow(step: ToolStep?, title: String, preview: String, trailing: S
         Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.labelLarge, color = if (step?.error == true) scheme.error else strong, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (preview.isNotEmpty()) {
-                Text(preview, style = codeStyle.copy(fontSize = MaterialTheme.typography.bodySmall.fontSize), color = strong, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(preview, style = ChatText.code.copy(fontSize = MaterialTheme.typography.bodySmall.fontSize), color = colors.timelineBody, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
-        if (trailing != null) Text(trailing, Modifier.padding(start = 8.dp), style = MaterialTheme.typography.labelSmall, color = strong)
+        if (trailing != null) Text(trailing, Modifier.padding(start = 8.dp), style = MaterialTheme.typography.labelSmall, color = colors.timelineMuted)
         if (step != null) Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.padding(start = 4.dp).size(16.dp), tint = strong)
     }
 }

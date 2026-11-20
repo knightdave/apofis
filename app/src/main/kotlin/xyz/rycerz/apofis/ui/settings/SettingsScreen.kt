@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.settings
 
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -20,7 +21,6 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -78,8 +78,8 @@ fun SettingsScreen(
             TopAppBar(
                 title = { Text(stringResource(R.string.settings_title)) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = stringResource(R.string.back))
+                    ApofisIconButton(onClick = onBack, contentDescription = stringResource(R.string.back)) {
+                        Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = null, Modifier.size(20.dp))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -141,7 +141,7 @@ private fun Section(title: Int, content: @Composable ColumnScope.() -> Unit) {
     Text(
         stringResource(title),
         style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+        color = ApofisTheme.colors.sectionTitle,
         modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 8.dp).semantics { heading() },
     )
     Surface(

@@ -343,7 +343,7 @@ class ChatViewModel(
  * item stays. While polling, the stored items are shown exactly as they are, with a "catching up" item after them.
  * The part up to the turn start is reused as the same list object while the transcript is unchanged.
  */
-internal class LiveMerger {
+internal class LiveMerger(private val now: () -> Double = { System.currentTimeMillis() / 1000.0 }) {
     private var transcript: List<ChatItem>? = null
     private var runId: String? = null
     private var stored: List<ChatItem> = emptyList() // stage 1: the stored items shown while streaming
@@ -354,7 +354,7 @@ internal class LiveMerger {
         if (live == null) return transcript
         // Stage 1, only when the transcript or the run changes; a streamed token reads no stored item.
         if (transcript !== this.transcript || live.runId != runId) {
-            if (live.runId != runId) since = System.currentTimeMillis() / 1000.0
+            if (live.runId != runId) since = now()
             this.transcript = transcript
             runId = live.runId
             val start = transcript.indexOfLast { it is UserMessage && it.runId == live.runId }
@@ -373,8 +373,9 @@ internal class LiveMerger {
     }
 }
 
-/** For previews and screenshots: [LiveMerger] without its cache. */
-internal fun withLive(transcript: List<ChatItem>, live: LiveReply?): List<ChatItem> = LiveMerger().merge(transcript, live)
+/** For previews and screenshots: [LiveMerger] without its cache; [now] stamps the live item (goldens pass a fixed time). */
+internal fun withLive(transcript: List<ChatItem>, live: LiveReply?, now: () -> Double = { System.currentTimeMillis() / 1000.0 }): List<ChatItem> =
+    LiveMerger(now).merge(transcript, live)
 
 /** A read-only view of [head] followed by [tail]. Equal views with the same [head] compare only their tails. */
 internal class Joined<T>(val head: List<T>, val tail: List<T>) : AbstractList<T>() {

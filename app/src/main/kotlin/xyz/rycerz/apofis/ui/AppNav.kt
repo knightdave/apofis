@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui
 
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.BackHandler
@@ -23,7 +24,6 @@ import xyz.rycerz.apofis.ui.drawer.DrawerActions
 import xyz.rycerz.apofis.ui.drawer.DrawerContent
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
 import xyz.rycerz.apofis.ui.drawer.PromptHost
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -186,16 +186,16 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         }
     }
     val drawerButton: @Composable () -> Unit = {
-        IconButton(onClick = {
+        ApofisIconButton(onClick = {
             keyboard?.hide()
             scope.launch { drawerState.open() }
-        }) {
-            Icon(painterResource(R.drawable.lucide_menu), contentDescription = stringResource(R.string.drawer_open), Modifier.size(20.dp))
+        }, contentDescription = stringResource(R.string.drawer_open)) {
+            Icon(painterResource(R.drawable.lucide_menu), contentDescription = null, Modifier.size(20.dp))
         }
     }
     val newChatButton: @Composable RowScope.() -> Unit = {
-        IconButton(onClick = drawer::newChat) {
-            Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = stringResource(R.string.drawer_new_chat), Modifier.size(20.dp))
+        ApofisIconButton(onClick = drawer::newChat, contentDescription = stringResource(R.string.drawer_new_chat)) {
+            Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = null, Modifier.size(20.dp))
         }
     }
     if (showArchived) {
