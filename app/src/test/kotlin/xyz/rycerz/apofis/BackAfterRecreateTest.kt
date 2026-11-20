@@ -4,9 +4,12 @@ import android.os.Looper
 import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
+import mockwebserver3.RecordedRequest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -38,9 +41,15 @@ class BackAfterRecreateTest {
     fun firstRunBackAfterRotationCancelsTheCheck() {
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
         val server = MockWebServer()
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(3_000, TimeUnit.MILLISECONDS).build(),
-        )
+        // The answer is held until the test has pressed Back, so the result always arrives late, however slow the machine.
+        val backPressed = CountDownLatch(1)
+        val answered = CountDownLatch(1)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                backPressed.await(10, TimeUnit.SECONDS)
+                return MockResponse.Builder().code(200).body(fixture("capabilities.json")).build().also { answered.countDown() }
+            }
+        }
         server.start()
         try {
             // Without animations: the spinner's endless animation would keep every idle wait busy until the check ended.
@@ -51,7 +60,7 @@ class BackAfterRecreateTest {
             val vm: ConnectViewModel = back.target!!
             vm.onUrlChange(server.url("/").toString())
             vm.onKeyChange("sk-1")
-            vm.connect()
+            val probe = vm.connect()!!
             assertTrue(server.takeRequest(5, TimeUnit.SECONDS) != null)
 
             controller.recreate() // rotation while the check runs
@@ -61,8 +70,8 @@ class BackAfterRecreateTest {
 
             assertEquals(ConnectState.Idle, vm.state)
             assertFalse(back.busy.value)
-            Thread.sleep(3_500) // past the moment the response arrives
-            until("the late result to be dropped") { true }
+            backPressed.countDown() // now the server answers
+            until("the server to answer and the probe to finish") { answered.count == 0L && probe.isCompleted }
             assertEquals(ConnectState.Idle, vm.state)
             assertNull(app.container.credentials.load())
             assertNull(app.container.connection.value)
