@@ -19,20 +19,14 @@ android {
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        // The API key comes from the environment only, never a file. The URLs come from
-        // -Pandroid.testInstrumentationRunnerArguments.apofisUrl=... and ...apofisDirectUrl=...
-        System.getenv("APOFIS_KEY")?.let { testInstrumentationRunnerArguments["apofisKey"] = it }
+        // No credentials here: run-e2e.sh builds and installs both APKs without the key and passes it, the URLs and
+        // the run nonce only to `am instrument -e ...` on the device. Gradle never sees the key.
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
-}
-
-// The key is a runner argument, so a tracked connected test task would store it in Gradle's execution history.
-tasks.matching { it.name.startsWith("connected") }.configureEach {
-    doNotTrackState("Instrumentation arguments may hold credentials")
 }
 
 dependencies {
