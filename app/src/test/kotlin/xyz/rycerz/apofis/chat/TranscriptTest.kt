@@ -41,6 +41,7 @@ class TranscriptTest {
         assertEquals("call_bcfa62f8a89f42adb149a971df2bb7cf", step.callId)
         assertFalse(step.error)
         assertFalse(step.running)
+        assertEquals("apofis-marker", step.result)
         assertEquals("command=sleep 20; echo apofis-marker, timeout=30", step.argsPreview)
         assertEquals("The command completed successfully: apofis-marker.", reply.text)
         assertEquals(listOf("u16393", "r16394", "u16398", "r16399"), items.map { it.key })
@@ -104,15 +105,89 @@ class TranscriptTest {
         assertEquals("command=ls", step.argsPreview)
     }
 
+    private fun stepFor(result: String) =
+        toolSteps(buildTranscript(listOf(row(1, "assistant", toolCallsJson = call("c1")), row(2, "tool", result, toolCallId = "c1")))).single()
+
     @Test
     fun toolErrorDetected() {
         for (result in listOf("""{"exit_code": 2}""", """{"error": "boom"}""")) {
-            val items = buildTranscript(listOf(row(1, "assistant", toolCallsJson = call("c1")), row(2, "tool", result, toolCallId = "c1")))
-            val step = toolSteps(items).single()
+            val step = stepFor(result)
             assertTrue(result, step.error)
             assertFalse(step.running)
             assertEquals(result, step.result)
         }
+        for (result in listOf("""{"error": null}""", """{"error": false}""", """{"error": ""}""", """{"exit_code": 0}""", "plain text")) {
+            assertFalse(result, stepFor(result).error)
+        }
+    }
+
+    @Test
+    fun resultShowsOutputField() {
+        val step = toolSteps(buildTranscript(rows("messages_tool_run.json"))).first()
+        assertEquals("apofis-marker", step.result)
+        assertFalse(step.resultTruncated)
+        assertEquals("""{"output": 7}""", stepFor("""{"output": 7}""").result)
+    }
+
+    @Test
+    fun hugeResultExitCodeNearEndFlagged() {
+        val huge = """{"output": "${"x".repeat(3_000_000)}", "exit_code": 2, "error": null}"""
+        assertTrue(stepFor(huge).error)
+        assertTrue(stepFor("""{"output": "${"x".repeat(3_000_000)}", "error": "boom"}""").error)
+        assertFalse(stepFor("""{"output": "${"x".repeat(3_000_000)}", "exit_code": 0, "error": null}""").error)
+    }
+
+    @Test
+    fun noticeBetweenCallAndResult() {
+        val items = buildTranscript(
+            listOf(
+                row(1, "user", "hi"),
+                row(2, "assistant", toolCallsJson = call("c1")),
+                row(3, "system", "Switched model", displayKind = "model_switch"),
+                row(4, "tool", """{"output": "ok", "exit_code": 0}""", toolCallId = "c1"),
+                row(5, "assistant", "done"),
+            ),
+        )
+        assertEquals(listOf("u1", "r2", "n3"), items.map { it.key })
+        val step = toolSteps(items).single()
+        assertFalse(step.running)
+        assertEquals("ok", step.result)
+        assertEquals("done", (items[1] as AssistantReply).text)
+    }
+
+    @Test
+    fun orphanToolRowShownOnce() {
+        val items = buildTranscript(
+            listOf(
+                row(1, "assistant", toolCallsJson = call("c1")),
+                row(2, "tool", "first", toolCallId = "c1"),
+                row(3, "tool", "lost", toolCallId = "c9"),
+            ),
+        )
+        val steps = toolSteps(items)
+        assertEquals(listOf("c1" to "first", "c9" to "lost"), steps.map { it.callId to it.result })
+        assertFalse(steps[1].running)
+    }
+
+    @Test
+    fun textIsNotTrimmed() {
+        val code = "    indented code\nline  \n"
+        val items = buildTranscript(
+            listOf(
+                row(1, "user", "  hi\n"),
+                row(2, "assistant", code, reasoning = "  think\n"),
+                row(3, "assistant", "  \n"),
+                row(4, "assistant", "tail\n"),
+            ),
+        )
+        assertEquals("  hi\n", (items[0] as UserMessage).text)
+        val reply = items[1] as AssistantReply
+        assertEquals("$code\n\ntail\n", reply.text)
+        assertEquals(ReasoningStep("  think\n"), reply.steps.single())
+        assertEquals(
+            "  indented\n\n",
+            unwrapSteer("[OUT-OF-BAND USER MESSAGE - x]\n  indented\n\n\n[/OUT-OF-BAND USER MESSAGE]"),
+        )
     }
 
     @Test
