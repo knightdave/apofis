@@ -158,8 +158,14 @@ private fun isError(fields: ResultFields): Boolean {
     val error = fields.error
     val errorSet = error != null && error != JsonNull &&
         !(error is JsonPrimitive && ((!error.isString && error.booleanOrNull == false) || (error.isString && error.content.isEmpty())))
-    val exit = (fields.exitCode as? JsonPrimitive)?.takeIf { !it.isString }?.content?.toBigIntegerOrNull()
-    return errorSet || (exit != null && exit.signum() != 0)
+    val exit = (fields.exitCode as? JsonPrimitive)?.takeIf { !it.isString }?.content
+    return errorSet || (exit != null && isNonZeroInteger(exit))
+}
+
+/** One pass over the literal: optional `-`, then ASCII digits only, at least one of them not `0`. */
+private fun isNonZeroInteger(literal: String): Boolean {
+    val digits = literal.removePrefix("-")
+    return digits.isNotEmpty() && digits.all { it in '0'..'9' } && digits.any { it != '0' }
 }
 
 private fun argsPreview(arguments: JsonElement?): String {

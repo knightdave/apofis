@@ -122,6 +122,15 @@ class TranscriptTest {
     }
 
     @Test
+    fun exitCodeMustBeNonZeroInteger() {
+        assertTrue(stepFor("""{"exit_code": 1${"0".repeat(399_999)}}""").error) // 400000 digits
+        assertTrue(stepFor("""{"exit_code": -3}""").error)
+        for (code in listOf("0", "-0", "00", "2.5", "1e3")) {
+            assertFalse(code, stepFor("""{"exit_code": $code}""").error)
+        }
+    }
+
+    @Test
     fun resultShowsOutputField() {
         val step = toolSteps(buildTranscript(rows("messages_tool_run.json"))).first()
         assertEquals("apofis-marker", step.result)
