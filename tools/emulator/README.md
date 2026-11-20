@@ -18,9 +18,9 @@ shell user. Tests:
   cleared app data (`pm clear`, checked), grants `ACCESS_LOCAL_NETWORK` and connects. Every prompt's first line
   carries the run's nonce, so the chat's server title does. The chat's identity comes from the chat the test opened:
   it reads the open chat's key K from the chat screen's tag `chat.key:<K>` before sending, journals `send <K>
-  <scenario>` before pressing Send, and then, from the app's database, only the row whose key is K, once the app has
-  created it on the server (`session <K> <id> <scenario>` for its current and earlier ids), and again after the reply.
-  No other row is read or journaled. Chat items are found only by the app's test tags (`user:<key>`,
+  <scenario>` before pressing Send, and at the scenario's end (also when it failed) writes its one completing line
+  `chat <scenario> <K> <ids>`: from the app's database, only the row whose key is K, its server ids (current first,
+  then earlier ones), or `none` when the app never created it on the server. No other row is read or journaled. Chat items are found only by the app's test tags (`user:<key>`,
   `reply:<key>/...`, `step:<replyKey>:<i>:<tool>`, `notice:<key>`, `composer.send`, `composer.stop`, `status.line`,
   `chat.key:<key>`, exposed as resource ids): a reply counts only as the reply item right after this scenario's user
   message item, holding the marker; the running step must be a `terminal` step of that reply whose own text is exactly
@@ -78,19 +78,25 @@ shell user. Tests:
    completion token and the checksum lines before it parse. A timeout, a dropped connection, a line after the token or
    anything else copies nothing. It copies exactly those names into `build/e2e/.incoming-<run-id>/` (never descending
    into a directory), verifies every checksum, that nothing else arrived, and scans the copy, then renames it to
-   `build/e2e/<run-id>/` in one step. On any failure or interrupt it deletes the incoming files (by name, `rm -f`, then
-   `rmdir`), so a `build/e2e/<run-id>/` exists only when fully verified.
-8. Deletes the journaled sessions: each only after a `GET` on that exact id returns the same id, an `apofis-` id,
+   `build/e2e/<run-id>/` in one step. rsync writes its temporary files only inside the incoming
+   directory. On any failure or interrupt it deletes everything inside the incoming directory, whatever the name
+   (`find -mindepth 1 -delete`, then `rmdir`, only for a directory directly inside `build/e2e/` named `.incoming-*`), so
+   a `build/e2e/<run-id>/` exists only when fully verified.
+8. Decides first whether the journal is complete: every scenario that passed must have a send line, and every
+   scenario with a send line must have exactly one `chat` line for the same key with server ids (a `chat` line also
+   needs its send). Otherwise the run fails ("sessions may remain"), and no server request is made for any incomplete
+   or unmatched entry. Then deletes the sessions of the complete entries: each only after a `GET` on that exact id returns the same id, an `apofis-` id,
    with the run's nonce in its title (a turn still running is retried). For the steer scenario's session it also
    requires the steered turn in order (exactly one steer row with exactly the steering text, every ordinary user row
    before it, the last final answer after it ending with BANANA); for the journaled stopped run, `GET /v1/runs/<id>`
-   must name that session and say `cancelled`. Anything else is left alone and fails. A missing or unreadable journal,
-   or a `send <K>` without any journaled id of chat K, fails the run ("sessions may remain").
+   must name that session and say `cancelled`. Anything else is left alone and fails. A missing or unreadable journal fails
+   the run ("sessions may remain") with no server request at all.
 9. Within one 240 s deadline: waits until no e2e process is left on the emulator host, removes this run's directory,
    releases the lock (only if it holds this run's id), and requires one token per fact with its expected value:
    `EMULATOR=absent ADB=absent REMOTE=absent AVD=absent RUNDIR=absent LOCK=released PORTS=closed DONE` (PORTS: no
-   listener in the port ranges that was not there before). A missing token, an `error` value or running out of time
-   fails. Then it compares `~`, `~/.android`, `~/.config`, `~/.cache`, `~/.local` and the user's `/tmp` entries with
+   listener in the port ranges that was not there before). Every probe answers absent/present/unknown (`unknown`
+   when its command failed or its output did not parse; ports only `closed` after a parsed listing). A missing token,
+   an `unknown` value or running out of time fails. Then it compares `~`, `~/.android`, `~/.config`, `~/.cache`, `~/.local` and the user's `/tmp` entries with
    before the run. The whole cleanup on the build host is limited to 15 minutes; past that it reports failure and
    exits instead of hanging.
 

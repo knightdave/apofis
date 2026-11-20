@@ -103,41 +103,67 @@ check "every remote code has a text on the build host" 'for c in $(grep -o "rmsg
 out=$t/rs
 mkdir -p "$out/device"
 key_sent=1
-printf 'send %s connectAndChat\nsession %s %s connectAndChat\nrun %s %s\n' "$K1" "$K1" "$K1" "$R1" "$K1" >"$out/device/sessions.txt"
+printf 'send %s connectAndChat\nchat connectAndChat %s %s,%s\nrun %s %s\n' "$K1" "$K1" "$K1" "$K9" "$R1" "$K1" >"$out/device/sessions.txt"
 o=$(report_sessions 0 2>/dev/null)
 check "journal: exact lines reported with their count" 'has "$o" "@@SESSIONS-END 3@@" && [ "$(grep -c "^@@J " <<<"$o")" = 3 ]'
-printf 'session %s %s connectAndChat' "$K1" "$K1" >"$out/device/sessions.txt"
+printf 'chat connectAndChat %s %s' "$K1" "$K1" >"$out/device/sessions.txt"
 check "journal: a cut-off last line is unknown" '[ "$(report_sessions 0 2>/dev/null)" = "$(printf "@@MSG journal-cut@@\n@@SESSIONS-UNKNOWN@@")" ]'
 printf 'session %s connectAndChat\n' "$K1" >"$out/device/sessions.txt"
 check "journal: an old-form line is malformed, nothing passed on" '[ "$(report_sessions 0 2>/dev/null)" = "$(printf "@@MSG journal-malformed@@\n@@SESSIONS-UNKNOWN@@")" ]'
 rm -f "$out/device/sessions.txt"
 check "journal: a missing journal is unknown" 'has "$(report_sessions 0 2>/dev/null)" "@@SESSIONS-UNKNOWN@@"'
 
-# 6. Cleanup without a complete journal fails and reads nothing on the server.
+# 6. Journal completeness is decided first: no server request for anything that is not a complete, matched entry.
+# The stub plays the server for this run's sessions and counts every request.
 # shellcheck disable=SC2329 # replaces the real server call
-hermes() { echo "$*" >>"$t/server-calls"; echo 200; }
-mode=smoke
-for s in '' unknown bad; do
-  key_sent_local=1 sessions_state=$s journal=()
+hermes() {
+  local id=${2#api/sessions/}
+  echo "$1 $2" >>"$t/server-calls"
+  case $1 in
+    GET) if grep -qx "$id" "$t/deleted" 2>/dev/null; then echo 404; else printf '{"session":{"id":"%s","title":"Test %s-1"}}' "$id" "$nonce" >"$3"; echo 200; fi ;;
+    DELETE) echo "$id" >>"$t/deleted"; printf '{"id":"%s","deleted":true}' "$id" >"$3"; echo 200 ;;
+  esac
+}
+requests() { [ -e "$t/server-calls" ] && grep -c . "$t/server-calls" || echo 0; }
+sessions_case() { # <mode> <passed scenarios> <journal lines...>
+  mode=$1 key_sent_local=1 sessions_state=ok results_known=1
+  read -ra passed_scenarios <<<"$2"
+  shift 2
+  journal=("$@")
+  rm -f "$t/server-calls" "$t/deleted"
   rc=0; o=$(check_sessions 2>&1) || rc=$?
-  check "journal state '${s:-missing}': cleanup fails with the fixed message" '[ "$rc" = 1 ] && has "$o" "sessions this run created may remain"'
+}
+for s in '' unknown bad; do
+  sessions_case smoke ''
+  sessions_state=$s
+  rc=0; o=$(check_sessions 2>&1) || rc=$?
+  check "journal state '${s:-missing}': fails with the fixed message, no request" '[ "$rc" = 1 ] && has "$o" "sessions this run created may remain" && [ "$(requests)" = 0 ]'
 done
-key_sent_local=1 sessions_state=ok journal=("send $K1 connectAndChat")
+sessions_case scenario connectAndChat
+check "empty journal with a passing sending scenario: fails, no server request" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(requests)" = 0 ]'
+sessions_case scenario '' "send $K1 connectAndChat"
+check "a send without its chat line: fails, no server request" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(requests)" = 0 ]'
+sessions_case scenario connectAndChat "send $K1 connectAndChat" "chat connectAndChat $K1 none"
+check "a chat line without an id (none): fails, no server request" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
+sessions_case scenario connectAndChat "send $K1 connectAndChat" "chat connectAndChat $K9 $K9"
+check "a chat line for another key (unmatched): fails, no request for it" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
+sessions_case full 'connectAndChat stopDuringRun' "send $K1 connectAndChat" "chat connectAndChat $K1 $K1" "send $K9 stopDuringRun" "run $R1 $K9"
+check "one complete and one incomplete entry: fails, requests only for the complete one" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(requests)" -gt 0 ] && ! grep -q "$K9\|$R1" "$t/server-calls" && grep -qx "DELETE api/sessions/$K1" "$t/server-calls"'
+sessions_case scenario connectAndChat "send $K1 connectAndChat" "chat connectAndChat $K1 $K1" "chat connectAndChat $K1 $K1,$K9"
+check "two chat lines for one scenario: fails, no request" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
+sessions_case scenario connectAndChat "send $K1 connectAndChat" "chat connectAndChat $K1 $K1"
+check "a complete, matched entry: proved, deleted and checked gone; passes" '[ "$rc" = 0 ] && [ "$(cat "$t/server-calls")" = "$(printf "GET api/sessions/%s\nDELETE api/sessions/%s\nGET api/sessions/%s" "$K1" "$K1" "$K1")" ]'
+sessions_case smoke ''
+check "nothing sent (smoke): complete and empty journal passes, no request" '[ "$rc" = 0 ] && has "$o" "complete and empty" && [ "$(requests)" = 0 ]'
+sessions_case scenario ''
+results_known=''
 rc=0; o=$(check_sessions 2>&1) || rc=$?
-check "journal empty after a send (no id of the chat): fails, sessions may remain" '[ "$rc" = 1 ] && has "$o" "journal is incomplete" && has "$o" "may remain"'
-key_sent_local=1 sessions_state=ok journal=("send $K1 connectAndChat" "session $K9 $K9 connectAndChat")
-rc=0; o=$(check_sessions 2>&1) || rc=$?
-check "an id of another chat does not complete a send: fails" '[ "$rc" = 1 ] && has "$o" "journal is incomplete"'
+check "sending mode, results not verified, empty journal: fails, no request" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
+key_sent_local='' sessions_state='' journal=() passed_scenarios=()
 rm -f "$t/server-calls"
-key_sent_local=1 sessions_state=ok journal=("run $R1 $K9")
-rc=0; o=$(check_sessions 2>&1) || rc=$?
-check "a journaled run of a session not proved this run's: not read, fails" '[ "$rc" = 1 ] && [ ! -e "$t/server-calls" ]'
-key_sent_local=1 sessions_state=ok journal=()
-rc=0; o=$(check_sessions 2>&1) || rc=$?
-check "nothing sent (smoke): complete and empty journal passes, no server call" '[ "$rc" = 0 ] && has "$o" "complete and empty" && [ ! -e "$t/server-calls" ]'
-key_sent_local='' sessions_state=''
-check "key never sent: no sessions possible, no read" 'check_sessions 2>/dev/null && [ ! -e "$t/server-calls" ]'
+check "key never sent: no sessions possible, no request" 'check_sessions 2>/dev/null && [ "$(requests)" = 0 ]'
 unset -f hermes
+mode=smoke
 
 # 6b. The steered turn on the server, from canned records (the build host's jq check).
 steer=$(steering_text)
@@ -197,7 +223,7 @@ o=$(probe "$t/nostate" run-x "$PORT_RANGES" "${r#LISTENERS=}" "$EMU_RE" "$ADB_RE
 check "probe: every token on a clean host, accepted" 'verify_probe "$o" 2>/dev/null || { echo "$o" | tr "\n" " "; false; }'
 rc=0; m=$(verify_probe "$(grep -v "^RUNDIR=" <<<"$o")" 2>&1) || rc=$?
 check "postcheck: a missing token fails and is named" '[ "$rc" = 1 ] && has "$m" "not confirmed: RUNDIR=absent"'
-rc=0; m=$(verify_probe "${o/AVD=absent/AVD=error}" 2>&1) || rc=$?
+rc=0; m=$(verify_probe "${o/AVD=absent/AVD=unknown}" 2>&1) || rc=$?
 check "postcheck: an inaccessible or unexpected value fails" '[ "$rc" = 1 ] && has "$m" "AVD=absent"'
 check "postcheck: an empty report (SSH failed) fails" '! verify_probe "" 2>/dev/null'
 mkdir -p "$t/st9/lock.d"
@@ -206,8 +232,22 @@ o=$(probe "$t/st9" run-x "$PORT_RANGES" "${r#LISTENERS=}" "$EMU_RE" "$ADB_RE" "$
 check "probe: this run's lock still there is LOCK=held, fails" 'has "$o" LOCK=held && ! verify_probe "$o" 2>/dev/null'
 mkdir -p "$t/st9/noaccess"
 chmod 000 "$t/st9/noaccess"
-check "probe: an unsearchable directory is error, not absent" '[ "$(path_state "$t/st9/noaccess/x")" = error ]'
+check "probe: an unsearchable directory is unknown, not absent" '[ "$(path_state "$t/st9/noaccess/x")" = unknown ]'
 chmod 700 "$t/st9/noaccess"
+# The port listing: a failing ss, or output that does not parse, gives PORTS=unknown, never closed.
+mkdir -p "$t/ssfail" "$t/ssodd"
+printf '#!/bin/sh\nexit 1\n' >"$t/ssfail/ss"
+printf '#!/bin/sh\necho "LISTEN 0 4096 127.0.0.1:5037 0.0.0.0:*"\necho "LISTEN 0 4096 garbled"\n' >"$t/ssodd/ss"
+chmod +x "$t/ssfail/ss" "$t/ssodd/ss"
+o=$(PATH="$t/ssfail:$PATH" probe "$t/nostate" run-x "$PORT_RANGES" none "$EMU_RE" "$ADB_RE" "$SCRIPT_RE")
+check "probe: a failing port listing gives PORTS=unknown and fails" 'has "$o" PORTS=unknown && lacks "$o" PORTS=closed && ! verify_probe "$o" 2>/dev/null'
+o=$(PATH="$t/ssodd:$PATH" probe "$t/nostate" run-x "$PORT_RANGES" none "$EMU_RE" "$ADB_RE" "$SCRIPT_RE")
+check "probe: an unparsable port listing gives PORTS=unknown and fails" 'has "$o" PORTS=unknown && ! verify_probe "$o" 2>/dev/null'
+mkdir -p "$t/ssok"
+printf '#!/bin/sh\necho "LISTEN 0 4096 127.0.0.1:5037 0.0.0.0:*"\n' >"$t/ssok/ss"
+chmod +x "$t/ssok/ss"
+o=$(PATH="$t/ssok:$PATH" probe "$t/nostate" run-x "$PORT_RANGES" none "$EMU_RE" "$ADB_RE" "$SCRIPT_RE")
+check "probe: a parsed listing with a new port in the ranges gives PORTS=open (control)" 'has "$o" PORTS=open && [ "$(PATH="$t/ssok:$PATH" listeners_now "$PORT_RANGES")" = LISTENERS=5037 ]'
 
 # 10. The remote stage: the export is copied only after exit 0 with this run's completion token as the last line,
 # after a valid manifest. A fake ssh plays the emulator host.
@@ -251,17 +291,20 @@ REMOTE_TIMEOUT=60
 # 11. An interrupt (SIGINT) during the import: the real traps leave no final directory and no incoming files.
 cat >"$t/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
-# Copies the listed files like the real one, then stays busy, so the interrupt arrives mid-import.
-for a in "$@"; do case $a in --files-from=*) list=${a#*=} ;; esac; done
+# Copies the listed files like the real one and leaves a temporary file holding the key in its --temp-dir, then
+# stays busy (or, with FAKE_KILL, kills itself) so the import is cut off mid-copy.
+for a in "$@"; do case $a in --files-from=*) list=${a#*=} ;; --temp-dir=*) td=${a#*=} ;; esac; done
 src=${*: -2:1} dst=${*: -1}
 while IFS= read -r f; do cp -- "$src/$f" "$dst/$f"; done <"$list"
+printf 'partial %s\n' "$FAKE_KEY" >"${td:?no --temp-dir}/.logcat.txt.Ab12Cd"
+[ -z "${FAKE_KILL:-}" ] || kill -KILL $$
 sleep 3
 EOF
 chmod +x "$t/bin/rsync"
 make_export "$t/src11"
 printf '%s\n' "${export_files[@]}" >"$t/files11"
 set -m # job control: the child gets SIGINT like a foreground run would
-PATH="$t/bin:$PATH" APOFIS_E2E_LIB=1 bash -c '
+FAKE_KEY=$key PATH="$t/bin:$PATH" APOFIS_E2E_LIB=1 bash -c '
   source "$1/run-e2e.sh"
   set +e
   tmp=$(mktemp -d) E2E_OUT=$2 run_id=run11 key=$3
@@ -274,11 +317,24 @@ PATH="$t/bin:$PATH" APOFIS_E2E_LIB=1 bash -c '
 pid=$!
 set +m
 sleep 1.5
-check "interrupt during import: the incoming files exist mid-import" '[ -e "$E2E_OUT/.incoming-run11/logcat.txt" ]'
+check "interrupt during import: the incoming files (and a temporary file) exist mid-import" '[ -e "$E2E_OUT/.incoming-run11/logcat.txt" ] && [ -e "$E2E_OUT/.incoming-run11/.logcat.txt.Ab12Cd" ]'
 kill -INT "$pid"
 rc=0; wait "$pid" || rc=$?
 check "interrupt during import: exit 130, no final directory, no incoming files" '[ "$rc" = 130 ] && nothing_kept run11 && lacks "$(cat "$t/out11")" "import returned"'
 check "interrupt inside a redirected call: the cleanup's messages still reach the terminal" 'has "$(cat "$t/out11")" "the key never left this host"'
+
+# 11b. A killed copy (the receiver dies mid-file, leaving a temporary file with the key): the incoming directory is gone.
+make_export "$t/src11b"
+run_id=run11b rc=0
+o=$(FAKE_KILL=1 FAKE_KEY=$key PATH="$t/bin:$PATH" import_export "$t/src11b/" 2>&1) || rc=$?
+check "killed copy: fails, the incoming directory with its temporary file is absent, nothing kept" '[ "$rc" != 0 ] && nothing_kept run11b && has "$o" "stage copy"'
+# The pattern delete refuses anything but an incoming directory directly inside build/e2e.
+mkdir -p "$t/other/.incoming-x" "$E2E_OUT/notincoming"
+touch "$t/other/.incoming-x/keep" "$E2E_OUT/notincoming/keep"
+incoming=$t/other/.incoming-x rc=0; drop_incoming 2>/dev/null || rc=$?
+check "incoming cleanup: refuses a directory outside build/e2e" '[ "$rc" = 1 ] && [ -e "$t/other/.incoming-x/keep" ]'
+incoming=$E2E_OUT/notincoming rc=0; drop_incoming 2>/dev/null || rc=$?
+check "incoming cleanup: refuses a name without .incoming-" '[ "$rc" = 1 ] && [ -e "$E2E_OUT/notincoming/keep" ]'
 
 # 12. The cleanup has an overall limit: a hanging step ends in a reported failure, not a hang.
 s=$SECONDS rc=0

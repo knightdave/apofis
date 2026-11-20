@@ -42,6 +42,7 @@ class SurvivalE2eTest {
     @After
     fun cleanUp() {
         app.airplane(false)
+        app.journalSent() // the scenario's one completing journal line, also when it failed
         app.log("scenario ${name.methodName} ends")
     }
 
@@ -199,9 +200,9 @@ class SurvivalE2eTest {
     /** Sends [prompt] in the chat this scenario opened (its key read from the chat screen's tag); returns that key. */
     private fun sendPrompt(prompt: String, online: Boolean = true): String = session.also { app.send(it, prompt, online = online) }
 
-    /** Journals the chat's ids again after the reply (compression can give it a new id); it must be on the server. */
+    /** After the reply the chat must be on the server (its ids are journaled at the scenario's end). */
     private fun journalAfterReply(chat: String) {
-        if (!app.journalChat(chat)) fail("The chat is not on the server after the reply; its ids were never journaled")
+        if (!app.chatOnServer(chat)) fail("The chat is not on the server after the reply")
     }
 
     /** The composer is back to Send: no run is going on. */

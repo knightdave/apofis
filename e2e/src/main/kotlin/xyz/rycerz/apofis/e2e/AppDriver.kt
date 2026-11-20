@@ -276,16 +276,23 @@ class AppDriver {
         return ChatRow(cols[0], lineage, cols[2] == "1")
     }
 
+    /** Whether the app has created chat [key] (the chat this test opened) on the server. Reads only that chat's row. */
+    fun chatOnServer(key: String): Boolean = (chatRow(key) ?: fail("The chat $key is gone from the app's database")).onServer
+
+    /** The chat this scenario sent a message in, if any; [journalSent] writes its one completing line at the end. */
+    private var sentChat: String? = null
+
     /**
-     * Journals the server ids of chat [key] (the chat this test opened and read from the screen), once the app has
-     * created it on the server: its current id and earlier ids, as "session <key> <id> <scenario>". Nothing else of the
-     * app's database is read. Returns false while the chat is not on the server yet.
+     * Writes the scenario's one completing journal line when it sent a message: "chat <scenario> <key> <ids>", the
+     * chat's server ids (current first, then earlier ones), or "none" when the app never created it on the server. The
+     * build host requires exactly one such line for every scenario with a send line. Call once, at the scenario's end.
      */
-    fun journalChat(key: String): Boolean {
-        val row = chatRow(key) ?: fail("The chat $key is gone from the app's database")
-        if (!row.onServer) return false
-        (listOf(row.currentId) + row.lineage).distinct().forEach { journal("session $key $it $scenario") }
-        return true
+    fun journalSent() {
+        val key = sentChat ?: return
+        sentChat = null
+        val row = chatRow(key)
+        val ids = if (row?.onServer == true) (listOf(row.currentId) + row.lineage).distinct().joinToString(",") else "none"
+        journal("chat $scenario $key $ids")
     }
 
     /** Journals the id of the run the app is following for chat [sessionKey] (exactly one), with that chat's id. */
@@ -306,7 +313,8 @@ class AppDriver {
         val p = line.split(' ')
         val ok = when (p[0]) {
             "send" -> p.size == 3 && SESSION_ID.matches(p[1]) && SCENARIO.matches(p[2])
-            "session" -> p.size == 4 && SESSION_ID.matches(p[1]) && SESSION_ID.matches(p[2]) && SCENARIO.matches(p[3])
+            "chat" -> p.size == 4 && SCENARIO.matches(p[1]) && SESSION_ID.matches(p[2]) &&
+                (p[3] == "none" || p[3].split(',').let { ids -> ids.size in 1..8 && ids.all(SESSION_ID::matches) })
             "run" -> p.size == 3 && RUN_ID.matches(p[1]) && SESSION_ID.matches(p[2])
             else -> false
         }
@@ -319,18 +327,19 @@ class AppDriver {
     /**
      * Sends [text] in the open chat, which must be [chat] (read from the chat screen's tag first): journals "send <chat>
      * <scenario>" before pressing the button showing [button] (Send, or Send to the running reply), so the build host
-     * knows a message may have created a session. When [online], waits until the chat is on the server and journals its
-     * ids; offline, that happens after the reply.
+     * knows a message may have created a session. When [online], waits until the app has created the chat on the server.
      */
     fun send(chat: String, text: String, button: String = str("chat_send"), online: Boolean = true) {
         if (openChatKey() != chat) fail("The open chat is not the one this test opened")
         val composer = nodes { it.className == "android.widget.EditText" }.singleOrNull() ?: fail("No composer. Screen: ${screen()}")
         setField(composer, text)
         device.waitForIdle()
+        if (sentChat != null && sentChat != chat) fail("A scenario sends in one chat only")
+        sentChat = chat
         journal("send $chat $scenario")
         clickTag("composer.send", button)
         log("sent: $text")
-        if (online) waitFor("the chat on the server, its ids journaled", 15_000) { journalChat(chat) }
+        if (online) waitFor("the chat on the server", 15_000) { chatOnServer(chat) }
     }
 
     /**

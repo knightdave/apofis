@@ -108,10 +108,11 @@ allowlist() {
 }
 allowed() { allowlist | grep -qxF -- "$1"; }
 
-# The session journal's line forms: a send in chat <key> (written before the send), a server id of chat <key>, and
-# the run the app followed for chat <key>.
+# The session journal's line forms: "send <key> <scenario>" (written before each send in chat <key>), one
+# "chat <scenario> <key> <ids>|none" per scenario that sent (written at its end: the chat's server ids, current first,
+# or none when the app never had one), and "run <run id> <key>" (the run the app followed in chat <key>).
 journal_line_ok() {
-  [[ $1 =~ ^send\ $SESSION_RE\ [A-Za-z]{1,40}$ || $1 =~ ^session\ $SESSION_RE\ $SESSION_RE\ [A-Za-z]{1,40}$ ||
+  [[ $1 =~ ^send\ $SESSION_RE\ [A-Za-z]{1,40}$ || $1 =~ ^chat\ [A-Za-z]{1,40}\ $SESSION_RE\ (none|$SESSION_RE(,$SESSION_RE){0,7})$ ||
     $1 =~ ^run\ $RUN_RE\ $SESSION_RE$ ]]
 }
 
@@ -182,27 +183,32 @@ lock_release() {
 
 lock_owned() { local oid=''; read -r oid <"$1/lock.d/owner" 2>/dev/null && [ "$oid" = "$2" ]; }
 
-# present, absent (the nearest existing ancestor is a searchable directory) or error (could not tell).
+# present, absent (the nearest existing ancestor is a searchable directory) or unknown (could not tell).
 path_state() {
   local d
   if [ -e "$1" ] || [ -L "$1" ]; then echo present; return; fi
   d=$(dirname -- "$1")
   while [ ! -e "$d" ]; do d=$(dirname -- "$d"); done
-  if [ -d "$d" ] && [ -x "$d" ]; then echo absent; else echo error; fi
+  if [ -d "$d" ] && [ -x "$d" ]; then echo absent; else echo unknown; fi
 }
 
-# LISTENERS=<comma separated ports in the ranges>, LISTENERS=none or LISTENERS=error.
+# LISTENERS=<comma separated ports in the ranges>, LISTENERS=none, or LISTENERS=unknown when ss failed or any line of
+# its output does not parse (its local address must end in :<port>).
 listeners_now() {
   local l p
-  l=$(ss -Hltn) || { echo LISTENERS=error; return; }
-  p=$(awk -v r="$1" 'BEGIN { n = split(r, a, " ") } { p = $4; sub(/.*:/, "", p); for (i = 1; i < n; i += 2) if (p + 0 >= a[i] && p + 0 <= a[i + 1]) print p + 0 }' <<<"$l" |
-    sort -un | paste -sd, -)
+  l=$(ss -Hltn) || { echo LISTENERS=unknown; return; }
+  p=$(awk -v r="$1" 'BEGIN { n = split(r, a, " ") }
+    NF < 5 || $4 !~ /:[0-9]+$/ { bad = 1; exit }
+    { p = $4; sub(/.*:/, "", p); for (i = 1; i < n; i += 2) if (p + 0 >= a[i] && p + 0 <= a[i + 1]) print p + 0 }
+    END { exit bad }' <<<"$l") || { echo LISTENERS=unknown; return; }
+  p=$(sort -un <<<"$p" | paste -sd, -) || { echo LISTENERS=unknown; return; }
   echo "LISTENERS=${p:-none}"
 }
 
 # What is left on the emulator host, independent of any record the run kept. One token per fact, then DONE:
-# EMULATOR, ADB, REMOTE (processes), AVD, RUNDIR = absent|present|error; LOCK = released|held|error (held: still
-# this run's); PORTS = closed|open|error (open: a listener in the ranges that was not there before the run).
+# EMULATOR, ADB, REMOTE (processes), AVD, RUNDIR = absent|present|unknown; LOCK = released|held|unknown (held: still
+# this run's); PORTS = closed|open|unknown (open: a listener in the ranges that was not there before the run). Every
+# fact is reported absent, released or closed only when its check ran and its answer was understood.
 # probe <state dir> <run id> <ranges> <ports before> <emulator re> <adb re> <script re>
 probe() {
   local st=$1 run=$2 before=,$4, r name re a b p l oid=''
@@ -210,26 +216,27 @@ probe() {
     case $name in EMULATOR) re=$5 ;; ADB) re=$6 ;; *) re=$7 ;; esac
     r=0
     pgrep -u "$(id -u)" -f -- "$re" >/dev/null || r=$?
-    case $r in 0) echo "$name=present" ;; 1) echo "$name=absent" ;; *) echo "$name=error" ;; esac
+    case $r in 0) echo "$name=present" ;; 1) echo "$name=absent" ;; *) echo "$name=unknown" ;; esac
   done
   a=$(path_state "$st/avd/apofis-e2e.avd") b=$(path_state "$st/avd/apofis-e2e.ini")
   if [ "$a" = absent ] && [ "$b" = absent ]; then echo AVD=absent
   elif [ "$a" = present ] || [ "$b" = present ]; then echo AVD=present
-  else echo AVD=error; fi
+  else echo AVD=unknown; fi
   echo "RUNDIR=$(path_state "$st/runs/$run")"
   case $(path_state "$st/lock.d") in
     absent) echo LOCK=released ;;
     present) read -r oid <"$st/lock.d/owner" 2>/dev/null
-      if [ "$oid" = "$run" ]; then echo LOCK=held; elif [ -n "$oid" ]; then echo LOCK=released; else echo LOCK=error; fi ;;
-    *) echo LOCK=error ;;
+      if [ "$oid" = "$run" ]; then echo LOCK=held; elif [ -n "$oid" ]; then echo LOCK=released; else echo LOCK=unknown; fi ;;
+    *) echo LOCK=unknown ;;
   esac
   l=$(listeners_now "$3")
   l=${l#LISTENERS=}
-  if [ "$l" = error ]; then echo PORTS=error
-  else
+  if [[ $l =~ ^(none|[0-9]+(,[0-9]+)*)$ ]]; then
     r=closed
     for p in ${l//,/ }; do [ "$p" = none ] || [[ $before == *",$p,"* ]] || r=open; done
     echo "PORTS=$r"
+  else
+    echo PORTS=unknown
   fi
   echo DONE
 }
@@ -543,7 +550,7 @@ scan_dir() {
 # ================================================================ build host
 key='' nonce='' run_id='' tmp='' interrupted='' key_sent_local='' mode='' arg=''
 tun_fd='' tunnel_pid='' tunnel_port='' rin='' rout='' remote_pid='' remote_shell_pid='' last_line=''
-sessions_state='' journal=() export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
+sessions_state='' journal=() passed_scenarios=() results_known='' export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
 incoming='' wd_pid='' orig_out='' orig_err=''
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
@@ -595,59 +602,71 @@ STEER_JQ='
     and ($f | length) > 0 and ($f | last | .key) > $s[0].key and ($f | last | .value.content | test("\\bBANANA\\W*$"))'
 steer_ok_json() { jq -e --arg id "$1" --arg text "$2" --arg end $'\n[/OUT-OF-BAND USER MESSAGE]' "$STEER_JQ" "$3" >/dev/null 2>&1; }
 
-# Checks and deletes the sessions the journal names; reads nothing on the server that the journal does not name.
-# Every "send <chat>" must have at least one journaled server id of that chat, otherwise sessions may remain. Each
-# id is first proved to be this run's (a GET on that id returns that id, an app id, with this run's nonce in its
-# title). Then, for the steer scenario, its record must show the steered turn; for a journaled run, its status must
-# name that session and be cancelled. Then the session is deleted and checked gone.
+# Checks and deletes the sessions the journal names; reads nothing on the server that is not a complete, matched
+# journal entry. Completeness is decided first: every scenario that passed must have sent; every scenario that sent
+# (one chat key) must have exactly one chat line for that key with server ids; a chat line needs its send. Anything
+# else fails the run with "sessions may remain", and only the complete entries are checked and deleted. Each of their
+# ids is first proved to be this run's (a GET on that id returns that id, an app id, with this run's nonce in its
+# title). Then, for the steer scenario, its record must show the steered turn; for a journaled run of a complete
+# entry's chat, its status must name that session and be cancelled. Then the session is deleted and checked gone.
 check_sessions() {
-  local l k id scen run body ok=0 n code steer_ok='' stop_ok='' verified=() v incomplete=''
+  local l k id ids scen run body ok=0 n code steer_ok='' stop_ok='' verified=() v bad='' entries=() keys=' ' s sends chats
   if [ -z "$key_sent_local" ]; then log "sessions: the key never left this host, so the app created none"; return 0; fi
   if [ "$sessions_state" != ok ]; then
     log "FAILED: the session journal is missing or unreadable; sessions this run created may remain on the server"
     return 1
   fi
-  for l in "${journal[@]}"; do
-    [ "${l%% *}" = send ] || continue
-    read -r k _ <<<"${l#send }"
-    printf '%s\n' "${journal[@]}" | grep -q "^session $k " || incomplete=1
+  jlines() { [ "${#journal[@]}" = 0 ] || printf '%s\n' "${journal[@]}"; }
+  for s in "${passed_scenarios[@]}"; do jlines | grep -Eq "^send [^ ]+ $s$" || bad=1; done
+  # Without the verified results it is unknown which scenarios ran; a journal without any send proves nothing then.
+  if [ "$mode" != smoke ] && [ -z "$results_known" ] && ! jlines | grep -q '^send '; then bad=1; fi
+  for s in $(jlines | awk '$1 == "send" { print $3 } $1 == "chat" { print $2 }' | sort -u); do
+    sends=$(jlines | awk -v s="$s" '$1 == "send" && $3 == s { print $2 }' | sort -u)
+    chats=$(jlines | awk -v s="$s" '$1 == "chat" && $2 == s')
+    if [ "$(grep -c . <<<"$sends")" = 1 ] && [ "$(grep -c . <<<"$chats")" = 1 ]; then
+      read -r _ _ k ids <<<"$chats"
+      if [ "$k" = "$sends" ] && [ "$ids" != none ]; then entries+=("$s $k $ids"); keys+="$k "; continue; fi
+    fi
+    bad=1
   done
-  if [ -n "$incomplete" ]; then
-    log "FAILED: the session journal is incomplete (a message was sent, but no server id of its chat was journaled); sessions this run created may remain on the server"
+  if [ -n "$bad" ]; then
+    log "FAILED: the session journal is missing a line, or a line is incomplete or unmatched; sessions this run created may remain on the server (only complete entries are checked and deleted)"
     ok=1
   elif [ "${#journal[@]}" = 0 ]; then
     log "sessions: the journal is complete and empty (nothing was sent)"
   fi
   body=$(mktemp)
-  for l in "${journal[@]}"; do
-    [ "${l%% *}" = session ] || continue
-    read -r k id scen <<<"${l#session }"
-    [[ $id =~ ^$SESSION_RE$ ]] || { log "FAILED: sessions: a malformed id; left alone"; ok=1; continue; }
-    for v in "${verified[@]}"; do [ "$v" != "$id" ] || continue 2; done
-    code=$(hermes GET "api/sessions/$id" "$body") || code=error
-    if [ "$code" = 404 ]; then log "sessions: $id not on the server (already gone)"; continue; fi
-    if [ "$code" != 200 ] || ! jq -e --arg id "$id" --arg n "$nonce" \
-      '.session | .id == $id and (.id | startswith("apofis-")) and ((.title // "") | contains($n))' "$body" >/dev/null 2>&1; then
-      log "FAILED: sessions: $id answered $code without this run's identity; left alone"
-      ok=1
-      continue
-    fi
-    verified+=("$id")
-    if [ "$scen" = steerDuringRun ]; then
-      code=$(hermes GET "api/sessions/$id/messages?order=oldest&include_compacted=true" "$body") || code=error
-      if [ "$code" = 200 ] && steer_ok_json "$id" "$(steering_text)" "$body"; then
-        log "server: $id holds one steer row of exactly the steering text, then the final answer ending with BANANA"
-        steer_ok=1
-      else
-        log "FAILED: server: $id does not show the steered turn in order (HTTP $code)"
+  for l in "${entries[@]}"; do
+    read -r scen k ids <<<"$l"
+    for id in ${ids//,/ }; do
+      [[ $id =~ ^$SESSION_RE$ ]] || { log "FAILED: sessions: a malformed id; left alone"; ok=1; continue; }
+      for v in "${verified[@]}"; do [ "$v" != "$id" ] || continue 2; done
+      code=$(hermes GET "api/sessions/$id" "$body") || code=error
+      if [ "$code" = 404 ]; then log "sessions: $id not on the server (already gone)"; continue; fi
+      if [ "$code" != 200 ] || ! jq -e --arg id "$id" --arg n "$nonce" \
+        '.session | .id == $id and (.id | startswith("apofis-")) and ((.title // "") | contains($n))' "$body" >/dev/null 2>&1; then
+        log "FAILED: sessions: $id answered $code without this run's identity; left alone"
         ok=1
+        continue
       fi
-    fi
+      verified+=("$id")
+      if [ "$scen" = steerDuringRun ]; then
+        code=$(hermes GET "api/sessions/$id/messages?order=oldest&include_compacted=true" "$body") || code=error
+        if [ "$code" = 200 ] && steer_ok_json "$id" "$(steering_text)" "$body"; then
+          log "server: $id holds one steer row of exactly the steering text, then the final answer ending with BANANA"
+          steer_ok=1
+        else
+          log "FAILED: server: $id does not show the steered turn in order (HTTP $code)"
+          ok=1
+        fi
+      fi
+    done
   done
   for l in "${journal[@]}"; do
     [ "${l%% *}" = run ] || continue
     read -r run id <<<"${l#run }"
     [[ $run =~ ^$RUN_RE$ ]] || { ok=1; continue; }
+    [[ $keys == *" $id "* ]] || { log "FAILED: server: a journaled run names a chat without a complete entry; not read"; ok=1; continue; }
     for v in "${verified[@]}"; do
       [ "$v" = "$id" ] || continue
       code=$(hermes GET "v1/runs/$run" "$body") || code=error
@@ -914,21 +933,27 @@ remote_complete() {
   [ "$1" = 0 ] && [ "$export_state" = ok ] && [ "$last_line" = "@@COMPLETE $run_id ${#export_files[@]}@@" ]
 }
 
-# Removes the files this run copied into the incoming directory (only allowlisted names: rm -f, or rmdir for an
-# empty directory a type change left), then the directory itself.
+# Removes everything inside this run's incoming directory, whatever its name (partial and temporary files of the copy
+# included), then the directory. Refuses unless $incoming is a real directory directly inside $E2E_OUT whose name
+# starts with .incoming-: the one place where deleting by pattern is right, because nothing in it is verified.
 drop_incoming() {
-  local f
-  [ -n "$incoming" ] && [ -d "$incoming" ] || { incoming=''; return 0; }
-  while IFS= read -r f; do
-    if [ -d "$incoming/$f" ] && [ ! -L "$incoming/$f" ]; then rmdir -- "$incoming/$f" 2>/dev/null; else rm -f -- "$incoming/$f"; fi
-  done < <(allowlist)
-  rmdir -- "$incoming" 2>/dev/null || log "FAILED: $incoming has entries this run did not copy; left alone"
+  local d=$incoming
   incoming=''
+  [ -n "$d" ] || return 0
+  if [ "${d%/*}" != "$E2E_OUT" ] || [[ ${d##*/} != .incoming-?* ]] || [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+    log "FAILED: refusing to clean $d: not an incoming directory of $E2E_OUT; left alone"
+    return 1
+  fi
+  [ -e "$d" ] || return 0
+  chmod -R u+w -- "$d" 2>/dev/null
+  find "$d" -mindepth 1 -delete 2>/dev/null
+  rmdir -- "$d" 2>/dev/null || { log "FAILED: could not remove $d; delete it by hand (unverified files)"; return 1; }
 }
 
 # import_export <source>: copies exactly the reported files into $E2E_OUT/.incoming-<run id> (new, never descending
-# into directories), verifies each checksum, that nothing else arrived, and scans the copy; then publishes it with one
-# rename as $E2E_OUT/<run id>. On any failure or interrupt the incoming files are deleted (here or in the cleanup).
+# into directories, temporary files only inside it), verifies each checksum, that nothing else arrived, and scans the
+# copy; then publishes it with one rename as $E2E_OUT/<run id>. On any failure or interrupt the incoming directory and
+# everything in it are deleted (here or in the cleanup).
 import_export() {
   local src=$1 final=$E2E_OUT/$run_id e h f fail=''
   if [ -e "$final" ] || [ -e "$E2E_OUT/.incoming-$run_id" ] || ! mkdir -p "$E2E_OUT"; then
@@ -938,7 +963,7 @@ import_export() {
   incoming=$E2E_OUT/.incoming-$run_id
   mkdir -- "$incoming" || { incoming=''; log "FAILED: stage copy: could not create $E2E_OUT/.incoming-$run_id; nothing copied"; return 1; }
   for e in "${export_files[@]}"; do printf '%s\n' "${e#* }"; done >"$tmp/files"
-  bounded 600 rsync --times --chmod=Fu+rw --files-from="$tmp/files" "$src" "$incoming/" >/dev/null 2>&1 || fail="copy"
+  bounded 600 rsync --times --chmod=Fu+rw --temp-dir="$(cd "$incoming" && pwd)" --files-from="$tmp/files" "$src" "$incoming/" >/dev/null 2>&1 || fail="copy"
   if [ -z "$fail" ]; then
     for e in "${export_files[@]}"; do
       h=${e%% *} f=${e#* }
@@ -1080,6 +1105,9 @@ main() {
   log "copying the ${#export_files[@]} scanned files to $E2E_OUT/$run_id"
   import_export "$HOST:$REMOTE_DIR/.state/runs/$run_id/export/" || exit "$SCANFAIL_EXIT"
   log "copied and verified (checksums match, key absent from the copy)"
+  # The scenarios that passed, for the journal's completeness check (each of them sent a message).
+  mapfile -t passed_scenarios < <(sed -n 's/^SurvivalE2eTest\.\([A-Za-z]*\) PASS$/\1/p' "$E2E_OUT/$run_id/results.txt" 2>/dev/null)
+  results_known=1
   evaluate "$E2E_OUT/$run_id" || die "tests failed or evidence is missing; files in $E2E_OUT/$run_id"
   log "PASSED; files in $E2E_OUT/$run_id (server checks and cleanup follow)"
 }
