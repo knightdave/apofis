@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -77,11 +78,17 @@ fun AppNav(container: AppContainer) {
                 )
             }
             LaunchedEffect(vm.state) { if (vm.state == ConnectState.Connected) chosen = Screen.CHAT }
-            val scope = rememberCoroutineScope()
-            // Leaving first cancels and waits for a running check; while saving, leave() refuses and Back is swallowed.
+            // Back cancels a running check synchronously before leaving; while saving, cancel() refuses and Back is
+            // swallowed. On first run, leaving means sending the app to the background, as the system would.
+            val activity = LocalActivity.current
             val canGoBack = reconnect && conn != null
-            val leave = { scope.launch { if (vm.leave()) chosen = Screen.SETTINGS }; Unit }
-            BackHandler(enabled = canGoBack || vm.state == ConnectState.Saving) { if (canGoBack) leave() }
+            val busy = vm.state == ConnectState.Testing || vm.state == ConnectState.Saving
+            val leave = {
+                if (vm.cancel()) {
+                    if (canGoBack) chosen = Screen.SETTINGS else activity?.moveTaskToBack(true)
+                }
+            }
+            BackHandler(enabled = canGoBack || busy, onBack = leave)
             ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
         Screen.CHAT -> ChatPlaceholder(conn, onSettings = { chosen = Screen.SETTINGS })

@@ -220,10 +220,11 @@ class ConnectViewModelTest {
         vm.connect()
         withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }
 
-        assertTrue(vm.leave())
+        assertTrue(vm.cancel()) // synchronous: nothing to wait for before navigating
         assertEquals(ConnectState.Idle, vm.state)
         withContext(Dispatchers.IO) { Thread.sleep(800) } // past the moment the response arrives
         assertTrue(saved.isEmpty())
+        assertEquals(ConnectState.Idle, vm.state) // a late result is ignored
     }
 
     @Test
@@ -239,7 +240,7 @@ class ConnectViewModelTest {
         val job = vm.connect()!!
         withContext(Dispatchers.IO) { while (vm.state != ConnectState.Saving) Thread.sleep(10) }
 
-        assertFalse(vm.leave())
+        assertFalse(vm.cancel())
         release.complete(Unit)
         job.join()
         assertEquals(ConnectState.Connected, vm.state)

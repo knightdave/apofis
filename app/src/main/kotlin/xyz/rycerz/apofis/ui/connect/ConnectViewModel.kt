@@ -67,6 +67,7 @@ class ConnectViewModel(
         private set
     private var pending: Credentials? = null
     private var job: Job? = null
+    private var attempt = 0 // bumped by every start and by cancel(); a result of an older attempt is dropped
 
     val keepsCurrentKey: Boolean get() = current != null
     val httpWarning: Boolean get() = url.trim().startsWith("http://", ignoreCase = true)
@@ -102,7 +103,11 @@ class ConnectViewModel(
             return fail(Field.URL, Reason.MALFORMED_URL)
         }
         state = ConnectState.Testing
-        return viewModelScope.launch { state = probe(api, Credentials(baseUrl, key)) }.also { job = it }
+        val mine = ++attempt
+        return viewModelScope.launch {
+            val result = probe(api, Credentials(baseUrl, key))
+            if (attempt == mine) state = result // a cancelled check never shows its late result
+        }.also { job = it }
     }
 
     // Every failure other than cancellation ends as a field error.
@@ -137,7 +142,11 @@ class ConnectViewModel(
     fun confirmServerChange(): Job? {
         val c = pending ?: return null
         pending = null
-        return viewModelScope.launch { state = saveOrFail(c) }.also { job = it }
+        val mine = ++attempt
+        return viewModelScope.launch {
+            val result = saveOrFail(c)
+            if (attempt == mine) state = result
+        }.also { job = it }
     }
 
     fun cancelServerChange() {
@@ -158,15 +167,14 @@ class ConnectViewModel(
     }
 
     /**
-     * For Back and any other way of leaving: cancels and waits for a running check, then returns true. Returns false
-     * while saving, which always runs to the end; the caller stays on the screen.
+     * For Back and any other way of leaving, called before navigating: cancels a running check at once, so nothing is
+     * saved afterwards, and returns true. Returns false while saving, which always runs to the end; stay on the screen.
      */
-    suspend fun leave(): Boolean {
+    fun cancel(): Boolean {
         if (state == ConnectState.Saving) return false
-        job?.let {
-            it.cancel()
-            it.join()
-        }
+        attempt++
+        job?.cancel()
+        job = null
         pending = null
         state = ConnectState.Idle
         return true

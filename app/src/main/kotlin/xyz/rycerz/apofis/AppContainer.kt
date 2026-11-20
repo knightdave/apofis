@@ -59,9 +59,10 @@ class Connected internal constructor(
     val repo: ChatRepository get() = liveRepo.also { checkOpen() }
     val follower: RunFollower get() = liveFollower.also { checkOpen() }
 
+    /** Only from the container's serialized lifecycle path; the follower's own gate decides what may stream. */
     internal suspend fun resume() {
         liveFollower.resumeAll()
-        scope.launch { sendQueue.drain() } // may outlast a stop; the starter attaches no stream then
+        scope.launch { sendQueue.drain() } // may outlast a stop: the follower's closed gate then attaches no stream
     }
 
     internal fun pause() = liveFollower.pauseAll()
@@ -79,6 +80,9 @@ private const val TAG = "Apofis"
 internal const val CACHE_PREFS = "cache"
 private const val CACHE_URL = "cache_base_url" // the server the cached rows came from
 internal const val SWITCH_MARKER = "switch_in_progress" // present from the first write of a switch until its last
+
+private const val ANY_CACHED_ROW = "SELECT EXISTS(SELECT 1 FROM SessionEntity) OR EXISTS(SELECT 1 FROM MessageEntity) " +
+    "OR EXISTS(SELECT 1 FROM PendingSendEntity) OR EXISTS(SELECT 1 FROM ActiveRunEntity) OR EXISTS(SELECT 1 FROM ReplyOutcomeEntity)"
 
 // ApiError causes can carry server or transport text, so only the class name is ever logged.
 private fun logFailure(e: Throwable) = Log.w(TAG, "Background task failed: ${e.javaClass.name}")
@@ -106,7 +110,15 @@ class AppContainer(
     private val published = MutableStateFlow<Connected?>(null)
     private val switchLock = Mutex()
 
-    private val foreground = Foreground(scope, resume = { connected()?.resume() }, pause = { current?.pause() }, onError = ::logFailure)
+    /** Test hooks: [beforeResume] runs on the lifecycle path before a resume; [beforeSwitch] at the start of a switch. */
+    internal var beforeResume: suspend () -> Unit = {}
+    internal var beforeSwitch: () -> Unit = {}
+
+    private val foreground = Foreground(scope, resume = { stillStarted ->
+        val c = connected()
+        beforeResume()
+        if (c != null && stillStarted()) c.resume()
+    }, pause = { current?.pause() }, onError = ::logFailure)
 
     /** The current graph for the UI; null when not connected. Changes only when a switch has finished. */
     val connection: StateFlow<Connected?> = published.asStateFlow()
@@ -131,10 +143,14 @@ class AppContainer(
         switchFailedBefore.also { switchFailedBefore = false }
     }
 
-    /** True when [baseUrl] differs from the saved server; saving it then deletes that server's cache, so ask first. */
+    /**
+     * True when saving [baseUrl] needs the user's consent: a saved server exists and differs, or anything is cached
+     * whose owner is unknown or differs. Saving then deletes that cache. Never cleared silently.
+     */
     suspend fun willClearCache(baseUrl: String): Boolean = withContext(Dispatchers.IO) {
-        val saved = connected()?.credentials?.baseUrl ?: cachePrefs.getString(CACHE_URL, null)
-        saved != null && saved != baseUrl
+        val owner = cachePrefs.getString(CACHE_URL, null)
+        val saved = connected()?.credentials?.baseUrl ?: owner
+        (saved != null && saved != baseUrl) || (owner != baseUrl && db.query(ANY_CACHED_ROW, null).use { it.moveToFirst() && it.getInt(0) == 1 })
     }
 
     /**
@@ -145,35 +161,32 @@ class AppContainer(
      */
     suspend fun connect(c: Credentials): Unit = withContext(NonCancellable + Dispatchers.IO) {
         switchLock.withLock {
-            val old = synchronized(this@AppContainer) {
-                loadLocked()
-                switching = true
-                current
-            }
-            old?.close()
-            WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
+            var next: Connected? = null
             try {
-                if (!cachePrefs.edit().putBoolean(SWITCH_MARKER, true).commit()) {
-                    publish(old?.credentials?.let(::build)) // nothing written yet: stay on the old server
-                    throw IOException("switch marker not written")
+                val old = synchronized(this@AppContainer) {
+                    loadLocked()
+                    switching = true
+                    current
                 }
-                var next: Connected? = null
-                try {
-                    if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
-                        commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
-                        withRepositoryLock { db.clearAllTables() }
-                    }
-                    if (!credentials.save(c)) throw IOException("credentials not written")
-                    next = build(c)
-                    commitOrThrow(cachePrefs.edit().putString(CACHE_URL, c.baseUrl))
-                    commitOrThrow(cachePrefs.edit().remove(SWITCH_MARKER))
-                    publish(next)
-                } catch (e: Exception) {
-                    next?.close()
-                    disconnect()
-                    publish(null)
-                    throw e
+                beforeSwitch()
+                old?.close()
+                WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
+                commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
+                if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
+                    commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
+                    withRepositoryLock { db.clearAllTables() }
                 }
+                if (!credentials.save(c)) throw IOException("credentials not written")
+                next = build(c)
+                commitOrThrow(cachePrefs.edit().putString(CACHE_URL, c.baseUrl))
+                commitOrThrow(cachePrefs.edit().remove(SWITCH_MARKER))
+                publish(next)
+            } catch (e: Exception) {
+                // Whatever step failed, the end state is disconnected with the credentials erased, never stuck switching.
+                runCatching { next?.close() }
+                disconnect()
+                publish(null)
+                throw e
             } finally {
                 afterSwitch()
             }
@@ -182,6 +195,9 @@ class AppContainer(
 
     /** App is visible: follow active runs, then send what is queued. Failures are logged, never thrown. */
     fun onStart() = foreground.start()
+
+    /** Returns once all lifecycle work queued so far has run; for tests. */
+    internal suspend fun awaitLifecycle() = foreground.idle()
 
     /** App left the screen: stop every stream; the runs continue on the server. */
     fun onStop() = foreground.stop()
@@ -194,7 +210,7 @@ class AppContainer(
             disconnect()
             null
         } else {
-            credentials.load()?.let(::build)
+            credentials.load()?.let(::build)?.also { scope.launch { scheduleQueuedSends() } }
         }
     }
 
@@ -216,9 +232,14 @@ class AppContainer(
 
     /** Durable send work was cancelled for the switch: schedule it again for what is still queued, then resume. */
     private suspend fun afterSwitch() {
-        runCatching { if (current != null && db.pendingSendDao().allQueued().isNotEmpty()) SendWorker.schedule(app) }
-            .onFailure(::logFailure)
+        if (current != null) scheduleQueuedSends()
         foreground.refresh()
+    }
+
+    // On every start with a connection and after every switch, so a process death between cancelling the durable
+    // work and enqueueing it again cannot strand queued sends. Idempotent: unique work, KEEP.
+    private suspend fun scheduleQueuedSends() {
+        runCatching { if (db.pendingSendDao().allQueued().isNotEmpty()) SendWorker.ensureScheduled(app) }.onFailure(::logFailure)
     }
 
     private fun commitOrThrow(editor: SharedPreferences.Editor) {
@@ -236,13 +257,10 @@ class AppContainer(
         // Cycle: the queue needs a RunStarter (the follower), the follower needs the repository, the repository the
         // queue. The queue only calls the starter after a send, by which time the follower exists.
         lateinit var follower: RunFollower
-        val starter = RunStarter { session, run ->
-            // A run started while stopped or after the switch stays stored; the next start resumes it. A stop racing
-            // this check is followed by its pause, which cancels the stream.
-            if (foreground.started && open.get()) follower.onRunStarted(session, run)
-        }
+        // The follower's own gate refuses a stream while the app is stopped; the run stays stored for the next start.
+        val starter = RunStarter { session, run -> if (open.get()) follower.onRunStarted(session, run) }
         val queue = SendQueue(api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get)
-        val repo = ChatRepository(api, db, System::currentTimeMillis, queue)
+        val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
         follower = RunFollower(api, db, repo, runScope, onRunFinished = { if (open.get()) queue.drain() })
         return Connected(c, api, db, repo, queue, follower, open, runScope)
     }

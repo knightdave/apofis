@@ -27,14 +27,19 @@ class SendWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     companion object {
         const val WORK_NAME = "apofis-send"
 
+        /** Like [schedule], but keeps work that is already enqueued or running: safe to call on every start. */
+        fun ensureScheduled(context: Context) =
+            WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request())
+
         // REPLACE starts the drain at once with a fresh backoff. Cancelling a running drain is safe: an interrupted
         // start stays queued and is retried with the same body and idempotency key.
         fun schedule(context: Context) {
-            val request = OneTimeWorkRequestBuilder<SendWorker>()
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                .build()
-            WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
+            WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request())
         }
+
+        private fun request() = OneTimeWorkRequestBuilder<SendWorker>()
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
     }
 }

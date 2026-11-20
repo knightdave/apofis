@@ -39,12 +39,15 @@ internal suspend fun <T> withRepositoryLock(block: suspend () -> T): T = lock.wi
  * messages. Sync calls fetch everything first and write once, so an [ApiError] leaves the cache untouched.
  * Every mutating call holds one lock across its fetch and write, so a slow call never undoes a later one.
  * [sendQueue] is needed only by [send], [cancelSend] and [retrySend].
+ * [active] turns false when the app switches servers: mutating calls then throw IllegalStateException("closed") and
+ * sync calls return without touching rows, each checked inside the lock before every request and first write.
  */
 class ChatRepository(
     private val api: HermesApi,
     private val db: AppDatabase,
     private val now: () -> Long = System::currentTimeMillis,
     private val sendQueue: SendQueue? = null,
+    private val active: () -> Boolean = { true },
 ) {
     private val sessionDao = db.sessionDao()
 
@@ -71,11 +74,12 @@ class ChatRepository(
         }.distinctUntilChanged()
     }
 
-    suspend fun refreshSessions() = lock.withLock {
+    suspend fun refreshSessions(): Unit = lock.withLock {
         val listed = mutableListOf<SessionDto>()
         var offset = 0
         for (pages in 1..MAX_PAGES + 1) {
             if (pages > MAX_PAGES) throw ApiError.Protocol
+            if (!active()) return@withLock
             val page = api.listSessions(SESSION_PAGE, offset)
             if (page.hasMore && page.data.isEmpty()) throw ApiError.Protocol // the rest of the list would be lost
             listed += page.data
@@ -104,6 +108,7 @@ class ChatRepository(
         // No cap: only chats with a pending send or an active run are retained, and those are few by nature.
         val retained = sessionDao.retainedKeys().toHashSet()
         for (row in unlisted.filter { it.archived || it.key in retained }) {
+            if (!active()) return@withLock
             val dto = try {
                 api.getSession(row.currentId)
             } catch (_: ApiError.NotFound) {
@@ -113,6 +118,7 @@ class ChatRepository(
             take(dto, row)
         }
         db.withTransaction {
+            if (!active()) return@withTransaction
             sessionDao.replaceServerSessions(visible.distinctBy { it.key })
             // A hidden chat survives only while the DAO keeps it for unsent work; its transcript goes at once.
             for (row in hidden) {
@@ -177,13 +183,14 @@ class ChatRepository(
     /** Under the lock: the server transcript as rows, or null when the chat has no server copy (no request made). */
     private suspend fun fetchRows(sessionKey: String): Pair<String, List<MessageEntity>>? {
         val session = sessionDao.get(sessionKey) ?: return null
-        if (!session.existsOnServer || session.hidden) return null
-        val (tip, messages) = fetchMessages(session.currentId)
+        if (!session.existsOnServer || session.hidden || !active()) return null
+        val (tip, messages) = fetchMessages(session.currentId) ?: return null
         return tip to messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
     }
 
     /** In a transaction: false when the chat went away or got hidden since the fetch. */
     private suspend fun replaceRows(sessionKey: String, tip: String, rows: List<MessageEntity>): Boolean {
+        if (!active()) return false
         val current = sessionDao.get(sessionKey) ?: return false
         if (current.hidden) return false
         db.messageDao().replaceSession(sessionKey, rows)
@@ -192,6 +199,7 @@ class ChatRepository(
     }
 
     suspend fun createLocalSession(): String = lock.withLock {
+        ensureOpen()
         val id = newSessionId()
         sessionDao.upsert(
             SessionEntity(
@@ -216,8 +224,10 @@ class ChatRepository(
     suspend fun delete(sessionKey: String) {
         requireAppKey(sessionKey)
         lock.withLock {
+            ensureOpen()
             val session = sessionDao.get(sessionKey) ?: return
             if (session.existsOnServer) api.deleteSession(session.currentId)
+            ensureOpen()
             sessionDao.delete(sessionKey)
         }
     }
@@ -245,9 +255,11 @@ class ChatRepository(
     /**
      * All pages of the transcript and the tip id that answered. If the tip changes between pages the read
      * starts over once; a second change, a reserved tip or endless paging is [ApiError.Protocol].
+     * Null when the repository was closed before a request.
      */
-    private suspend fun fetchMessages(id: String): Pair<String, List<MessageDto>> {
+    private suspend fun fetchMessages(id: String): Pair<String, List<MessageDto>>? {
         repeat(2) {
+            if (!active()) return null
             val first = api.messages(id, MESSAGE_PAGE, 0)
             val tip = first.sessionId
             if (isReservedId(tip)) throw ApiError.Protocol
@@ -256,6 +268,7 @@ class ChatRepository(
             var pages = 1
             while (last.size >= MESSAGE_PAGE) {
                 if (++pages > MAX_PAGES) throw ApiError.Protocol
+                if (!active()) return null
                 val page = api.messages(tip, MESSAGE_PAGE, all.size)
                 if (isReservedId(page.sessionId)) throw ApiError.Protocol
                 if (page.sessionId != tip) break
@@ -271,11 +284,15 @@ class ChatRepository(
     private suspend fun update(sessionKey: String, patch: suspend (String) -> Unit, change: (SessionEntity) -> SessionEntity) {
         requireAppKey(sessionKey)
         lock.withLock {
+            ensureOpen()
             val session = sessionDao.get(sessionKey) ?: return
             if (session.existsOnServer) patch(session.currentId)
+            ensureOpen()
             sessionDao.upsert(change(sessionDao.get(sessionKey) ?: return))
         }
     }
+
+    private fun ensureOpen() = check(active()) { "closed" }
 }
 
 private fun requireAppKey(sessionKey: String) = require(!isReservedId(sessionKey)) { "reserved session id" }

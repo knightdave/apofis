@@ -14,7 +14,7 @@ class ForegroundTest {
     @Test
     fun stopDuringASlowResumeEndsWithPause() = runTest {
         val slow = CompletableDeferred<Unit>()
-        val fg = Foreground(backgroundScope, resume = {
+        val fg = Foreground(backgroundScope, resume = { _ ->
             calls += "resume"
             slow.await()
             calls += "resumed"
@@ -33,7 +33,7 @@ class ForegroundTest {
 
     @Test
     fun resumeQueuedBehindAStopDoesNothing() = runTest {
-        val fg = Foreground(backgroundScope, resume = { calls += "resume" }, pause = { calls += "pause" }, onError = {})
+        val fg = Foreground(backgroundScope, resume = { _ -> calls += "resume" }, pause = { calls += "pause" }, onError = {})
         fg.start()
         fg.stop()
         runCurrent()
@@ -42,7 +42,7 @@ class ForegroundTest {
 
     @Test
     fun lastEventWins() = runTest {
-        val fg = Foreground(backgroundScope, resume = { calls += "resume" }, pause = { calls += "pause" }, onError = {})
+        val fg = Foreground(backgroundScope, resume = { _ -> calls += "resume" }, pause = { calls += "pause" }, onError = {})
         fg.start()
         fg.stop()
         fg.start()
@@ -53,7 +53,7 @@ class ForegroundTest {
     @Test
     fun aFailingResumeDoesNotStopLaterEvents() = runTest {
         val errors = mutableListOf<Throwable>()
-        val fg = Foreground(backgroundScope, resume = { throw IllegalStateException("boom") }, pause = { calls += "pause" }, onError = { errors += it })
+        val fg = Foreground(backgroundScope, resume = { _ -> throw IllegalStateException("boom") }, pause = { calls += "pause" }, onError = { errors += it })
         fg.start()
         runCurrent()
         fg.stop()

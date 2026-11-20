@@ -9,7 +9,17 @@ import androidx.work.WorkManager
 import androidx.work.testing.WorkManagerTestInitHelper
 import java.security.GeneralSecurityException
 import javax.crypto.KeyGenerator
+import java.util.Collections
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import mockwebserver3.Dispatcher
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
+import mockwebserver3.RecordedRequest
+import xyz.rycerz.apofis.api.fixture
+import xyz.rycerz.apofis.db.ActiveRunEntity
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -180,5 +190,102 @@ class AppContainerTest {
         assertTrue(restarted.consumeSwitchFailure())
         assertFalse(restarted.consumeSwitchFailure())
         assertFalse(app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).contains(SWITCH_MARKER))
+    }
+
+    private suspend fun eventually(what: String, check: suspend () -> Boolean) {
+        repeat(200) {
+            if (check()) return
+            withContext(Dispatchers.IO) { Thread.sleep(10) }
+        }
+        fail("timed out waiting for $what")
+    }
+
+    @Test
+    fun stopDuringASlowResumeLeavesNoStreamAndLaterRunsAttachNone() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requests += "${request.method} ${request.url.encodedPath}"
+                return if (request.method == "POST" && request.url.encodedPath == "/v1/runs") {
+                    MockResponse.Builder().code(202).body(fixture("run_start.json")).addHeader("Content-Type", "application/json").build()
+                } else {
+                    MockResponse.Builder().code(404).build()
+                }
+            }
+        }
+        server.start()
+        try {
+            container.connect(Credentials(server.url("/").toString(), "k"))
+            val c = container.connected()!!
+            addSession("apofis-a")
+            db.activeRunDao().upsert(ActiveRunEntity("run_stored", "apofis-a", null, "running", 1L))
+            val inResume = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            container.beforeResume = {
+                inResume.complete(Unit)
+                release.await()
+            }
+
+            container.onStart()
+            inResume.await()
+            container.onStop() // arrives while the resume is still in flight
+            release.complete(Unit)
+            container.awaitLifecycle()
+
+            // A run the send queue starts after the stop is stored but gets no stream.
+            addSession("apofis-b")
+            c.sendQueue.enqueue("apofis-b", "sent in the background")
+            c.sendQueue.drain()
+            withContext(Dispatchers.IO) { Thread.sleep(1_500) } // past the follower's 1 s first status read
+
+            val seen = synchronized(requests) { requests.toList() }
+            assertTrue(seen.toString(), "POST /v1/runs" in seen)
+            assertTrue(seen.toString(), seen.none { it.contains("/events") || it.contains("run_stored") || it.startsWith("GET /v1/runs/") })
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun startWithAConnectionReschedulesQueuedSends() = runTest {
+        container.connect(A)
+        addSession("apofis-a")
+        container.connected()!!.sendQueue.enqueue("apofis-a", "waiting")
+        val work = WorkManager.getInstance(app)
+        work.cancelAllWork().result.get()
+
+        val restarted = AppContainer(app, store) { db }
+        restarted.connected()
+
+        eventually("send work") {
+            work.getWorkInfosForUniqueWork(SendWorker.WORK_NAME).get().any { it.state == WorkInfo.State.ENQUEUED }
+        }
+    }
+
+    @Test
+    fun rowsOfAnUnknownOwnerAlwaysAsk() = runTest {
+        addSession("apofis-left-behind") // no saved connection and no cache owner, as after an interrupted switch
+        assertTrue(container.willClearCache(A.baseUrl))
+    }
+
+    @Test
+    fun failingSetupStepEndsDisconnectedAndNotStuck() = runTest {
+        container.connect(A)
+        addSession("apofis-a")
+        container.beforeSwitch = { throw IllegalStateException("setup failed") }
+
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: IllegalStateException) {
+        }
+
+        assertNull(container.connected())
+        assertNull(container.connection.value)
+        assertNull(store.load())
+        container.beforeSwitch = {}
+        container.connect(B) // not stuck switching
+        assertEquals(B, container.connected()!!.credentials)
     }
 }
