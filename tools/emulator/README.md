@@ -8,14 +8,21 @@ they can clear, force-stop and relaunch the app without killing themselves. They
 and accessibility actions, find elements by the app's own string resources, and run shell commands as the device's
 shell user. Tests:
 
+- `HarnessSelfTest` (no app, no server): the harness's own decisions (approval binding, reply and command-step
+  matching, tool-call parsing) against canned screens and server rows.
 - `SmokeE2eTest` (no model run): connect through loopback, connect to a private address with local network access
-  granted, and the local network request itself (rationale shown, refusal shown as a field error, connect after
-  the grant).
+  granted, and the local network flow (asked first for a literal private address; a refusal still tries; the failed
+  attempt offers "Allow local network access and retry", which connects once access is granted).
 - `SurvivalE2eTest` (one model run each): `connectAndChat`, `replySurvivesAirplaneMode`, `replySurvivesScreenOff`,
   `replySurvivesProcessDeath`, `offlineMessageSendsItself`, `steerDuringRun`, `stopDuringRun`. Each starts from
-  cleared app data (`pm clear`), grants `ACCESS_LOCAL_NETWORK` with `pm grant`, connects, checks the app opened a
-  new empty chat, asserts on visible text and saves a screenshot. An approval request is answered with Allow once
-  only when it shows exactly the command the test asked for.
+  cleared app data (`pm clear`, checked), grants `ACCESS_LOCAL_NETWORK`, connects, and journals the new chat's id on
+  the device before sending. Every prompt's first line carries the run's nonce, so the chat's server title does.
+  Interruptions are asserted positively (airplane mode setting on and the app saying Offline; `dumpsys power` read
+  and not Awake; the pid read, then `pidof` succeeding with no result and `/proc/<pid>` gone). A reply counts only
+  as the assistant reply paragraph below that turn's prompt, holding the scenario's marker; the running step must
+  show the scenario's own command. The server's record of the chat must agree (prompt once, one final answer with
+  the marker, the exact terminal command called). Allow once is tapped only when the approval block's own command
+  field equals the scenario's command; any other approval is denied and fails the test.
 
 ## The two hosts
 
@@ -25,36 +32,46 @@ shell user. Tests:
 
 ## What a run does
 
-1. `rsync`s the working tree (minus `.git`, `.claude/` and everything in `.gitignore`) to `~/tmp/apofis-e2e/` on the
-   emulator host and `git add`s it there, so the flake sees exactly the tracked and new files.
-2. Opens a reverse tunnel `ssh -R 127.0.0.1:<port>:127.0.0.1:8642`, with the first free port from 18642 to 18662,
-   bound to the emulator host's loopback only. The app reaches it at `http://10.0.2.2:<port>`, the emulator's host
-   alias (a private address: on API 37 the app needs local network access, which the tests grant). After boot,
-   `adb reverse` also maps the same port on the device's loopback, `http://127.0.0.1:<port>`: used by the loopback
-   smoke test and by the tests' own API calls (session cleanup), which need no permission.
-3. In `nix develop .#emulator` (the `emulator` shell in `flake.nix`: emulator, platform-tools, build tools and the
-   AOSP `android-37.0;default;x86_64` image) it creates the AVD `apofis-e2e` if missing and boots it headless with
-   `-no-window -no-audio -no-snapshot -wipe-data -accel on -cores 4 -memory 4096`, on the first free console/adb port
-   pair from 5554/5555, and its own adb server on 5037 (AGP's test engine only uses that port, so the run refuses to
-   start when 5037 is taken, rather than share or kill someone else's adb server). Boot is bounded by
-   `APOFIS_BOOT_TIMEOUT` (300 s).
-4. Runs `./gradlew :e2e:connectedDebugAndroidTest` for the chosen tests, with the two URLs as Gradle properties and
-   the API key in the environment variable `APOFIS_KEY` (read by `e2e/build.gradle.kts`). Bounded by
-   `APOFIS_TEST_TIMEOUT` (1800 s).
-5. Collects the Gradle log, logcat, emulator log, the test report (HTML and XML), screenshots and the list of
-   session ids the tests created (`device/sessions.txt`), checks them and the remote build output, Gradle home and
-   temp directory for the key, copies them to `build/e2e/<run-id>/`, stops the emulator and closes the tunnel. Then
-   it checks on the build host that every recorded session is gone (`GET` returns 404); a leftover is deleted only
-   when its id starts with `apofis-` and its title is one the tests set, and fails the run. Cleanup runs from a `trap`, also when a step fails, and the script checks
-   afterwards that no emulator process and no tunnel port remain. A run with zero executed tests counts as failed.
+0. Takes this host's lock, then the emulator host's lock (held by an SSH session for the whole run, released only
+   after the remote run has finished cleaning up). A second run is rejected here, before anything is changed.
+1. `rsync`s the working tree (minus `.git`, `.claude/` and everything in `.gitignore`) to `~/tmp/apofis-e2e/` and
+   `git add`s it there, so the flake sees exactly the tracked and new files.
+2. Opens a reverse tunnel `ssh -R 127.0.0.1:<port>:127.0.0.1:8642` (first free port from 18642) and checks with `ss`
+   that the actual listener is `127.0.0.1:<port>` only. Its stdin is held by the script, so it closes when the script
+   dies. The app reaches Hermes at `http://10.0.2.2:<port>`; `adb reverse` maps the same port to the device's
+   loopback for the loopback smoke test and the tests' own read-only API calls.
+3. In `nix develop .#emulator` builds and installs `app-debug.apk` and `e2e-debug.apk`. No key exists on the
+   emulator host at this point, and Gradle never sees it.
+4. Creates the AVD `apofis-e2e`, starts its own adb server (`adb -P 5037 nodaemon server`, stopped by pid) and the
+   emulator with `env -i` (only paths it needs, all inside `~/tmp/apofis-e2e/.state`), `-no-metrics
+   -crash-report-mode disabled`, no core dumps, `-no-window -no-snapshot -wipe-data -accel on -cores 4 -memory 4096`.
+5. Asks the build host for the key over the SSH session's stdin. A subshell reads it and pipes it to `adb shell`,
+   whose device shell reads it and passes it to `am instrument -w -r -e apofisKey ...`. The key is never on a host
+   command line, in an environment, in a file or in a long-lived shell variable on the emulator host.
+6. Always, also on failure or interrupt: pulls the device files (screenshots, result files, the session journal)
+   and logcat, stops the emulator and adb server (bounded waits, then TERM and KILL), deletes the AVD (the app's
+   storage, the only place the key rests, goes with it), then scans the whole `~/tmp/apofis-e2e/` (Gradle home,
+   project `.gradle` and build output, every run's artifacts, logs) for the key in raw, URL-encoded and base64 forms,
+   with patterns the build host sends at that moment. A match deletes the files and fails; a scan error fails.
+   Only a clean scan reports a manifest; the build host then copies exactly that set to `build/e2e/<run-id>/`,
+   verifies it and scans it again before printing anything from it. An interrupted run copies nothing back.
+7. Deletes the journaled sessions: each only after a `GET` on that exact id returns the same id, an `apofis-` id,
+   with the run's nonce in its title (a turn still running is retried). Anything else is left alone and fails. If the
+   journal could not be read, the run fails and says sessions may remain.
+8. Checks the emulator host: lock released, the run's process group, adb server, ports and tunnel port verified
+   absent (a probe that cannot run fails), and no new entries in `~`, `~/.android`, `~/.config`, `~/.cache`,
+   `~/.local` or the user's `/tmp` entries compared with before the run.
 
-The script exits non-zero when anything fails. Every run wipes the emulator's data, so two runs in a row do not
-affect each other; a lock prevents two runs at once on the emulator host.
+`--full` passes only when every smoke test, the self-tests and all seven scenarios ran and passed, and each smoke and
+scenario test left its screenshot (`device/<test>.png`), its own result file and logcat. A partial suite fails.
+
+The remote side sends a heartbeat every 5 s; when the connection is gone it stops itself and cleans up. Ctrl-C or
+SIGTERM on the build host stops the remote run the same way and still waits for its cleanup and checks.
 
 ## Running
 
 ```sh
-tools/emulator/run-e2e.sh --smoke                      # SmokeE2eTest, no model run
+tools/emulator/run-e2e.sh --smoke                      # SmokeE2eTest and HarnessSelfTest, no model run
 tools/emulator/run-e2e.sh --scenario stopDuringRun     # one survival scenario, one model run
 tools/emulator/run-e2e.sh --test 'SmokeE2eTest#connectViaLoopback'
 tools/emulator/run-e2e.sh --full                       # every e2e test: about 7 model runs, 15 minutes
@@ -65,36 +82,28 @@ minutes) and Gradle's dependencies into `~/tmp/apofis-e2e/.state/gradle`. Later 
 
 ## Safety rules
 
-- The API key is read from `~/.hermes/.env` on the build host and sent to the remote script on stdin. It is never
-  on a command line on the emulator host, never written there, and never printed. Gradle runs with
-  `--no-configuration-cache` and without daemons so nothing derived from it is kept. If the key is found in any
-  artifact or remote build file, the run fails and nothing is copied back.
+- The API key is read from `~/.hermes/.env` on the build host and sent only when the instrumentation starts (see
+  step 5). It is never printed. To test the leak path without the key, set `APOFIS_E2E_CANARY` to a string of at
+  least 16 characters: it is added to the scan patterns, and a file containing it on the emulator host fails the run.
 - The Connect screen sets `FLAG_SECURE`, so screenshots are taken only after connecting.
-- On the emulator host everything lives in `~/tmp/apofis-e2e/`: `ANDROID_USER_HOME`, `ANDROID_AVD_HOME`,
-  `ANDROID_EMULATOR_HOME`, `GRADLE_USER_HOME`, `TMPDIR` and `HOME` for the run all point into its `.state/`. No
-  `sudo`, no services, no changes to the user's configuration.
-- Emulator console, adb and the tunnel listen on 127.0.0.1 only.
-- Tests create Hermes sessions only through the app (ids start with `apofis-`). After `pm clear` the app's
-  database holds only the chats the test created (nothing lists the server's sessions yet), so the ids read from it
-  with `run-as ... sqlite3` are exactly the test's. Each is deleted through the API after a `GET` confirms the
-  prefix and the title. Prompts only run `sleep N; echo apofis-e2e-<n>`.
+- On the emulator host everything lives in `~/tmp/apofis-e2e/` (Nix keeps using its own cache in the real home).
+  No `sudo`, no services, no changes to the user's configuration. Emulator console, adb and the tunnel listen on
+  127.0.0.1 only.
+- Tests create Hermes sessions only through the app (ids start with `apofis-`), and the build host deletes only
+  sessions whose identity it has proved (step 7). Prompts only run `sleep N # apofis-e2e-<n>` (the marker is a shell
+  comment, so the command stays one segment and the app's running step shows it whole).
 
 ## Cleaning up by hand
 
-On the emulator host, if a run was interrupted:
-
-```sh
-pgrep -u "$(id -u)" -a '^(qemu-system|emulator|netsimd|adb)'   # then kill the listed PIDs
-ss -ltnp | grep -E ':(5037|1864[2-9]|186[5-6][0-9]|555[4-9]|55[6-8][0-9]) '
-```
-
-On the build host, a leftover tunnel is an `ssh -N ... -R 127.0.0.1:18642:...` process: `pkill -f 'ssh -N .*-R 127.0.0.1:186'`.
+Normally nothing is left: the script verifies it. If it reports something left on the emulator host, the postcheck
+names the process group, pid or port of that run (`~/tmp/apofis-e2e/.state/runs/<run-id>/owned.txt`); stop exactly
+those. The AVD is deleted at the end of every run; a run finding one left behind deletes it first.
 
 To remove everything from the emulator host:
 
 ```sh
 cd ~/tmp/apofis-e2e
-nix develop .#emulator -c env ANDROID_AVD_HOME="$PWD/.state/avd" avdmanager delete avd -n apofis-e2e
+nix develop .#emulator -c env ANDROID_AVD_HOME="$PWD/.state/avd" avdmanager delete avd -n apofis-e2e # if one is left
 # then delete ~/tmp/apofis-e2e (run artifacts in .state/runs, Gradle caches in .state/gradle) with your file manager
 # or rm; the emulator and image stay in the Nix store until the next garbage collection.
 ```
