@@ -30,6 +30,7 @@ import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
+import xyz.rycerz.apofis.db.MIGRATION_1_2
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
@@ -118,7 +119,7 @@ private val logOnly = CoroutineExceptionHandler { _, e -> logFailure(e) }
 class AppContainer(
     private val app: Application,
     val credentials: CredentialStore = CredentialStore(app),
-    openDatabase: () -> AppDatabase = { Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").build() },
+    openDatabase: () -> AppDatabase = { Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").addMigrations(MIGRATION_1_2).build() },
 ) {
     val preferences = Preferences(app)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + logOnly)

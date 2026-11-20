@@ -17,6 +17,7 @@ import xyz.rycerz.apofis.api.MessageDto
 private const val STEER_OPEN = "[OUT-OF-BAND USER MESSAGE"
 private const val STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 private const val ARG_VALUE_LIMIT = 40
+private const val STORED_PREVIEW = "apofis_preview" // the arguments preview of a call stored by [storedToolCalls]
 
 /** Turns stored session rows (oldest first) into chat items. Linear in the number of rows. */
 fun buildTranscript(rows: List<MessageDto>): List<ChatItem> {
@@ -91,7 +92,7 @@ private class ReplyBuilder(first: MessageDto) {
             waiting[id] = this to steps.size
             val args = fullArgs(fn?.get("arguments"))
             steps += ToolStep(
-                id, name, argsPreview(fn?.get("arguments")), null, false, false, true,
+                id, name, obj.str(STORED_PREVIEW) ?: argsPreview(fn?.get("arguments")), null, false, false, true,
                 args = args.take(TOOL_RESULT_DISPLAY_LIMIT), argsTruncated = args.length > TOOL_RESULT_DISPLAY_LIMIT,
             )
         }
@@ -159,6 +160,31 @@ private fun decodeResult(text: String): ResultFields? =
     } catch (e: IllegalArgumentException) {
         null
     }
+
+/**
+ * The tool calls of an assistant row as they are stored. A list longer than [TOOL_RESULT_DISPLAY_LIMIT] is rebuilt
+ * from what the transcript shows of each call (its id, its name, its preview and its full arguments cut one
+ * character past the limit), so a multi-megabyte argument never has to fit a database cursor window, while
+ * [buildTranscript] shows the same steps. A call without an id is never shown, so it is not kept.
+ */
+fun storedToolCalls(text: String?): String? {
+    if (text == null || text.length <= TOOL_RESULT_DISPLAY_LIMIT) return text
+    val calls = parseArray(text).mapNotNull { call ->
+        val obj = call as? JsonObject ?: return@mapNotNull null
+        val fn = obj["function"] as? JsonObject
+        val id = obj.str("id") ?: obj.str("call_id") ?: return@mapNotNull null
+        val arguments = fn?.get("arguments")
+        buildJsonObject {
+            put("id", id)
+            put("function", buildJsonObject {
+                put("name", fn?.str("name") ?: obj.str("name") ?: "")
+                put("arguments", fullArgs(arguments).take(TOOL_RESULT_DISPLAY_LIMIT + 1))
+            })
+            put(STORED_PREVIEW, argsPreview(arguments))
+        }
+    }
+    return JsonArray(calls).toString()
+}
 
 /**
  * A tool result as it is stored. One longer than [TOOL_RESULT_DISPLAY_LIMIT] is cut before storage to what the list

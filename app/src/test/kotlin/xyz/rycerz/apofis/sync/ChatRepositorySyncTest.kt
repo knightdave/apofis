@@ -13,6 +13,11 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import kotlinx.coroutines.test.runTest
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -118,6 +123,63 @@ class ChatRepositorySyncTest {
         idempotencyKey = key, sessionKey = sessionKey, text = "unsent", requestBody = "{}", createdAt = createdAt,
         state = "queued", runId = null, error = null,
     )
+
+    @Test
+    fun multiMegabyteToolArgumentSyncsAndReadsBackFromAFreshDatabase() = runTest {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        app.deleteDatabase("args.db")
+        fun open() = Room.databaseBuilder(app, AppDatabase::class.java, "args.db").allowMainThreadQueries().build()
+        val first = open()
+        first.sessionDao().upsert(session("apofis-a"))
+        val args = buildJsonObject {
+            put("path", "/tmp/big")
+            put("content", "x".repeat(3_000_000)) // a large file write: only the argument is large
+        }.toString()
+        val calls = buildJsonArray {
+            addJsonObject {
+                put("id", "c1")
+                put("type", "function")
+                putJsonObject("function") {
+                    put("name", "write_file")
+                    put("arguments", args)
+                }
+            }
+        }.toString()
+        val assistant = buildJsonObject {
+            put("id", 2)
+            put("role", "assistant")
+            put("content", "")
+            put("tool_calls", calls)
+            put("timestamp", 2.0)
+        }.toString()
+        respond(
+            rawMessages(
+                "apofis-a",
+                listOf(
+                    """{"id":1,"role":"user","content":"write it","timestamp":1.0}""",
+                    assistant,
+                    """{"id":3,"role":"tool","content":"{\"output\":\"ok\"}","tool_call_id":"c1","timestamp":3.0}""",
+                ),
+            ),
+        )
+        assertTrue(ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), first).syncMessages("apofis-a"))
+        first.close()
+
+        val reopened = open() // the chat opened again later: a new reader of the stored rows
+        try {
+            val reply = ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), reopened).transcript("apofis-a").first()
+                .filterIsInstance<AssistantReply>().single()
+            val step = reply.steps.single() as ToolStep
+            assertEquals("write_file", step.name)
+            assertEquals(TOOL_RESULT_DISPLAY_LIMIT, step.args.length)
+            assertTrue(step.argsTruncated)
+            assertTrue(step.argsPreview.startsWith("path=/tmp/big, content=xxx"))
+            assertEquals("ok", step.result)
+        } finally {
+            reopened.close()
+            app.deleteDatabase("args.db")
+        }
+    }
 
     @Test
     fun multiMegabyteToolResultSyncsAndReadsBackThroughTheDatabase() = runTest {

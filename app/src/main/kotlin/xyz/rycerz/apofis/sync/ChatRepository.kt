@@ -18,6 +18,7 @@ import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.chat.buildTranscript
+import xyz.rycerz.apofis.chat.storedToolCalls
 import xyz.rycerz.apofis.chat.storedToolResult
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.MessageEntity
@@ -398,7 +399,7 @@ private fun SessionDto.toEntity(cached: SessionEntity?): SessionEntity {
 private fun MessageDto.toEntity(sessionKey: String, position: Int) = MessageEntity(
     sessionKey = sessionKey, position = position, id = id, role = role, displayKind = displayKind,
     content = if (role == "tool") storedToolResult(content) else content,
-    reasoning = reasoning, toolCallsJson = toolCallsJson, toolCallId = toolCallId, toolName = toolName,
+    reasoning = reasoning, toolCallsJson = storedToolCalls(toolCallsJson), toolCallId = toolCallId, toolName = toolName,
     timestamp = timestamp, finishReason = finishReason,
 )
 
