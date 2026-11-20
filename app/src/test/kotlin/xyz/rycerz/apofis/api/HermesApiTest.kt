@@ -20,6 +20,7 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import java.util.concurrent.TimeUnit
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -329,6 +330,39 @@ class HermesApiTest {
             )
         }
         assertTrue(expectError { api.startRun("{}", "k") } is ApiError.Network)
+    }
+
+    @Test
+    fun timeoutWhileCallerActiveIsNetwork() = runTest {
+        server.enqueue(MockResponse.Builder().onResponseStart(SocketEffect.Stall).build())
+        val client = HermesApi.defaultClient().newBuilder().callTimeout(300, TimeUnit.MILLISECONDS).build()
+        val timed = HermesApi(server.url("/").toString(), "k", client)
+        assertTrue(expectError { timed.runStatus("r") } is ApiError.Network)
+    }
+
+    @Test
+    fun statusOnlyErrorsIgnoreTruncatedBody() = runTest {
+        val cases = listOf(
+            401 to ApiError.Unauthorized,
+            404 to ApiError.NotFound,
+            503 to ApiError.Unavailable(7),
+            307 to ApiError.Http(307, null),
+        )
+        for ((code, expected) in cases) {
+            server.enqueue(
+                MockResponse.Builder().code(code).addHeader("Retry-After", "7").addHeader("Location", "http://elsewhere/")
+                    .body(fixture("error_401.json")).onResponseBody(SocketEffect.CloseSocket()).build(),
+            )
+            assertEquals("$code", expected, expectError { api.runStatus("r") })
+        }
+    }
+
+    @Test
+    fun createSessionValidatesId() = runTest {
+        for (bad in listOf("a/b", "..", ".", "", "a\\b")) {
+            assertThrows(bad, IllegalArgumentException::class.java) { runBlocking { api.createSession(bad, "t") } }
+        }
+        assertEquals(0, server.requestCount)
     }
 
     @Test

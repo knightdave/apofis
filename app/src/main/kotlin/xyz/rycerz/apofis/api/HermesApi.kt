@@ -2,10 +2,10 @@ package xyz.rycerz.apofis.api
 
 import java.io.IOException
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.serialization.SerializationException
@@ -44,7 +44,7 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
     /** Returns false when the id already exists. A deleted id gives [ApiError.Conflict] `session_deleted`. */
     suspend fun createSession(id: String, title: String?, systemPrompt: String? = null): Boolean {
         val body = jsonBody {
-            put("id", id)
+            put("id", validId(id))
             if (title != null) put("title", title)
             if (systemPrompt != null) put("system_prompt", systemPrompt)
         }
@@ -134,10 +134,7 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
             // The first part is a fixed path; the rest (ids and fixed names) are single encoded segments.
             // addPathSegments replaces a trailing empty segment, so "http://h/" and "http://h" give the same URL.
             addPathSegments(segments.first())
-            segments.drop(1).forEach { s ->
-                require(s.isNotEmpty() && '/' !in s && '\\' !in s && s != "." && s != "..") { "invalid id" }
-                addPathSegment(s)
-            }
+            segments.drop(1).forEach { addPathSegment(validId(it)) }
             query()
         }.build()
 
@@ -166,8 +163,8 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
                     onSuccess(response)
                 }
             } catch (e: IOException) {
-                // call.cancel() from the finally below makes the read fail; that is cancellation, not a network error.
-                if (call.isCanceled()) throw CancellationException("cancelled")
+                // A cancelled caller makes call.cancel() below fail the read: that is cancellation. Timeouts are Network.
+                ensureActive()
                 throw ApiError.Network(e)
             }
         }
@@ -179,21 +176,26 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
     }
 
     private fun errorOf(response: Response): ApiError {
-        val text = response.body.string() // an IOException here is Network, like any other read
+        // Statuses that need no error code are mapped before the body is read, so a truncated body cannot mask them.
+        when {
+            response.code in 300..399 -> return ApiError.Http(response.code, null)
+            response.code == 401 -> return ApiError.Unauthorized
+            response.code == 404 -> return ApiError.NotFound
+            response.code == 503 -> return ApiError.Unavailable(response.header("Retry-After")?.trim()?.toLongOrNull())
+        }
+        val text = response.body.string() // the code is needed to classify, so an IOException here is Network
         // Only a short machine code survives, and never one that echoes the key.
         val code = runCatching { json.decodeFromString<ErrorEnvelope>(text).error.code }.getOrNull()
             ?.takeIf { codeFormat.matches(it) && apiKey !in it }
-        return when {
-            response.code in 300..399 -> ApiError.Http(response.code, null)
-            response.code == 401 -> ApiError.Unauthorized
-            response.code == 404 -> ApiError.NotFound
-            response.code == 409 && code != null -> ApiError.Conflict(code)
-            response.code == 503 -> ApiError.Unavailable(response.header("Retry-After")?.trim()?.toLongOrNull())
-            else -> ApiError.Http(response.code, code)
-        }
+        return if (response.code == 409 && code != null) ApiError.Conflict(code) else ApiError.Http(response.code, code)
     }
 
     companion object {
+        /** One id rule for every method: a single path segment that cannot change the target resource. */
+        private fun validId(id: String): String = id.also {
+            require(it.isNotEmpty() && '/' !in it && '\\' !in it && it != "." && it != "..") { "invalid id" }
+        }
+
         private val JSON = "application/json".toMediaType()
         private val codeFormat = Regex("[a-z0-9_]{1,64}")
         internal val json = Json {
