@@ -32,6 +32,14 @@ shell user. Tests:
   row of exactly the steering text, then the last final answer ending with BANANA, with no other user turn). The
   harness never approves anything: an approval block on screen fails the scenario without being touched.
 
+`--app-test <Class>` runs one of the app's own instrumented tests (`app/src/androidTest`, runner
+`xyz.rycerz.apofis.test/androidx.test.runner.AndroidJUnitRunner`) instead of the `:e2e` module: it builds
+`:app:assembleDebugAndroidTest`, opens no tunnel and never sends the key (the build host refuses the request in this
+mode; the key is read only for the scan patterns), so no server session can exist. The test writes its files to the
+app's external files directory (`files/blur`), which is pulled with the device files; only the fixed names in
+`APP_FILES` are staged, scanned and copied back like every other export. `ChatLookupE2eTest` (in `:e2e`, run with
+`--test`) checks the chat screen's tags and labels and types without sending: no model run.
+
 ## The two hosts
 
 - **Build host**: has this repository, the Nix dev shell and Hermes at `http://127.0.0.1:8642`. It needs no KVM.
@@ -126,6 +134,7 @@ tools/emulator/run-e2e.sh --smoke                      # SmokeE2eTest and Harnes
 tools/emulator/run-e2e.sh --scenario stopDuringRun     # one survival scenario, one model run
 tools/emulator/run-e2e.sh --test 'SmokeE2eTest#connectViaLoopback'
 tools/emulator/run-e2e.sh --full                       # every e2e test: about 7 model runs, 15 minutes
+tools/emulator/run-e2e.sh --app-test BlurCostTest      # an instrumented test of the app itself; no tunnel, no key
 tools/emulator/run-e2e-selftest.sh                     # the script's own safeguards, locally: no host, no key
 ```
 

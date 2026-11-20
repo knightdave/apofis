@@ -185,7 +185,7 @@ class AppDriver {
 
     // ---- acting
 
-    private fun setField(field: AccessibilityNodeInfo, text: String) {
+    fun setField(field: AccessibilityNodeInfo, text: String) {
         // Not UiObject2.setText: it logs the text it sets, and the key must never reach logcat.
         val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
         if (!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) fail("Could not fill a text field")

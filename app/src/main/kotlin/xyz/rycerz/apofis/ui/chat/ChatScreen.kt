@@ -1,14 +1,9 @@
 package xyz.rycerz.apofis.ui.chat
 
-import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -17,23 +12,33 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.zIndex
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.platform.LocalDensity
+import xyz.rycerz.apofis.ui.theme.backdropSource
+import xyz.rycerz.apofis.ui.theme.rememberBackdropState
+import xyz.rycerz.apofis.ui.theme.transparent
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -41,10 +46,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
@@ -63,17 +66,14 @@ import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
 import java.time.LocalDate
 import java.time.ZoneId
-import xyz.rycerz.apofis.ui.theme.ApofisIconButton
-import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.wash
 
 /**
- * The chat: app bar with the title and the status line, the message list and the composer. Stateless: [state] comes
- * from [ChatViewModel], which also implements [actions]. [onOpenConnection] is called when the user taps a rejected
- * key; [onRetryLoad] when the chat could not be opened ([StatusLine.LOAD_FAILED]) and the user asks to try again.
- * [zone] and [today] label the date separators.
+ * The chat: the message list fills the screen under a transparent top bar (title and status line) and the bottom area
+ * (notes and the composer). Stateless: [state] comes from [ChatViewModel], which also implements [actions].
+ * [onOpenConnection] is called when the user taps a rejected key; [onRetryLoad] when the chat could not be opened
+ * ([StatusLine.LOAD_FAILED]) and the user asks to try again. [zone] and [today] label the date separators.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     state: ChatUiState,
@@ -85,8 +85,8 @@ fun ChatScreen(
     appBarActions: @Composable RowScope.() -> Unit = {},
     zone: ZoneId = ZoneId.systemDefault(),
     today: LocalDate = LocalDate.now(zone),
+    listState: LazyListState = rememberLazyListState(),
 ) {
-    val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
     val steps = remember { StepIndex() }
@@ -95,46 +95,65 @@ fun ChatScreen(
     // The request sits at the bottom; a same-id request with a new generation is a new request and is revealed again.
     val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
+    val follow = rememberFollow(listState, state)
+    val backdrop = rememberBackdropState()
+    val density = LocalDensity.current
+    var bottomArea by remember { mutableIntStateOf(0) } // the bottom area's height with its insets, px
+    var bottomContent by remember { mutableIntStateOf(0) } // the same without the larger of keyboard and navigation bar, px
+    val surface = MaterialTheme.colorScheme.surface
+    val fade = with(density) { 180.dp.toPx() }
+    val composerGap = with(density) { 8.dp.toPx() }
 
-    Scaffold(
-        modifier.testTag("chat.key:${state.sessionKey}"), // the end-to-end tests read the open chat's key here
-        containerColor = MaterialTheme.colorScheme.surface,
-        topBar = {
-            TopAppBar(
-                title = { Title(state, onOpenConnection, onRetryLoad) },
-                navigationIcon = navigationIcon,
-                actions = appBarActions,
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
-            )
-        },
-        bottomBar = {
-            Column(Modifier.navigationBarsPadding().imePadding()) {
-                state.composerNote?.let { ComposerNoteLine(it) }
-                if (linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
-                state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
-                Composer(
-                    state.draft,
-                    if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
-                    { actions.onDraftChange(it, state.draftRevision) },
-                    onSend = {
-                        linkFailed = false
-                        actions.onSendClick()
-                        scope.launch { listState.scrollToItem(0) }
-                    },
-                    onStop = { state.live?.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
-                    busy = state.sending,
-                )
-            }
-        },
-    ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding)) {
-            if (state.status == StatusLine.LOAD_FAILED) {
-                Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-                    WashTextButton(R.string.chat_load_retry, onRetryLoad)
+    val topPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + TopBarHeight + 8.dp
+    // The bottom is read when the list measures, after the bottom area (measured first) has stored its height.
+    val listPadding = remember(topPadding, density) {
+        object : PaddingValues {
+            override fun calculateLeftPadding(layoutDirection: LayoutDirection) = 0.dp
+            override fun calculateRightPadding(layoutDirection: LayoutDirection) = 0.dp
+            override fun calculateTopPadding() = topPadding
+            override fun calculateBottomPadding() = with(density) { bottomArea.toDp() } + 8.dp
+        }
+    }
+
+    Box(modifier.fillMaxSize().background(surface).testTag("chat.key:${state.sessionKey}")) { // the end-to-end tests read the open chat's key here
+        Column(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .zIndex(1f) // composed first (measured before the list) but drawn over it
+                .layout { measurable, constraints ->
+                    // Read by the list's padding during its measure in this same pass: no frame with a stale padding.
+                    val placeable = measurable.measure(constraints)
+                    bottomArea = placeable.height
+                    layout(placeable.width, placeable.height) { placeable.place(0, 0) }
                 }
-                return@Box
+                .navigationBarsPadding()
+                .imePadding() // max(keyboard, navigation bar), applied once
+                .onSizeChanged { bottomContent = it.height },
+        ) {
+            state.composerNote?.let { ComposerNoteLine(it) }
+            if (linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
+            state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
+            Composer(
+                state.draft,
+                if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
+                { actions.onDraftChange(it, state.draftRevision) },
+                onSend = {
+                    linkFailed = false
+                    actions.onSendClick()
+                    follow.onSend()
+                    scope.launch { listState.scrollToItem(0) }
+                },
+                onStop = { state.live?.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
+                busy = state.sending,
+            )
+        }
+        if (state.status == StatusLine.LOAD_FAILED) {
+            Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                WashTextButton(R.string.chat_load_retry, onRetryLoad)
             }
+        } else {
             MessageList(
                 state.items,
                 state.live,
@@ -144,31 +163,33 @@ fun ChatScreen(
                 onCancel = { it.idempotencyKey?.let(actions::onCancel) },
                 onStep = { detail = it },
                 listState = listState,
-                contentPadding = PaddingValues(vertical = 8.dp),
+                contentPadding = listPadding,
                 zone = zone,
                 today = today,
+                modifier = Modifier
+                    .backdropSource(backdrop)
+                    .drawWithContent {
+                        drawContent()
+                        // Inside the source, so the sharp list and any blurred sample of it both fade; no text below the composer.
+                        // The composer card's bottom edge: above the insets and the card's 8 dp outer margin (Composer.kt).
+                        val edge = size.height - (bottomArea - bottomContent) - composerGap
+                        drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = edge - fade, endY = edge), Offset(0f, edge - fade), Size(size.width, fade))
+                        drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
+                    },
                 onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
             )
-            val away by remember { derivedStateOf { listState.canScrollBackward } }
-            if (away) {
-                ApofisIconButton(
-                    onClick = { scope.launch { listState.animateScrollToItem(0) } },
-                    contentDescription = stringResource(R.string.chat_scroll_to_bottom),
-                    Modifier.align(Alignment.BottomEnd).padding(end = 4.dp, bottom = 4.dp),
-                    visualSize = 32.dp,
-                ) {
-                    Box(
-                        Modifier
-                            .fillMaxSize()
-                            .background(ApofisTheme.colors.cardFill, CircleShape)
-                            .border(1.dp, ApofisTheme.colors.hairlineStrong, CircleShape),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(painterResource(R.drawable.lucide_arrow_down), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
-                    }
-                }
-            }
+            ScrollToBottomButton(
+                visible = follow.buttonVisible,
+                backdrop = backdrop,
+                onClick = {
+                    follow.onButton()
+                    scope.launch { listState.animateScrollToItem(0) }
+                },
+                // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
+                Modifier.align(Alignment.BottomEnd).padding(end = 2.dp).offset { IntOffset(0, -bottomArea - 2.dp.roundToPx()) },
+            )
         }
+        ChatTopBar(state, onOpenConnection, onRetryLoad, navigationIcon, appBarActions, Modifier.align(Alignment.TopCenter))
     }
 
     state.confirmCancel?.let { id ->
@@ -269,56 +290,6 @@ private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: (
         }
         WashTextButton(R.string.chat_unsent_put_back, onPutBack)
         WashTextButton(R.string.chat_unsent_discard, onDiscard)
-    }
-}
-
-@Composable
-private fun Title(state: ChatUiState, onOpenConnection: () -> Unit, onRetryLoad: () -> Unit) {
-    val scheme = MaterialTheme.colorScheme
-    val action = when (state.status) {
-        StatusLine.KEY_REJECTED -> stringResource(R.string.chat_status_open_connection) to onOpenConnection
-        StatusLine.LOAD_FAILED -> stringResource(R.string.chat_load_retry) to onRetryLoad
-        else -> null
-    }
-    // The whole title area is the touch target: the status line alone is too small.
-    Column(
-        Modifier
-            .heightIn(min = 48.dp)
-            .then(if (action != null) Modifier.clickable(onClickLabel = action.first, onClick = action.second) else Modifier),
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Text(
-            state.title.ifEmpty { stringResource(R.string.chat_new_title) },
-            Modifier.testTag("chat.title"), // the end-to-end tests read the open chat's title here
-            style = MaterialTheme.typography.titleMedium,
-            color = scheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        val (icon, text, color) = when (state.status) {
-            StatusLine.IDLE -> Triple(null, state.host, scheme.onSurfaceVariant)
-            StatusLine.WORKING -> Triple(null, stringResource(R.string.chat_status_working), scheme.primary)
-            StatusLine.QUEUED -> Triple(null, stringResource(R.string.chat_status_queued), scheme.primary)
-            StatusLine.OFFLINE -> Triple(R.drawable.lucide_wifi_off, stringResource(R.string.chat_status_offline), scheme.error)
-            StatusLine.UNREACHABLE -> Triple(R.drawable.lucide_cloud_off, stringResource(R.string.chat_status_unreachable), scheme.error)
-            StatusLine.KEY_REJECTED -> Triple(R.drawable.lucide_key_round, stringResource(R.string.chat_status_key_rejected), scheme.error)
-            StatusLine.SERVER_ERROR -> Triple(R.drawable.lucide_triangle_exclamation_point, stringResource(R.string.chat_status_server_error), scheme.error)
-            StatusLine.CHAT_GONE -> Triple(R.drawable.lucide_triangle_exclamation_point, stringResource(R.string.chat_status_chat_gone), scheme.error)
-            StatusLine.LOAD_FAILED -> Triple(R.drawable.lucide_triangle_exclamation_point, stringResource(R.string.chat_status_load_failed), scheme.error)
-        }
-        StatusText(icon, text, color, tappable = action != null)
-    }
-}
-
-@Composable
-private fun StatusText(@DrawableRes icon: Int?, text: String, color: Color, tappable: Boolean) {
-    Row(Modifier.testTag("status.line").semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }, verticalAlignment = Alignment.CenterVertically) {
-        if (icon != null) {
-            Icon(painterResource(icon), null, Modifier.size(12.dp), tint = color)
-            Box(Modifier.width(4.dp))
-        }
-        Text(text, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        if (tappable) Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(12.dp), tint = color)
     }
 }
 

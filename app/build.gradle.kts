@@ -22,6 +22,8 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = System.getenv("APOFIS_VERSION_CODE")?.toInt() ?: 1
         versionName = System.getenv("APOFIS_VERSION_NAME") ?: "0.1.0-dev"
+        // Only the emulator measurement (BlurCostTest, run-e2e.sh --app-test) uses instrumented tests.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     // Release signing needs all four variables; with none set the release APK is unsigned.
@@ -100,4 +102,8 @@ dependencies {
     // Gestures, focus and the frame clock in Compose tests; test only, never on the release classpath.
     testImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+    // The blur measurement on the emulator (BlurCostTest); never on the release classpath.
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.ext.junit)
 }

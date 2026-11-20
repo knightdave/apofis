@@ -563,6 +563,28 @@ STEPS=$t/steps12c APOFIS_E2E_LIB=1 bash -c '
   exit 0' _ "$here" >"$t/out12c" 2>&1 || rc=$?
 check "watchdog FIFO cannot be made: warns, releases the lock and runs the sessions step, exit 0" '[ "$rc" = 0 ] && has "$(cat "$t/out12c")" "WARNING: could not arm" && lacks "$(cat "$t/out12c")" "did not finish" && [ "$(cat "$t/steps12c" 2>/dev/null)" = "$(printf "lock\nsessions")" ]'
 
+# 12d. --app-test: the app's own test runs with its own runner, no key is ever handed out, and only its fixed files
+# come back.
+check "app test: names accepted only as app:<Class>" 'tests_ok app:BlurCostTest && ! tests_ok "app:../x" && ! tests_ok "app:a b" && ! tests_ok "app:"'
+check "app test: the app's class and runner" '[ "$(instrument_target app:BlurCostTest)" = "-e class xyz.rycerz.apofis.BlurCostTest xyz.rycerz.apofis.test/androidx.test.runner.AndroidJUnitRunner" ]'
+check "e2e test: still the e2e module's class and runner" '[ "$(instrument_target ChatLookupE2eTest)" = "-e class xyz.rycerz.apofis.e2e.ChatLookupE2eTest xyz.rycerz.apofis.e2e/androidx.test.runner.AndroidJUnitRunner" ]'
+check "app test: the build host never answers the key request" '(mode=app interrupted=""; ! key_allowed) && (mode=smoke interrupted=""; key_allowed) && (mode=smoke interrupted=130; ! key_allowed)'
+check "app test: its files are allowlisted, nothing else of the app" 'allowed blur-cost.txt && allowed blur-on.png && allowed blur-off-keyboard.png && ! allowed app && ! allowed blur.db'
+mkdir -p "$t/app-stage/device/app" "$t/app-stage/exp"
+for f in blur-cost.txt blur-on.png blur-off.png blur-on-keyboard.png blur-off-keyboard.png other.txt; do printf 'x\n' >"$t/app-stage/device/app/$f"; done
+printf 'INSTRUMENTATION_CODE: -1\n' >"$t/app-stage/instrument.txt"
+rc=0; (out=$t/app-stage logcat_ok=''; stage "$t/app-stage/exp") || rc=$?
+check "app test: staging copies exactly its five files (and the instrumentation output)" '[ "$rc" = 0 ] && [ "$(ls "$t/app-stage/exp" | grep -v "^results.txt$" | sort | tr "\n" " ")" = "blur-cost.txt blur-off-keyboard.png blur-off.png blur-on-keyboard.png blur-on.png instrument.txt " ]'
+mkdir -p "$t/app-eval"
+printf 'INSTRUMENTATION_STATUS: class=xyz.rycerz.apofis.BlurCostTest\nINSTRUMENTATION_STATUS: test=measure\nINSTRUMENTATION_STATUS_CODE: 0\nINSTRUMENTATION_CODE: -1\n' >"$t/app-eval/instrument.txt"
+printf 'I ApofisE2e: x\n' >"$t/app-eval/logcat.txt"
+printf 'hardware=true\np95_delta_ms=1.00 allocs_delta=2.0 accepted=yes (p95 at most 4 ms worse, at most 10 more allocations per frame)\n' >"$t/app-eval/blur-cost.txt"
+rc=0; o=$(mode=app arg=BlurCostTest; evaluate "$t/app-eval" 2>&1) || rc=$?
+check "app test: missing screenshots fail the evaluation" '[ "$rc" != 0 ] && has "$o" "missing blur-on.png"'
+for f in blur-on.png blur-off.png blur-on-keyboard.png blur-off-keyboard.png; do printf 'x' >"$t/app-eval/$f"; done
+rc=0; o=$(mode=app arg=BlurCostTest; evaluate "$t/app-eval" 2>&1) || rc=$?
+check "app test: complete files pass and the numbers are printed" '[ "$rc" = 0 ] && has "$o" "pass  BlurCostTest#measure" && has "$o" "accepted=yes"'
+
 # 13. Every instrumentation test class writes its own result rows (Evidence), which the cleanup requires.
 for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
   grep -q '^ *@Test' "$f" || continue
