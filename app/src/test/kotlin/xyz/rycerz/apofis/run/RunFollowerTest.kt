@@ -76,6 +76,17 @@ class RunFollowerTest {
     private val roomStatusAtDelay = CopyOnWriteArrayList<String?>()
 
     /** Runs on the database thread just before each statement, so a test can act in the middle of a write. */
+    private val gates = CopyOnWriteArrayList<CountDownLatch>()
+    private val gateTimeouts = AtomicInteger()
+
+    /** A gate the test opens; tearDown fails the test if one was never opened or a [pass] timed out. */
+    private fun gate() = CountDownLatch(1).also { gates += it }
+
+    /** Waits (on a server thread) for the gate to open; a timeout is recorded and fails the test in tearDown. */
+    private fun CountDownLatch.pass() {
+        if (!await(10, TimeUnit.SECONDS)) gateTimeouts.incrementAndGet()
+    }
+
     @Volatile private var beforeQuery: (sql: String, args: List<Any?>) -> Unit = { _, _ -> }
 
     @Before
@@ -99,8 +110,12 @@ class RunFollowerTest {
 
     @After
     fun tearDown() {
+        val unopened = gates.count { it.count > 0 }
+        gates.forEach { it.countDown() } // no server thread stays blocked
         db.close()
         server.close()
+        assertEquals("gates never opened", 0, unopened)
+        assertEquals("gate waits that timed out", 0, gateTimeouts.get())
     }
 
     private fun TestScope.follower(
@@ -170,7 +185,7 @@ class RunFollowerTest {
     /** Messages that answer only after [gate] opens, so the live state before Finish can be read. */
     private fun gatedMessages(gate: CountDownLatch) {
         routes[MESSAGES] = {
-            gate.await(10, TimeUnit.SECONDS)
+            gate.pass()
             json(messagesBody)()
         }
     }
@@ -209,10 +224,10 @@ class RunFollowerTest {
     fun streamsThenReplacesWithServerRows() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         val steer = "[OUT-OF-BAND USER MESSAGE - sent while you were working]\\ntext p2\\n[/OUT-OF-BAND USER MESSAGE]"
         routes[MESSAGES] = {
-            gate.await(10, TimeUnit.SECONDS)
+            gate.pass()
             json(
                 """{"session_id":"$KEY","data":[{"id":10,"role":"user","content":" text p1 ","timestamp":1.0},""" +
                     """{"id":11,"role":"user","display_kind":"steer","content":"$steer","timestamp":1.5},""" +
@@ -284,7 +299,7 @@ class RunFollowerTest {
     fun silentCloseReconnects() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(STATUS, status("running"))
         // The second connection replays seq 2 once more: it must not be appended twice.
@@ -400,13 +415,13 @@ class RunFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
-        val stopped = CountDownLatch(1)
+        val stopped = gate()
         routes["/v1/runs/$RUN/stop"] = {
             stopped.countDown()
             json("""{"run_id":"$RUN","status":"stopping"}""")()
         }
         routes[EVENTS] = {
-            stopped.await(10, TimeUnit.SECONDS)
+            stopped.pass()
             sseResponse(delta(0, "a"), terminal(1, "cancelled"))
         }
         started(f)
@@ -452,14 +467,14 @@ class RunFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         val attaches = AtomicInteger()
         routes[EVENTS] = {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(delta(0, "a"), frame(1, approvalEvent))
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                release.pass()
                 sseResponse(terminal(2))
             }
         }
@@ -488,7 +503,7 @@ class RunFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
-        val release = CountDownLatch(1)
+        val release = gate()
         val current = java.util.concurrent.atomic.AtomicReference(status("waiting_for_approval", pendingControl))
         routes[STATUS] = { current.get()() }
         val attaches = AtomicInteger()
@@ -496,7 +511,7 @@ class RunFollowerTest {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(frame(1, approvalEvent))
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                release.pass()
                 sseResponse(terminal(2))
             }
         }
@@ -573,7 +588,7 @@ class RunFollowerTest {
     fun unknownEventTypesIgnored() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(
             EVENTS,
@@ -599,7 +614,7 @@ class RunFollowerTest {
     fun toolStepsCarryDuration() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(
             EVENTS,
@@ -666,7 +681,7 @@ class RunFollowerTest {
     private suspend fun heldOpen(f: RunFollower, release: CountDownLatch) {
         messages()
         routes[EVENTS] = {
-            release.await(10, TimeUnit.SECONDS)
+            release.pass()
             sseResponse(terminal(5))
         }
         started(f)
@@ -675,7 +690,7 @@ class RunFollowerTest {
     @Test
     fun approvalReplacedReturnsChanged() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", otherControl))
         heldOpen(f, release)
 
@@ -692,7 +707,7 @@ class RunFollowerTest {
     @Test
     fun approvalGoneReturnsGone() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("running"))
         heldOpen(f, release)
 
@@ -705,7 +720,7 @@ class RunFollowerTest {
     @Test
     fun clarifyUsesSameRule() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         val clarify = """{"kind":"clarify","prompt_id":"cl_1","execution_generation":2,"command":null,"question":"Which?"}"""
         on(STATUS, status("waiting_for_approval", clarify))
         on("/v1/runs/$RUN/clarify", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"cl_1"}"""))
@@ -764,14 +779,14 @@ class RunFollowerTest {
     fun approvalRefreshFailureIsRetried() = runTest {
         val f = follower()
         messages()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, json("{}", 500), status("waiting_for_approval", pendingControl))
         val attaches = AtomicInteger()
         routes[EVENTS] = {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(delta(0, "a"), frame(1, approvalEvent), delta(2, "never applied"))
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                release.pass()
                 sseResponse(terminal(9))
             }
         }
@@ -788,7 +803,7 @@ class RunFollowerTest {
     @Test
     fun unauthorizedStopCancelsFollower() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on("/v1/runs/$RUN/stop", json("""{"error":{"code":"invalid_api_key"}}""", 401))
         heldOpen(f, release)
         awaitUntil { requestsTo(EVENTS).isNotEmpty() }
@@ -978,7 +993,7 @@ class RunFollowerTest {
     fun transcriptNeverLosesUserTextDuringFinish() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         started(f)
@@ -1020,7 +1035,7 @@ class RunFollowerTest {
     @Test
     fun newerApprovalDuringPostIsShown() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("waiting_for_approval", otherControl)) // published while the POST was in flight
@@ -1036,7 +1051,7 @@ class RunFollowerTest {
     @Test
     fun alreadyResolvedReportsGone() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("running"))
@@ -1052,7 +1067,7 @@ class RunFollowerTest {
     @Test
     fun conflictWithReplacementReportsChanged() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("waiting_for_approval", otherControl))
@@ -1071,9 +1086,16 @@ class RunFollowerTest {
         messages()
         on(STATUS, status("running"))
         on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
-        beforeQuery = { sql, _ -> if ("SET polling = 1" in sql) f.pauseAll() } // lands while the truncation is stored
+        val paused = AtomicBoolean(false)
+        beforeQuery = { sql, _ ->
+            if ("SET polling = 1" in sql) {
+                f.pauseAll() // lands while the truncation is stored
+                paused.set(true)
+            }
+        }
         started(f)
         db.activeRunDao().observeAll().first { it.singleOrNull()?.polling == true } // the old process's write commits
+        assertTrue(paused.get())
 
         val done = CompletableDeferred<Unit>()
         val g = follower(done) // a later resume, here in a new process
@@ -1099,7 +1121,7 @@ class RunFollowerTest {
     @Test
     fun stopIntentIsStoredApartFromStatus() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("running"))
         on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
         heldOpen(f, release)
@@ -1146,7 +1168,7 @@ class RunFollowerTest {
     fun terminalStatusIsStoredBeforeFinish() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(EVENTS, sse(terminal(0)))
         started(f)
@@ -1199,7 +1221,7 @@ class RunFollowerTest {
     @Test
     fun failedReadAfterPostKeepsApprovalAndRetries() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("waiting_for_approval", otherControl))
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}"""))
         heldOpen(f, release)
@@ -1214,7 +1236,7 @@ class RunFollowerTest {
     @Test
     fun malformedAnswerWithRequestStillPendingIsAnError() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         on("/v1/runs/$RUN/approval", json("not json"))
         heldOpen(f, release)
@@ -1231,7 +1253,7 @@ class RunFollowerTest {
     @Test
     fun malformedAnswerWithRequestGoneIsGone() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("running"))
@@ -1250,7 +1272,7 @@ class RunFollowerTest {
         messages()
         on(STATUS, status("running"), status("completed"))
         on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
-        val paused = CountDownLatch(1)
+        val paused = gate()
         beforeQuery = { sql, _ ->
             if ("SET polling = 1" in sql) {
                 f.pauseAll() // the old job is still writing polling = true
@@ -1271,10 +1293,17 @@ class RunFollowerTest {
         messages()
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         routes[MESSAGES] = { MockResponse.Builder().code(503).build() } // Finish never completes here
-        beforeQuery = { sql, args -> if ("SET status" in sql && "completed" in args) f.pauseAll() } // lands while it is stored
+        val paused = AtomicBoolean(false)
+        beforeQuery = { sql, args ->
+            if ("SET status" in sql && "completed" in args) {
+                f.pauseAll() // lands while the terminal status is being stored
+                paused.set(true)
+            }
+        }
         started(f)
 
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
+        assertTrue(paused.get())
     }
 
     @Test
@@ -1329,7 +1358,7 @@ class RunFollowerTest {
     @Test
     fun acceptedAnswerStaysSentWhenTheReadIsRejected() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}"""))
         heldOpen(f, release)
@@ -1343,7 +1372,7 @@ class RunFollowerTest {
     @Test
     fun alreadyResolvedWithFailedReadRethrowsAndRetries() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("running"))
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}"""))
         heldOpen(f, release)
@@ -1364,14 +1393,14 @@ class RunFollowerTest {
     fun olderReadNeverOverwritesANewerApproval() = runTest {
         val f = follower()
         messages()
-        val slow = CountDownLatch(1)
-        val emit = CountDownLatch(1)
+        val slow = gate()
+        val emit = gate()
         val reads = AtomicInteger()
         routes[STATUS] = {
             when (reads.incrementAndGet()) {
                 1 -> status("waiting_for_approval", pendingControl)()
                 2 -> {
-                    slow.await(10, TimeUnit.SECONDS) // started first, finishes last, and shows nothing pending
+                    slow.pass() // started first, finishes last, and shows nothing pending
                     status("running")()
                 }
                 else -> status("waiting_for_approval", otherControl)()
@@ -1379,7 +1408,7 @@ class RunFollowerTest {
         }
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}"""))
         routes[EVENTS] = {
-            emit.await(10, TimeUnit.SECONDS)
+            emit.pass()
             heldStream(frame(1, approvalEvent))()
         }
         started(f)
@@ -1398,7 +1427,7 @@ class RunFollowerTest {
     @Test
     fun truncatedAnswerResponseIsReconciled() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("running"))
@@ -1461,7 +1490,7 @@ class RunFollowerTest {
     @Test
     fun refreshKeepsRetryingUntilAReadSucceeds() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         val failed = json("{}", 500)
         on(STATUS, status("waiting_for_approval", pendingControl), failed, failed, failed, failed, failed, failed, status("running"))
         on("/v1/runs/$RUN/approval", resolvedBody)
@@ -1479,7 +1508,7 @@ class RunFollowerTest {
         val resumed = AtomicBoolean(false)
         val readsWhilePaused = AtomicInteger()
         val f = follower(onDelay = { if (paused.compareAndSet(false, true)) pauseAll() }) // the gate closes during the backoff
-        val release = CountDownLatch(1)
+        val release = gate()
         val reads = AtomicInteger()
         routes[STATUS] = {
             if (paused.get() && !resumed.get()) readsWhilePaused.incrementAndGet()
@@ -1504,7 +1533,7 @@ class RunFollowerTest {
     @Test
     fun rejectionBetweenStatusReadAndItsApplyStaysShown() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         heldOpen(f, release)
         addSession("apofis-b")
@@ -1522,6 +1551,7 @@ class RunFollowerTest {
         }
 
         assertEquals(AnswerResult.CHANGED, f.answerApproval(KEY, "ctl_gone", 2, ApprovalChoice.ONCE))
+        assertTrue(once.get()) // the rejection did land between the read and its apply
         assertTrue(f.credentialsRejected.value)
         release.countDown()
     }
@@ -1529,7 +1559,7 @@ class RunFollowerTest {
     @Test
     fun rejectedRefreshAfterAnswerStopsTheStream() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
         on("/v1/runs/$RUN/approval", resolvedBody)
         heldOpen(f, release)
@@ -1562,12 +1592,13 @@ class RunFollowerTest {
         f.resumeAll()
 
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
+        assertTrue(once.get()) // the pause did land before the apply
     }
 
     @Test
     fun cancelledRefreshStaysRequestedUntilApplied() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), status("waiting_for_approval", otherControl))
         on("/v1/runs/$RUN/approval", resolvedBody)
         heldOpen(f, release)
@@ -1669,7 +1700,7 @@ class RunFollowerTest {
     @Test
     fun sendRightAfterStopIsShownIsNotSteered() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("running"))
         on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
         on(steerPath, json(fixture("steer_response.json")))

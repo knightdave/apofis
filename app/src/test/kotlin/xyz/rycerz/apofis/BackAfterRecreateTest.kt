@@ -69,6 +69,7 @@ class BackAfterRecreateTest {
             assertNull(app.container.credentials.load())
             assertNull(app.container.connection.value)
             controller.pause().stop().destroy()
+            holding.verify()
         } finally {
             server.close()
         }

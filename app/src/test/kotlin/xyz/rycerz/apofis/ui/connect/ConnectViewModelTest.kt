@@ -19,6 +19,7 @@ import mockwebserver3.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -47,8 +48,12 @@ class ConnectViewModelTest {
 
     @After
     fun tearDown() {
-        server.close()
-        Dispatchers.resetMain()
+        try {
+            holding.verify()
+        } finally {
+            server.close()
+            Dispatchers.resetMain()
+        }
     }
 
     private fun vm(current: Credentials? = null) =
@@ -202,7 +207,7 @@ class ConnectViewModelTest {
         vm.onUrlChange(server.url("/").toString())
         vm.onKeyChange("sk-secret")
         val probe = vm.connect()!!
-        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }
+        assertNotNull(withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }) // the probe is in flight
         store.clear()
         probe.join()
         response.countDown()
@@ -219,7 +224,7 @@ class ConnectViewModelTest {
         vm.onUrlChange(server.url("/").toString())
         vm.onKeyChange("sk-1")
         vm.connect()
-        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }
+        assertNotNull(withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }) // the probe is in flight
 
         assertTrue(vm.cancel()) // synchronous: nothing to wait for before navigating
         assertEquals(ConnectState.Idle, vm.state)
@@ -260,6 +265,7 @@ class ConnectViewModelTest {
         vm.connect()
 
         assertTrue(back.busy.value) // set synchronously by connect()
+        assertNotNull(withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }) // the probe is in flight
         assertTrue(back.cancel())
         assertEquals(ConnectState.Idle, vm.state)
         assertFalse(back.busy.value)

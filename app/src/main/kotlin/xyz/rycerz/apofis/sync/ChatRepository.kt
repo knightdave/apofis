@@ -51,6 +51,9 @@ class ChatRepository(
 ) {
     private val sessionDao = db.sessionDao()
 
+    /** Test-only: runs in the plain [syncMessages] after its fetch has returned, right before its write. */
+    internal var beforeSyncWrite: suspend () -> Unit = {}
+
     fun sessions(archived: Boolean = false): Flow<List<SessionEntity>> = sessionDao.observe(archived)
 
     /** One chat's row, or null once it is gone. */
@@ -154,6 +157,7 @@ class ChatRepository(
         requireAppKey(sessionKey)
         return lock.withLock {
             val (tip, rows) = fetchRows(sessionKey) ?: return@withLock false
+            beforeSyncWrite()
             db.withTransaction { replaceRows(sessionKey, tip, rows) }
             true
         }

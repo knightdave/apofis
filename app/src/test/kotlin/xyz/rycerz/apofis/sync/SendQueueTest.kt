@@ -6,6 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -63,8 +64,12 @@ class SendQueueTest {
 
     @After
     fun tearDown() {
-        db.close()
-        server.close()
+        try {
+            holding.verify()
+        } finally {
+            db.close()
+            server.close()
+        }
     }
 
     private fun respond(body: String, code: Int = 200) =
@@ -612,12 +617,14 @@ class SendQueueTest {
     fun failedSteerAfterDeleteLeavesNoRow() = runTest {
         addSession("apofis-a")
         running("apofis-a")
-        server.enqueue(MockResponse.Builder().code(400).body("{}").headersDelay(500, TimeUnit.MILLISECONDS).build())
+        val refused = holding.hold(MockResponse.Builder().code(400).body("{}").build())
         respond(fixture("session_delete.json"))
         val repo = ChatRepository(api, db, { clock }, queue)
         val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
         take()
-        val delete = launch(Dispatchers.Default) { repo.delete("apofis-a") }
+        // Undispatched: it runs to its first suspension, the lock the steer holds, before launch returns.
+        val delete = launch(Dispatchers.Default, CoroutineStart.UNDISPATCHED) { repo.delete("apofis-a") }
+        refused.countDown()
         send.join()
         delete.join()
         assertNull(db.sessionDao().get("apofis-a"))
