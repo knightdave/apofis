@@ -16,26 +16,39 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - id: sdk
+        run: scripts/sdk-versions.sh >> "$GITHUB_OUTPUT"
       - uses: android-actions/setup-android@v4
         with:
-          packages: platform-tools platforms;android-37.2 build-tools;37.0.0
+          packages: ${{ steps.sdk.outputs.packages }}
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew lintDebug testDebugUnitTest
+      - run: ./gradlew lintDebug testDebugUnitTest assembleDebug
+      - run: scripts/check-apk-permissions-test.sh
+      - run: scripts/release-lock-test.sh
+      - run: scripts/check-apk-permissions.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/aapt2" app/build/outputs/apk/debug/app-debug.apk
 
   release:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Per-ref groups: a newer pending main run may replace an older pending one
+    # (saves building pre-releases that would be skipped anyway), and no ref can
+    # cancel another ref's run. Release ordering is enforced by the publish lock.
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
+      - id: sdk
+        run: scripts/sdk-versions.sh >> "$GITHUB_OUTPUT"
       - uses: android-actions/setup-android@v4
         with:
-          packages: platform-tools platforms;android-37.2 build-tools;37.0.0
+          packages: ${{ steps.sdk.outputs.packages }}
       - uses: gradle/actions/setup-gradle@v6
 
       - name: Set version
@@ -47,6 +60,22 @@ jobs:
           else
             echo "APOFIS_VERSION_NAME=0.1.0-pre.${{ github.run_number }}" >> "$GITHUB_ENV"
             echo "RELEASE_TAG=pre-${{ github.run_number }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.APOFIS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.APOFIS_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.APOFIS_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.APOFIS_KEY_PASSWORD }}
+        run: |
+          missing=""
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "$(printenv "$v")" ] || missing="$missing APOFIS_$v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing or empty signing secrets:$missing"
+            exit 1
           fi
 
       - name: Decode keystore
@@ -63,14 +92,24 @@ jobs:
           APOFIS_KEY_PASSWORD: ${{ secrets.APOFIS_KEY_PASSWORD }}
         run: ./gradlew lintDebug testDebugUnitTest assembleRelease
 
-      - name: Publish release
+      - name: Check permissions
+        run: scripts/check-apk-permissions.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/aapt2" app/build/outputs/apk/release/app-release.apk
+
+      - name: Acquire publish lock
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          apk="apofis-$APOFIS_VERSION_NAME.apk"
-          cp app/build/outputs/apk/release/app-release.apk "$apk"
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            gh release create "$RELEASE_TAG" "$apk" --title "Apofis $APOFIS_VERSION_NAME" --generate-notes --verify-tag
-          else
-            gh release create "$RELEASE_TAG" "$apk" --title "Apofis $APOFIS_VERSION_NAME" --generate-notes --prerelease --target "$GITHUB_SHA"
-          fi
+        run: scripts/release-lock.sh acquire
+
+      # Critical section: stale versionCode check and publication. The timeout keeps a
+      # live holder well under the lock's 20 minute stale age.
+      - name: Publish release
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/publish-release.sh app/build/outputs/apk/release/app-release.apk
+
+      - name: Release publish lock
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release-lock.sh release
