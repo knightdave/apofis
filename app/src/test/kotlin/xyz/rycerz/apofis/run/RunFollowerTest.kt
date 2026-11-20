@@ -1160,7 +1160,7 @@ class RunFollowerTest {
         f.resumeAll()
 
         f.live(KEY).first { it?.text == "a" }
-        assertEquals("brand_new_state", f.live(KEY).value!!.status)
+        assertEquals("running", f.live(KEY).value!!.status) // shown as stored: the screen and the send queue agree
         assertEquals("running", db.activeRunDao().forSession(KEY)!!.status)
     }
 
@@ -1293,17 +1293,18 @@ class RunFollowerTest {
         messages()
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         routes[MESSAGES] = { MockResponse.Builder().code(503).build() } // Finish never completes here
-        val paused = AtomicBoolean(false)
+        val paused = gate()
         f.beforeStatusStore = { status ->
-            if (status == "completed" && paused.compareAndSet(false, true)) {
+            if (status == "completed" && paused.count > 0) {
                 pauseAll() // lands as the terminal status starts being stored, before anything is written
+                paused.countDown()
                 yield()
             }
         }
         started(f)
 
+        awaitUntil { paused.count == 0L } // the pause itself happened
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
-        assertTrue(paused.get())
     }
 
     @Test
@@ -1793,5 +1794,111 @@ class RunFollowerTest {
         assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
         finish.countDown()
         done.await() // the run ends before the database closes
+    }
+
+    @Test
+    fun lateRunningReadAfterRestartShowsTheStoredTerminalStatus() = runTest {
+        val f = follower() // a new process over a database that already stored the terminal status
+        on(STATUS, status("running"))
+        on(EVENTS, heldStream())
+        on(steerPath, json(fixture("steer_response.json")))
+        addSession()
+        addRun(status = "completed")
+        f.resumeAll()
+
+        awaitUntil { requestsTo(EVENTS).isNotEmpty() } // it attaches only once the read has been published
+        assertEquals("completed", f.live(KEY).value!!.status)
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        SendQueue(api, db, { _, _ -> }, System::currentTimeMillis).submit(KEY, "late")
+        assertTrue(requestsTo(steerPath).isEmpty())
+    }
+
+    @Test
+    fun failedTerminalStoreIsRetriedByTheNextObservation() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val atRetry = CopyOnWriteArrayList<String>()
+        val f = follower(done, onDelay = {
+            atRetry += "live=${live(KEY).value?.status} row=${db.activeRunDao().forSession(KEY)?.status}"
+        })
+        val stores = AtomicInteger()
+        f.beforeStatusStore = { if (it == "completed" && stores.getAndIncrement() == 0) throw SQLiteException("disk I/O error") }
+        val finish = gate()
+        gatedMessages(finish)
+        on(STATUS, status("completed"))
+        on(EVENTS, sse(terminal(0)))
+        started(f)
+
+        awaitUntil { f.live(KEY).value?.status == "completed" }
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        assertEquals(listOf("live=running row=running"), atRetry) // nothing terminal stored or shown before the retry
+        assertEquals(2, stores.get())
+        finish.countDown()
+        done.await()
+    }
+
+    private val stopPath = "/v1/runs/$RUN/stop"
+
+    @Test
+    fun overlappingStopsKeepTheIntentOfTheOneAccepted() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val release = gate()
+        val firstAnswer = gate()
+        val secondAnswer = gate()
+        on(STATUS, status("stopping"))
+        val stops = AtomicInteger()
+        routes[stopPath] = {
+            if (stops.incrementAndGet() == 1) {
+                firstAnswer.pass()
+                json("{}", 500)()
+            } else {
+                secondAnswer.pass()
+                json("""{"run_id":"$RUN","status":"stopping"}""")()
+            }
+        }
+        messages()
+        routes[EVENTS] = {
+            release.pass()
+            sseResponse(terminal(5, "cancelled"))
+        }
+        started(f)
+
+        val first = backgroundScope.async { runCatching { f.stop(KEY) } }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        val second = backgroundScope.async { f.stop(KEY) }
+        awaitUntil { requestsTo(stopPath).size == 2 }
+        firstAnswer.countDown()
+        assertTrue(first.await().exceptionOrNull() is ApiError.Http) // failed while the second is in flight
+        assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        secondAnswer.countDown()
+        second.await()
+        release.countDown()
+        done.await()
+
+        assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
+    }
+
+    @Test
+    fun overlappingStopsThatBothFailLeaveNoIntent() = runTest {
+        val f = follower()
+        val release = gate()
+        val firstAnswer = gate()
+        on(STATUS, status("running"))
+        val stops = AtomicInteger()
+        routes[stopPath] = {
+            if (stops.incrementAndGet() == 1) firstAnswer.pass()
+            json("{}", 500)()
+        }
+        heldOpen(f, release)
+
+        val first = backgroundScope.async { runCatching { f.stop(KEY) } }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is ApiError.Http) // fails while the first is in flight
+        assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        firstAnswer.countDown()
+        assertTrue(first.await().exceptionOrNull() is ApiError.Http)
+
+        assertFalse(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        release.countDown()
     }
 }
