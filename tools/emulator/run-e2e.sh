@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end tests on a headless emulator on another host. See tools/emulator/README.md.
 #
-#   tools/emulator/run-e2e.sh --smoke   connect test (part A)
-#   tools/emulator/run-e2e.sh --full    the survival scenarios (part B, not written yet)
+#   tools/emulator/run-e2e.sh --smoke             connect tests, no model run
+#   tools/emulator/run-e2e.sh --full              every e2e test: smoke tests and the seven survival scenarios
+#   tools/emulator/run-e2e.sh --scenario <name>   one survival scenario, e.g. stopDuringRun
+#   tools/emulator/run-e2e.sh --test <Class[#method]>   any test in the e2e module
 #
 # Runs on the build host; it calls itself on the emulator host with --remote (internal).
 set -euo pipefail
@@ -20,16 +22,13 @@ die() { log "FAILED: $*"; exit 1; }
 # Prints the files under the given paths that contain $APOFIS_KEY (pattern read via -f, never argv; binary files too).
 find_key() { grep -rlF -f <(printf '%s\n' "$APOFIS_KEY") "$@" 2>/dev/null || true; }
 
-test_class() {
-  case $1 in
-    smoke) echo xyz.rycerz.apofis.e2e.SmokeE2eTest ;;
-    *) die "unknown mode $1" ;;
-  esac
-}
+RESULTS=e2e/build/outputs/androidTest-results/connected/debug
+REPORT=e2e/build/reports/androidTests/connected
+DEVICE_OUT=/data/local/tmp/apofis-e2e
 
 # ---------------------------------------------------------------- emulator host
 remote() {
-  local mode=$1 tunnel_port=$2 run_id=$3
+  local tests=$1 tunnel_port=$2 run_id=$3
   local root=$HOME/$REMOTE_DIR state
   state=$root/.state
   local out=$state/runs/$run_id
@@ -42,7 +41,7 @@ remote() {
   export ANDROID_USER_HOME=$state/android ANDROID_EMULATOR_HOME=$state/android ANDROID_AVD_HOME=$state/avd
   export GRADLE_USER_HOME=$state/gradle TMPDIR=$state/tmp JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=$state/tmp
   cd "$root"
-  exec nix develop .#emulator -c env HOME="$state/home" "$root/tools/emulator/run-e2e.sh" --in-shell "$mode" "$tunnel_port" "$out"
+  exec nix develop .#emulator -c env HOME="$state/home" "$root/tools/emulator/run-e2e.sh" --in-shell "$tests" "$tunnel_port" "$out"
 }
 
 free_port() { ! ss -Hltn "sport = :$1" | grep -q .; }
@@ -62,8 +61,9 @@ stop_emulator() {
 }
 
 in_shell() {
-  local mode=$1 tunnel_port=$2 out=$3 class p
-  class=$(test_class "$mode")
+  local class=xyz.rycerz.apofis.e2e.$1 tunnel_port=$2 out=$3 p filter
+  # "all": the whole e2e module; otherwise one class or Class#method.
+  if [ "$1" = all ]; then filter=-Pandroid.testInstrumentationRunnerArguments.package=xyz.rycerz.apofis.e2e; else filter=-Pandroid.testInstrumentationRunnerArguments.class=$class; fi
   local avd=apofis-e2e image="system-images;android-37.0;default;x86_64"
 
   # AGP's test engine always talks to the adb server on 5037, so it must be free: this run starts and stops its own.
@@ -98,12 +98,14 @@ in_shell() {
   log "booted in $((SECONDS - start))s; $(grep -m1 KVM "$out/accel-check.txt")"
   # adbd logs every shell command, and am instrument carries the key: silence adbd before running tests.
   adb shell 'setprop log.tag.adbd S; settings put global window_animation_scale 0; settings put global transition_animation_scale 0;
-    settings put global animator_duration_scale 0; input keyevent 82; mkdir -p /data/local/tmp/apofis-e2e'
+    settings put global animator_duration_scale 0; settings put system screen_off_timeout 1800000;
+    input keyevent 82; mkdir -p '"$DEVICE_OUT"
 
-  # The app's connections to the emulator's host alias 10.0.2.2 time out (the shell's work; cause not yet known),
-  # while loopback works: adb reverse maps the device's 127.0.0.1 port to the tunnel.
+  # Two ways in: the emulator's host alias 10.0.2.2 (a private address: the app needs local network access on
+  # API 37), and the device's loopback, which adb reverse maps to the tunnel (needs no permission; also used by
+  # the tests' own API calls).
   adb reverse "tcp:$tunnel_port" "tcp:$tunnel_port" >/dev/null
-  local hermes_url=http://127.0.0.1:$tunnel_port health=''
+  local hermes_url=http://127.0.0.1:$tunnel_port direct_url=http://10.0.2.2:$tunnel_port health=''
   for _ in $(seq 30); do
     # The sleep keeps nc's write side open: adb reverse drops the connection on a half-close.
     health=$(adb shell "(printf 'GET /health HTTP/1.0\\r\\n\\r\\n'; sleep 2) | nc -w 5 127.0.0.1 $tunnel_port | head -1" 2>&1 | tr -d '\r')
@@ -115,28 +117,29 @@ in_shell() {
 
   log "stage 4: connectedDebugAndroidTest ($class, Hermes at $hermes_url)"
   local rc=0
-  rm -f app/build/outputs/androidTest-results/connected/debug/*.xml # results of an earlier run must not count
+  rm -f "$RESULTS"/*.xml # results of an earlier run must not count
   # No configuration cache and no daemons: nothing derived from the key's environment is kept on disk or in memory.
   timeout "$TEST_TIMEOUT" ./gradlew --no-daemon --no-configuration-cache --console=plain \
     -Pkotlin.compiler.execution.strategy=in-process \
     "-Pandroid.testInstrumentationRunnerArguments.apofisUrl=$hermes_url" \
-    "-Pandroid.testInstrumentationRunnerArguments.class=$class" \
-    connectedDebugAndroidTest >"$out/gradle.log" 2>&1 || rc=$?
+    "-Pandroid.testInstrumentationRunnerArguments.apofisDirectUrl=$direct_url" \
+    "$filter" \
+:e2e:connectedDebugAndroidTest >"$out/gradle.log" 2>&1 || rc=$?
   tail -5 "$out/gradle.log" >&2
   # AGP reports success with zero tests when it loses the device, so count them.
   local counts
-  counts=$(grep -ho '<testsuites tests="[0-9]*" failures="[0-9]*" errors="[0-9]*"' app/build/outputs/androidTest-results/connected/debug/*.xml 2>/dev/null || true)
+  counts=$(grep -ho '<testsuites tests="[0-9]*" failures="[0-9]*" errors="[0-9]*"' "$RESULTS"/*.xml 2>/dev/null || true)
   log "results: ${counts:-none}"
   [[ $counts =~ tests=\"[1-9][0-9]*\"\ failures=\"0\"\ errors=\"0\" ]] || { [ "$rc" != 0 ] || rc=1; }
 
   log "collecting artifacts"
   adb logcat -d >"$out/logcat.txt" 2>&1 || true
-  adb pull /data/local/tmp/apofis-e2e "$out/screenshots" >/dev/null 2>&1 || true
-  cp -r app/build/reports/androidTests/connected "$out/report" 2>/dev/null || true
-  cp -r app/build/outputs/androidTest-results/connected "$out/results" 2>/dev/null || true
+  adb pull "$DEVICE_OUT" "$out/device" >/dev/null 2>&1 || true # screenshots and sessions.txt
+  cp -r "$REPORT" "$out/report" 2>/dev/null || true
+  cp -r "${RESULTS%/debug}" "$out/results" 2>/dev/null || true
 
   local leaks
-  leaks=$(find_key "$out" app/build build .gradle "$HOME" "$ANDROID_USER_HOME" "$TMPDIR" "$GRADLE_USER_HOME")
+  leaks=$(find_key "$out" app/build e2e/build build .gradle "$HOME" "$ANDROID_USER_HOME" "$TMPDIR" "$GRADLE_USER_HOME")
   if [ -n "$leaks" ]; then
     log "the API key was found in these files on $(hostname); not copying artifacts back:"
     while IFS= read -r f; do log "  $f"; done <<<"$leaks"
@@ -169,15 +172,46 @@ local_cleanup() {
   exit "$rc"
 }
 
+# Calls the Hermes session API on the build host: hermes <method> <id> <body-file>; prints the HTTP status.
+hermes() {
+  curl -s -m 20 -o "$3" -w '%{http_code}' -X "$1" -H @<(printf 'Authorization: Bearer %s\n' "$APOFIS_KEY") \
+    "http://127.0.0.1:$HERMES_PORT/api/sessions/$2"
+}
+
+# Every session id the tests recorded must be gone from the server. A leftover is deleted only after a GET shows
+# an app session id with a title the tests set; any leftover fails the run.
+check_sessions() {
+  local file=$1 body id code title left=0
+  [ -s "$file" ] || { log "sessions: none recorded"; return 0; }
+  body=$(mktemp)
+  while IFS= read -r id; do
+    [[ $id =~ ^apofis-[A-Za-z0-9-]+$ ]] || { log "sessions: ignoring a malformed id"; continue; }
+    code=$(hermes GET "$id" "$body")
+    if [ "$code" = 404 ]; then log "sessions: $id gone (404)"; continue; fi
+    left=1
+    title=$(grep -o '"title": *"[^"]*"' "$body" | head -1 | sed 's/.*: *"//; s/"$//')
+    if [ "$code" = 200 ] && [[ $title == "Automated app test"* || $title == "Reply with exactly: apofis-e2e"* || -z $title ]]; then
+      log "sessions: $id left on the server (title \"$title\"); DELETE returned $(hermes DELETE "$id" "$body")"
+    else
+      log "sessions: $id answered $code with title \"$title\"; not deleting it"
+    fi
+  done < <(sort -u "$file")
+  rm -f "$body"
+  [ "$left" = 0 ]
+}
+
 main() {
-  local mode=''
+  local tests=''
   case ${1:-} in
-    --smoke) mode=smoke ;;
-    --full) die "full mode: the survival scenarios arrive with part B of task 12" ;;
+    --smoke) tests=SmokeE2eTest ;;
+    --full) tests=all ;;
+    --scenario) tests=SurvivalE2eTest#${2:?scenario name} ;;
+    --test) tests=${2:?test class} ;;
     --remote) shift; remote "$@"; return ;;
     --in-shell) shift; in_shell "$@"; return ;;
-    *) echo "usage: $0 --smoke | --full" >&2; exit 2 ;;
+    *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]>" >&2; exit 2 ;;
   esac
+  [[ $tests =~ ^[A-Za-z0-9_#]+$ ]] || die "bad test name: $tests"
   cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
   local run_id key
   run_id=$(date +%Y%m%d-%H%M%S)
@@ -213,7 +247,7 @@ main() {
   # The key travels on stdin only: it is not on any command line and not written to disk on the remote host.
   # shellcheck disable=SC2029
   timeout $((BOOT_TIMEOUT + TEST_TIMEOUT + 3600)) ssh "$HOST" \
-    "cd ~/$REMOTE_DIR && exec tools/emulator/run-e2e.sh --remote $mode $tunnel_port $run_id" <<<"$key" || rc=$?
+    "cd ~/$REMOTE_DIR && exec tools/emulator/run-e2e.sh --remote $tests $tunnel_port $run_id" <<<"$key" || rc=$?
 
   [ "$rc" = "$LEAK_EXIT" ] && die "API key leaked on $HOST (see above); artifacts left there"
   log "stage 5: copying artifacts to build/e2e/$run_id"
@@ -221,6 +255,7 @@ main() {
   rsync -a "$HOST:$REMOTE_DIR/.state/runs/$run_id/" "build/e2e/$run_id/" || die "copying artifacts failed"
   APOFIS_KEY=$key
   [ -z "$(find_key "build/e2e/$run_id")" ] || die "API key found in build/e2e/$run_id"
+  check_sessions "build/e2e/$run_id/device/sessions.txt" || { log "FAILED: sessions created by the run were left on the server"; [ "$rc" != 0 ] || rc=1; }
   [ "$rc" = 0 ] || die "remote run failed (exit $rc); artifacts in build/e2e/$run_id"
   log "PASSED; artifacts in build/e2e/$run_id"
 }

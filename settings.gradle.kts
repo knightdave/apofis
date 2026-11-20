@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "apofis"
 include(":app")
+include(":e2e")
