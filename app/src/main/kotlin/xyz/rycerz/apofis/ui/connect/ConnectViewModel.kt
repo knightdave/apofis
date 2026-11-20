@@ -69,14 +69,14 @@ class ConnectViewModel(
         get() = shown
         private set(value) {
             shown = value
-            back?.isEnabled = value == ConnectState.Testing || value == ConnectState.Saving
+            back?.update(this, value == ConnectState.Testing || value == ConnectState.Saving)
         }
     private var pending: Credentials? = null
     private var job: Job? = null
     private var attempt = 0 // bumped by every start and by cancel(); a result of an older attempt is dropped
 
     init {
-        back?.target = this
+        back?.attach(this)
     }
 
     val keepsCurrentKey: Boolean get() = current != null
@@ -115,13 +115,13 @@ class ConnectViewModel(
         state = ConnectState.Testing
         val mine = ++attempt
         return viewModelScope.launch {
-            val result = probe(api, Credentials(baseUrl, key))
+            val result = probe(api, Credentials(baseUrl, key), mine)
             if (attempt == mine) state = result // a cancelled check never shows its late result
         }.also { job = it }
     }
 
     // Every failure other than cancellation ends as a field error.
-    private suspend fun probe(api: HermesApi, c: Credentials): ConnectState {
+    private suspend fun probe(api: HermesApi, c: Credentials, mine: Int): ConnectState {
         try {
             api.capabilities()
         } catch (e: CancellationException) {
@@ -146,7 +146,7 @@ class ConnectViewModel(
             pending = c
             return ConnectState.ConfirmServerChange
         }
-        return saveOrFail(c)
+        return saveOrFail(c, mine)
     }
 
     fun confirmServerChange(): Job? {
@@ -154,7 +154,7 @@ class ConnectViewModel(
         pending = null
         val mine = ++attempt
         return viewModelScope.launch {
-            val result = saveOrFail(c)
+            val result = saveOrFail(c, mine)
             if (attempt == mine) state = result
         }.also { job = it }
     }
@@ -165,8 +165,10 @@ class ConnectViewModel(
     }
 
     // Storage or cache clearing can fail (disk full, keystore error); show it instead of crashing.
-    private suspend fun saveOrFail(c: Credentials): ConnectState = try {
-        currentCoroutineContext().ensureActive() // Back may have cancelled while the server was checked
+    private suspend fun saveOrFail(c: Credentials, mine: Int): ConnectState = try {
+        // Back may have cancelled while the server was checked: a result of a cancelled attempt never saves.
+        if (attempt != mine) throw CancellationException("cancelled")
+        currentCoroutineContext().ensureActive()
         state = ConnectState.Saving
         save(c)
         ConnectState.Connected
@@ -191,10 +193,7 @@ class ConnectViewModel(
     }
 
     override fun onCleared() {
-        if (back?.target === this) {
-            back.target = null
-            back.isEnabled = false
-        }
+        back?.detach(this)
         pending = null
         apiKey.clearText()
     }

@@ -35,7 +35,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
-import xyz.rycerz.apofis.ui.connect.ConnectBack
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
@@ -45,7 +44,7 @@ enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT, LICENSES }
 
 /** State-based navigation: Connect when not connected, otherwise the chat; Settings and Connection from there. */
 @Composable
-fun AppNav(container: AppContainer, connectBack: ConnectBack) {
+fun AppNav(container: AppContainer) {
     var loaded by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         container.load() // decrypts the stored key off the main thread
@@ -75,12 +74,12 @@ fun AppNav(container: AppContainer, connectBack: ConnectBack) {
                     willClearCache = container::willClearCache,
                     save = container::connect,
                     failedBefore = !reconnect && container.consumeSwitchFailure(),
-                    back = connectBack,
+                    back = container.connectBack,
                 )
             }
             LaunchedEffect(vm.state) { if (vm.state == ConnectState.Connected) chosen = Screen.CHAT }
             // Back cancels a running check synchronously before returning to Settings; while saving, cancel() refuses
-            // and Back is swallowed. Without a screen to return to, the activity's ConnectBack handles a busy Back.
+            // and Back is swallowed. Without a screen to return to, the activity's callback handles a busy Back.
             val canGoBack = reconnect && conn != null
             val leave = { if (vm.cancel()) chosen = Screen.SETTINGS }
             BackHandler(enabled = canGoBack, onBack = leave)

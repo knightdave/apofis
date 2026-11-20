@@ -3,6 +3,7 @@ package xyz.rycerz.apofis
 import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -11,8 +12,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.ui.AppNav
-import xyz.rycerz.apofis.ui.connect.ConnectBack
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.isDarkTheme
 
@@ -30,9 +33,18 @@ class MainActivity : ComponentActivity() {
                 }
             },
         )
-        // Added here, not from Compose, so Back cancels a connect check even before the frame that shows it.
-        val connectBack = ConnectBack { moveTaskToBack(true) }
-        onBackPressedDispatcher.addCallback(this, connectBack)
+        // Each Activity adds its own callback (removed with it) and enables it from the container's state, so Back
+        // cancels a connect check before any frame and after rotation. Enabled at once from the current value.
+        val connectBack = container.connectBack
+        val back = object : OnBackPressedCallback(connectBack.busy.value) {
+            override fun handleOnBackPressed() {
+                if (connectBack.cancel()) moveTaskToBack(true) // while saving: consumed, nothing happens
+            }
+        }
+        onBackPressedDispatcher.addCallback(this, back)
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) { connectBack.busy.collect { back.isEnabled = it } }
+        }
         setContent {
             val prefs = container.preferences
             val mode by prefs.themeMode.collectAsState()
@@ -45,7 +57,7 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            ApofisTheme(mode, dynamicColor, pureBlack) { AppNav(container, connectBack) }
+            ApofisTheme(mode, dynamicColor, pureBlack) { AppNav(container) }
         }
     }
 }

@@ -1,6 +1,5 @@
 package xyz.rycerz.apofis.ui.connect
 
-import androidx.activity.OnBackPressedDispatcher
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewmodel.initializer
@@ -9,6 +8,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -249,36 +249,29 @@ class ConnectViewModelTest {
     }
 
     @Test
-    fun systemBackCancelsAProbeStartedThisInstant() = runTest {
+    fun backHolderFollowsTheCheckAndCancelsIt() = runTest {
         server.enqueue(
             MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(500, TimeUnit.MILLISECONDS).build(),
         )
-        var left = 0
-        val dispatcher = OnBackPressedDispatcher()
-        val back = ConnectBack { left++ }
-        dispatcher.addCallback(back) // as MainActivity does in onCreate, before any composition
+        val back = ConnectBack()
         val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, back = back)
-        assertFalse(dispatcher.hasEnabledCallbacks())
+        assertFalse(back.busy.value)
         vm.onUrlChange(server.url("/").toString())
         vm.onKeyChange("sk-1")
         vm.connect()
 
-        assertTrue(dispatcher.hasEnabledCallbacks()) // no frame needed between connect() and Back
-        dispatcher.onBackPressed()
-        assertEquals(1, left)
+        assertTrue(back.busy.value) // set synchronously by connect()
+        assertTrue(back.cancel())
         assertEquals(ConnectState.Idle, vm.state)
-        assertFalse(dispatcher.hasEnabledCallbacks())
+        assertFalse(back.busy.value)
         withContext(Dispatchers.IO) { Thread.sleep(800) } // past the moment the response arrives
         assertTrue(saved.isEmpty())
     }
 
     @Test
-    fun systemBackIsConsumedAndIgnoredWhileSaving() = runTest {
+    fun backHolderRefusesWhileSaving() = runTest {
         server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
-        var left = 0
-        val dispatcher = OnBackPressedDispatcher()
-        val back = ConnectBack { left++ }
-        dispatcher.addCallback(back)
+        val back = ConnectBack()
         val release = CompletableDeferred<Unit>()
         val vm = ConnectViewModel(null, willClearCache = { false }, save = {
             release.await()
@@ -289,14 +282,38 @@ class ConnectViewModelTest {
         val job = vm.connect()!!
         withContext(Dispatchers.IO) { while (vm.state != ConnectState.Saving) Thread.sleep(10) }
 
-        assertTrue(dispatcher.hasEnabledCallbacks())
-        dispatcher.onBackPressed()
-        assertEquals(0, left)
+        assertTrue(back.busy.value)
+        assertFalse(back.cancel())
         release.complete(Unit)
         job.join()
         assertEquals(ConnectState.Connected, vm.state)
         assertEquals(1, saved.size)
-        assertFalse(dispatcher.hasEnabledCallbacks())
+        assertFalse(back.busy.value)
+    }
+
+    @Test
+    fun aResultArrivingAfterCancelNeverSaves() = runTest {
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        val inCheck = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        // A step that ignores cancellation, so only the save step's own check can stop the save.
+        val vm = ConnectViewModel(null, willClearCache = {
+            withContext(NonCancellable) {
+                inCheck.complete(Unit)
+                release.await()
+            }
+            false
+        }, save = { saved += it })
+        vm.onUrlChange(server.url("/").toString())
+        vm.onKeyChange("sk-1")
+        val job = vm.connect()!!
+        inCheck.await()
+
+        assertTrue(vm.cancel())
+        release.complete(Unit)
+        job.join()
+        assertTrue(saved.isEmpty())
+        assertEquals(ConnectState.Idle, vm.state)
     }
 
     @Test

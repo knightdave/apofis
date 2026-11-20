@@ -34,6 +34,7 @@ import xyz.rycerz.apofis.sync.RunStarter
 import xyz.rycerz.apofis.sync.SendQueue
 import xyz.rycerz.apofis.sync.SendWorker
 import xyz.rycerz.apofis.sync.withRepositoryLock
+import xyz.rycerz.apofis.ui.connect.ConnectBack
 
 /**
  * Everything bound to one server and key. Closed as a whole when the credentials change. After [close]:
@@ -97,6 +98,9 @@ class AppContainer(
 ) {
     val preferences = Preferences(app)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + logOnly)
+
+    /** Back during a connect check; here so it outlives rotation. */
+    val connectBack = ConnectBack()
 
     // One database for the app's lifetime; it outlives credential changes.
     private val db by lazy(openDatabase)

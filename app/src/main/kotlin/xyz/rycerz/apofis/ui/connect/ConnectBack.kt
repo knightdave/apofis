@@ -1,16 +1,37 @@
 package xyz.rycerz.apofis.ui.connect
 
-import androidx.activity.OnBackPressedCallback
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * System Back while a connect check or save runs, added by the activity in onCreate so it works before any frame.
- * The [ConnectViewModel] it is given to enables it synchronously as it enters Testing or Saving. Back then cancels the
- * check and calls [leave]; while saving it is consumed and does nothing.
+ * Owned by the container, so it outlives rotation and holds nothing of an Activity. The current [ConnectViewModel]
+ * reports here synchronously whether a check or save runs ([busy]); each Activity enables its own Back callback from
+ * [busy] and calls [cancel] on Back.
  */
-class ConnectBack(private val leave: () -> Unit) : OnBackPressedCallback(false) {
-    internal var target: ConnectViewModel? = null
+class ConnectBack {
+    private val busyFlow = MutableStateFlow(false)
+    val busy: StateFlow<Boolean> = busyFlow.asStateFlow()
 
-    override fun handleOnBackPressed() {
-        if (target?.cancel() == true) leave()
+    // Main thread only.
+    internal var target: ConnectViewModel? = null
+        private set
+
+    /** Cancels a running check and returns true; false while saving (Back is consumed) or with nothing to cancel. */
+    fun cancel(): Boolean = target?.cancel() == true
+
+    internal fun attach(vm: ConnectViewModel) {
+        target = vm
+        busyFlow.value = false
+    }
+
+    internal fun update(vm: ConnectViewModel, busy: Boolean) {
+        if (target === vm) busyFlow.value = busy
+    }
+
+    internal fun detach(vm: ConnectViewModel) {
+        if (target !== vm) return
+        target = null
+        busyFlow.value = false
     }
 }
