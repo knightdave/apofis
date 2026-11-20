@@ -144,6 +144,8 @@
     <string name="licenses_commonmark">commonmark-java (BSD 2-Clause)</string>
     <string name="md_image">Image</string>
     <string name="md_table">Table</string>
+    <string name="md_table_copy">Copy table</string>
+    <string name="code_copy">Copy code</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
     <string name="drawer_open">Open chat list</string>
     <string name="drawer_new_chat">New chat</string>

@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import androidx.compose.ui.text.AnnotatedString
 import java.text.BreakIterator
 import java.text.StringCharacterIterator
 import xyz.rycerz.apofis.ui.chat.CHUNK
@@ -62,8 +63,12 @@ sealed interface DisplayChunk {
     /** Plain text, as milestone 1 showed every paragraph. */
     data class Literal(val text: String) : DisplayChunk
 
-    /** Monospace code; [start] is the raw offset of this slice in the reply text. */
-    data class Code(val text: String, val start: Int, val first: Boolean, val last: Boolean) : DisplayChunk
+    /**
+     * Monospace code; [start] is the offset of this slice in the reply text (line endings LF). [highlighted]: [text]
+     * with theme-free syntax annotations (see [tokens]), sliced from the whole block; null while the fence is open, for
+     * a plain language or over [HIGHLIGHT_MAX_CHARS].
+     */
+    data class Code(val text: String, val start: Int, val first: Boolean, val last: Boolean, val highlighted: AnnotatedString? = null) : DisplayChunk
 }
 
 /**
@@ -75,7 +80,9 @@ sealed interface DisplayChunk {
 fun displayChunks(source: CharSequence, block: LogicalBlock): List<DisplayChunk> {
     if (block.kind == BlockKind.CODE || block.mode == BlockMode.LITERAL || !parseable(source, block)) {
         val out = ArrayList<DisplayChunk>()
-        rawPieces(source, block, block.start) { s, e, _, last -> out += rawChunk(source, block, s, e, last) }
+        // A closed fence is highlighted once over its whole source, so a comment or string keeps its color across cuts.
+        val whole = if (highlighted(block)) tokens(source.subSequence(block.start, block.end), languageOf(block.lang)!!) else null
+        rawPieces(source, block, block.start) { s, e, _, last -> out += rawChunk(source, block, s, e, last, whole) }
         return out
     }
     Work.markdownParses++
@@ -103,10 +110,17 @@ private fun parseable(source: CharSequence, block: LogicalBlock): Boolean {
     return true
 }
 
-/** The chunk for piece [s, e) of a LITERAL or CODE block. */
-internal fun rawChunk(source: CharSequence, block: LogicalBlock, s: Int, e: Int, last: Boolean): DisplayChunk =
-    if (block.kind == BlockKind.CODE) DisplayChunk.Code(source.substring(s, e), s, first = s == block.start, last = last)
-    else DisplayChunk.Literal(source.substring(s, e))
+/** Whether [block] is shown highlighted: a closed fence of a known language within [HIGHLIGHT_MAX_CHARS]. */
+internal fun highlighted(block: LogicalBlock): Boolean =
+    block.kind == BlockKind.CODE && block.fenceClosed && block.end - block.start <= HIGHLIGHT_MAX_CHARS && languageOf(block.lang) != null
+
+/** The chunk for piece [s, e) of a LITERAL or CODE block; [whole]: the highlighted block, sliced here. */
+internal fun rawChunk(source: CharSequence, block: LogicalBlock, s: Int, e: Int, last: Boolean, whole: AnnotatedString? = null): DisplayChunk =
+    if (block.kind == BlockKind.CODE) {
+        DisplayChunk.Code(source.substring(s, e), s, first = s == block.start, last = last, whole?.subSequence(s - block.start, e - block.start))
+    } else {
+        DisplayChunk.Literal(source.substring(s, e))
+    }
 
 /**
  * Cuts a LITERAL or CODE block from [from] (a piece start) to its end. [emit] gets each piece, the offset up to which

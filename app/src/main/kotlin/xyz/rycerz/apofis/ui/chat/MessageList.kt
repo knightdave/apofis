@@ -12,7 +12,9 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -45,6 +47,8 @@ import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_CHARS
 import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_COLUMNS
 import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_ROWS
 import xyz.rycerz.apofis.ui.markdown.displayChunks
+import xyz.rycerz.apofis.ui.markdown.highlighted
+import xyz.rycerz.apofis.ui.markdown.infoWord
 import xyz.rycerz.apofis.ui.markdown.rawChunk
 import xyz.rycerz.apofis.ui.markdown.rawPieces
 
@@ -155,7 +159,7 @@ internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<Logical
     }
     if (fence) {
         endPara(s, out, true, i)
-        s.fenceLang = text.substring(first + FENCE.length, end).trim()
+        s.fenceLang = infoWord(text, first + FENCE.length, end)
         s.fenceBody = minOf(nl + 1, text.length)
         return
     }
@@ -448,6 +452,10 @@ internal object Work {
     var largestParse = 0 // the longest source handed to the markdown parser
     var lfChars = 0L // characters written while making line endings LF
     var parseFailures = 0L // blocks shown literally because parsing or slicing threw: a bug, never expected
+    var highlights = 0L // code blocks handed to the highlighter
+    var highlightSteps = 0L // characters the highlighter looked at
+    var largestHighlight = 0 // the longest code handed to the highlighter
+    var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
 }
 
 /**
@@ -505,8 +513,32 @@ private fun blockRows(key: String, b: LogicalBlock, text: CharSequence): List<Te
 /** [text] with CRLF and bare CR as LF: done once where text comes in, so every later stage sees one line ending. */
 internal fun lf(text: String): String = if (text.indexOf('\r') < 0) text else text.replace("\r\n", "\n").replace('\r', '\n')
 
-/** Every text row of a reply, parsed from scratch. */
-internal fun replyRows(key: String, text: String): List<TextRow> = lf(text).let { t -> parseBlocks(t).flatMap { blockRows(key, it, t) } }
+/**
+ * Every text row of a reply, parsed from scratch. [closeFences]: the reply is no longer live, so an unclosed fence is
+ * shown closed (highlighted, with its bottom edge); a live reply's open fence stays plain until it closes.
+ */
+internal fun replyRows(key: String, text: String, closeFences: Boolean = false): List<TextRow> = lf(text).let { t ->
+    parseBlocks(t).flatMap { b -> blockRows(key, if (closeFences && b.kind == BlockKind.CODE) b.copy(fenceClosed = true) else b, t) }
+}
+
+/** The raw source (line endings LF) of logical block [blockIndex] of [replyText], from a fresh parse; null if none. */
+internal fun blockSource(replyText: String, blockIndex: Int): String? {
+    val t = lf(replyText)
+    return parseBlocks(t).getOrNull(blockIndex)?.let { t.substring(it.start, it.end) }
+}
+
+/** What Copy puts on the clipboard for text row [rowKey]: the raw source of its whole block in the canonical reply. */
+internal fun copySource(items: List<ChatItem>, rowKey: String): String? {
+    val key = replyKeyOf(rowKey)
+    val reply = items.lastOrNull { it is AssistantReply && it.key == key } as AssistantReply? ?: return null
+    return blockSource(reply.text, blockIndexOf(rowKey))
+}
+
+/** The reply key of a text row key `<reply>/b<i>/c<j>`. */
+internal fun replyKeyOf(rowKey: String): String = rowKey.substringBeforeLast("/b")
+
+/** The logical block index of a text row key `<reply>/b<i>/c<j>`, or -1. */
+internal fun blockIndexOf(rowKey: String): Int = rowKey.substringAfterLast("/b").substringBefore("/c").toIntOrNull() ?: -1
 
 /** The first [size] elements of [backing], which is only ever appended to: a view, never a copy. */
 private class Prefix<T>(private val backing: List<T>, override val size: Int) : AbstractList<T>() {
@@ -643,7 +675,8 @@ internal class ReplyText {
         if (same && p!!.end == b.end && p.fenceClosed == b.fenceClosed) {
             return Open(b, prev!!.settled, prev.starts, prev.decided, prev.size, prev.loose, prev.looseStart)
         }
-        if (b.kind != BlockKind.CODE && b.mode == BlockMode.PARSED) return Open(b, ArrayList(), ArrayList(), ArrayList(), 0, blockRows(key, b, text), b.start)
+        // A closed fence that is highlighted is built whole once (highlighting runs over the whole block, then slices).
+        if ((b.kind != BlockKind.CODE && b.mode == BlockMode.PARSED) || highlighted(b)) return Open(b, ArrayList(), ArrayList(), ArrayList(), 0, blockRows(key, b, text), b.start)
         var settled = ArrayList<TextRow>()
         var starts = ArrayList<Int>()
         var decided = ArrayList<Int>()
@@ -838,7 +871,7 @@ internal class ChatRows(private val zone: ZoneId) {
             is Notice -> listOf(NoticeRow(item))
             is AssistantReply -> buildList {
                 if (item.steps.isNotEmpty()) add(StepsRow(item))
-                addAll(replyRows(item.key, item.text))
+                addAll(replyRows(item.key, item.text, closeFences = !item.live))
                 if (item.live || item.outcome != null) add(FooterRow(item))
             }
         }
@@ -863,6 +896,7 @@ internal fun MessageList(
     onLink: (String) -> Unit = {},
 ) {
     val builder = remember(zone) { ChatRows(zone) }
+    val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
     // One sideways scroll per table, shared by its slices (separate list items), by "<reply>/b<index>".
     val tableScrolls = remember { HashMap<String, ScrollState>() }
     val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
@@ -885,12 +919,14 @@ internal fun MessageList(
                             val step = row.reply.steps[i] as ToolStep
                             onStep(StepSubject(row.reply.key, i, step.callId.ifEmpty { null }, step.name))
                         }
-                        is TextRow ->
+                        is TextRow -> {
+                            val source = { copySource(latest, row.key) }
                             if (row.kind == BlockKind.TABLE) {
-                                TextBlock(row, onLink, tableScrolls.getOrPut(row.key.substringBeforeLast("/c")) { ScrollState(0) })
+                                TextBlock(row, onLink, tableScrolls.getOrPut(row.key.substringBeforeLast("/c")) { ScrollState(0) }, source)
                             } else {
-                                TextBlock(row, onLink)
+                                TextBlock(row, onLink, source = source)
                             }
+                        }
                         is FooterRow -> ReplyFooter(row.reply, live.takeIf { row.reply.live }, notes, answering, actions)
                         is NoticeRow -> NoticeLine(row.notice.text)
                         GoneRow -> Notice(R.string.chat_answer_gone)

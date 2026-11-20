@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -35,6 +36,10 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import xyz.rycerz.apofis.R
@@ -46,7 +51,12 @@ import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.ui.markdown.BlockKind
 import xyz.rycerz.apofis.ui.markdown.DisplayChunk
+import xyz.rycerz.apofis.ui.markdown.CopyButton
 import xyz.rycerz.apofis.ui.markdown.MarkdownChunk
+import xyz.rycerz.apofis.ui.markdown.Tone
+import xyz.rycerz.apofis.ui.markdown.blockFrame
+import xyz.rycerz.apofis.ui.markdown.styled
+import xyz.rycerz.apofis.ui.markdown.syntaxColors
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.scaled
@@ -54,11 +64,12 @@ import xyz.rycerz.apofis.ui.theme.wash
 
 /**
  * One display chunk of a logical block: markdown (flat, full width) or a fenced code block (monospace, scrolls
- * sideways). Chunks of one block sit flush against each other: only the first has the top spacing and label, only the
- * last the bottom. [tableScroll] is shared by the slices of one table.
+ * sideways). Chunks of one block sit flush against each other: only the first has the top spacing and the header, only
+ * the last the bottom. [tableScroll] is shared by the slices of one table; [source] gives the raw source of the whole
+ * block for Copy.
  */
 @Composable
-internal fun TextBlock(row: TextRow, onLink: (String) -> Unit = {}, tableScroll: ScrollState = rememberScrollState()) {
+internal fun TextBlock(row: TextRow, onLink: (String) -> Unit = {}, tableScroll: ScrollState = rememberScrollState(), source: () -> String? = { null }) {
     if (row.kind != BlockKind.CODE) {
         // Half the 0.9 b block spacing above and below each block.
         val half = with(LocalDensity.current) { (scaled(ChatText.assistant).fontSize * 0.45f).toDp() }
@@ -67,34 +78,34 @@ internal fun TextBlock(row: TextRow, onLink: (String) -> Unit = {}, tableScroll:
             onLink,
             Modifier.padding(start = 20.dp, end = 20.dp, top = if (row.first) half else 0.dp, bottom = if (row.joinBelow) 0.dp else half),
             tableScroll,
+            source,
         )
         return
     }
-    val text = (row.chunk as? DisplayChunk.Code)?.text ?: ""
-    val top = if (row.first) 6.dp else 0.dp
-    val bottom = if (row.joinBelow) 0.dp else 6.dp
-    val radius = 16.dp
-    val shape = RoundedCornerShape(
-        topStart = if (row.first) radius else 0.dp,
-        topEnd = if (row.first) radius else 0.dp,
-        bottomStart = if (row.joinBelow) 0.dp else radius,
-        bottomEnd = if (row.joinBelow) 0.dp else radius,
-    )
+    val code = row.chunk as? DisplayChunk.Code
+    val colors = ApofisTheme.colors
+    val onSurface = MaterialTheme.colorScheme.onSurface
+    val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+    val syntax = remember(dark, colors.codeFill, onSurface) { syntaxColors(dark, colors.codeFill, onSurface) }
+    val tokens = code?.highlighted
+    val text = if (tokens != null) remember(tokens, syntax) { styled(tokens, syntax) } else AnnotatedString(code?.text ?: "")
     Column(
         Modifier
-            .padding(start = 16.dp, end = 16.dp, top = top, bottom = bottom)
+            .padding(start = 16.dp, end = 16.dp, top = if (row.first) 6.dp else 0.dp, bottom = if (row.joinBelow) 0.dp else 6.dp)
             .fillMaxWidth()
-            .background(ApofisTheme.colors.cardFill, shape)
-            // A border per chunk would draw lines across a long block, so only a block of one chunk has it.
-            .then(if (row.first && !row.joinBelow) Modifier.border(1.dp, ApofisTheme.colors.hairline, shape) else Modifier),
+            // The bottom edge and corners close the block only once its fence is closed (or the reply is not live).
+            .blockFrame(row.first, !row.joinBelow && row.fenceClosed, colors.hairline, 16.dp)
+            .background(colors.codeFill),
     ) {
-        if (row.first && row.lang.isNotEmpty()) {
-            Text(
-                row.lang,
-                Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp),
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        if (row.first) {
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(start = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // At most 32 characters of one word (see infoWord), on one line.
+                Text(row.lang, Modifier.weight(1f), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                CopyButton(R.string.code_copy, source)
+            }
         }
         Text(
             text,
@@ -102,7 +113,7 @@ internal fun TextBlock(row: TextRow, onLink: (String) -> Unit = {}, tableScroll:
                 .horizontalScroll(rememberScrollState())
                 .padding(start = 12.dp, end = 12.dp, top = if (row.first) 8.dp else 0.dp, bottom = if (row.joinBelow) 0.dp else 8.dp),
             style = scaled(ChatText.code),
-            color = MaterialTheme.colorScheme.onSurface,
+            color = if (tokens != null) syntax[Tone.CODE.ordinal] else onSurface,
             softWrap = false,
         )
     }

@@ -1,5 +1,18 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import android.content.ClipboardManager
+import android.content.Context
+import androidx.compose.foundation.layout.Column
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.test.core.app.ApplicationProvider
+import java.time.ZoneOffset
+import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.ui.chat.ChatRows
+import xyz.rycerz.apofis.ui.chat.TextBlock
+import xyz.rycerz.apofis.ui.chat.TextRow
+import xyz.rycerz.apofis.ui.chat.copySource
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
@@ -93,5 +106,47 @@ class MarkdownUiTest {
         assertEquals(1, rule.onAllNodes(state(ToggleableState.Off) and hasText("open")).fetchSemanticsNodes().size)
         assertEquals(1, rule.onAllNodes(state(ToggleableState.On) and hasText("done")).fetchSemanticsNodes().size)
         assertEquals(0, rule.onAllNodes(hasClickAction(), useUnmergedTree = true).fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun copyButtonsCopyTheWholeBlockAndShowPressAndFocus() {
+        rule.mainClock.autoAdvance = false
+        lateinit var inputMode: InputModeManager
+        val body = (1..300).joinToString("\n") { "val v$it = \"s$it\" // $it" }
+        val table = "| a | b |\n|---|---|\n| 1 | 2 |"
+        val items = listOf(AssistantReply("r1", emptyList(), "```kotlin\n$body\n```\n\n$table", 0.0))
+        val rows = ChatRows(ZoneOffset.UTC).rows(items).filterIsInstance<TextRow>()
+        val code = rows.first { it.kind == BlockKind.CODE }
+        assertTrue(rows.count { it.kind == BlockKind.CODE } > 1) // the block is split, Copy still takes all of it
+        val tableRow = rows.first { it.kind == BlockKind.TABLE }
+        rule.setContent {
+            Themed {
+                inputMode = LocalInputModeManager.current
+                Column {
+                    TextBlock(tableRow, source = { copySource(items, tableRow.key) })
+                    TextBlock(code, source = { copySource(items, code.key) }) // only its header needs to be on screen
+                }
+            }
+        }
+        rule.mainClock.advanceTimeBy(frames)
+        val clipboard = ApplicationProvider.getApplicationContext<Context>().getSystemService(ClipboardManager::class.java)
+        for ((description, expected) in listOf("Copy code" to body, "Copy table" to table)) {
+            val button = rule.onNodeWithContentDescription(description)
+            button.assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button)).assert(hasClickAction())
+            val idle = button.captureToImage()
+            button.performTouchInput { down(center) }
+            rule.mainClock.advanceTimeBy(frames)
+            assertFalse("$description shows no press", same(idle, button.captureToImage()))
+            button.performTouchInput { up() }
+            rule.mainClock.advanceTimeBy(frames)
+            rule.waitForIdle()
+            assertEquals(description, expected, clipboard.primaryClip?.getItemAt(0)?.text?.toString())
+            assertTrue("$description still looks pressed", same(idle, button.captureToImage()))
+            rule.runOnUiThread { inputMode.requestInputMode(InputMode.Keyboard) }
+            button.requestFocus()
+            rule.mainClock.advanceTimeBy(frames)
+            assertFalse("$description shows no focus", same(idle, button.captureToImage()))
+            rule.runOnUiThread { inputMode.requestInputMode(InputMode.Touch) }
+        }
     }
 }

@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import android.content.ClipData
+import androidx.annotation.StringRes
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -27,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -44,6 +47,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -70,6 +75,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import xyz.rycerz.apofis.R
+import kotlinx.coroutines.launch
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.scaled
@@ -79,13 +86,19 @@ import xyz.rycerz.apofis.ui.theme.scaled
  * shared by every slice of one table, so they scroll sideways together.
  */
 @Composable
-fun MarkdownChunk(chunk: DisplayChunk, onLink: (String) -> Unit, modifier: Modifier = Modifier, tableScroll: ScrollState = rememberScrollState()) {
+fun MarkdownChunk(
+    chunk: DisplayChunk,
+    onLink: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    tableScroll: ScrollState = rememberScrollState(),
+    source: () -> String? = { null },
+) {
     val body = scaled(ChatText.assistant)
     val link by rememberUpdatedState(onLink)
     val open: (String) -> Unit = { link(it) }
     when (chunk) {
         is DisplayChunk.Blocks -> Blocks(chunk.blocks, body, MaterialTheme.colorScheme.onSurface, false, open, modifier)
-        is DisplayChunk.TableSlice -> Table(chunk.table, chunk.from, chunk.to, chunk.widths, chunk.first, chunk.last, tableScroll, open, modifier)
+        is DisplayChunk.TableSlice -> Table(chunk.table, chunk.from, chunk.to, chunk.widths, chunk.first, chunk.last, tableScroll, open, source, modifier)
         is DisplayChunk.Literal -> Text(chunk.text, modifier.fillMaxWidth(), style = body, color = MaterialTheme.colorScheme.onSurface)
         is DisplayChunk.Code -> Text(
             chunk.text,
@@ -141,7 +154,7 @@ private fun Block(b: MdBlock, body: TextStyle, color: Color, strike: Boolean, on
             )
         }
         is MdBlock.ListBlock -> ListView(b, body, color, strike, onLink)
-        is MdBlock.Table -> Table(b, 0, b.rows.size, remember(b) { tableWidths(b) }, first = true, last = true, rememberScrollState(), onLink)
+        is MdBlock.Table -> Table(b, 0, b.rows.size, remember(b) { tableWidths(b) }, first = true, last = true, rememberScrollState(), onLink, { null }) // unreachable: tables are their own logical blocks
         is MdBlock.Image -> ImageTile(b, onLink)
         MdBlock.Rule -> Box(Modifier.fillMaxWidth().padding(vertical = 12.dp).height(1.dp).background(colors.hairline))
     }
@@ -311,6 +324,7 @@ private fun Table(
     last: Boolean,
     scroll: ScrollState,
     onLink: (String) -> Unit,
+    source: () -> String?,
     modifier: Modifier = Modifier,
 ) {
     val colors = ApofisTheme.colors
@@ -325,15 +339,16 @@ private fun Table(
         val total = width(columns)
         // A narrow table shares the spare width, each column up to the cap; what is left stays outside the frame.
         val fitted = if (total < maxWidth && columns.isNotEmpty()) columns.map { minOf(MaxColumn, it + (maxWidth - total) / columns.size) } else columns
-        Column(Modifier.width(minOf(maxWidth, width(fitted))).tableFrame(first, last, colors.tableBorder)) {
+        Column(Modifier.width(minOf(maxWidth, width(fitted))).blockFrame(first, last, colors.tableBorder, TableRadius)) {
             if (first) {
                 Row(
-                    Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(horizontal = 12.dp),
+                    Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(start = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(painterResource(R.drawable.lucide_table), null, Modifier.size(16.dp), tint = colors.codeLabel)
                     Box(Modifier.width(6.dp))
-                    Text(stringResource(R.string.md_table), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel)
+                    Text(stringResource(R.string.md_table), Modifier.weight(1f), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel, maxLines = 1)
+                    CopyButton(R.string.md_table_copy, source)
                 }
             }
             Column(Modifier.horizontalScroll(scroll)) {
@@ -367,8 +382,8 @@ private fun TableRow(cells: List<MdText>, align: List<Align>, widths: List<Dp>, 
 }
 
 /** Clips to a rounded frame and draws its outline; an edge that continues in the next or previous slice is open. */
-private fun Modifier.tableFrame(first: Boolean, last: Boolean, color: Color) = clipToBounds().drawWithCache {
-    val r = TableRadius.toPx()
+internal fun Modifier.blockFrame(first: Boolean, last: Boolean, color: Color, radius: Dp) = clipToBounds().drawWithCache {
+    val r = radius.toPx()
     val stroke = 1.dp.toPx()
     val top = if (first) 0f else -r
     val bottom = if (last) size.height else size.height + r
@@ -379,5 +394,20 @@ private fun Modifier.tableFrame(first: Boolean, last: Boolean, color: Color) = c
     onDrawWithContent {
         clipPath(clip) { this@onDrawWithContent.drawContent() }
         drawPath(outline, color, style = Stroke(stroke))
+    }
+}
+
+/** A header action: copies [source] (the raw source of the whole block) to the clipboard as plain text, no toast. */
+@Composable
+internal fun CopyButton(@StringRes description: Int, source: () -> String?) {
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    val current by rememberUpdatedState(source)
+    ApofisIconButton(
+        onClick = { current()?.let { text -> scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(null, text))) } } },
+        contentDescription = stringResource(description),
+        visualSize = 24.dp,
+    ) {
+        Icon(painterResource(R.drawable.lucide_copy), null, Modifier.size(16.dp), tint = ApofisTheme.colors.codeLabel)
     }
 }
