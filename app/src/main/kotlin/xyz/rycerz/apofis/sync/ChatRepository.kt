@@ -1,12 +1,13 @@
 package xyz.rycerz.apofis.sync
 
 import androidx.room.withTransaction
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.MessageDto
@@ -52,12 +53,22 @@ class ChatRepository(
     /** Server rows, then pending sends (oldest first) as unsent [UserMessage]s, with reply outcomes attached. */
     fun transcript(sessionKey: String): Flow<List<ChatItem>> {
         requireAppKey(sessionKey)
-        // Mapped once per change of the message rows, then reused when only pending sends or outcomes change.
-        val server = db.messageDao().observe(sessionKey).distinctUntilChanged()
-            .map { rows -> rows.withIndex().associate { (i, row) -> row.id to i } to buildTranscript(rows.map { it.toDto() }) }
-        return combine(server, db.replyOutcomeDao().observe(sessionKey), db.pendingSendDao().observe(sessionKey)) { (positions, items), outcomes, pending ->
-            withOutcomes(positions, items, outcomes) + pending.map { it.toItem() }
-        }
+        return flow {
+            var lastRows: List<MessageEntity>? = null
+            var mapped: Pair<Map<Long, Int>, List<ChatItem>> = emptyMap<Long, Int>() to emptyList()
+            db.invalidationTracker.createFlow("MessageEntity", "PendingSendEntity", "ReplyOutcomeEntity").collect {
+                // One read transaction for all three tables: a send moving from pending to the transcript is never in neither.
+                val (rows, outcomes, pending) = db.withTransaction {
+                    Triple(db.messageDao().rows(sessionKey), db.replyOutcomeDao().rows(sessionKey), db.pendingSendDao().rows(sessionKey))
+                }
+                // Mapped once per change of the message rows, then reused when only pending sends or outcomes change.
+                if (rows != lastRows) {
+                    lastRows = rows
+                    mapped = rows.withIndex().associate { (i, row) -> row.id to i } to buildTranscript(rows.map { it.toDto() })
+                }
+                emit(withOutcomes(mapped.first, mapped.second, outcomes) + pending.map { it.toItem() })
+            }
+        }.distinctUntilChanged()
     }
 
     suspend fun refreshSessions() = lock.withLock {
@@ -113,20 +124,71 @@ class ChatRepository(
         }
     }
 
-    suspend fun syncMessages(sessionKey: String) {
+    /** True when the transcript was fetched: a request was made and the server accepted it. */
+    suspend fun syncMessages(sessionKey: String): Boolean {
         requireAppKey(sessionKey)
-        lock.withLock {
-            val session = sessionDao.get(sessionKey) ?: return
-            if (!session.existsOnServer || session.hidden) return
-            val (tip, messages) = fetchMessages(session.currentId)
-            val rows = messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
-            db.withTransaction {
-                val current = sessionDao.get(sessionKey) ?: return@withTransaction
-                if (current.hidden) return@withTransaction
-                db.messageDao().replaceSession(sessionKey, rows)
-                sessionDao.upsert(current.movedTo(tip).copy(stale = false))
-            }
+        return lock.withLock {
+            val (tip, rows) = fetchRows(sessionKey) ?: return@withLock false
+            db.withTransaction { replaceRows(sessionKey, tip, rows) }
+            true
         }
+    }
+
+    /**
+     * Like [syncMessages], and runs [afterReplace] with the fetched rows inside the transaction that writes them, so
+     * no observer sees a state between the two. Only the fetch is cancellable: from the write on, through
+     * [afterCommit] (run after the lock is released, only when the transaction committed with the block run), the
+     * call completes even if the caller is cancelled. [onFetched] runs as soon as the fetch has returned, before
+     * the write. True when the transcript was fetched.
+     */
+    suspend fun syncMessages(
+        sessionKey: String,
+        onFetched: () -> Unit = {},
+        afterCommit: suspend () -> Unit = {},
+        afterReplace: suspend (List<MessageDto>) -> Unit,
+    ): Boolean {
+        requireAppKey(sessionKey)
+        lock.lock()
+        val fetched = try {
+            fetchRows(sessionKey)
+        } catch (e: Throwable) {
+            lock.unlock()
+            throw e
+        }
+        if (fetched == null) {
+            lock.unlock()
+            return false
+        }
+        onFetched()
+        val (tip, rows) = fetched
+        withContext(NonCancellable) {
+            val written = try {
+                db.withTransaction {
+                    replaceRows(sessionKey, tip, rows).also { if (it) afterReplace(rows.map { r -> r.toDto() }) }
+                }
+            } finally {
+                lock.unlock()
+            }
+            if (written) afterCommit()
+        }
+        return true
+    }
+
+    /** Under the lock: the server transcript as rows, or null when the chat has no server copy (no request made). */
+    private suspend fun fetchRows(sessionKey: String): Pair<String, List<MessageEntity>>? {
+        val session = sessionDao.get(sessionKey) ?: return null
+        if (!session.existsOnServer || session.hidden) return null
+        val (tip, messages) = fetchMessages(session.currentId)
+        return tip to messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
+    }
+
+    /** In a transaction: false when the chat went away or got hidden since the fetch. */
+    private suspend fun replaceRows(sessionKey: String, tip: String, rows: List<MessageEntity>): Boolean {
+        val current = sessionDao.get(sessionKey) ?: return false
+        if (current.hidden) return false
+        db.messageDao().replaceSession(sessionKey, rows)
+        sessionDao.upsert(current.movedTo(tip).copy(stale = false))
+        return true
     }
 
     suspend fun createLocalSession(): String = lock.withLock {
