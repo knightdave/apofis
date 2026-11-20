@@ -1580,10 +1580,11 @@ class RunFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("completed"))
-        val once = AtomicBoolean(false)
+        val paused = gate()
         f.beforeStatusApply = {
-            if (once.compareAndSet(false, true)) {
-                pauseAll() // lands after the read returned, before its result is applied
+            if (paused.count > 0) {
+                pauseAll() // lands after the read returned, at the first point that can be cancelled
+                paused.countDown()
                 yield()
             }
         }
@@ -1592,8 +1593,8 @@ class RunFollowerTest {
         addRun()
         f.resumeAll()
 
+        awaitUntil { paused.count == 0L } // the pause itself happened
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
-        assertTrue(once.get()) // the pause did land before the apply
     }
 
     @Test
@@ -1819,9 +1820,15 @@ class RunFollowerTest {
         val atRetry = CopyOnWriteArrayList<String>()
         val f = follower(done, onDelay = {
             atRetry += "live=${live(KEY).value?.status} row=${db.activeRunDao().forSession(KEY)?.status}"
+            db.openHelper.writableDatabase.execSQL("DROP TRIGGER IF EXISTS fail_terminal")
         })
+        // The first terminal write itself is attempted and fails in SQLite; the trigger is dropped at the retry delay.
+        db.openHelper.writableDatabase.execSQL(
+            "CREATE TRIGGER fail_terminal BEFORE UPDATE OF status ON ActiveRunEntity WHEN NEW.status = 'completed' " +
+                "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
         val stores = AtomicInteger()
-        f.beforeStatusStore = { if (it == "completed" && stores.getAndIncrement() == 0) throw SQLiteException("disk I/O error") }
+        f.beforeStatusStore = { if (it == "completed") stores.incrementAndGet() }
         val finish = gate()
         gatedMessages(finish)
         on(STATUS, status("completed"))
@@ -1837,6 +1844,21 @@ class RunFollowerTest {
     }
 
     private val stopPath = "/v1/runs/$RUN/stop"
+    private val stopAccepted = json("""{"run_id":"$RUN","status":"stopping"}""")
+
+    /** The position of [request] among the stop requests, in the order the server recorded them. */
+    private fun stopIndex(request: RecordedRequest) = requestsTo(stopPath).indexOfFirst { it === request }
+
+    /** A run whose stream ends in a cancellation only once [release] opens; its transcript sync answers at once. */
+    private suspend fun cancelledOnRelease(f: RunFollower, release: CountDownLatch) {
+        on(STATUS, status("stopping"))
+        messages()
+        routes[EVENTS] = {
+            release.pass()
+            sseResponse(terminal(5, "cancelled"))
+        }
+        started(f)
+    }
 
     @Test
     fun overlappingStopsKeepTheIntentOfTheOneAccepted() = runTest {
@@ -1845,23 +1867,16 @@ class RunFollowerTest {
         val release = gate()
         val firstAnswer = gate()
         val secondAnswer = gate()
-        on(STATUS, status("stopping"))
-        val stops = AtomicInteger()
-        routes[stopPath] = {
-            if (stops.incrementAndGet() == 1) {
+        routes[stopPath] = { request ->
+            if (stopIndex(request) == 0) {
                 firstAnswer.pass()
                 json("{}", 500)()
             } else {
                 secondAnswer.pass()
-                json("""{"run_id":"$RUN","status":"stopping"}""")()
+                stopAccepted()
             }
         }
-        messages()
-        routes[EVENTS] = {
-            release.pass()
-            sseResponse(terminal(5, "cancelled"))
-        }
-        started(f)
+        cancelledOnRelease(f, release)
 
         val first = backgroundScope.async { runCatching { f.stop(KEY) } }
         awaitUntil { requestsTo(stopPath).size == 1 }
@@ -1884,9 +1899,8 @@ class RunFollowerTest {
         val release = gate()
         val firstAnswer = gate()
         on(STATUS, status("running"))
-        val stops = AtomicInteger()
-        routes[stopPath] = {
-            if (stops.incrementAndGet() == 1) firstAnswer.pass()
+        routes[stopPath] = { request ->
+            if (stopIndex(request) == 0) firstAnswer.pass()
             json("{}", 500)()
         }
         heldOpen(f, release)
@@ -1900,5 +1914,62 @@ class RunFollowerTest {
 
         assertFalse(db.activeRunDao().forSession(KEY)!!.stopRequested)
         release.countDown()
+    }
+
+    @Test
+    fun stopWhoseIntentCannotBeStoredSendsNothingAndALaterStopCounts() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val release = gate()
+        val answer = gate()
+        routes[stopPath] = {
+            answer.pass()
+            stopAccepted()
+        }
+        cancelledOnRelease(f, release)
+        db.openHelper.writableDatabase.execSQL(
+            "CREATE TRIGGER fail_intent BEFORE UPDATE OF stopRequested ON ActiveRunEntity BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
+
+        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is SQLiteException) // the error surfaces
+        assertTrue(requestsTo(stopPath).isEmpty()) // and nothing was sent without a stored intent
+        db.openHelper.writableDatabase.execSQL("DROP TRIGGER fail_intent")
+        val second = backgroundScope.async { f.stop(KEY) }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        release.countDown() // the run is cancelled before the stop's answer arrives
+        done.await()
+
+        assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
+        answer.countDown()
+        second.await()
+    }
+
+    @Test
+    fun acceptedStopSurvivesItsCallerBeingCancelled() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val release = gate()
+        val firstAnswer = gate()
+        routes[stopPath] = { request ->
+            if (stopIndex(request) == 0) {
+                firstAnswer.pass()
+                stopAccepted()
+            } else {
+                json("{}", 500)()
+            }
+        }
+        cancelledOnRelease(f, release)
+
+        val first = backgroundScope.launch { f.stop(KEY) }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        first.cancel() // the caller goes away while the server takes the stop
+        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is ApiError.Http) // an overlapping stop fails
+        firstAnswer.countDown()
+        first.join()
+        assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        release.countDown()
+        done.await()
+
+        assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
     }
 }

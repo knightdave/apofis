@@ -151,18 +151,7 @@ class RunFollower(
         // user's stop, and a stop by another client never does.
         // The status itself changes only when the server reports it, through the refresher.
         val refresher = refresher(run)
-        refresher.stopStarted()
-        var accepted = false
-        var failed = false
-        try {
-            io(run.runId) { api.stop(run.runId) }
-            accepted = true
-        } catch (e: ApiError) {
-            failed = true
-            throw e
-        } finally {
-            refresher.stopEnded(accepted, failed)
-        }
+        refresher.stop { io(run.runId) { api.stop(run.runId) } }
         refresher.request()
     }
 
@@ -265,14 +254,13 @@ class RunFollower(
                 applying.withLock {
                     val ordered = ticket != null && status !in TERMINAL
                     if (ordered && ticket!! <= applied) return@withLock
-                    db.activeRunDao().setStatus(run.runId, stored(status))
-                    val row = db.activeRunDao().get(run.runId)
+                    val held = db.activeRunDao().storeStatus(run.runId, stored(status))
                     if (ordered) applied = ticket!!
-                    if (row == null) {
+                    if (held == null) {
                         state(run.sessionKey).update { if (it?.runId == run.runId) null else it }
                     } else {
-                        val accepted = row.status == stored(status)
-                        edit(run) { it.copy(status = row.status, pending = if (accepted) pending else null) }
+                        val accepted = held == stored(status)
+                        edit(run) { it.copy(status = held, pending = if (accepted) pending else null) }
                     }
                 }
                 true
@@ -281,28 +269,39 @@ class RunFollower(
             }
         }
 
-        /** A stop request for this run starts: its intent is stored at once, ahead of the server's answer. */
-        suspend fun stopStarted(): Unit = withContext(NonCancellable) {
-            stopping.withLock {
-                if (stopsInFlight++ == 0 && !stopAccepted) {
-                    stopAccepted = db.activeRunDao().get(run.runId)?.stopRequested == true // from before a restart
+        /**
+         * One stop request ([post]), not cancellable as a whole, so a cancelled caller never loses an accepted stop.
+         * The intent is stored before the request is sent (if it cannot be, nothing is sent and the error surfaces).
+         * Accepted: the intent stays, whatever other requests do. Failed: it is cleared only if no other stop is in
+         * flight and none was accepted. The in-flight count is kept in try/finally, so no exception can leak it.
+         */
+        suspend fun stop(post: suspend () -> Unit): Unit = withContext(NonCancellable) {
+            stopping.withLock { stopsInFlight++ }
+            var accepted = false
+            var failed = false
+            try {
+                stopping.withLock {
+                    if (stopsInFlight == 1 && !stopAccepted) {
+                        stopAccepted = db.activeRunDao().get(run.runId)?.stopRequested == true // from before a restart
+                    }
                     db.activeRunDao().setStopRequested(run.runId)
                 }
-            }
-        }
-
-        /**
-         * A stop request ended. Accepted: the intent stays, whatever other requests do. Failed: the intent is cleared
-         * only if no other stop is in flight and none was accepted. Cut off: it stays, since it may have been taken.
-         */
-        suspend fun stopEnded(accepted: Boolean, failed: Boolean): Unit = withContext(NonCancellable) {
-            stopping.withLock {
-                stopsInFlight--
-                if (accepted) {
-                    stopAccepted = true
-                    db.activeRunDao().setStopRequested(run.runId)
-                } else if (failed && stopsInFlight == 0 && !stopAccepted) {
-                    db.activeRunDao().clearStopRequested(run.runId)
+                try {
+                    post()
+                } catch (e: ApiError) {
+                    failed = true
+                    throw e
+                }
+                accepted = true
+            } finally {
+                stopping.withLock {
+                    stopsInFlight--
+                    if (accepted) {
+                        stopAccepted = true
+                        db.activeRunDao().setStopRequested(run.runId)
+                    } else if (failed && stopsInFlight == 0 && !stopAccepted) {
+                        db.activeRunDao().clearStopRequested(run.runId)
+                    }
                 }
             }
         }

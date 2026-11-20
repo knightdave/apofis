@@ -260,5 +260,11 @@ class DaosTest {
         assertEquals(false, dao.forSession("t")!!.stopRequested)
         dao.clearStopRequested("gone")
         assertNull(dao.get("gone"))
+
+        dao.upsert(ActiveRunEntity("run_3", "u", null, "running", 1L))
+        assertEquals("queued", dao.storeStatus("run_3", "queued"))
+        assertEquals("failed", dao.storeStatus("run_3", "failed"))
+        assertEquals("failed", dao.storeStatus("run_3", "running")) // rejected: returns what the row holds
+        assertNull(dao.storeStatus("gone", "running"))
     }
 }
