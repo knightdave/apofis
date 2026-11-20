@@ -21,6 +21,7 @@ import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ToolStep
+import xyz.rycerz.apofis.ui.theme.ChatText
 
 /**
  * The tool step a sheet shows, fixed when the sheet opens and never changed: its reply's key, its index there, its
@@ -121,7 +122,7 @@ private fun Section(title: String, body: String, code: Boolean = true) {
         Text(
             body,
             Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
-            style = codeStyle,
+            style = ChatText.code,
             color = MaterialTheme.colorScheme.onSurface,
             softWrap = false,
         )

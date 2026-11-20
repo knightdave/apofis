@@ -392,9 +392,10 @@ internal fun MessageList(
     onStep: (StepSubject) -> Unit,
     listState: LazyListState,
     contentPadding: PaddingValues,
+    zone: ZoneId,
+    today: LocalDate,
     modifier: Modifier = Modifier,
 ) {
-    val zone = remember { ZoneId.systemDefault() }
     val builder = remember(zone) { ChatRows(zone) }
     val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     // An answer that came too late shows under the reply, live or stored, unless that request is somehow drawn again.
@@ -410,7 +411,7 @@ internal fun MessageList(
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
                 Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
                     when (row) {
-                        is DateRow -> DateSeparator(row.day, zone)
+                        is DateRow -> DateSeparator(row.day, today)
                         is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
                         is StepsRow -> StepList(row.reply.steps, tag = "step:${row.reply.key}") { i ->
                             val step = row.reply.steps[i] as ToolStep
@@ -436,8 +437,7 @@ private fun rowTag(row: Row): Modifier = when (row) {
 }
 
 @Composable
-private fun DateSeparator(day: LocalDate, zone: ZoneId) {
-    val today = LocalDate.now(zone)
+private fun DateSeparator(day: LocalDate, today: LocalDate) {
     val label = when (day) {
         today -> stringResource(R.string.chat_today)
         today.minusDays(1) -> stringResource(R.string.chat_yesterday)

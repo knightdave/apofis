@@ -4,6 +4,7 @@ import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -21,9 +22,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -58,12 +59,17 @@ import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.ComposeError
 import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
+import java.time.LocalDate
+import java.time.ZoneId
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.theme.wash
 
 /**
  * The chat: app bar with the title and the status line, the message list and the composer. Stateless: [state] comes
  * from [ChatViewModel], which also implements [actions]. [onOpenConnection] is called when the user taps a rejected
  * key; [onRetryLoad] when the chat could not be opened ([StatusLine.LOAD_FAILED]) and the user asks to try again.
+ * [zone] and [today] label the date separators.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -75,6 +81,8 @@ fun ChatScreen(
     onRetryLoad: () -> Unit = {},
     navigationIcon: @Composable () -> Unit = {},
     appBarActions: @Composable RowScope.() -> Unit = {},
+    zone: ZoneId = ZoneId.systemDefault(),
+    today: LocalDate = LocalDate.now(zone),
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -116,7 +124,7 @@ fun ChatScreen(
             if (state.status == StatusLine.LOAD_FAILED) {
                 Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-                    TextButton(onClick = onRetryLoad) { Text(stringResource(R.string.chat_load_retry)) }
+                    WashTextButton(R.string.chat_load_retry, onRetryLoad)
                 }
                 return@Box
             }
@@ -130,26 +138,25 @@ fun ChatScreen(
                 onStep = { detail = it },
                 listState = listState,
                 contentPadding = PaddingValues(vertical = 8.dp),
+                zone = zone,
+                today = today,
             )
             val away by remember { derivedStateOf { listState.canScrollBackward } }
             if (away) {
-                IconButton(
+                ApofisIconButton(
                     onClick = { scope.launch { listState.animateScrollToItem(0) } },
+                    contentDescription = stringResource(R.string.chat_scroll_to_bottom),
                     Modifier.align(Alignment.BottomEnd).padding(end = 4.dp, bottom = 4.dp),
+                    visualSize = 32.dp,
                 ) {
                     Box(
                         Modifier
-                            .size(32.dp)
+                            .fillMaxSize()
                             .background(ApofisTheme.colors.cardFill, CircleShape)
                             .border(1.dp, ApofisTheme.colors.hairlineStrong, CircleShape),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Icon(
-                            painterResource(R.drawable.lucide_arrow_down),
-                            stringResource(R.string.chat_scroll_to_bottom),
-                            Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.onSurface,
-                        )
+                        Icon(painterResource(R.drawable.lucide_arrow_down), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
                     }
                 }
             }
@@ -244,8 +251,8 @@ private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: (
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        TextButton(onClick = onPutBack) { Text(stringResource(R.string.chat_unsent_put_back)) }
-        TextButton(onClick = onDiscard) { Text(stringResource(R.string.chat_unsent_discard)) }
+        WashTextButton(R.string.chat_unsent_put_back, onPutBack)
+        WashTextButton(R.string.chat_unsent_discard, onDiscard)
     }
 }
 
@@ -311,7 +318,13 @@ private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, di
                 Text(stringResource(text), Modifier.padding(top = 12.dp))
             }
         },
-        confirmButton = { TextButton(onClick = onConfirm) { Text(stringResource(confirm)) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(dismiss)) } },
+        confirmButton = { WashTextButton(confirm, onConfirm) },
+        dismissButton = { WashTextButton(dismiss, onDismiss) },
     )
+}
+
+@Composable
+private fun WashTextButton(label: Int, onClick: () -> Unit) {
+    val source = remember { MutableInteractionSource() }
+    TextButton(onClick = onClick, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) { Text(stringResource(label)) }
 }

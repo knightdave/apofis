@@ -19,15 +19,18 @@ class Preferences(context: Context) {
     )
     private val dynamic = MutableStateFlow(prefs.getBoolean(DYNAMIC_COLOR, true))
     private val black = MutableStateFlow(prefs.getBoolean(PURE_BLACK, false))
+    private val vibrate = MutableStateFlow(prefs.getBoolean(HAPTICS, true))
 
     // StateFlows so the first frame already has the stored theme.
     val themeMode: StateFlow<ThemeMode> = mode
     val dynamicColor: StateFlow<Boolean> = dynamic
     val pureBlack: StateFlow<Boolean> = black
+    val haptics: StateFlow<Boolean> = vibrate
 
     suspend fun setThemeMode(value: ThemeMode) = write(mode, value) { putString(THEME_MODE, value.name) }
     suspend fun setDynamicColor(value: Boolean) = write(dynamic, value) { putBoolean(DYNAMIC_COLOR, value) }
     suspend fun setPureBlack(value: Boolean) = write(black, value) { putBoolean(PURE_BLACK, value) }
+    suspend fun setHaptics(value: Boolean) = write(vibrate, value) { putBoolean(HAPTICS, value) }
 
     /** The chat open last, restored after the process was killed when it still exists. */
     var lastChat: String?
@@ -43,6 +46,7 @@ class Preferences(context: Context) {
         const val THEME_MODE = "theme_mode"
         const val DYNAMIC_COLOR = "dynamic_color"
         const val PURE_BLACK = "pure_black"
+        const val HAPTICS = "haptics"
         const val LAST_CHAT = "last_chat"
     }
 }

@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui
 
+import androidx.compose.foundation.layout.size
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -7,7 +9,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -43,8 +44,8 @@ fun LicensesScreen(onBack: () -> Unit) {
             TopAppBar(
                 title = { Text(stringResource(R.string.settings_licenses)) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = stringResource(R.string.back))
+                    ApofisIconButton(onClick = onBack, contentDescription = stringResource(R.string.back)) {
+                        Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = null, Modifier.size(20.dp))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),

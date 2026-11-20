@@ -1,5 +1,10 @@
 package xyz.rycerz.apofis.ui.connect
 
+import androidx.compose.runtime.remember
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import xyz.rycerz.apofis.ui.theme.wash
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import android.view.WindowManager
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -23,7 +28,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedSecureTextField
 import androidx.compose.material3.OutlinedTextField
@@ -93,8 +97,8 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                 title = {},
                 navigationIcon = {
                     if (onBack != null) {
-                        IconButton(onClick = onBack) {
-                            Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = stringResource(R.string.back))
+                        ApofisIconButton(onClick = onBack, contentDescription = stringResource(R.string.back)) {
+                            Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = null, Modifier.size(20.dp))
                         }
                     }
                 },
@@ -129,7 +133,10 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                     failed?.reason == Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK -> ({
                         Column {
                             Text(urlError.orEmpty())
-                            TextButton(onClick = vm::retryWithLocalNetwork) { Text(stringResource(R.string.connect_local_network_retry)) }
+                            val retry = remember { MutableInteractionSource() }
+                            TextButton(onClick = vm::retryWithLocalNetwork, Modifier.wash(retry, ButtonDefaults.textShape), interactionSource = retry) {
+                                Text(stringResource(R.string.connect_local_network_retry))
+                            }
                         }
                     })
                     urlError != null -> ({ Text(urlError) })
@@ -164,9 +171,11 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                 onKeyboardAction = { vm.connect() },
                 trailingIcon = {
                     val description = stringResource(if (keyVisible) R.string.connect_key_hide_description else R.string.connect_key_show_description)
+                    val toggle = remember { MutableInteractionSource() }
                     TextButton(
                         onClick = { keyVisible = !keyVisible },
-                        modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = description },
+                        modifier = Modifier.heightIn(min = 48.dp).wash(toggle, ButtonDefaults.textShape).semantics { contentDescription = description },
+                        interactionSource = toggle,
                     ) {
                         Text(stringResource(if (keyVisible) R.string.connect_key_hide else R.string.connect_key_show))
                     }
@@ -175,10 +184,12 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                     .fillMaxWidth()
                     .semantics { if (keyError != null) error(keyError) },
             )
+            val connect = remember { MutableInteractionSource() }
             Button(
                 onClick = { vm.connect() },
                 enabled = !testing,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).wash(connect, ButtonDefaults.shape, ring = MaterialTheme.colorScheme.onPrimary),
+                interactionSource = connect,
             ) {
                 if (testing) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -197,8 +208,18 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
             onDismissRequest = vm::cancelServerChange,
             title = { Text(stringResource(R.string.server_change_title)) },
             text = { Text(stringResource(R.string.server_change_text)) },
-            confirmButton = { TextButton(onClick = { vm.confirmServerChange() }) { Text(stringResource(R.string.server_change_confirm)) } },
-            dismissButton = { TextButton(onClick = vm::cancelServerChange) { Text(stringResource(R.string.cancel)) } },
+            confirmButton = {
+                val source = remember { MutableInteractionSource() }
+                TextButton(onClick = { vm.confirmServerChange() }, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) {
+                    Text(stringResource(R.string.server_change_confirm))
+                }
+            },
+            dismissButton = {
+                val source = remember { MutableInteractionSource() }
+                TextButton(onClick = vm::cancelServerChange, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) {
+                    Text(stringResource(R.string.cancel))
+                }
+            },
         )
     }
 }

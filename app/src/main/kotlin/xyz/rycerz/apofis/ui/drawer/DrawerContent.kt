@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.drawer
 
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -205,13 +206,22 @@ private fun GroupHeader(label: GroupLabel) {
 internal fun ChatRow(row: DrawerRow.Chat, onClick: () -> Unit, onLongPress: () -> Unit, a11yActions: List<Pair<String, () -> Unit>>) {
     val scheme = MaterialTheme.colorScheme
     val moreLabel = stringResource(R.string.drawer_more_actions)
+    val haptics = ApofisTheme.haptics
     Row(
         Modifier
             .fillMaxWidth()
             .heightIn(min = 48.dp)
             .clip(RoundedCornerShape(16.dp))
-            .background(if (row.selected) scheme.primary.copy(alpha = 0.12f) else Color.Transparent)
-            .combinedClickable(onLongClickLabel = moreLabel, onLongClick = onLongPress, onClick = onClick)
+            .background(if (row.selected) ApofisTheme.colors.selectedRow else Color.Transparent)
+            .combinedClickable(
+                onLongClickLabel = moreLabel,
+                onLongClick = {
+                    haptics.light()
+                    onLongPress()
+                },
+                hapticFeedbackEnabled = false, // the app's own light() is the one feedback for this gesture
+                onClick = onClick,
+            )
             .semantics { customActions = a11yActions.map { (label, run) -> CustomAccessibilityAction(label) { run(); true } } }
             .padding(start = 14.dp, top = 10.dp, end = 8.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
