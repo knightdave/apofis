@@ -58,6 +58,41 @@ class ConnectViewModelTest {
     }
 
     @Test
+    fun privateAddressAsksForLocalNetworkFirst() {
+        var granted = false
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { granted })
+        vm.submit("http://10.0.2.2:18642", "k")
+        assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
+        vm.onLocalNetworkResult(false)
+        assertEquals(ConnectState.Failed(Field.URL, Reason.LOCAL_NETWORK_DENIED), vm.state)
+        vm.submit("http://10.0.2.2:18642", "k") // Connect again asks again
+        assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
+        granted = true
+        vm.onLocalNetworkResult(true)
+        assertEquals(ConnectState.Testing, vm.state) // the check starts; not waited for, it would go to the network
+        vm.cancel()
+        assertTrue(saved.isEmpty())
+    }
+
+    @Test
+    fun publicAddressNeedsNoLocalNetwork() {
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false }, resolvesLocal = { false })
+        vm.submit(server.url("/").toString(), "k") // 127.0.0.1: loopback is not local network
+        assertEquals(ConnectState.Connected, vm.state)
+    }
+
+    @Test
+    fun grantedLocalNetworkIsNotAskedAgain() {
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { true })
+        vm.onUrlChange("http://192.168.1.5:8642")
+        vm.onKeyChange("k")
+        vm.connect()
+        assertEquals(ConnectState.Testing, vm.state)
+        vm.cancel()
+    }
+
+    @Test
     fun malformedUrl() {
         val vm = vm()
         vm.submit("hermes.example:8642", "k")

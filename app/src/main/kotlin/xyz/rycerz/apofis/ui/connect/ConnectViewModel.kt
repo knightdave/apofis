@@ -13,6 +13,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import java.net.SocketTimeoutException
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
@@ -30,11 +31,15 @@ enum class Reason {
     KEY_INVALID, // a character an HTTP header cannot carry
     KEY_REJECTED,
     SAVE_FAILED,
+    LOCAL_NETWORK_DENIED, // the server is on the local network and the user refused local network access
 }
 
 sealed interface ConnectState {
     data object Idle : ConnectState
     data object Testing : ConnectState // cancellable: Back cancels it first
+
+    /** The server is on the local network: the screen asks the system for local network access, then calls back. */
+    data object NeedsLocalNetwork : ConnectState
 
     /** Writing the switch; runs to the end, and Back is ignored meanwhile. */
     data object Saving : ConnectState
@@ -57,6 +62,8 @@ class ConnectViewModel(
     private val save: suspend (Credentials) -> Unit,
     failedBefore: Boolean = false,
     private val back: ConnectBack? = null,
+    private val localNetworkGranted: () -> Boolean = { true },
+    private val resolvesLocal: suspend (host: String) -> Boolean = { false },
 ) : ViewModel() {
     var url by mutableStateOf(current?.baseUrl.orEmpty())
         private set
@@ -112,6 +119,10 @@ class ConnectViewModel(
         } catch (_: IllegalArgumentException) {
             return fail(Field.URL, Reason.MALFORMED_URL)
         }
+        if (!localNetworkGranted() && hostNeedsLocalNetwork(parsed.host)) {
+            state = ConnectState.NeedsLocalNetwork
+            return null
+        }
         state = ConnectState.Testing
         val mine = ++attempt
         return viewModelScope.launch {
@@ -129,7 +140,14 @@ class ConnectViewModel(
         } catch (e: ApiError) {
             return when (e) {
                 ApiError.Unauthorized -> ConnectState.Failed(Field.KEY, Reason.KEY_REJECTED)
-                is ApiError.Network -> ConnectState.Failed(Field.URL, Reason.UNREACHABLE)
+                // A blocked local network connection times out; a host name is asked about only after that happens.
+                is ApiError.Network -> if (e.cause is SocketTimeoutException && !localNetworkGranted() &&
+                    resolvesLocal(c.baseUrl.toHttpUrlOrNull()?.host.orEmpty())
+                ) {
+                    ConnectState.NeedsLocalNetwork
+                } else {
+                    ConnectState.Failed(Field.URL, Reason.UNREACHABLE)
+                }
                 else -> ConnectState.Failed(Field.URL, Reason.NOT_HERMES)
             }
         } catch (_: Exception) {
@@ -147,6 +165,13 @@ class ConnectViewModel(
             return ConnectState.ConfirmServerChange
         }
         return saveOrFail(c, mine)
+    }
+
+    /** The system's answer to the local network request: granted tries again, refused is a field error. */
+    fun onLocalNetworkResult(granted: Boolean): Job? {
+        if (state != ConnectState.NeedsLocalNetwork) return null
+        if (granted) return connect().also { if (it == null && state == ConnectState.NeedsLocalNetwork) fail(Field.URL, Reason.LOCAL_NETWORK_DENIED) }
+        return fail(Field.URL, Reason.LOCAL_NETWORK_DENIED)
     }
 
     fun confirmServerChange(): Job? {

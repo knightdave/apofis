@@ -26,6 +26,8 @@
     <string name="connect_error_key_invalid">Klucz zawiera niedozwolone znaki</string>
     <string name="connect_error_key_rejected">Klucz odrzucony</string>
     <string name="connect_error_save_failed">Nie udało się zapisać połączenia. Spróbuj ponownie.</string>
+    <string name="connect_error_local_network_denied">Odmówiono dostępu do sieci lokalnej. Dotknij Połącz, aby zapytać ponownie, lub zezwól Apofis na Urządzenia w pobliżu w ustawieniach systemu.</string>
+    <string name="connect_local_network_rationale">Potrzebne do łączenia z serwerami w sieci lokalnej</string>
     <string name="server_change_title">Zmienić serwer?</string>
     <string name="server_change_text">Zapisane czaty zostaną usunięte z tego telefonu, a niewysłane wiadomości skasowane. Czaty pozostaną na poprzednim serwerze.</string>
     <string name="server_change_confirm">Zmień</string>

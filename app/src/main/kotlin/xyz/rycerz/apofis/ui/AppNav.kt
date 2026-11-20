@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui
 
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -29,7 +31,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
@@ -44,6 +48,9 @@ import xyz.rycerz.apofis.ui.chat.onlineFlow
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
+import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_MIN_SDK
+import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_PERMISSION
+import xyz.rycerz.apofis.ui.connect.resolvesToLocalNetwork
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
 
 enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT, LICENSES }
@@ -74,6 +81,7 @@ fun AppNav(container: AppContainer) {
             val reconnect = screen == Screen.RECONNECT
             // Scoped to this screen's presence: leaving clears the view model, which cancels its probe and drops the key.
             val owner = rememberViewModelStoreOwner()
+            val context = LocalContext.current.applicationContext
             val vm = viewModel(viewModelStoreOwner = owner) {
                 ConnectViewModel(
                     current = if (reconnect) conn?.credentials else null,
@@ -81,6 +89,11 @@ fun AppNav(container: AppContainer) {
                     save = container::connect,
                     failedBefore = !reconnect && container.consumeSwitchFailure(),
                     back = container.connectBack,
+                    localNetworkGranted = {
+                        Build.VERSION.SDK_INT < LOCAL_NETWORK_MIN_SDK ||
+                            context.checkSelfPermission(LOCAL_NETWORK_PERMISSION) == PackageManager.PERMISSION_GRANTED
+                    },
+                    resolvesLocal = { withContext(Dispatchers.IO) { resolvesToLocalNetwork(it) } },
                 )
             }
             LaunchedEffect(vm.state) { if (vm.state == ConnectState.Connected) chosen = Screen.CHAT }
