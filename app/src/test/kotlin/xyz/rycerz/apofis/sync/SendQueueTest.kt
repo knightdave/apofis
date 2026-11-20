@@ -385,6 +385,31 @@ class SendQueueTest {
     }
 
     @Test
+    fun refusedRetryKeepsTheUncertaintyOfAnEarlierAttempt() = runTest {
+        addSession("apofis-a")
+        val lost = holding.hold(
+            MockResponse.Builder().code(202).body(fixture("run_start.json")).addHeader("Content-Type", "application/json").build(),
+        )
+        val key = queue.enqueue("apofis-a", "maybe sent")
+        val first = launch(Dispatchers.Default) { queue.drain() }
+        take() // the server accepted the first POST; its response is lost
+        first.cancel()
+        first.join()
+        lost.countDown()
+        respond("{}", 503) // the retry is refused before it reaches Hermes: that settles only this request
+        assertFalse(queue.drain())
+        assertEquals(2, server.requestCount)
+        assertTrue(pending(key).attempted)
+        clock += SEND_EXPIRY_MS + 1
+        queue.drain()
+        assertEquals("expired_uncertain", pending(key).error)
+        val requests = server.requestCount
+
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, queue.retry(key))
+        assertEquals(requests, server.requestCount)
+    }
+
+    @Test
     fun steerIsStoredBeforeTheRequest() = runTest {
         addSession("apofis-a")
         running("apofis-a")

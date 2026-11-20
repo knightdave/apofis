@@ -270,11 +270,8 @@ class SendQueue(
             api.startRun(send.requestBody, send.idempotencyKey)
         } catch (e: ApiError) {
             ensureOpen()
-            val row = when {
-                !requested -> send
-                refused(e) -> send.copy(attempted = false)
-                else -> sent
-            }
+            // A refusal settles only this request: an earlier attempt may still have been accepted, so keep its flag.
+            val row = if (!requested || refused(e)) send else sent
             return@withRepositoryLock when (e) {
                 is ApiError.Network, is ApiError.Unavailable -> {
                     pendingDao.update(row)
