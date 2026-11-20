@@ -222,8 +222,7 @@ class RunFollowerTest {
 
     @Test
     fun finishAfterConfirmedDeleteRecreatesNothing() = runTest {
-        val done = CompletableDeferred<Unit>()
-        val f = follower(done)
+        val f = follower()
         val gate = gate()
         messages()
         routes[EVENTS] = {
@@ -234,9 +233,10 @@ class RunFollowerTest {
         awaitUntil { requestsTo(EVENTS).isNotEmpty() }
         db.sessionDao().delete(KEY) // the server accepted DELETE; the local cascade ran
         gate.countDown()
-        done.await()
+        awaitUntil { requestsTo(EVENTS).isNotEmpty() && f.following.isEmpty() } // the frame was handled and the job ended
 
         assertTrue(outcomes().isEmpty())
+        assertTrue(finished.isEmpty()) // nothing was settled, so nothing is handed on
         assertNull(db.sessionDao().get(KEY))
         assertTrue(db.pendingSendDao().observe(KEY).first().isEmpty())
         assertNull(f.live(KEY).value)
@@ -275,6 +275,27 @@ class RunFollowerTest {
         awaitUntil { requestsTo(STATUS).isNotEmpty() } // the sync and its write are done
 
         assertTrue(f.credentialsRejected.value)
+    }
+
+    @Test
+    fun finishOfAClosedConnectionLeavesTheRunToTheNewOne() = runTest {
+        val open = AtomicBoolean(true)
+        val f = RunFollower(api, db, repo, backgroundScope, delayMs = {}, onRunFinished = { finished += it }, active = open::get)
+        val wrote = CompletableDeferred<Unit>()
+        f.beforeFinishWrite = {
+            open.set(false) // a switch to a new key at the same server closes this connection; its rows stay
+            wrote.complete(Unit)
+        }
+        on(MESSAGES, notFound()) // no transcript: the fallback finish without one
+        on(EVENTS, sse(terminal(0, "cancelled")))
+        started(f)
+        wrote.await()
+        awaitUntil { f.following.isEmpty() }
+
+        assertNotNull(db.activeRunDao().get(RUN)) // the new connection's follower still needs it
+        assertEquals("sending", db.pendingSendDao().get("p1")!!.state) // not failed as unconfirmed
+        assertTrue(outcomes().isEmpty())
+        assertTrue(finished.isEmpty()) // no drain for a run this follower did not settle
     }
 
     @Test

@@ -335,7 +335,7 @@ class AppContainer(
                 queue.drain()
                 runScope.launch { refreshQuietly(repo, composer) } // not on the follower's own, non-cancellable path
             }
-        })
+        }, active = open::get)
         return Connected(c, api, db, repo, queue, follower, open, runScope, composer)
     }
 }

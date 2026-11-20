@@ -87,6 +87,7 @@ class RunFollower(
     private val scope: CoroutineScope,
     private val delayMs: suspend (Long) -> Unit = { delay(it) },
     private val onRunFinished: suspend (sessionKey: String) -> Unit = {},
+    private val active: () -> Boolean = { true }, // false once this follower's connection is closed
 ) : RunStarter {
     private val lives = ConcurrentHashMap<String, MutableStateFlow<LiveReply?>>()
     private val jobs = HashMap<String, Job>() // by run id; it also guards [foreground] and [stopping]
@@ -629,11 +630,12 @@ class RunFollower(
             try {
                 if (sync) {
                     var wrote = false
+                    var settled = false
                     try {
                         // The hand-off runs inside the repository call, only after its transaction has committed.
                         // Each page request's success is recorded as it returns, before mapping, the database phase and the drain.
-                        repo.syncMessages(key, onResponse = { recordKey(accepted = true) }, afterCommit = { handOff() }) { rows ->
-                            write(status, buildTranscript(rows))
+                        repo.syncMessages(key, onResponse = { recordKey(accepted = true) }, afterCommit = { handOff(settled) }) { rows ->
+                            settled = write(status, buildTranscript(rows))
                             wrote = true
                         }
                     } catch (e: ApiError) {
@@ -651,8 +653,8 @@ class RunFollower(
                     if (wrote) return true
                 }
                 withContext(NonCancellable) {
-                    withRepositoryLock { db.withTransaction { write(status, items = null) } }
-                    handOff() // reached only when the transaction returned normally
+                    val settled = withRepositoryLock { db.withTransaction { write(status, items = null) } }
+                    handOff(settled) // reached only when the transaction returned normally
                 }
                 return true
             } catch (_: SQLException) {
@@ -673,11 +675,13 @@ class RunFollower(
          * Inside the repository lock and a transaction. A pending send is removed only when the transcript the user
          * would see ([items]; null: unknown) shows it; otherwise it becomes failed `unconfirmed` and stays on screen.
          */
-        private suspend fun write(status: String?, items: List<ChatItem>?) {
+        private suspend fun write(status: String?, items: List<ChatItem>?): Boolean {
             beforeFinishWrite()
-            // Still owned: a confirmed delete or a cache clear (both under this lock) removed the row, and nothing of the
-            // run may come back. There is no foreign key to refuse an orphan outcome.
-            val owned = db.activeRunDao().get(id)?.takeIf { db.sessionDao().get(key) != null } ?: return
+            // Still owned, checked under the repository lock that a switch, a cache clear and a delete also take: a closed
+            // connection's follower settles nothing (a same-server switch keeps the row for the new one), and a deleted
+            // or cleared run never comes back. There is no foreign key to refuse an orphan outcome.
+            if (!active()) return false
+            val owned = db.activeRunDao().get(id)?.takeIf { it.sessionKey == key && db.sessionDao().get(key) != null } ?: return false
             val stopped = owned.stopRequested
             val outcome = when (status) {
                 "failed" -> ReplyOutcome.FAILED
@@ -699,12 +703,15 @@ class RunFollower(
                 db.replyOutcomeDao().upsert(ReplyOutcomeEntity(key, db.messageDao().maxId(key) ?: 0, outcome.name, detail = null))
             }
             db.activeRunDao().delete(id)
+            return true
         }
 
-        private suspend fun handOff() {
+        /** Drops this follower's memory of the run; only a transaction that [settled] the run starts the next work. */
+        private suspend fun handOff(settled: Boolean) {
             seqs -= id
             refreshers -= id
             state(key).update { if (it?.runId == id) null else it }
+            if (!settled) return
             try {
                 onRunFinished(key)
             } catch (e: CancellationException) {
