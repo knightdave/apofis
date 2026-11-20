@@ -257,6 +257,27 @@ class RunFollowerTest {
     }
 
     @Test
+    fun earlierTranscriptFetchDoesNotClearALaterRejection() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, json("{}", 500)) // the follower's next read fails without saying anything about the key
+        addSession()
+        addSession("apofis-b")
+        addRun("run_b", "apofis-b")
+        on("/v1/runs/run_b/stop", json("""{"error":{"code":"invalid_api_key"}}""", 401))
+        addRun(lastSeq = 3) // after a restart: the resume syncs the transcript first
+        repo.beforeSyncWrite = {
+            // The transcript GET has returned; only then does another request learn the key was refused.
+            assertTrue(runCatching { f.stop("apofis-b", "run_b") }.exceptionOrNull() is ApiError.Unauthorized)
+        }
+
+        f.resumeAll()
+        awaitUntil { requestsTo(STATUS).isNotEmpty() } // the sync and its write are done
+
+        assertTrue(f.credentialsRejected.value)
+    }
+
+    @Test
     fun backgroundWorkerFinishesAnEndedRunThenSendsTheNextMessage() = runTest {
         val f = follower() // never resumed: the app is in the background, so no follower runs
         messages()

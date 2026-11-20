@@ -165,11 +165,14 @@ class ChatRepository(
     /** True when server rows of this chat are cached on the phone. */
     suspend fun hasCachedMessages(sessionKey: String): Boolean = db.messageDao().hasRows(sessionKey)
 
-    /** True when the transcript was fetched: a request was made and the server accepted it. */
-    suspend fun syncMessages(sessionKey: String): Boolean {
+    /**
+     * True when the transcript was fetched: a request was made and the server accepted it. [onResponse] runs as each
+     * page request returns successfully, before any mapping or database work.
+     */
+    suspend fun syncMessages(sessionKey: String, onResponse: () -> Unit = {}): Boolean {
         requireAppKey(sessionKey)
         return lock.withLock {
-            val (tip, rows) = fetchRows(sessionKey) ?: return@withLock false
+            val (tip, rows) = fetchRows(sessionKey, onResponse) ?: return@withLock false
             beforeSyncWrite()
             db.withTransaction { replaceRows(sessionKey, tip, rows) }
             true
@@ -180,19 +183,19 @@ class ChatRepository(
      * Like [syncMessages], and runs [afterReplace] with the fetched rows inside the transaction that writes them, so
      * no observer sees a state between the two. Only the fetch is cancellable: from the write on, through
      * [afterCommit] (run after the lock is released, only when the transaction committed with the block run), the
-     * call completes even if the caller is cancelled. [onFetched] runs as soon as the fetch has returned, before
-     * the write. True when the transcript was fetched.
+     * call completes even if the caller is cancelled. [onResponse] runs as each page request returns successfully,
+     * before any mapping or database work. True when the transcript was fetched.
      */
     suspend fun syncMessages(
         sessionKey: String,
-        onFetched: () -> Unit = {},
+        onResponse: () -> Unit = {},
         afterCommit: suspend () -> Unit = {},
         afterReplace: suspend (List<MessageDto>) -> Unit,
     ): Boolean {
         requireAppKey(sessionKey)
         lock.lock()
         val fetched = try {
-            fetchRows(sessionKey)
+            fetchRows(sessionKey, onResponse)
         } catch (e: Throwable) {
             lock.unlock()
             throw e
@@ -201,7 +204,6 @@ class ChatRepository(
             lock.unlock()
             return false
         }
-        onFetched()
         val (tip, rows) = fetched
         withContext(NonCancellable) {
             val written = try {
@@ -217,10 +219,10 @@ class ChatRepository(
     }
 
     /** Under the lock: the server transcript as rows, or null when the chat has no server copy (no request made). */
-    private suspend fun fetchRows(sessionKey: String): Pair<String, List<MessageEntity>>? {
+    private suspend fun fetchRows(sessionKey: String, onResponse: () -> Unit): Pair<String, List<MessageEntity>>? {
         val session = sessionDao.get(sessionKey) ?: return null
         if (!session.existsOnServer || session.hidden || !active()) return null
-        val (tip, messages) = fetchMessages(session.currentId) ?: return null
+        val (tip, messages) = fetchMessages(session.currentId, onResponse) ?: return null
         return tip to messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
     }
 
@@ -309,10 +311,10 @@ class ChatRepository(
      * starts over once; a second change, a reserved tip or endless paging is [ApiError.Protocol].
      * Null when the repository was closed before a request.
      */
-    private suspend fun fetchMessages(id: String): Pair<String, List<MessageDto>>? {
+    private suspend fun fetchMessages(id: String, onResponse: () -> Unit): Pair<String, List<MessageDto>>? {
         repeat(2) {
             if (!active()) return null
-            val first = api.messages(id, MESSAGE_PAGE, 0)
+            val first = api.messages(id, MESSAGE_PAGE, 0).also { onResponse() }
             val tip = first.sessionId
             if (isReservedId(tip)) throw ApiError.Protocol
             val all = first.messages.toMutableList()
@@ -321,7 +323,7 @@ class ChatRepository(
             while (last.size >= MESSAGE_PAGE) {
                 if (++pages > MAX_PAGES) throw ApiError.Protocol
                 if (!active()) return null
-                val page = api.messages(tip, MESSAGE_PAGE, all.size)
+                val page = api.messages(tip, MESSAGE_PAGE, all.size).also { onResponse() }
                 if (isReservedId(page.sessionId)) throw ApiError.Protocol
                 if (page.sessionId != tip) break
                 all += page.messages

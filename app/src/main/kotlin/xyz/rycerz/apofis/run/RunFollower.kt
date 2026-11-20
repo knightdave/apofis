@@ -631,8 +631,8 @@ class RunFollower(
                     var wrote = false
                     try {
                         // The hand-off runs inside the repository call, only after its transaction has committed.
-                        // The fetch's success is recorded as it returns, before the database phase and the drain.
-                        repo.syncMessages(key, onFetched = { recordKey(accepted = true) }, afterCommit = { handOff() }) { rows ->
+                        // Each page request's success is recorded as it returns, before mapping, the database phase and the drain.
+                        repo.syncMessages(key, onResponse = { recordKey(accepted = true) }, afterCommit = { handOff() }) { rows ->
                             write(status, buildTranscript(rows))
                             wrote = true
                         }
@@ -661,13 +661,12 @@ class RunFollower(
         }
 
         private suspend fun syncQuietly() = quietly {
-            val fetched = try {
-                repo.syncMessages(key)
+            try {
+                repo.syncMessages(key, onResponse = { recordKey(accepted = true) }) // at the HTTP boundary, not after the write
             } catch (e: ApiError.Unauthorized) {
                 rejectedFor(id)
                 throw e
             }
-            if (fetched) recordKey(accepted = true)
         }
 
         /**

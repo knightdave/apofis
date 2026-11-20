@@ -689,7 +689,7 @@ class ChatRepositorySyncTest {
 
         // No server copy to read: no request, the block does not run.
         db.sessionDao().upsert(session("apofis-l", existsOnServer = false))
-        assertFalse(repo.syncMessages("apofis-l") { fail("must not run") })
+        assertFalse(repo.syncMessages("apofis-l", afterReplace = { fail("must not run") }))
         assertFalse(repo.syncMessages("apofis-l"))
     }
 
