@@ -22,6 +22,7 @@
     <string name="connect_error_not_hermes">Not a Hermes API server</string>
     <string name="connect_error_key_required">Enter the API key</string>
     <string name="connect_error_key_rejected">Key rejected</string>
+    <string name="connect_error_save_failed">Could not save the connection. Try again.</string>
     <string name="server_change_title">Switch server?</string>
     <string name="server_change_text">Chats cached from the previous server, including messages waiting to be sent, will be removed from this device. They stay on that server.</string>
     <string name="server_change_confirm">Switch</string>

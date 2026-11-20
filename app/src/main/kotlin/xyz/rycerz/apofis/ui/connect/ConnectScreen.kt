@@ -54,6 +54,7 @@ private fun Reason.text() = when (this) {
     Reason.NOT_HERMES -> R.string.connect_error_not_hermes
     Reason.KEY_REQUIRED -> R.string.connect_error_key_required
     Reason.KEY_REJECTED -> R.string.connect_error_key_rejected
+    Reason.SAVE_FAILED -> R.string.connect_error_save_failed
 }
 
 /** First-run connect screen, and the Connection row of Settings when [onBack] is set. */

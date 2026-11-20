@@ -22,6 +22,7 @@
     <string name="connect_error_not_hermes">To nie jest serwer API Hermesa</string>
     <string name="connect_error_key_required">Podaj klucz API</string>
     <string name="connect_error_key_rejected">Klucz odrzucony</string>
+    <string name="connect_error_save_failed">Nie udało się zapisać połączenia. Spróbuj ponownie.</string>
     <string name="server_change_title">Zmienić serwer?</string>
     <string name="server_change_text">Czaty zapisane z poprzedniego serwera, łącznie z wiadomościami czekającymi na wysłanie, zostaną usunięte z tego urządzenia. Na tamtym serwerze pozostaną.</string>
     <string name="server_change_confirm">Zmień</string>

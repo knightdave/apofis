@@ -139,6 +139,21 @@ class ConnectViewModelTest {
     }
 
     @Test
+    fun saveFailureShowsErrorInsteadOfCrashing() {
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        val failing = ConnectViewModel(null, willClearCache = { clearsCache }, save = { throw java.io.IOException("disk full") })
+        failing.submit(server.url("/").toString(), "k")
+        assertEquals(ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED), failing.state)
+
+        clearsCache = true
+        failing.submit(server.url("/").toString(), "k")
+        assertEquals(ConnectState.ConfirmServerChange, failing.state)
+        runTest { failing.confirmServerChange()?.join() }
+        assertEquals(ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED), failing.state)
+    }
+
+    @Test
     fun editingClearsError() {
         val vm = vm()
         vm.submit("nope", "k")

@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -16,7 +17,7 @@ import xyz.rycerz.apofis.settings.Credentials
 
 enum class Field { URL, KEY }
 
-enum class Reason { MISSING_SCHEME, MALFORMED_URL, UNREACHABLE, NOT_HERMES, KEY_REQUIRED, KEY_REJECTED }
+enum class Reason { MISSING_SCHEME, MALFORMED_URL, UNREACHABLE, NOT_HERMES, KEY_REQUIRED, KEY_REJECTED, SAVE_FAILED }
 
 sealed interface ConnectState {
     data object Idle : ConnectState
@@ -84,8 +85,7 @@ class ConnectViewModel(
                     pending = c
                     ConnectState.ConfirmServerChange
                 } else {
-                    save(c)
-                    ConnectState.Connected
+                    saveOrFail(c)
                 }
             } catch (e: ApiError) {
                 when (e) {
@@ -101,15 +101,22 @@ class ConnectViewModel(
         val c = pending ?: return null
         pending = null
         state = ConnectState.Testing
-        return viewModelScope.launch {
-            save(c)
-            state = ConnectState.Connected
-        }
+        return viewModelScope.launch { state = saveOrFail(c) }
     }
 
     fun cancelServerChange() {
         pending = null
         state = ConnectState.Idle
+    }
+
+    // Storage or cache clearing can fail (disk full, keystore error); show it instead of crashing.
+    private suspend fun saveOrFail(c: Credentials): ConnectState = try {
+        save(c)
+        ConnectState.Connected
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED)
     }
 
     private fun fail(field: Field, reason: Reason): Job? {
