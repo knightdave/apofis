@@ -830,13 +830,21 @@ local_cleanup() {
   [ -z "$orig_err" ] || exec 1>&"$orig_out" 2>&"$orig_err"
   # The whole cleanup is bounded: a watchdog interrupts it after TRAP_LIMIT seconds. It waits with the read builtin on
   # a FIFO nobody writes, so it never has a child (no sleep to leave behind), and end_local cancels it with KILL, which
-  # no state of it can catch or lose (a catchable signal can be swallowed between its fork and exec). If the FIFO
-  # cannot be made or opened, the read fails at once and the cleanup reports an overrun: never an unbounded cleanup.
+  # no state of it can catch or lose (a catchable signal can be swallowed between its fork and exec). It alarms only on
+  # its timeout: if it cannot be armed, it warns and the whole cleanup runs without a limit (never a false overrun
+  # that would skip the lock release and the session cleanup).
   trap cleanup_overrun ALRM
-  mkfifo -m 600 "$tmp/wd" 2>/dev/null
-  # shellcheck disable=SC2016 # expanded by the inner bash
-  bash -c 'exec 9<>"$3"; read -r -t "$1" -u 9 _; kill -ALRM "$2"' _ "$TRAP_LIMIT" $$ "$tmp/wd" </dev/null >/dev/null 2>&1 &
-  wd_pid=$!
+  local wd_warn="WARNING: could not arm the cleanup's ${TRAP_LIMIT}s limit; cleaning up without one"
+  if [ -n "$tmp" ] && mkfifo -m 600 "$tmp/wd" 2>/dev/null; then
+    # shellcheck disable=SC2016 # expanded by the inner bash
+    bash -c "$(declare -f log)"'
+      exec 9<>"$3" || { log "$4"; exit 0; }
+      read -r -t "$1" -u 9 _
+      if [ "$?" -gt 128 ]; then kill -ALRM "$2"; else log "$4"; fi' _ "$TRAP_LIMIT" $$ "$tmp/wd" "$wd_warn" </dev/null >/dev/null &
+    wd_pid=$!
+  else
+    log "$wd_warn"
+  fi
   if [ -n "$remote_pid" ]; then stop_pid "$remote_pid" && wait "$remote_pid" 2>/dev/null; fi
   [ -z "$rin" ] || exec {rin}>&-
   [ -z "$rout" ] || exec {rout}<&-

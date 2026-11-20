@@ -521,6 +521,20 @@ check "watchdog cancelled before it starts: exit 0 at once, no sleep ever left" 
 wd_case wd-split '' 1
 check "watchdog cancel delayed past its start (split signals, late setsid): exit 0, no sleep left" '[ "$rc" = 0 ] && [ "$el" -lt 5 ] && [ -z "$alive_sleeps" ]'
 
+# 12c. A watchdog that cannot be armed (no FIFO) warns and the whole cleanup still runs, without a limit: the lock is
+# released and the sessions step runs. The lock release takes 1 s, so an alarm from a failed watchdog would cut it.
+rc=0
+STEPS=$t/steps12c APOFIS_E2E_LIB=1 bash -c '
+  source "$1/run-e2e.sh"
+  set +e
+  TRAP_LIMIT=30 tmp=$(mktemp -d) key=x lock_tried=1 run_id=runW
+  mkfifo() { return 1; }
+  rsh_fn() { sleep 1; echo lock >>"$STEPS"; echo RELEASED; }
+  check_sessions() { echo sessions >>"$STEPS"; }
+  trap local_cleanup EXIT
+  exit 0' _ "$here" >"$t/out12c" 2>&1 || rc=$?
+check "watchdog FIFO cannot be made: warns, releases the lock and runs the sessions step, exit 0" '[ "$rc" = 0 ] && has "$(cat "$t/out12c")" "WARNING: could not arm" && lacks "$(cat "$t/out12c")" "did not finish" && [ "$(cat "$t/steps12c" 2>/dev/null)" = "$(printf "lock\nsessions")" ]'
+
 # 13. Every instrumentation test class writes its own result rows (Evidence), which the cleanup requires.
 for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
   grep -q '^ *@Test' "$f" || continue
