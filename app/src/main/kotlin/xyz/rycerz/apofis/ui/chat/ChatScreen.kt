@@ -75,7 +75,7 @@ fun ChatScreen(
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    var detail by remember { mutableStateOf<StepRef?>(null) } // the tool step shown in the sheet
+    var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
     val steps = remember { StepIndex() }
     val pendingId = state.live?.pending?.requestId
     LaunchedEffect(pendingId) { if (pendingId != null) listState.animateScrollToItem(0) } // the request sits at the bottom
@@ -187,10 +187,10 @@ fun ChatScreen(
             )
         }
     }
-    detail?.let { ref ->
-        // Looked up on every change, so full arguments and the result show as soon as they exist.
-        val found = steps.find(state.items, ref)
-        LaunchedEffect(found?.ref) { detail = found?.ref } // follows a live step to its stored reply; closes once gone
+    detail?.let { subject ->
+        // Looked up on every change, so full arguments and the result show as soon as they exist; closes once gone.
+        val found = steps.find(state.items, subject)
+        LaunchedEffect(found == null) { if (found == null) detail = null }
         found?.let { ToolDetailSheet(it.step, it.live, onDismiss = { detail = null }) }
     }
 }

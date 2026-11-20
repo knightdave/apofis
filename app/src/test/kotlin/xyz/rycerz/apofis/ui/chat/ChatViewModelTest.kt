@@ -482,39 +482,52 @@ class ChatViewModelTest {
         assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, done.composerNote)
     }
 
+    private fun tool(callId: String?, name: String, result: String) = ToolStep(callId ?: "", name, "", result, false, error = false, running = false)
+
     @Test
-    fun toolSheetFollowsItsStepByPosition() {
+    fun toolSheetShowsItsStepAsItCompletes() {
         val preview = ToolStep("c1", "terminal", "command=ls", null, false, error = false, running = true)
         val full = preview.copy(args = "{\n    \"command\": \"ls\"\n}", result = "a", running = false)
+        val subject = StepSubject("r2", 0, "c1", "terminal")
         val index = StepIndex()
-        val live = listOf(user("u1"), AssistantReply("live", listOf(preview), "", 1.0, live = true))
-        val ref = StepRef("live", 0, "c1", live = true)
-        assertEquals(StepIndex.Found(preview, true, ref), index.find(live, ref))
-        // The run ended: the stored reply replaces the live one, found by the live step's call id, and the sheet moves to it.
-        val stored = listOf(user("u1"), AssistantReply("r2", listOf(full), "", 1.0))
-        assertEquals(StepIndex.Found(full, false, StepRef("r2", 0, "c1", live = false)), index.find(stored, ref))
-        assertEquals(null, index.find(listOf(user("u1")), ref))
+        assertEquals(StepIndex.Found(preview, true), index.find(listOf(user("u1"), AssistantReply("r2", listOf(preview), "", 1.0, live = true)), subject))
+        assertEquals(StepIndex.Found(full, false), index.find(listOf(user("u1"), AssistantReply("r2", listOf(full), "", 1.0)), subject))
+        // The live key was a placeholder with no stored key to map to: the sheet closes at run end.
+        assertEquals(null, index.find(listOf(user("u1"), AssistantReply("r2", listOf(full), "", 1.0)), subject.copy(replyKey = "live")))
+    }
+
+    @Test
+    fun removingTheStepClosesTheSheetEvenIfAnotherReplyReusesItsCallId() {
+        val subject = StepSubject("r2", 0, "c1", "terminal")
+        val items = listOf(AssistantReply("r2", emptyList(), "", 1.0), AssistantReply("r5", listOf(tool("c1", "terminal", "other")), "", 1.0))
+        assertEquals(null, StepIndex().find(items, subject))
+    }
+
+    @Test
+    fun aStepWithoutCallIdIsOnlyItsPosition() {
+        val subject = StepSubject("r2", 0, null, "terminal")
+        val index = StepIndex()
+        assertEquals("mine", index.find(listOf(AssistantReply("r2", listOf(tool(null, "terminal", "mine")), "", 1.0)), subject)!!.step.result)
+        assertEquals(null, index.find(listOf(AssistantReply("r2", listOf(tool("c9", "terminal", "later")), "", 1.0)), subject)) // took an id
+        assertEquals(null, index.find(listOf(AssistantReply("r2", listOf(tool(null, "browser", "later")), "", 1.0)), subject)) // another tool
     }
 
     @Test
     fun toolSheetStaysOnItsStepWhenAStepIsInsertedBeforeIt() {
-        val a = ToolStep("c1", "terminal", "", "A", false, error = false, running = false)
-        val b = a.copy(callId = "c2", result = "B")
+        val a = tool("c1", "terminal", "A")
+        val b = tool("c2", "terminal", "B")
+        val subject = StepSubject("r2", 1, "c2", "terminal")
         val index = StepIndex()
-        val ref = StepRef("r2", 1, "c2", live = false)
-        assertEquals("B", index.find(listOf(AssistantReply("r2", listOf(a, b), "", 1.0)), ref)!!.step.result)
-        val moved = index.find(listOf(AssistantReply("r2", listOf(a, ReasoningStep("thinking"), b), "", 1.0)), ref)!!
-        assertEquals("B", moved.step.result)
-        assertEquals(2, moved.ref.index)
-        assertEquals(null, index.find(listOf(AssistantReply("r2", listOf(a), "", 1.0)), ref)) // gone: the sheet closes
+        assertEquals("B", index.find(listOf(AssistantReply("r2", listOf(a, b), "", 1.0)), subject)!!.step.result)
+        assertEquals("B", index.find(listOf(AssistantReply("r2", listOf(a, ReasoningStep("thinking"), b), "", 1.0)), subject)!!.step.result)
+        assertEquals(null, index.find(listOf(AssistantReply("r2", listOf(a), "", 1.0)), subject)) // gone: the sheet closes
     }
 
     @Test
     fun toolStepsWithoutCallIdsOpenTheirOwnResults() {
-        val orphan = ToolStep("", "terminal", "", "first", false, error = false, running = false)
-        val items = listOf(user("u1"), AssistantReply("r2", listOf(orphan, orphan.copy(result = "second")), "", 1.0))
-        assertEquals("second", StepIndex().find(items, StepRef("r2", 1, "", live = false))!!.step.result)
-        assertEquals("first", StepIndex().find(items, StepRef("r2", 0, "", live = false))!!.step.result)
+        val items = listOf(user("u1"), AssistantReply("r2", listOf(tool(null, "terminal", "first"), tool(null, "terminal", "second")), "", 1.0))
+        assertEquals("second", StepIndex().find(items, StepSubject("r2", 1, null, "terminal"))!!.step.result)
+        assertEquals("first", StepIndex().find(items, StepSubject("r2", 0, null, "terminal"))!!.step.result)
     }
 
     /** A list that counts reads of its items. */
@@ -531,7 +544,7 @@ class ChatViewModelTest {
         val merger = LiveMerger()
         val rows = ChatRows(java.time.ZoneId.of("UTC"))
         val index = StepIndex()
-        val ref = StepRef("u0", 0, "", live = false) // a step that is not there: a full miss
+        val ref = StepSubject("r9", 0, "c2", "terminal") // a call that is not there: a full miss
         rows.rows(merger.merge(stored, liveReply("a")))
         index.find(merger.merge(stored, liveReply("a")), ref)
         stored.reads = 0

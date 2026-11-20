@@ -23,65 +23,43 @@ import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ToolStep
 
 /**
- * The tool step a sheet shows. A step with a call id is that call wherever it moves; [replyKey] and [index] are where
- * it was last seen, and the only identity of a step without a call id. [live]: it was seen in the live reply.
+ * The tool step a sheet shows, fixed when the sheet opens and never changed: its reply's key, its index there, its
+ * call id (null without one) and its tool name.
  */
-internal data class StepRef(val replyKey: String, val index: Int, val callId: String, val live: Boolean)
+internal data class StepSubject(val replyKey: String, val index: Int, val callId: String?, val name: String)
 
 /**
- * Resolves [StepRef]s in the chat items. The stored part (a [Joined]'s head, else the whole list) is indexed once per
- * list instance; the live tail is a few items. A step with a call id is checked against it at its remembered place,
- * else looked up by reply key and call id, else (its reply was replaced, as at run end) by the call id alone when
- * exactly one step has it. [Found.ref] names where it is now.
+ * Resolves a [StepSubject] within its own reply only. With a call id: the one step of that reply with that id.
+ * Without: the step at its index, if it also has no call id and the same tool name. Anything else is null, and the
+ * sheet closes. The stored part (a [Joined]'s head, else the whole list) is indexed by reply key once per list
+ * instance; the live tail is a few items. A live reply keeps its key at run end when the stored reply was already
+ * known; a reply still keyed "live" has no stored key to map to, so its sheet closes then.
  */
 internal class StepIndex {
-    data class Found(val step: ToolStep, val live: Boolean, val ref: StepRef)
+    data class Found(val step: ToolStep, val live: Boolean)
 
     private var head: List<ChatItem>? = null
     private val byKey = HashMap<String, AssistantReply>()
-    private val byCall = HashMap<String, StepRef?>() // null: more than one step has that call id
 
-    fun find(items: List<ChatItem>, ref: StepRef): Found? {
+    fun find(items: List<ChatItem>, subject: StepSubject): Found? {
         val joined = items as? Joined<*>
         @Suppress("UNCHECKED_CAST")
         val stored = joined?.head as List<ChatItem>? ?: items
         @Suppress("UNCHECKED_CAST")
         val tail = joined?.tail as List<ChatItem>? ?: emptyList()
-        if (stored !== head) index(stored)
-        val reply = reply(tail, ref.replyKey)
-        val there = reply?.let { at(it, ref.index) }
-        if (ref.callId.isEmpty() || there?.step?.callId == ref.callId) return there
-        reply?.let { inCall(it, ref.callId) }?.let { return it }
-        for (item in tail) if (item is AssistantReply) inCall(item, ref.callId)?.let { return it }
-        return byCall[ref.callId]?.let { r -> byKey[r.replyKey]?.let { at(it, r.index) } }
-    }
-
-    private fun reply(tail: List<ChatItem>, key: String): AssistantReply? =
-        tail.lastOrNull { it is AssistantReply && it.key == key } as AssistantReply? ?: byKey[key]
-
-    private fun at(reply: AssistantReply, index: Int): Found? {
-        val step = reply.steps.getOrNull(index) as? ToolStep ?: return null
-        return Found(step, reply.live, StepRef(reply.key, index, step.callId, reply.live))
-    }
-
-    private fun inCall(reply: AssistantReply, callId: String): Found? {
-        val i = reply.steps.indexOfFirst { it is ToolStep && it.callId == callId }
-        return if (i < 0) null else at(reply, i)
-    }
-
-    private fun index(stored: List<ChatItem>) {
-        head = stored
-        byKey.clear()
-        byCall.clear()
-        for (item in stored) {
-            if (item !is AssistantReply) continue
-            byKey[item.key] = item
-            item.steps.forEachIndexed { i, step ->
-                if (step is ToolStep && step.callId.isNotEmpty()) {
-                    byCall[step.callId] = if (step.callId in byCall) null else StepRef(item.key, i, step.callId, item.live)
-                }
-            }
+        if (stored !== head) {
+            head = stored
+            byKey.clear()
+            for (item in stored) if (item is AssistantReply) byKey[item.key] = item
         }
+        val reply = tail.lastOrNull { it is AssistantReply && it.key == subject.replyKey } as AssistantReply?
+            ?: byKey[subject.replyKey] ?: return null
+        val step = if (subject.callId != null) {
+            reply.steps.filter { it is ToolStep && it.callId == subject.callId }.singleOrNull() as ToolStep?
+        } else {
+            (reply.steps.getOrNull(subject.index) as? ToolStep)?.takeIf { it.callId.isEmpty() && it.name == subject.name }
+        }
+        return step?.let { Found(it, reply.live) }
     }
 }
 

@@ -388,7 +388,7 @@ internal fun MessageList(
     answering: Boolean,
     actions: ChatActions,
     onCancel: (UserMessage) -> Unit,
-    onStep: (StepRef) -> Unit,
+    onStep: (StepSubject) -> Unit,
     listState: LazyListState,
     contentPadding: PaddingValues,
     modifier: Modifier = Modifier,
@@ -412,7 +412,7 @@ internal fun MessageList(
                         is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
                         is StepsRow -> StepList(row.reply.steps) { i ->
                             val step = row.reply.steps[i] as ToolStep
-                            onStep(StepRef(row.reply.key, i, step.callId, row.reply.live))
+                            onStep(StepSubject(row.reply.key, i, step.callId.ifEmpty { null }, step.name))
                         }
                         is TextRow -> TextBlock(row)
                         is FooterRow -> ReplyFooter(row.reply, live.takeIf { row.reply.live }, notes, answering, actions)
