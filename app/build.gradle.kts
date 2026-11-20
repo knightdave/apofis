@@ -83,6 +83,10 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.androidx.work.runtime)
+    implementation(libs.commonmark)
+    implementation(libs.commonmark.ext.gfm.tables)
+    implementation(libs.commonmark.ext.gfm.strikethrough)
+    implementation(libs.commonmark.ext.task.list.items)
 
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

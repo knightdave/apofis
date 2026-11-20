@@ -30,14 +30,23 @@ import xyz.rycerz.apofis.R
 
 /** Packaged from the repository's licenses/ directory (see app/build.gradle.kts). */
 const val LUCIDE_LICENSE_ASSET = "LUCIDE-LICENSE"
+const val COMMONMARK_LICENSE_ASSET = "COMMONMARK-LICENSE"
+const val COMMONMARK_NOTICE_ASSET = "COMMONMARK-NOTICE"
+
+/** Every shipped license: its heading and its asset. */
+private val LICENSES = listOf(
+    R.string.licenses_lucide to listOf(LUCIDE_LICENSE_ASSET),
+    // The repository's license at the pinned tag, then the notice the four jars carry (another copyright line).
+    R.string.licenses_commonmark to listOf(COMMONMARK_LICENSE_ASSET, COMMONMARK_NOTICE_ASSET),
+)
 
 /** The third-party license texts shipped in the app, verbatim. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LicensesScreen(onBack: () -> Unit) {
     val context = LocalContext.current
-    val lucide by produceState("") {
-        value = withContext(Dispatchers.IO) { context.assets.open(LUCIDE_LICENSE_ASSET).bufferedReader().use { it.readText() } }
+    val texts by produceState(emptyList<String>()) {
+        value = withContext(Dispatchers.IO) { LICENSES.map { (_, assets) -> assets.joinToString("\n\n") { a -> context.assets.open(a).bufferedReader().use { it.readText() } } } }
     }
     Scaffold(
         topBar = {
@@ -59,12 +68,14 @@ fun LicensesScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 8.dp),
         ) {
-            Text(
-                stringResource(R.string.licenses_lucide),
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(bottom = 12.dp).semantics { heading() },
-            )
-            Text(lucide, style = MaterialTheme.typography.bodyMedium)
+            LICENSES.forEachIndexed { i, (title, _) ->
+                Text(
+                    stringResource(title),
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(top = if (i == 0) 0.dp else 24.dp, bottom = 12.dp).semantics { heading() },
+                )
+                Text(texts.getOrElse(i) { "" }, style = MaterialTheme.typography.bodyMedium)
+            }
         }
     }
 }

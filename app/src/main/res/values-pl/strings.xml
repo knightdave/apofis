@@ -137,6 +137,9 @@
     <string name="settings_source">Kod źródłowy</string>
     <string name="settings_licenses">Licencje open source</string>
     <string name="licenses_lucide">Ikony Lucide</string>
+    <string name="licenses_commonmark">commonmark-java (licencja BSD 2-Clause)</string>
+    <string name="md_image">Obraz</string>
+    <string name="md_table">Tabela</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
     <string name="drawer_open">Otwórz listę czatów</string>
     <string name="drawer_new_chat">Nowy czat</string>
