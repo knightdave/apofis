@@ -80,9 +80,14 @@ shell user. Tests:
    into a directory), verifies every checksum, that nothing else arrived, and scans the copy, then renames it to
    `build/e2e/<run-id>/` in one step. rsync writes its temporary files only inside the incoming
    directory. On any failure or interrupt it deletes everything inside the incoming directory, whatever the name
-   (`find -mindepth 1 -delete`, then `rmdir`, only for a directory directly inside `build/e2e/` named `.incoming-*`), so
-   a `build/e2e/<run-id>/` exists only when fully verified.
-8. Decides first whether the journal is complete: every scenario that passed must have a send line, and every
+   (`find -mindepth 1 -delete`, then `rmdir`), and forgets the directory only once it is verified gone; a delete that
+   fails ends the run non-zero, naming the directory to remove by hand. Before creating, deleting or renaming, `build`,
+   `build/e2e` and the incoming directory must be real directories (no symbolic links), and the incoming directory's
+   canonical path must be exactly `<repository>/build/e2e/.incoming-<run-id>`. A `build/e2e/<run-id>/` therefore exists
+   only when fully verified. The cleanup ignores further INT, TERM and HUP from its first line.
+8. Decides first whether the journal is complete. It needs positive evidence of what ran: the verified copy's
+   `results.txt`, present, readable, non-empty and a results list; without it the run fails ("sessions may remain")
+   whatever the journal says. Every scenario that passed must have a send line, and every
    scenario with a send line must have exactly one `chat` line for the same key with server ids (a `chat` line also
    needs its send). Otherwise the run fails ("sessions may remain"), and no server request is made for any incomplete
    or unmatched entry. Then deletes the sessions of the complete entries: each only after a `GET` on that exact id returns the same id, an `apofis-` id,
@@ -95,7 +100,8 @@ shell user. Tests:
    releases the lock (only if it holds this run's id), and requires one token per fact with its expected value:
    `EMULATOR=absent ADB=absent REMOTE=absent AVD=absent RUNDIR=absent LOCK=released PORTS=closed DONE` (PORTS: no
    listener in the port ranges that was not there before). Every probe answers absent/present/unknown (`unknown`
-   when its command failed or its output did not parse; ports only `closed` after a parsed listing). A missing token,
+   when any step failed or its output did not parse; each step's status is checked on its own, not a pipeline's last;
+   ports are `closed` only after a parsed listing). A missing token,
    an `unknown` value or running out of time fails. Then it compares `~`, `~/.android`, `~/.config`, `~/.cache`, `~/.local` and the user's `/tmp` entries with
    before the run. The whole cleanup on the build host is limited to 15 minutes; past that it reports failure and
    exits instead of hanging.

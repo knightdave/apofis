@@ -12,6 +12,7 @@ APOFIS_E2E_LIB=1 source "$here/run-e2e.sh"
 t=$(mktemp -d "${TMPDIR:-/tmp}/apofis-e2e-selftest.XXXXXX")
 tmp=$t/tmp
 mkdir "$tmp"
+E2E_ROOT=$t
 E2E_OUT=$t/build/e2e
 key=SELFTESTfakeKEY0123456789abcdefSELFTESTfakeKEY0123456789abcdef # a fake key, never the real one
 nonce=0a1b2c3d
@@ -125,9 +126,11 @@ hermes() {
   esac
 }
 requests() { [ -e "$t/server-calls" ] && grep -c . "$t/server-calls" || echo 0; }
-sessions_case() { # <mode> <passed scenarios> <journal lines...>
-  mode=$1 key_sent_local=1 sessions_state=ok results_known=1
-  read -ra passed_scenarios <<<"$2"
+sessions_case() { # <mode> <passed scenarios> <journal lines...>: a verified results file listing them, and the journal
+  local sc
+  mode=$1 key_sent_local=1 sessions_state=ok published=1 run_id=sess
+  mkdir -p "$E2E_OUT/sess"
+  { echo SmokeE2eTest.connectViaLoopback PASS; for sc in $2; do echo "SurvivalE2eTest.$sc PASS"; done; } >"$E2E_OUT/sess/results.txt"
   shift 2
   journal=("$@")
   rm -f "$t/server-calls" "$t/deleted"
@@ -156,10 +159,31 @@ check "a complete, matched entry: proved, deleted and checked gone; passes" '[ "
 sessions_case smoke ''
 check "nothing sent (smoke): complete and empty journal passes, no request" '[ "$rc" = 0 ] && has "$o" "complete and empty" && [ "$(requests)" = 0 ]'
 sessions_case scenario ''
-results_known=''
+published=''
 rc=0; o=$(check_sessions 2>&1) || rc=$?
-check "sending mode, results not verified, empty journal: fails, no request" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
-key_sent_local='' sessions_state='' journal=() passed_scenarios=()
+check "results not verified (nothing published), empty journal: fails, no request" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(requests)" = 0 ]'
+sessions_case scenario ''
+rm -f "$E2E_OUT/sess/results.txt"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+check "missing results.txt and an empty journal: fails, sessions may remain, no request" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(requests)" = 0 ]'
+for m in smoke scenario; do
+  sessions_case "$m" ''
+  : >"$E2E_OUT/sess/results.txt"
+  rc=0; o=$(check_sessions 2>&1) || rc=$?
+  check "empty results.txt ($m): fails, sessions may remain, no request" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(requests)" = 0 ]'
+done
+sessions_case scenario ''
+chmod 000 "$E2E_OUT/sess/results.txt"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+chmod 600 "$E2E_OUT/sess/results.txt"
+check "unreadable results.txt: fails, no request" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
+sessions_case scenario ''
+printf 'something else\n' >"$E2E_OUT/sess/results.txt"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+check "results.txt that is not a results list: fails, no request" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
+rm -f "$E2E_OUT/sess/results.txt"
+rmdir "$E2E_OUT/sess"
+key_sent_local='' sessions_state='' journal=() published=''
 rm -f "$t/server-calls"
 check "key never sent: no sessions possible, no request" 'check_sessions 2>/dev/null && [ "$(requests)" = 0 ]'
 unset -f hermes
@@ -248,6 +272,22 @@ printf '#!/bin/sh\necho "LISTEN 0 4096 127.0.0.1:5037 0.0.0.0:*"\n' >"$t/ssok/ss
 chmod +x "$t/ssok/ss"
 o=$(PATH="$t/ssok:$PATH" probe "$t/nostate" run-x "$PORT_RANGES" none "$EMU_RE" "$ADB_RE" "$SCRIPT_RE")
 check "probe: a parsed listing with a new port in the ranges gives PORTS=open (control)" 'has "$o" PORTS=open && [ "$(PATH="$t/ssok:$PATH" listeners_now "$PORT_RANGES")" = LISTENERS=5037 ]'
+# Each step of each probe failing in turn gives unknown, never absent, released or closed (port 5037 is listening).
+for c in awk sort paste dirname id pgrep; do
+  mkdir -p "$t/fail-$c"
+  printf '#!/bin/sh\nexit 3\n' >"$t/fail-$c/$c"
+  chmod +x "$t/fail-$c/$c"
+done
+for c in awk sort paste; do
+  o=$(PATH="$t/fail-$c:$t/ssok:$PATH" probe "$t/nostate" run-x "$PORT_RANGES" 5037 "$EMU_RE" "$ADB_RE" "$SCRIPT_RE")
+  check "probe: $c failing in the port listing gives PORTS=unknown, not closed" 'has "$o" PORTS=unknown && ! verify_probe "$o" 2>/dev/null'
+done
+o=$(PATH="$t/fail-dirname:$PATH" probe "$t/nostate" run-x "$PORT_RANGES" none "$EMU_RE" "$ADB_RE" "$SCRIPT_RE")
+check "probe: dirname failing gives AVD, RUNDIR and LOCK unknown, not absent" 'has "$o" AVD=unknown && has "$o" RUNDIR=unknown && has "$o" LOCK=unknown && ! verify_probe "$o" 2>/dev/null'
+for c in id pgrep; do
+  o=$(PATH="$t/fail-$c:$PATH" probe "$t/nostate" run-x "$PORT_RANGES" none "$EMU_RE" "$ADB_RE" "$SCRIPT_RE")
+  check "probe: $c failing gives the process facts unknown, not absent" 'has "$o" EMULATOR=unknown && has "$o" ADB=unknown && has "$o" REMOTE=unknown && ! verify_probe "$o" 2>/dev/null'
+done
 
 # 10. The remote stage: the export is copied only after exit 0 with this run's completion token as the last line,
 # after a valid manifest. A fake ssh plays the emulator host.
@@ -307,7 +347,7 @@ set -m # job control: the child gets SIGINT like a foreground run would
 FAKE_KEY=$key PATH="$t/bin:$PATH" APOFIS_E2E_LIB=1 bash -c '
   source "$1/run-e2e.sh"
   set +e
-  tmp=$(mktemp -d) E2E_OUT=$2 run_id=run11 key=$3
+  tmp=$(mktemp -d) E2E_ROOT=${2%/build/e2e} E2E_OUT=$2 run_id=run11 key=$3
   mapfile -t export_files <"$4"
   exec {orig_out}>&1 {orig_err}>&2 # as main does
   trap local_cleanup EXIT
@@ -335,6 +375,58 @@ incoming=$t/other/.incoming-x rc=0; drop_incoming 2>/dev/null || rc=$?
 check "incoming cleanup: refuses a directory outside build/e2e" '[ "$rc" = 1 ] && [ -e "$t/other/.incoming-x/keep" ]'
 incoming=$E2E_OUT/notincoming rc=0; drop_incoming 2>/dev/null || rc=$?
 check "incoming cleanup: refuses a name without .incoming-" '[ "$rc" = 1 ] && [ -e "$E2E_OUT/notincoming/keep" ]'
+
+# 11c. TERM while the incoming directory is being deleted: it ends up gone, or left and reported; never silently left.
+real_find=$(command -v find)
+mkdir -p "$t/slowfind"
+printf '#!/bin/sh\nsleep 1.5\nexec %s "$@"\n' "$real_find" >"$t/slowfind/find"
+chmod +x "$t/slowfind/find"
+term_case() { # <name> <how the child reaches drop_incoming: direct|cleanup>
+  mkdir -p "$E2E_OUT/.incoming-$1"
+  printf 'partial %s\n' "$key" >"$E2E_OUT/.incoming-$1/.logcat.txt.Ab12Cd"
+  PATH="$t/slowfind:$PATH" APOFIS_E2E_LIB=1 bash -c '
+    source "$1/run-e2e.sh"
+    set +e
+    tmp=$(mktemp -d) E2E_ROOT=$2 E2E_OUT=$2/build/e2e run_id=$3 incoming=$2/build/e2e/.incoming-$3
+    exec {orig_out}>&1 {orig_err}>&2
+    trap local_cleanup EXIT
+    trap "on_signal 143" TERM
+    case $4 in direct) drop_incoming; echo "drop returned" >&2 ;; cleanup) exit 0 ;; esac' _ "$here" "$t" "$1" "$2" >"$t/out-$1" 2>&1 &
+  pid=$!
+  sleep 0.7
+  kill -TERM "$pid"
+  rc=0; wait "$pid" || rc=$?
+}
+term_case runT1 direct
+check "TERM during the import's delete: exit 143, the incoming directory is gone" '[ "$rc" = 143 ] && [ ! -e "$E2E_OUT/.incoming-runT1" ]'
+term_case runT2 cleanup
+check "TERM during the cleanup's delete: ignored, the incoming directory is gone" '[ "$rc" = 0 ] && [ ! -e "$E2E_OUT/.incoming-runT2" ]'
+# A delete that cannot complete is reported with the directory's name and fails the run.
+mkdir -p "$E2E_OUT/.incoming-runT3/sub"
+touch "$E2E_OUT/.incoming-runT3/sub/x"
+chmod 500 "$E2E_OUT/.incoming-runT3/sub"
+run_id=runT3 incoming=$E2E_OUT/.incoming-runT3 rc=0
+o=$(chmod() { :; }; drop_incoming 2>&1) || rc=$?
+command chmod 700 "$E2E_OUT/.incoming-runT3/sub"
+check "a delete that fails: non-zero, names the directory to remove by hand, keeps the record" '[ "$rc" = 1 ] && has "$o" "could not delete $E2E_OUT/.incoming-runT3" && has "$o" "by hand"'
+incoming=$E2E_OUT/.incoming-runT3
+drop_incoming
+check "the kept record lets a retry delete it" '[ ! -e "$E2E_OUT/.incoming-runT3" ] && [ -z "$incoming" ]'
+
+# 11d. build/e2e replaced by a symbolic link: refused, nothing outside the repository touched.
+mkdir -p "$t/sym/build" "$t/elsewhere/.incoming-runS"
+ln -s "$t/elsewhere" "$t/sym/build/e2e"
+touch "$t/elsewhere/.incoming-runS/keep"
+saved_root=$E2E_ROOT saved_out=$E2E_OUT
+E2E_ROOT=$t/sym E2E_OUT=$t/sym/build/e2e run_id=runS incoming=$t/sym/build/e2e/.incoming-runS rc=0
+o=$(drop_incoming 2>&1) || rc=$?
+check "symlinked build/e2e: the delete is refused with a fixed message, nothing outside touched" '[ "$rc" = 1 ] && has "$o" "refusing to delete" && [ -e "$t/elsewhere/.incoming-runS/keep" ]'
+make_export "$t/srcS"
+run_id=runS2 incoming='' rc=0
+o=$(import_export "$t/srcS/" 2>&1) || rc=$?
+check "symlinked build/e2e: the import is refused, nothing created outside" '[ "$rc" = 1 ] && has "$o" "not a real directory" && [ "$(ls -A "$t/elsewhere")" = .incoming-runS ]'
+E2E_ROOT=$saved_root E2E_OUT=$saved_out incoming=''
+rm -f "$t/sym/build/e2e"
 
 # 12. The cleanup has an overall limit: a hanging step ends in a reported failure, not a hang.
 s=$SECONDS rc=0

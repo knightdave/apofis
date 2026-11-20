@@ -23,7 +23,8 @@ TRAP_LIMIT=900                     # the build host's whole cleanup; past it, it
 LEAK_EXIT=3
 SCANFAIL_EXIT=4
 CLEANUP_EXIT=5
-E2E_OUT=build/e2e                  # verified copies, relative to the repository
+E2E_ROOT=.                         # the repository (main runs from its top)
+E2E_OUT=$E2E_ROOT/build/e2e        # verified copies
 DEVICE_OUT=/data/local/tmp/apofis-e2e
 PKG=xyz.rycerz.apofis.e2e
 RUNNER=$PKG/androidx.test.runner.AndroidJUnitRunner
@@ -187,13 +188,16 @@ lock_owned() { local oid=''; read -r oid <"$1/lock.d/owner" 2>/dev/null && [ "$o
 path_state() {
   local d
   if [ -e "$1" ] || [ -L "$1" ]; then echo present; return; fi
-  d=$(dirname -- "$1")
-  while [ ! -e "$d" ]; do d=$(dirname -- "$d"); done
+  d=$(dirname -- "$1") && [ -n "$d" ] || { echo unknown; return; }
+  while [ ! -e "$d" ]; do
+    [ "$d" != . ] && [ "$d" != / ] || { echo unknown; return; }
+    d=$(dirname -- "$d") && [ -n "$d" ] || { echo unknown; return; }
+  done
   if [ -d "$d" ] && [ -x "$d" ]; then echo absent; else echo unknown; fi
 }
 
-# LISTENERS=<comma separated ports in the ranges>, LISTENERS=none, or LISTENERS=unknown when ss failed or any line of
-# its output does not parse (its local address must end in :<port>).
+# LISTENERS=<comma separated ports in the ranges>, LISTENERS=none, or LISTENERS=unknown when any step failed: the
+# listing, its parsing (every local address must end in :<port>), sorting or joining. Each step's own status counts.
 listeners_now() {
   local l p
   l=$(ss -Hltn) || { echo LISTENERS=unknown; return; }
@@ -201,7 +205,9 @@ listeners_now() {
     NF < 5 || $4 !~ /:[0-9]+$/ { bad = 1; exit }
     { p = $4; sub(/.*:/, "", p); for (i = 1; i < n; i += 2) if (p + 0 >= a[i] && p + 0 <= a[i + 1]) print p + 0 }
     END { exit bad }' <<<"$l") || { echo LISTENERS=unknown; return; }
-  p=$(sort -un <<<"$p" | paste -sd, -) || { echo LISTENERS=unknown; return; }
+  p=$(sort -un <<<"$p") || { echo LISTENERS=unknown; return; }
+  p=$(paste -sd, - <<<"$p") || { echo LISTENERS=unknown; return; }
+  [[ $p =~ ^([0-9]+(,[0-9]+)*)?$ ]] || { echo LISTENERS=unknown; return; }
   echo "LISTENERS=${p:-none}"
 }
 
@@ -211,11 +217,12 @@ listeners_now() {
 # fact is reported absent, released or closed only when its check ran and its answer was understood.
 # probe <state dir> <run id> <ranges> <ports before> <emulator re> <adb re> <script re>
 probe() {
-  local st=$1 run=$2 before=,$4, r name re a b p l oid=''
+  local st=$1 run=$2 before=,$4, r name re a b p l u oid=''
   for name in EMULATOR ADB REMOTE; do
     case $name in EMULATOR) re=$5 ;; ADB) re=$6 ;; *) re=$7 ;; esac
     r=0
-    pgrep -u "$(id -u)" -f -- "$re" >/dev/null || r=$?
+    u=$(id -u) && [[ $u =~ ^[0-9]+$ ]] || u=''
+    if [ -n "$u" ]; then pgrep -u "$u" -f -- "$re" >/dev/null || r=$?; else r=3; fi
     case $r in 0) echo "$name=present" ;; 1) echo "$name=absent" ;; *) echo "$name=unknown" ;; esac
   done
   a=$(path_state "$st/avd/apofis-e2e.avd") b=$(path_state "$st/avd/apofis-e2e.ini")
@@ -550,7 +557,7 @@ scan_dir() {
 # ================================================================ build host
 key='' nonce='' run_id='' tmp='' interrupted='' key_sent_local='' mode='' arg=''
 tun_fd='' tunnel_pid='' tunnel_port='' rin='' rout='' remote_pid='' remote_shell_pid='' last_line=''
-sessions_state='' journal=() passed_scenarios=() results_known='' export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
+sessions_state='' journal=() published='' export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
 incoming='' wd_pid='' orig_out='' orig_err=''
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
@@ -603,7 +610,8 @@ STEER_JQ='
 steer_ok_json() { jq -e --arg id "$1" --arg text "$2" --arg end $'\n[/OUT-OF-BAND USER MESSAGE]' "$STEER_JQ" "$3" >/dev/null 2>&1; }
 
 # Checks and deletes the sessions the journal names; reads nothing on the server that is not a complete, matched
-# journal entry. Completeness is decided first: every scenario that passed must have sent; every scenario that sent
+# journal entry. Completeness is decided first: the verified results file must exist and list the tests; every
+# scenario that passed must have sent; every scenario that sent
 # (one chat key) must have exactly one chat line for that key with server ids; a chat line needs its send. Anything
 # else fails the run with "sessions may remain", and only the complete entries are checked and deleted. Each of their
 # ids is first proved to be this run's (a GET on that id returns that id, an app id, with this run's nonce in its
@@ -617,9 +625,16 @@ check_sessions() {
     return 1
   fi
   jlines() { [ "${#journal[@]}" = 0 ] || printf '%s\n' "${journal[@]}"; }
-  for s in "${passed_scenarios[@]}"; do jlines | grep -Eq "^send [^ ]+ $s$" || bad=1; done
-  # Without the verified results it is unknown which scenarios ran; a journal without any send proves nothing then.
-  if [ "$mode" != smoke ] && [ -z "$results_known" ] && ! jlines | grep -q '^send '; then bad=1; fi
+  # Positive evidence of what ran: the verified copy's results file, non-empty and readable, every line a result. Without
+  # it nothing proves which scenarios sent, whatever the journal says.
+  local rf=$E2E_OUT/$run_id/results.txt passed=''
+  if [ -n "$published" ] && [ -f "$rf" ] && [ -r "$rf" ] && [ -s "$rf" ] && ! grep -qvE '^[A-Za-z0-9]+\.[A-Za-z0-9]+ (PASS|FAIL)$' "$rf"; then
+    passed=$(sed -n 's/^SurvivalE2eTest\.\([A-Za-z]*\) PASS$/\1/p' "$rf") || { passed=''; bad=1; }
+  else
+    log "FAILED: no verified results file, so it is unknown which scenarios sent"
+    bad=1
+  fi
+  for s in $passed; do jlines | grep -Eq "^send [^ ]+ $s$" || bad=1; done
   for s in $(jlines | awk '$1 == "send" { print $3 } $1 == "chat" { print $2 }' | sort -u); do
     sends=$(jlines | awk -v s="$s" '$1 == "send" && $3 == s { print $2 }' | sort -u)
     chats=$(jlines | awk -v s="$s" '$1 == "chat" && $2 == s')
@@ -783,16 +798,22 @@ postcheck() {
 }
 
 # Removes what this run left in build/e2e unverified and its temp files, and stops the cleanup's watchdog.
+# Fails when the incoming directory could not be removed (drop_incoming names it).
 end_local() {
-  drop_incoming
-  if [ -n "$wd_pid" ]; then kill -TERM "$wd_pid" 2>/dev/null; wait "$wd_pid" 2>/dev/null; wd_pid=''; fi
+  local r=0
+  drop_incoming || r=1
+  if [ -n "$wd_pid" ]; then
+    kill -KILL -- "-$wd_pid" 2>/dev/null # its own process group: the watchdog and its sleep together
+    wait "$wd_pid" 2>/dev/null
+    wd_pid=''
+  fi
   if [ -n "$tmp" ]; then rm -f "$tmp/in" "$tmp/out" "$tmp/before.txt" "$tmp/after.txt" "$tmp/files"; rmdir "$tmp"; tmp=''; fi
+  return "$r"
 }
 
 cleanup_overrun() {
   log "FAILED: the cleanup did not finish within ${TRAP_LIMIT}s and stopped there; sessions or emulator host checks may be incomplete"
   [ -z "$lock_tried" ] || [ -n "$released" ] || lock_help "may still be held by this run ($run_id)"
-  wd_pid=''
   end_local
   key=''
   exit 1
@@ -800,20 +821,18 @@ cleanup_overrun() {
 
 local_cleanup() {
   local rc=$? bad='' r new
+  # No further INT, TERM or HUP can abort the cleanup.
+  trap '' INT TERM HUP
   set +e
   # A signal can end the run inside a function call whose output is redirected (to /dev/null): the cleanup's own
   # messages go to the original terminal.
   [ -z "$orig_err" ] || exec 1>&"$orig_out" 2>&"$orig_err"
-  # The whole cleanup is bounded: a watchdog interrupts it after TRAP_LIMIT seconds. It starts before the signals are
-  # ignored, so it can still be stopped with TERM.
+  # The whole cleanup is bounded: a watchdog interrupts it after TRAP_LIMIT seconds. It runs in its own process group
+  # (setsid does not fork here: a background child is never a group leader), which end_local kills as a whole.
   trap cleanup_overrun ALRM
-  (
-    trap 'kill "$s" 2>/dev/null; exit 0' TERM
-    sleep "$TRAP_LIMIT" & s=$!
-    wait "$s" && kill -ALRM $$
-  ) 2>/dev/null &
+  # shellcheck disable=SC2016 # expanded by the inner bash
+  setsid bash -c 'sleep "$1" && kill -ALRM "$2"' _ "$TRAP_LIMIT" $$ </dev/null >/dev/null 2>&1 &
   wd_pid=$!
-  trap '' INT TERM HUP
   if [ -n "$remote_pid" ]; then stop_pid "$remote_pid" && wait "$remote_pid" 2>/dev/null; fi
   [ -z "$rin" ] || exec {rin}>&-
   [ -z "$rout" ] || exec {rout}<&-
@@ -842,7 +861,7 @@ local_cleanup() {
   for r in "$tunnel_pid" "$remote_pid"; do
     [ -z "$r" ] || ! alive "$r" || { log "FAILED: local process $r is still running"; bad=1; }
   done
-  end_local
+  end_local || bad=1
   key=''
   [ -z "$bad" ] || { [ "$rc" != 0 ] || rc=1; }
   exit "$rc"
@@ -933,21 +952,33 @@ remote_complete() {
   [ "$1" = 0 ] && [ "$export_state" = ok ] && [ "$last_line" = "@@COMPLETE $run_id ${#export_files[@]}@@" ]
 }
 
+# True only when the repository's build and build/e2e and <dir> are real directories (no symbolic links) and <dir>'s
+# canonical path is exactly <canonical repository>/build/e2e/.incoming-<this run id>.
+incoming_safe() {
+  local c root
+  [ "$E2E_OUT" = "$E2E_ROOT/build/e2e" ] && [ "$1" = "$E2E_OUT/.incoming-$run_id" ] || return 1
+  for c in "$E2E_ROOT/build" "$E2E_OUT" "$1"; do [ -d "$c" ] && [ ! -L "$c" ] || return 1; done
+  root=$(realpath -e -- "$E2E_ROOT") && c=$(realpath -e -- "$1") && [ "$c" = "$root/build/e2e/.incoming-$run_id" ]
+}
+
 # Removes everything inside this run's incoming directory, whatever its name (partial and temporary files of the copy
-# included), then the directory. Refuses unless $incoming is a real directory directly inside $E2E_OUT whose name
-# starts with .incoming-: the one place where deleting by pattern is right, because nothing in it is verified.
+# included), then the directory: the one place where deleting by pattern is right, because nothing in it is verified.
+# Only after incoming_safe. $incoming is cleared only once the directory is verified gone; otherwise this fails with a
+# message naming the directory to remove by hand.
 drop_incoming() {
   local d=$incoming
-  incoming=''
   [ -n "$d" ] || return 0
-  if [ "${d%/*}" != "$E2E_OUT" ] || [[ ${d##*/} != .incoming-?* ]] || [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
-    log "FAILED: refusing to clean $d: not an incoming directory of $E2E_OUT; left alone"
-    return 1
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    if ! incoming_safe "$d"; then
+      log "FAILED: refusing to delete $d: build, build/e2e or it is not a real directory of this repository (a symbolic link?); check it and remove it by hand"
+      return 1
+    fi
+    chmod -R u+w -- "$d" 2>/dev/null
+    find "$d" -mindepth 1 -delete 2>/dev/null
+    rmdir -- "$d" 2>/dev/null
+    if [ -e "$d" ] || [ -L "$d" ]; then log "FAILED: could not delete $d (unverified files, maybe the key); remove it by hand"; return 1; fi
   fi
-  [ -e "$d" ] || return 0
-  chmod -R u+w -- "$d" 2>/dev/null
-  find "$d" -mindepth 1 -delete 2>/dev/null
-  rmdir -- "$d" 2>/dev/null || { log "FAILED: could not remove $d; delete it by hand (unverified files)"; return 1; }
+  incoming=''
 }
 
 # import_export <source>: copies exactly the reported files into $E2E_OUT/.incoming-<run id> (new, never descending
@@ -956,12 +987,21 @@ drop_incoming() {
 # everything in it are deleted (here or in the cleanup).
 import_export() {
   local src=$1 final=$E2E_OUT/$run_id e h f fail=''
-  if [ -e "$final" ] || [ -e "$E2E_OUT/.incoming-$run_id" ] || ! mkdir -p "$E2E_OUT"; then
+  # build and build/e2e must be real directories before anything is created inside them.
+  if [ -L "$E2E_ROOT/build" ] || [ -L "$E2E_OUT" ] || ! mkdir -p "$E2E_OUT" || [ -L "$E2E_ROOT/build" ] || [ -L "$E2E_OUT" ]; then
+    log "FAILED: stage copy: build or build/e2e is not a real directory of this repository (a symbolic link?); nothing copied"
+    return 1
+  fi
+  if [ -e "$final" ] || [ -L "$final" ] || [ -e "$E2E_OUT/.incoming-$run_id" ] || [ -L "$E2E_OUT/.incoming-$run_id" ] ||
+    ! mkdir -- "$E2E_OUT/.incoming-$run_id"; then
     log "FAILED: stage copy: could not create a new incoming directory in $E2E_OUT; nothing copied"
     return 1
   fi
   incoming=$E2E_OUT/.incoming-$run_id
-  mkdir -- "$incoming" || { incoming=''; log "FAILED: stage copy: could not create $E2E_OUT/.incoming-$run_id; nothing copied"; return 1; }
+  if ! incoming_safe "$incoming"; then
+    log "FAILED: stage copy: build, build/e2e or the incoming directory is not a real directory of this repository (a symbolic link?); nothing copied, nothing deleted"
+    return 1
+  fi
   for e in "${export_files[@]}"; do printf '%s\n' "${e#* }"; done >"$tmp/files"
   bounded 600 rsync --times --chmod=Fu+rw --temp-dir="$(cd "$incoming" && pwd)" --files-from="$tmp/files" "$src" "$incoming/" >/dev/null 2>&1 || fail="copy"
   if [ -z "$fail" ]; then
@@ -976,8 +1016,13 @@ import_export() {
     scan_dir "$incoming" "$(key_patterns | tail -n +2)" || src_rc=$?
     case $src_rc in 1) ;; 0) fail="local scan (key found)" ;; *) fail="local scan (could not complete)" ;; esac
   fi
-  if [ -z "$fail" ] && mv -T -- "$incoming" "$final"; then incoming=''; return 0; fi
-  drop_incoming
+  # The same check guards the rename into the final directory.
+  if [ -z "$fail" ] && incoming_safe "$incoming" && [ ! -e "$final" ] && [ ! -L "$final" ] && mv -T -- "$incoming" "$final"; then
+    incoming=''
+    published=1
+    return 0
+  fi
+  drop_incoming || true # it names the directory left to remove by hand; the run fails either way
   log "FAILED: stage ${fail:-publish}: the copied files were deleted; nothing kept in $E2E_OUT"
   return 1
 }
@@ -1105,9 +1150,6 @@ main() {
   log "copying the ${#export_files[@]} scanned files to $E2E_OUT/$run_id"
   import_export "$HOST:$REMOTE_DIR/.state/runs/$run_id/export/" || exit "$SCANFAIL_EXIT"
   log "copied and verified (checksums match, key absent from the copy)"
-  # The scenarios that passed, for the journal's completeness check (each of them sent a message).
-  mapfile -t passed_scenarios < <(sed -n 's/^SurvivalE2eTest\.\([A-Za-z]*\) PASS$/\1/p' "$E2E_OUT/$run_id/results.txt" 2>/dev/null)
-  results_known=1
   evaluate "$E2E_OUT/$run_id" || die "tests failed or evidence is missing; files in $E2E_OUT/$run_id"
   log "PASSED; files in $E2E_OUT/$run_id (server checks and cleanup follow)"
 }
