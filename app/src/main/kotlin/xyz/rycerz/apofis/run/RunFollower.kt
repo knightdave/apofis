@@ -673,7 +673,10 @@ class RunFollower(
          */
         private suspend fun write(status: String?, items: List<ChatItem>?) {
             beforeFinishWrite()
-            val stopped = db.activeRunDao().get(id)?.stopRequested == true
+            // Still owned: a confirmed delete or a cache clear (both under this lock) removed the row, and nothing of the
+            // run may come back. There is no foreign key to refuse an orphan outcome.
+            val owned = db.activeRunDao().get(id)?.takeIf { db.sessionDao().get(key) != null } ?: return
+            val stopped = owned.stopRequested
             val outcome = when (status) {
                 "failed" -> ReplyOutcome.FAILED
                 "interrupted" -> ReplyOutcome.INTERRUPTED

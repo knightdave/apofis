@@ -221,6 +221,28 @@ class RunFollowerTest {
     // ---- tests ----
 
     @Test
+    fun finishAfterConfirmedDeleteRecreatesNothing() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val gate = gate()
+        messages()
+        routes[EVENTS] = {
+            gate.pass() // the cancellation frame is delivered only after the chat was deleted here
+            sseResponse(terminal(1, "cancelled"))
+        }
+        started(f)
+        awaitUntil { requestsTo(EVENTS).isNotEmpty() }
+        db.sessionDao().delete(KEY) // the server accepted DELETE; the local cascade ran
+        gate.countDown()
+        done.await()
+
+        assertTrue(outcomes().isEmpty())
+        assertNull(db.sessionDao().get(KEY))
+        assertTrue(db.pendingSendDao().observe(KEY).first().isEmpty())
+        assertNull(f.live(KEY).value)
+    }
+
+    @Test
     fun backgroundWorkerFinishesAnEndedRunThenSendsTheNextMessage() = runTest {
         val f = follower() // never resumed: the app is in the background, so no follower runs
         messages()
