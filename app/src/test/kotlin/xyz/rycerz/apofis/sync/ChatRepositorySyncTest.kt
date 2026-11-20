@@ -468,6 +468,43 @@ class ChatRepositorySyncTest {
     }
 
     @Test
+    fun everyUnlistedRetainedChatIsChecked() = runTest {
+        val keys = (1..60).map { "apofis-r$it" }
+        keys.forEach {
+            db.sessionDao().upsert(session(it))
+            db.pendingSendDao().upsert(pending(it, "idem-$it"))
+        }
+        respond(page())
+        keys.forEach { respond("""{"object":"hermes.session","session":${sessionJson(it, hidden = true)}}""") }
+        repo.refreshSessions()
+        assertEquals(61, server.requestCount)
+        assertTrue(repo.sessions().first().isEmpty())
+        assertTrue(keys.all { db.sessionDao().get(it)!!.hidden })
+    }
+
+    @Test
+    fun lateToolResultKeepsReplyEligibleForNoticeOutcome() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        val call = """[{"id":"c1","type":"function","function":{"name":"t","arguments":"{}"}}]"""
+        respond(
+            rawMessages(
+                "apofis-s",
+                listOf(
+                    """{"id":1,"role":"user","content":"hi","timestamp":1.0}""",
+                    """{"id":2,"role":"assistant","content":"","tool_calls":$call,"timestamp":2.0}""",
+                    """{"id":3,"role":"system","display_kind":"model_switch","content":"switch","timestamp":3.0}""",
+                    """{"id":4,"role":"tool","tool_call_id":"c1","content":"late","timestamp":4.0}""",
+                ),
+            ),
+        )
+        repo.syncMessages("apofis-s")
+        db.replyOutcomeDao().upsert(ReplyOutcomeEntity("apofis-s", 3L, "stopped", null))
+        val replies = repo.transcript("apofis-s").first().filterIsInstance<AssistantReply>()
+        assertEquals(listOf(listOf(2L, 4L)), replies.map { it.rowIds })
+        assertEquals(listOf(ReplyOutcome.STOPPED), replies.map { it.outcome })
+    }
+
+    @Test
     fun titleFromCases() {
         assertEquals("first line", titleFrom("first line\nsecond"))
         assertEquals("real", titleFrom("\n   \n  real  \nmore"))

@@ -26,7 +26,6 @@ import xyz.rycerz.apofis.db.SessionEntity
 private const val SESSION_PAGE = 200
 private const val MESSAGE_PAGE = 500
 private const val MAX_PAGES = 100
-private const val MAX_DETAIL_READS = 50
 
 // Process-wide: the app has a single database, so every repository instance must share one lock.
 private val lock = Mutex()
@@ -81,11 +80,10 @@ class ChatRepository(private val api: HermesApi, private val db: AppDatabase, pr
         val listedKeys = (visible + hidden).mapTo(HashSet()) { it.key }
         val unlisted = cached.filter { it.existsOnServer && it.key !in listedKeys }
         // The list never returns archived chats, so each one known locally is read by id. A chat the DAO keeps
-        // for unsent work is read too, since the list also omits hidden chats; at most MAX_DETAIL_READS of those
-        // per refresh, the rest stay as cached until a later refresh.
+        // for unsent work is read too, since the list also omits hidden chats.
+        // No cap: only chats with a pending send or an active run are retained, and those are few by nature.
         val retained = sessionDao.retainedKeys().toHashSet()
-        val toRead = unlisted.filter { it.archived } + unlisted.filter { !it.archived && it.key in retained }.take(MAX_DETAIL_READS)
-        for (row in toRead) {
+        for (row in unlisted.filter { it.archived || it.key in retained }) {
             val dto = try {
                 api.getSession(row.currentId)
             } catch (_: ApiError.NotFound) {
@@ -236,8 +234,8 @@ private fun PendingSendEntity.toItem() = UserMessage(
 )
 
 /**
- * Each outcome goes to the reply that owns its message row, or else to the last reply whose rows all sit before
- * that row's position ([positions]: message id to transcript position). An unknown row means the last reply.
+ * Each outcome goes to the reply that owns its message row, or else to the last reply whose first row sits before
+ * that row's position (a late tool result does not move a reply) ([positions]: message id to transcript position). An unknown row means the last reply.
  */
 private fun withOutcomes(positions: Map<Long, Int>, items: List<ChatItem>, outcomes: List<ReplyOutcomeEntity>): List<ChatItem> {
     if (outcomes.isEmpty()) return items
@@ -250,7 +248,7 @@ private fun withOutcomes(positions: Map<Long, Int>, items: List<ChatItem>, outco
             ?: if (at == null) {
                 replies.lastOrNull()
             } else {
-                replies.lastOrNull { r -> (items[r] as AssistantReply).rowIds.all { (positions[it] ?: Int.MAX_VALUE) < at } }
+                replies.lastOrNull { r -> ((items[r] as AssistantReply).rowIds.firstOrNull()?.let(positions::get) ?: Int.MAX_VALUE) < at }
             }
             ?: continue
         result[target] = (result[target] as AssistantReply).copy(outcome = outcome)
