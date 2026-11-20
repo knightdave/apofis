@@ -456,6 +456,7 @@ internal object Work {
     var highlightSteps = 0L // characters the highlighter looked at
     var largestHighlight = 0 // the longest code handed to the highlighter
     var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
+    var timelineRows = 0L // timeline step rows composed
 }
 
 /**
@@ -948,10 +949,10 @@ internal fun MessageList(
                     when (row) {
                         is DateRow -> DateSeparator(row.day, today)
                         is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
-                        is StepsRow -> StepList(row.reply.steps, tag = "step:${row.reply.key}") { i ->
-                            val step = row.reply.steps[i] as ToolStep
-                            onStep(StepSubject(row.reply.key, i, step.callId.ifEmpty { null }, step.name))
-                        }
+                        is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
+                            // Read at tap time: a step that has since changed kind or gone opens nothing.
+                            (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
+                        })
                         is TextRow -> {
                             val source = { copySource(latest, row.key) }
                             if (row.kind == BlockKind.TABLE) {
@@ -970,7 +971,7 @@ internal fun MessageList(
     }
 }
 
-/** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [StepList]). */
+/** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [TimelineCard]). */
 private fun rowTag(row: Row): Modifier = when (row) {
     is UserRow -> Modifier.testTag("user:${row.key}")
     is TextRow -> Modifier.testTag("reply:${row.key}")

@@ -4,6 +4,7 @@ import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.test.junit4.ComposeContentTestRule
 import com.github.takahirom.roborazzi.RoborazziOptions
 import com.github.takahirom.roborazzi.captureRoboImage
 import com.github.takahirom.roborazzi.captureScreenRoboImage
@@ -39,5 +40,15 @@ fun windowShot(name: String, mode: ThemeMode = ThemeMode.LIGHT, content: @Compos
     val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
     activity.setContent { GoldenTheme(mode, seed = null, pureBlack = false, content = content) }
     shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2)) // sheet and dialog enter animations end
+    captureScreenRoboImage("src/test/screenshots/$name.png", options)
+}
+
+/**
+ * Like [windowShot], but driven by a Compose test rule's clock, so a sheet's enter animation always finishes before the
+ * capture (the looper-idle version sometimes captured a sheet still hidden).
+ */
+fun ComposeContentTestRule.windowShot(name: String, mode: ThemeMode = ThemeMode.LIGHT, content: @Composable () -> Unit) {
+    setContent { GoldenTheme(mode, seed = null, pureBlack = false, content = content) }
+    waitForIdle()
     captureScreenRoboImage("src/test/screenshots/$name.png", options)
 }

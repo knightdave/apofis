@@ -1,6 +1,13 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.annotation.StringRes
+import androidx.annotation.DrawableRes
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -15,13 +22,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -56,7 +61,7 @@ import xyz.rycerz.apofis.ui.theme.wash
 internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, onChoice: (String, Long, ApprovalChoice) -> Unit) {
     val command = control.command?.takeIf { it.isNotBlank() }
     val choose = { choice: ApprovalChoice -> onChoice(control.requestId, control.executionGeneration, choice) }
-    ControlCard(R.string.chat_approval_title, changed) {
+    ControlCard(R.string.chat_approval_title, changed, R.drawable.lucide_triangle_exclamation_point, ApofisTheme.colors.warning) {
         if (command != null) {
             CodeSurface {
                 Text(
@@ -71,18 +76,9 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             Text(stringResource(R.string.chat_approval_no_command), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
-            val deny = remember { MutableInteractionSource() }
-            OutlinedButton(
-                onClick = { choose(ApprovalChoice.DENY) },
-                Modifier.wash(deny, ButtonDefaults.outlinedShape),
-                enabled = !answering,
-                interactionSource = deny,
-            ) { Text(stringResource(R.string.chat_approval_deny)) }
+            Pill(stringResource(R.string.chat_approval_deny), filled = false, enabled = !answering) { choose(ApprovalChoice.DENY) }
             if (command != null) {
-                val once = remember { MutableInteractionSource() }
-                Button(onClick = { choose(ApprovalChoice.ONCE) }, Modifier.wash(once, ButtonDefaults.shape, ring = MaterialTheme.colorScheme.onPrimary), enabled = !answering, interactionSource = once) {
-                    Text(stringResource(R.string.chat_approval_once))
-                }
+                Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering) { choose(ApprovalChoice.ONCE) }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
                     ApofisIconButton(onClick = { menu = true }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
@@ -140,19 +136,26 @@ internal fun UnsupportedBlock() {
     }
 }
 
+/** Header: a 24 dp icon column (approval: warning triangle; others: info), then the title as a heading. */
 @Composable
-private fun ControlCard(@StringRes title: Int, changed: Boolean, content: @Composable () -> Unit) {
+private fun ControlCard(
+    @StringRes title: Int,
+    changed: Boolean,
+    @DrawableRes icon: Int = R.drawable.lucide_info,
+    tint: Color = ApofisTheme.colors.timelineStrong,
+    content: @Composable () -> Unit,
+) {
     val shape = RoundedCornerShape(16.dp)
     Column(
         Modifier
             .padding(horizontal = 16.dp, vertical = 6.dp)
             .fillMaxWidth()
-            .background(ApofisTheme.colors.cardFill, shape)
+            .background(ApofisTheme.colors.timelineFill, shape)
             .border(1.dp, ApofisTheme.colors.hairlineStrong, shape)
             .padding(12.dp),
     ) {
         Row(Modifier.padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(painterResource(R.drawable.lucide_triangle_exclamation_point), null, Modifier.size(18.dp), tint = ApofisTheme.colors.warning)
+            Box(Modifier.width(24.dp), contentAlignment = Alignment.Center) { Icon(painterResource(icon), null, Modifier.size(18.dp), tint = tint) }
             Box(Modifier.width(8.dp))
             Text(
                 stringResource(title),
@@ -169,6 +172,34 @@ private fun ControlCard(@StringRes title: Int, changed: Boolean, content: @Compo
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+    }
+}
+
+/**
+ * An answer button: a 36 dp pill (outlined, or [filled] in primary) centred in a 48 dp touch target, one node with
+ * the wash and focus ring on the pill itself.
+ */
+@Composable
+private fun Pill(label: String, filled: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val source = remember { MutableInteractionSource() }
+    val scheme = MaterialTheme.colorScheme
+    Box(
+        Modifier
+            .heightIn(min = 48.dp)
+            .clickable(source, indication = null, enabled = enabled, role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            Modifier
+                .heightIn(min = 36.dp)
+                .alpha(if (enabled) 1f else 0.38f)
+                .then(if (filled) Modifier.background(scheme.primary, CircleShape) else Modifier.border(1.dp, ApofisTheme.colors.hairlineStrong, CircleShape))
+                .wash(source, CircleShape, ring = if (filled) scheme.onPrimary else Color.Unspecified)
+                .padding(horizontal = 16.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(label, style = MaterialTheme.typography.labelLarge, color = if (filled) scheme.onPrimary else scheme.onSurface)
         }
     }
 }

@@ -92,8 +92,9 @@ fun ChatScreen(
     val steps = remember { StepIndex() }
     val uriHandler = LocalUriHandler.current
     var linkFailed by remember { mutableStateOf(false) } // shown until the next send or the next link that opens
-    val pendingId = state.live?.pending?.requestId
-    LaunchedEffect(pendingId) { if (pendingId != null) listState.animateScrollToItem(0) } // the request sits at the bottom
+    // The request sits at the bottom; a same-id request with a new generation is a new request and is revealed again.
+    val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
+    LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
 
     Scaffold(
         modifier.testTag("chat.key:${state.sessionKey}"), // the end-to-end tests read the open chat's key here

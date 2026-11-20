@@ -3,13 +3,10 @@ package xyz.rycerz.apofis.ui.chat
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -20,7 +17,9 @@ import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.Step
 import xyz.rycerz.apofis.chat.ToolStep
+import xyz.rycerz.apofis.ui.theme.ApofisSheet
 import xyz.rycerz.apofis.ui.theme.ChatText
 
 /**
@@ -32,15 +31,24 @@ internal data class StepSubject(val replyKey: String, val index: Int, val callId
 /**
  * Resolves a [StepSubject] within its own reply only. With a call id: the one step of that reply with that id.
  * Without: the step at its index, if it also has no call id and the same tool name. Anything else is null, and the
- * sheet closes. The stored part (a [Joined]'s head, else the whole list) is indexed by reply key once per list
- * instance; the live tail is a few items. A live reply keeps its key at run end when the stored reply was already
- * known; a reply still keyed "live" has no stored key to map to, so its sheet closes then.
+ * sheet closes. The reply is resolved on every call (the live tail first, then the stored part, which is indexed by
+ * reply key once per list instance). Only the step lookup is cached, by the identity of the reply's steps list and the
+ * subject, so a streamed text token scans no step; [Found] is always built from the current reply. A live reply keeps
+ * its key at run end when the stored reply was already known; a reply still keyed "live" has no stored key to map to,
+ * so its sheet closes then.
  */
 internal class StepIndex {
     data class Found(val step: ToolStep, val live: Boolean)
 
+    /** Step lists scanned so far; for tests. */
+    var scans = 0
+        private set
+
     private var head: List<ChatItem>? = null
     private val byKey = HashMap<String, AssistantReply>()
+    private var steps: List<Step>? = null
+    private var subject: StepSubject? = null
+    private var step: ToolStep? = null
 
     fun find(items: List<ChatItem>, subject: StepSubject): Found? {
         val joined = items as? Joined<*>
@@ -55,27 +63,25 @@ internal class StepIndex {
         }
         val reply = tail.lastOrNull { it is AssistantReply && it.key == subject.replyKey } as AssistantReply?
             ?: byKey[subject.replyKey] ?: return null
-        val step = if (subject.callId != null) {
-            reply.steps.filter { it is ToolStep && it.callId == subject.callId }.singleOrNull() as ToolStep?
-        } else {
-            (reply.steps.getOrNull(subject.index) as? ToolStep)?.takeIf { it.callId.isEmpty() && it.name == subject.name }
+        if (reply.steps !== steps || subject != this.subject) {
+            scans++
+            steps = reply.steps
+            this.subject = subject
+            step = if (subject.callId != null) {
+                reply.steps.filter { it is ToolStep && it.callId == subject.callId }.singleOrNull() as ToolStep?
+            } else {
+                (reply.steps.getOrNull(subject.index) as? ToolStep)?.takeIf { it.callId.isEmpty() && it.name == subject.name }
+            }
         }
         return step?.let { Found(it, reply.live) }
     }
 }
 
 /** A tool step in full: name, arguments and the (display-truncated) result. [live]: from the reply still running. */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun ToolDetailSheet(step: ToolStep, live: Boolean, onDismiss: () -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(start = 16.dp, end = 16.dp, bottom = 16.dp)
-                .navigationBarsPadding(),
-        ) {
+    ApofisSheet(onDismiss) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
             Text(
                 step.name,
                 Modifier.semantics { heading() },
