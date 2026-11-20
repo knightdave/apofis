@@ -1,0 +1,43 @@
+package xyz.rycerz.apofis.chat
+
+sealed interface ChatItem { val key: String }
+
+data class UserMessage(
+    override val key: String,
+    val text: String,
+    val steered: Boolean,
+    val timestamp: Double,
+    val state: SendState = SendState.SENT,
+    val idempotencyKey: String? = null,
+) : ChatItem
+
+enum class SendState { QUEUED, SENDING, FAILED, SENT }
+
+data class AssistantReply(
+    override val key: String,
+    val steps: List<Step>,
+    val text: String,
+    val timestamp: Double,
+    val live: Boolean = false,
+    val outcome: ReplyOutcome? = null,
+) : ChatItem
+
+data class Notice(override val key: String, val kind: String, val text: String) : ChatItem
+
+sealed interface Step
+
+data class ReasoningStep(val text: String) : Step
+
+data class ToolStep(
+    val callId: String,
+    val name: String,
+    val argsPreview: String,
+    val result: String?,
+    val resultTruncated: Boolean,
+    val error: Boolean,
+    val running: Boolean,
+) : Step
+
+enum class ReplyOutcome { STOPPED, FAILED, INTERRUPTED }
+
+const val TOOL_RESULT_DISPLAY_LIMIT = 20000
