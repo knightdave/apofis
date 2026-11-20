@@ -49,6 +49,15 @@ object SendError {
 
 enum class RetryResult { STARTED, NEEDS_CONFIRMATION, NOT_FOUND }
 
+/** What [SendQueue.cancel] did, read under the drain lock, so the UI can say it truthfully. */
+enum class CancelResult {
+    REMOVED,
+    REMOVED_MAY_HAVE_SENT, // removed from this phone, but a request for it may already have reached the server
+    STARTED, // already being sent or delivered: nothing was removed
+    NOT_FOUND,
+    NOW_ATTEMPTED, // a request for it may have gone out since the user was told it had not: nothing was removed
+}
+
 // Process-wide like the repository lock: the app foreground and SendWorker must never start the same send twice.
 // Lock order: drainLock, then the repository lock.
 private val drainLock = Mutex()
@@ -90,16 +99,26 @@ class SendQueue(
      * the session and a delete cannot remove the row in between.
      */
     internal suspend fun submit(sessionKey: String, text: String) {
-        val queued = drainLock.withLock {
-            withRepositoryLock {
-                ensureOpen()
-                val row = insert(sessionKey, text, steer = true)
-                if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
+        var stored = false
+        try {
+            val queued = drainLock.withLock {
+                withRepositoryLock {
+                    ensureOpen()
+                    val row = insert(sessionKey, text, steer = true)
+                    stored = true
+                    if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
+                }
             }
-        }
-        if (queued) {
-            schedule()
-            drain()
+            if (queued) {
+                schedule()
+                drain()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Contract: a throw means nothing was stored, so the caller may offer the text again. Once the row
+            // exists it is the message: whatever fails later shows on its bubble or is retried by a later drain.
+            if (!stored) throw e
         }
     }
 
@@ -131,11 +150,17 @@ class SendQueue(
         }
     }
 
-    /** Removes a queued or failed send; one started or steered cannot be taken back. */
-    suspend fun cancel(idempotencyKey: String) = drainLock.withLock {
+    /**
+     * Removes a queued or failed send; one started or steered cannot be taken back. [mayHaveSentShown] is what the
+     * user was told; a row attempted since a "not sent yet" warning is kept ([CancelResult.NOW_ATTEMPTED]).
+     */
+    suspend fun cancel(idempotencyKey: String, mayHaveSentShown: Boolean = true): CancelResult = drainLock.withLock {
         ensureOpen()
-        val send = pendingDao.get(idempotencyKey) ?: return@withLock
-        if (send.state == PendingState.QUEUED || send.state == PendingState.FAILED) pendingDao.delete(idempotencyKey)
+        val send = pendingDao.get(idempotencyKey) ?: return@withLock CancelResult.NOT_FOUND
+        if (send.state != PendingState.QUEUED && send.state != PendingState.FAILED) return@withLock CancelResult.STARTED
+        if (send.attempted && !mayHaveSentShown) return@withLock CancelResult.NOW_ATTEMPTED
+        if (pendingDao.delete(idempotencyKey) == 0) return@withLock CancelResult.NOT_FOUND
+        if (send.attempted) CancelResult.REMOVED_MAY_HAVE_SENT else CancelResult.REMOVED
     }
 
     /**
