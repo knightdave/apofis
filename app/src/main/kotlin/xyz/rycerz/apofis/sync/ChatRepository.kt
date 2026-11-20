@@ -138,10 +138,12 @@ class ChatRepository(
      * Like [syncMessages], and runs [afterReplace] with the fetched rows inside the transaction that writes them, so
      * no observer sees a state between the two. Only the fetch is cancellable: from the write on, through
      * [afterCommit] (run after the lock is released, only when the transaction committed with the block run), the
-     * call completes even if the caller is cancelled. True when the transcript was fetched.
+     * call completes even if the caller is cancelled. [onFetched] runs as soon as the fetch has returned, before
+     * the write. True when the transcript was fetched.
      */
     suspend fun syncMessages(
         sessionKey: String,
+        onFetched: () -> Unit = {},
         afterCommit: suspend () -> Unit = {},
         afterReplace: suspend (List<MessageDto>) -> Unit,
     ): Boolean {
@@ -157,6 +159,7 @@ class ChatRepository(
             lock.unlock()
             return false
         }
+        onFetched()
         val (tip, rows) = fetched
         withContext(NonCancellable) {
             val written = try {

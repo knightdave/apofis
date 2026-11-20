@@ -8,6 +8,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -1440,5 +1441,115 @@ class RunFollowerTest {
         awaitUntil { f.following.isEmpty() }
 
         assertTrue(f.credentialsRejected.value)
+    }
+
+    // ---- fix round 5 ----
+
+    private val resolvedBody = json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}""")
+
+    @Test
+    fun refreshKeepsRetryingUntilAReadSucceeds() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        val failed = json("{}", 500)
+        on(STATUS, status("waiting_for_approval", pendingControl), failed, failed, failed, failed, failed, failed, status("running"))
+        on("/v1/runs/$RUN/approval", resolvedBody)
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        awaitUntil { f.live(KEY).value?.pending == null }
+        assertEquals(listOf(1000L, 2000L, 4000L, 8000L, 16000L, 30000L), delays)
+        release.countDown()
+    }
+
+    @Test
+    fun refreshPendingAtPauseResumesAfterResumeAll() = runTest {
+        val paused = AtomicBoolean(false)
+        val resumed = AtomicBoolean(false)
+        val readsWhilePaused = AtomicInteger()
+        val f = follower(onDelay = { if (paused.compareAndSet(false, true)) pauseAll() }) // the gate closes during the backoff
+        val release = CountDownLatch(1)
+        val reads = AtomicInteger()
+        routes[STATUS] = {
+            if (paused.get() && !resumed.get()) readsWhilePaused.incrementAndGet()
+            when (reads.incrementAndGet()) {
+                1 -> status("waiting_for_approval", pendingControl)()
+                2 -> json("{}", 500)()
+                else -> status("running")()
+            }
+        }
+        on("/v1/runs/$RUN/approval", resolvedBody)
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        awaitUntil { paused.get() }
+        resumed.set(true)
+        f.resumeAll()
+        awaitUntil { f.live(KEY).value?.pending == null }
+        assertEquals(0, readsWhilePaused.get())
+        release.countDown()
+    }
+
+    @Test
+    fun rejectionBetweenStatusReadAndItsApplyStaysShown() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        heldOpen(f, release)
+        addSession("apofis-b")
+        addRun("run_b", "apofis-b")
+        on("/v1/runs/run_b/stop", unauthorized)
+        val once = AtomicBoolean(false)
+        f.beforeStatusApply = {
+            if (once.compareAndSet(false, true)) {
+                try {
+                    stop("apofis-b") // completes after the status GET returned, before the follower is done with it
+                    fail("expected Unauthorized")
+                } catch (_: ApiError.Unauthorized) {
+                }
+            }
+        }
+
+        assertEquals(AnswerResult.CHANGED, f.answerApproval(KEY, "ctl_gone", 2, ApprovalChoice.ONCE))
+        assertTrue(f.credentialsRejected.value)
+        release.countDown()
+    }
+
+    @Test
+    fun rejectedRefreshAfterAnswerStopsTheStream() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
+        on("/v1/runs/$RUN/approval", resolvedBody)
+        heldOpen(f, release)
+        awaitUntil { requestsTo(EVENTS).isNotEmpty() }
+
+        assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        awaitUntil { f.following.isEmpty() }
+        assertTrue(f.credentialsRejected.value)
+        release.countDown()
+        assertEquals(1, requestsTo(EVENTS).size)
+        assertNotNull(db.activeRunDao().forSession(KEY))
+        assertTrue(finished.isEmpty())
+    }
+
+    @Test
+    fun pauseWhileApplyingTerminalStatusStillStoresIt() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("completed"))
+        val once = AtomicBoolean(false)
+        f.beforeStatusApply = {
+            if (once.compareAndSet(false, true)) {
+                pauseAll() // lands after the read returned, before its result is applied
+                yield()
+            }
+        }
+        f.resumeAll()
+        addSession()
+        addRun()
+        f.resumeAll()
+
+        awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
     }
 }
