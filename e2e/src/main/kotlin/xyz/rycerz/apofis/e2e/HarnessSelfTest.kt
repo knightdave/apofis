@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -20,6 +21,9 @@ private const val PROMPT = "Automated app test 0a1b2c3d-2. Use the terminal tool
 
 @RunWith(AndroidJUnit4::class)
 class HarnessSelfTest {
+    /** Its own result rows, like every test class: run-e2e.sh's cleanup requires a results list. */
+    @get:Rule val evidence = Evidence(AppDriver())
+
     /** A message list (node 0): items added in order, each 100 px below the previous one. */
     private class Screen {
         val nodes = mutableListOf(UiNode(0, -1, right = 1000, bottom = 3000))

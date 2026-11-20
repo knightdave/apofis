@@ -628,7 +628,8 @@ check_sessions() {
   # Positive evidence of what ran: the verified copy's results file, non-empty and readable, every line a result. Without
   # it nothing proves which scenarios sent, whatever the journal says.
   local rf=$E2E_OUT/$run_id/results.txt passed=''
-  if [ -n "$published" ] && [ -f "$rf" ] && [ -r "$rf" ] && [ -s "$rf" ] && ! grep -qvE '^[A-Za-z0-9]+\.[A-Za-z0-9]+ (PASS|FAIL)$' "$rf"; then
+  if [ -n "$published" ] && [ -f "$rf" ] && [ -r "$rf" ] && [ -s "$rf" ] &&
+    { grep -qvE '^[A-Za-z0-9]+\.[A-Za-z0-9]+ (PASS|FAIL)$' "$rf"; [ "$?" = 1 ]; }; then # 1: no malformed row; 2: grep failed
     passed=$(sed -n 's/^SurvivalE2eTest\.\([A-Za-z]*\) PASS$/\1/p' "$rf") || { passed=''; bad=1; }
   else
     log "FAILED: no verified results file, so it is unknown which scenarios sent"
@@ -803,7 +804,9 @@ end_local() {
   local r=0
   drop_incoming || r=1
   if [ -n "$wd_pid" ]; then
-    kill -KILL -- "-$wd_pid" 2>/dev/null # its own process group: the watchdog and its sleep together
+    # Its process group (the watchdog and its sleep) and its pid: before setsid has made the group, the pid alone is
+    # the watchdog, which has not started its sleep yet.
+    kill -KILL -- "-$wd_pid" "$wd_pid" 2>/dev/null
     wait "$wd_pid" 2>/dev/null
     wd_pid=''
   fi
@@ -961,6 +964,20 @@ incoming_safe() {
   root=$(realpath -e -- "$E2E_ROOT") && c=$(realpath -e -- "$1") && [ "$c" = "$root/build/e2e/.incoming-$run_id" ]
 }
 
+# real_dir <dir> <canonical path>: <dir> is a real directory (no symbolic link) at exactly that canonical path; if it is
+# missing and its intended canonical path is that one, it is created first. Its parent must have been checked.
+real_dir() {
+  [ -e "$1" ] || [ -L "$1" ] || { [ "$(realpath -m -- "$1")" = "$2" ] && mkdir -- "$1"; } || return 1
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(realpath -e -- "$1")" = "$2" ]
+}
+
+# Positive evidence that <path> does not exist: its parent was listed and the name is not in it (a failed lookup is
+# not absence).
+listed_absent() {
+  local l
+  l=$(ls -A -- "${1%/*}" 2>/dev/null) && ! grep -qxF -- "${1##*/}" <<<"$l"
+}
+
 # Removes everything inside this run's incoming directory, whatever its name (partial and temporary files of the copy
 # included), then the directory: the one place where deleting by pattern is right, because nothing in it is verified.
 # Only after incoming_safe. $incoming is cleared only once the directory is verified gone; otherwise this fails with a
@@ -968,15 +985,17 @@ incoming_safe() {
 drop_incoming() {
   local d=$incoming
   [ -n "$d" ] || return 0
-  if [ -e "$d" ] || [ -L "$d" ]; then
+  if ! listed_absent "$d"; then
     if ! incoming_safe "$d"; then
       log "FAILED: refusing to delete $d: build, build/e2e or it is not a real directory of this repository (a symbolic link?); check it and remove it by hand"
       return 1
     fi
     chmod -R u+w -- "$d" 2>/dev/null
     find "$d" -mindepth 1 -delete 2>/dev/null
-    rmdir -- "$d" 2>/dev/null
-    if [ -e "$d" ] || [ -L "$d" ]; then log "FAILED: could not delete $d (unverified files, maybe the key); remove it by hand"; return 1; fi
+    if ! rmdir -- "$d" 2>/dev/null && ! listed_absent "$d"; then
+      log "FAILED: could not delete $d (unverified files, maybe the key); remove it by hand"
+      return 1
+    fi
   fi
   incoming=''
 }
@@ -986,13 +1005,16 @@ drop_incoming() {
 # copy; then publishes it with one rename as $E2E_OUT/<run id>. On any failure or interrupt the incoming directory and
 # everything in it are deleted (here or in the cleanup).
 import_export() {
-  local src=$1 final=$E2E_OUT/$run_id e h f fail=''
-  # build and build/e2e must be real directories before anything is created inside them.
-  if [ -L "$E2E_ROOT/build" ] || [ -L "$E2E_OUT" ] || ! mkdir -p "$E2E_OUT" || [ -L "$E2E_ROOT/build" ] || [ -L "$E2E_OUT" ]; then
+  local src=$1 final=$E2E_OUT/$run_id e h f fail='' root
+  # Before each create: the canonical repository path, then build and build/e2e, each a real directory at exactly its
+  # canonical path (created if missing, and checked again after).
+  if ! root=$(realpath -e -- "$E2E_ROOT") || [ "$E2E_OUT" != "$E2E_ROOT/build/e2e" ] ||
+    ! real_dir "$E2E_ROOT/build" "$root/build" || ! real_dir "$E2E_OUT" "$root/build/e2e"; then
     log "FAILED: stage copy: build or build/e2e is not a real directory of this repository (a symbolic link?); nothing copied"
     return 1
   fi
   if [ -e "$final" ] || [ -L "$final" ] || [ -e "$E2E_OUT/.incoming-$run_id" ] || [ -L "$E2E_OUT/.incoming-$run_id" ] ||
+    [ "$(realpath -m -- "$E2E_OUT/.incoming-$run_id")" != "$root/build/e2e/.incoming-$run_id" ] ||
     ! mkdir -- "$E2E_OUT/.incoming-$run_id"; then
     log "FAILED: stage copy: could not create a new incoming directory in $E2E_OUT; nothing copied"
     return 1
@@ -1022,8 +1044,11 @@ import_export() {
     published=1
     return 0
   fi
-  drop_incoming || true # it names the directory left to remove by hand; the run fails either way
-  log "FAILED: stage ${fail:-publish}: the copied files were deleted; nothing kept in $E2E_OUT"
+  if drop_incoming; then
+    log "FAILED: stage ${fail:-publish}: the copied files were deleted; nothing kept in $E2E_OUT"
+  else
+    log "FAILED: stage ${fail:-publish}" # drop_incoming named the directory left to remove by hand
+  fi
   return 1
 }
 

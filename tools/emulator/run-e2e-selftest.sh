@@ -181,6 +181,10 @@ sessions_case scenario ''
 printf 'something else\n' >"$E2E_OUT/sess/results.txt"
 rc=0; o=$(check_sessions 2>&1) || rc=$?
 check "results.txt that is not a results list: fails, no request" '[ "$rc" = 1 ] && [ "$(requests)" = 0 ]'
+sessions_case smoke ''
+# shellcheck disable=SC2329 # the row validator fails (exit 2) on a well-formed file; every other grep is real
+rc=0; o=$(grep() { if [ "$1" = -qvE ]; then return 2; fi; command grep "$@"; }; check_sessions 2>&1) || rc=$?
+check "results validator error (grep exit 2): fails, no verified results, no request" '[ "$rc" = 1 ] && has "$o" "no verified results file" && [ "$(requests)" = 0 ]'
 rm -f "$E2E_OUT/sess/results.txt"
 rmdir "$E2E_OUT/sess"
 key_sent_local='' sessions_state='' journal=() published=''
@@ -428,6 +432,37 @@ check "symlinked build/e2e: the import is refused, nothing created outside" '[ "
 E2E_ROOT=$saved_root E2E_OUT=$saved_out incoming=''
 rm -f "$t/sym/build/e2e"
 
+# 11e. A lookup error is not absence: with build/e2e unsearchable the incoming directory cannot be seen, so nothing
+# proves it gone; the delete fails, names it and keeps the record.
+mkdir -p "$t/eacc/build/e2e/.incoming-runE"
+touch "$t/eacc/build/e2e/.incoming-runE/.logcat.txt.Ab12Cd"
+command chmod 000 "$t/eacc/build/e2e"
+E2E_ROOT=$t/eacc E2E_OUT=$t/eacc/build/e2e run_id=runE incoming=$t/eacc/build/e2e/.incoming-runE rc=0
+drop_incoming >"$t/outE" 2>&1 || rc=$? # in this shell, so a cleared record would show
+command chmod 700 "$t/eacc/build/e2e"
+o=$(cat "$t/outE")
+check "lookup error during the delete: fails, names the directory, keeps the record" '[ "$rc" = 1 ] && has "$o" ".incoming-runE" && has "$o" "by hand" && [ "$incoming" = "$t/eacc/build/e2e/.incoming-runE" ] && [ -e "$t/eacc/build/e2e/.incoming-runE/.logcat.txt.Ab12Cd" ]'
+E2E_ROOT=$saved_root E2E_OUT=$saved_out incoming=''
+# An import whose delete fails never claims that nothing was kept.
+make_export "$t/srcE"
+printf 'planted change\n' >>"$t/srcE/logcat.txt"
+run_id=runE2 rc=0
+# shellcheck disable=SC2329 # a delete that fails
+o=$(drop_incoming() { log "FAILED: could not delete it; remove it by hand"; return 1; }; import_export "$t/srcE/" 2>&1) || rc=$?
+check "failed delete after a failed import: no claim that nothing was kept" '[ "$rc" = 1 ] && has "$o" "by hand" && lacks "$o" "nothing kept"'
+remove_tree "$E2E_OUT/.incoming-runE2"
+
+# 11f. Checks before create: a repository path that cannot be resolved refuses before anything is created.
+mkdir "$t/rp"
+E2E_ROOT=$t/rp E2E_OUT=$t/rp/build/e2e run_id=runR incoming='' rc=0
+# shellcheck disable=SC2329 # canonical paths unavailable
+o=$(realpath() { return 1; }; import_export "$t/srcS/" 2>&1) || rc=$?
+check "unresolvable repository path: refused, nothing created" '[ "$rc" = 1 ] && [ -z "$(ls -A "$t/rp")" ]'
+E2E_ROOT=$t/gone E2E_OUT=$t/gone/build/e2e run_id=runR rc=0
+o=$(import_export "$t/srcS/" 2>&1) || rc=$?
+check "missing repository directory: refused, nothing created" '[ "$rc" = 1 ] && [ ! -e "$t/gone" ]'
+E2E_ROOT=$saved_root E2E_OUT=$saved_out incoming=''
+
 # 12. The cleanup has an overall limit: a hanging step ends in a reported failure, not a hang.
 s=$SECONDS rc=0
 APOFIS_E2E_LIB=1 bash -c '
@@ -438,6 +473,27 @@ APOFIS_E2E_LIB=1 bash -c '
   trap local_cleanup EXIT
   exit 0' _ "$here" >"$t/out12" 2>&1 || rc=$?
 check "cleanup over its limit: exit 1 with the fixed message within 10 s" '[ "$rc" = 1 ] && has "$(cat "$t/out12")" "did not finish within 2s" && [ $((SECONDS - s)) -le 10 ]'
+# 12b. A cleanup with nothing to do stops its watchdog at once (before or after it has its own process group): exit 0
+# well before the limit, and no sleep of it left. Three times, as the race is with the watchdog's start.
+wd_ok=1
+for i in 1 2 3; do
+  lim=4.$i$$ s=$SECONDS rc=0
+  APOFIS_E2E_LIB=1 bash -c '
+    source "$1/run-e2e.sh"
+    set +e
+    TRAP_LIMIT=$2 tmp=$(mktemp -d)
+    trap local_cleanup EXIT
+    exit 0' _ "$here" "$lim" >"$t/out12b" 2>&1 || rc=$?
+  { [ "$rc" = 0 ] && [ $((SECONDS - s)) -lt 3 ] && ! pgrep -fx "sleep $lim" >/dev/null; } || wd_ok=''
+  pkill -fx "sleep $lim" || true
+done
+check "quick cleanup: the watchdog is stopped, exit 0 at once, no sleep left (3 runs)" "[ -n '$wd_ok' ]"
+
+# 13. Every instrumentation test class writes its own result rows (Evidence), which the cleanup requires.
+for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
+  grep -q '^ *@Test' "$f" || continue
+  check "$(basename "$f" .kt) writes result rows (Evidence rule)" 'grep -q "@get:Rule val evidence = Evidence(" "$f"'
+done
 
 remove_tree "$t"
 echo "$passed passed, $failed failed"
