@@ -52,6 +52,7 @@ import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Notice
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.ToolStep
@@ -340,13 +341,13 @@ class ChatViewModelTest {
         vm.onApproval("ctl_1", 2, ApprovalChoice.ONCE)
         val after = vm.await { !it.answering && it.notes.isNotEmpty() }
         assertTrue(requests.none { it.target.endsWith("/approval") })
-        assertEquals(mapOf("ctl_1" to AnswerNote(AnswerResult.CHANGED, "ctl_2", 2)), after.notes) // shown with the block now waiting
+        assertEquals(mapOf(RequestRef("ctl_1", 2) to AnswerNote(AnswerResult.CHANGED, RequestRef("ctl_2", 2))), after.notes) // shown with the block now waiting
 
         routes[STATUS] = status("running")
         vm.onApproval("ctl_2", 2, ApprovalChoice.DENY) // settled meanwhile elsewhere
-        val gone = vm.await { it.notes["ctl_2"]?.result == AnswerResult.GONE }
+        val gone = vm.await { it.notes[RequestRef("ctl_2", 2)]?.result == AnswerResult.GONE }
         assertTrue(requests.none { it.target.endsWith("/approval") })
-        assertEquals(AnswerNote(AnswerResult.GONE), gone.notes["ctl_2"])
+        assertEquals(AnswerNote(AnswerResult.GONE), gone.notes[RequestRef("ctl_2", 2)])
     }
 
     @Test
@@ -450,11 +451,11 @@ class ChatViewModelTest {
         vm.await { it.live?.pending?.requestId == "ctl_1" }
         routes[STATUS] = status("running") // settled elsewhere before the answer
         vm.onApproval("ctl_1", 2, ApprovalChoice.DENY)
-        vm.await { it.notes["ctl_1"]?.result == AnswerResult.GONE }
+        vm.await { it.notes[RequestRef("ctl_1", 2)]?.result == AnswerResult.GONE }
         release.countDown()
 
         val ended = vm.await { it.live == null }
-        assertEquals(AnswerNote(AnswerResult.GONE), ended.notes["ctl_1"])
+        assertEquals(AnswerNote(AnswerResult.GONE), ended.notes[RequestRef("ctl_1", 2)])
         vm.onDraftChange("next")
         vm.onSendClick()
         vm.await { it.notes.isEmpty() && !it.sending }
@@ -481,13 +482,69 @@ class ChatViewModelTest {
     }
 
     @Test
-    fun toolSheetFollowsTheStepByCallId() {
+    fun toolSheetFollowsItsStepByPosition() {
         val preview = ToolStep("c1", "terminal", "command=ls", null, false, error = false, running = true)
         val full = preview.copy(args = "{\n    \"command\": \"ls\"\n}", result = "a", running = false)
+        val index = StepIndex()
         val live = listOf(user("u1"), AssistantReply("live", listOf(preview), "", 1.0, live = true))
-        assertEquals(preview to true, findStep(live, "c1"))
-        assertEquals(full to false, findStep(listOf(user("u1"), AssistantReply("r2", listOf(full), "", 1.0)), "c1"))
-        assertEquals(null, findStep(listOf(user("u1")), "c1"))
+        val ref = StepRef("live", 0, "c1", live = true)
+        assertEquals(StepIndex.Found(preview, true, ref), index.find(live, ref))
+        // The run ended: the stored reply replaces the live one, found by the live step's call id, and the sheet moves to it.
+        val stored = listOf(user("u1"), AssistantReply("r2", listOf(full), "", 1.0))
+        assertEquals(StepIndex.Found(full, false, StepRef("r2", 0, "c1", live = false)), index.find(stored, ref))
+        assertEquals(null, index.find(listOf(user("u1")), ref))
+    }
+
+    @Test
+    fun toolStepsWithoutCallIdsOpenTheirOwnResults() {
+        val orphan = ToolStep("", "terminal", "", "first", false, error = false, running = false)
+        val items = listOf(user("u1"), AssistantReply("r2", listOf(orphan, orphan.copy(result = "second")), "", 1.0))
+        assertEquals("second", StepIndex().find(items, StepRef("r2", 1, "", live = false))!!.step.result)
+        assertEquals("first", StepIndex().find(items, StepRef("r2", 0, "", live = false))!!.step.result)
+    }
+
+    /** A list that counts reads of its items. */
+    private class Counting(val items: List<ChatItem>) : AbstractList<ChatItem>() {
+        var reads = 0
+        override val size get() = items.size
+        override fun get(index: Int): ChatItem = items[index].also { reads++ }
+    }
+
+    @Test
+    fun liveUpdatesDoNotReadStoredItems() {
+        val stored = Counting(listOf(turn("u0")) + (1..1000).map { user("s$it").copy(steered = true) } +
+            AssistantReply("r9", listOf(ToolStep("c1", "terminal", "", "old", false, false, false)), "", 1.0))
+        val merger = LiveMerger()
+        val rows = ChatRows(java.time.ZoneId.of("UTC"))
+        val index = StepIndex()
+        val ref = StepRef("u0", 0, "", live = false) // a step that is not there: a full miss
+        rows.rows(merger.merge(stored, liveReply("a")))
+        index.find(merger.merge(stored, liveReply("a")), ref)
+        stored.reads = 0
+        repeat(10) {
+            val items = merger.merge(stored, liveReply("a" + "b".repeat(it + 1)))
+            rows.rows(items)
+            index.find(items, ref)
+        }
+        assertEquals(0, stored.reads)
+    }
+
+    @Test
+    fun changedShowsOnlyWithTheRequestThatReplacedTheAnsweredOne() {
+        val notes = mapOf(RequestRef("ctl_1", 2) to AnswerNote(AnswerResult.CHANGED, RequestRef("ctl_1", 3)))
+        fun control(id: String, generation: Long) = xyz.rycerz.apofis.api.PendingControl("approval", id, generation, "rm x", null)
+        assertTrue(showsChanged(notes, control("ctl_1", 3))) // only the generation changed: still another request
+        assertFalse(showsChanged(notes, control("ctl_1", 2)))
+        assertFalse(showsChanged(notes, control("ctl_9", 3))) // a later request is not labelled
+    }
+
+    @Test
+    fun stopStaysAvailableWhileASendIsInFlight() {
+        assertTrue(primaryEnabled(ComposerMode.STOP, busy = true))
+        assertFalse(primaryEnabled(ComposerMode.STEER, busy = true))
+        assertFalse(primaryEnabled(ComposerMode.SEND, busy = true))
+        assertTrue(primaryEnabled(ComposerMode.SEND, busy = false))
+        assertFalse(primaryEnabled(ComposerMode.SEND_DISABLED, busy = false))
     }
 
     private fun user(key: String, text: String = key) = UserMessage(key, text, false, 1.0)

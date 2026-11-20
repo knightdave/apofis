@@ -37,7 +37,8 @@ class BlocksTest {
 
     @Test
     fun streamingMatchesAFreshParseAtEveryLength() {
-        val full = "One\n\n```sh\necho hi\n```\n\nTwo words here\n  \nThree\n```\nopen"
+        val full = "One\n\n```sh\necho hi\n```\n\nTwo words here\n  \nThree\n```\nopen\n  \n```\n\nab\n``\n``x\n `\n````\n" +
+            "```py\ncode ``\n `\n  ```  \nafter\n```\nx\n```"
         val live = ReplyText()
         for (end in 1..full.length) {
             val text = full.substring(0, end)
@@ -56,6 +57,29 @@ class BlocksTest {
         for (i in 0 until 999) assertSame("row $i", before[i], after[i])
         assertEquals("x", after.last().text)
         assertEquals((0..1000).map { "r1/b$it/c0" }, after.map { it.key })
+    }
+
+    @Test
+    fun appendingBuildsRowsOnlyForTheChangedTail() {
+        val live = ReplyText()
+        for (text in listOf("word ".repeat(300_000), "```\n" + "a line of code\n".repeat(100_000), "word ".repeat(19).plus("!!!!\n\n").repeat(1000))) {
+            live.update("r1", text)
+            val built = Work.rowsBuilt
+            val rows = live.update("r1", text + "x")
+            assertTrue("built ${Work.rowsBuilt - built} rows for one character", Work.rowsBuilt - built <= 2)
+            assertEquals(fresh(text + "x"), rows.map { it.text to it.code })
+            live.update("other", "") // start over for the next text
+        }
+    }
+
+    @Test
+    fun chunkingIsOneForwardPass() {
+        val line = "x".repeat(200_000)
+        val before = Work.chunkSteps
+        val pieces = chunks(line)
+        assertTrue("inspected ${Work.chunkSteps - before}", Work.chunkSteps - before <= line.length)
+        assertTrue(pieces.all { it.length <= CHUNK })
+        assertEquals(line, pieces.joinToString(""))
     }
 
     @Test

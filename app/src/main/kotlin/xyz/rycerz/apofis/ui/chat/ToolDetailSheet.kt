@@ -22,14 +22,58 @@ import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ToolStep
 
-/** The tool step with [callId] in [items], newest first, and whether it belongs to the live reply. */
-internal fun findStep(items: List<ChatItem>, callId: String): Pair<ToolStep, Boolean>? {
-    for (item in items.asReversed()) {
-        if (item !is AssistantReply) continue
-        val step = item.steps.firstOrNull { it is ToolStep && it.callId == callId } as ToolStep? ?: continue
-        return step to item.live
+/** A tool step by position: its reply's key and its index there. [callId] and [live] only help a live step follow its reply. */
+internal data class StepRef(val replyKey: String, val index: Int, val callId: String, val live: Boolean)
+
+/**
+ * Resolves [StepRef]s in the chat items. The stored part (a [Joined]'s head, else the whole list) is indexed once per
+ * list instance; the live tail is a few items. A live step whose reply was replaced (by the stored rows at run end,
+ * or a key change) is found again by its call id when exactly one step has it, and [Found.ref] then names its new place.
+ */
+internal class StepIndex {
+    data class Found(val step: ToolStep, val live: Boolean, val ref: StepRef)
+
+    private var head: List<ChatItem>? = null
+    private val byKey = HashMap<String, AssistantReply>()
+    private val byCall = HashMap<String, StepRef?>() // null: more than one step has that call id
+
+    fun find(items: List<ChatItem>, ref: StepRef): Found? {
+        val joined = items as? Joined<*>
+        @Suppress("UNCHECKED_CAST")
+        val stored = joined?.head as List<ChatItem>? ?: items
+        @Suppress("UNCHECKED_CAST")
+        val tail = joined?.tail as List<ChatItem>? ?: emptyList()
+        if (stored !== head) index(stored)
+        at(tail, ref)?.let { return it }
+        if (!ref.live || ref.callId.isEmpty()) return null
+        for (item in tail) {
+            if (item !is AssistantReply) continue
+            val i = item.steps.indexOfFirst { it is ToolStep && it.callId == ref.callId }
+            if (i >= 0) return Found(item.steps[i] as ToolStep, item.live, StepRef(item.key, i, ref.callId, item.live))
+        }
+        return byCall[ref.callId]?.let { at(tail, it) }
     }
-    return null
+
+    private fun at(tail: List<ChatItem>, ref: StepRef): Found? {
+        val reply = tail.lastOrNull { it is AssistantReply && it.key == ref.replyKey } as AssistantReply? ?: byKey[ref.replyKey] ?: return null
+        val step = reply.steps.getOrNull(ref.index) as? ToolStep ?: return null
+        return Found(step, reply.live, ref.copy(live = reply.live))
+    }
+
+    private fun index(stored: List<ChatItem>) {
+        head = stored
+        byKey.clear()
+        byCall.clear()
+        for (item in stored) {
+            if (item !is AssistantReply) continue
+            byKey[item.key] = item
+            item.steps.forEachIndexed { i, step ->
+                if (step is ToolStep && step.callId.isNotEmpty()) {
+                    byCall[step.callId] = if (step.callId in byCall) null else StepRef(item.key, i, step.callId, item.live)
+                }
+            }
+        }
+    }
 }
 
 /** A tool step in full: name, arguments and the (display-truncated) result. [live]: from the reply still running. */

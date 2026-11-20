@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.api.PendingControl
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.run.AnswerResult
@@ -112,7 +113,7 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
  * block of the request that replaced the answered one, and only while that request is drawn (GONE notes: [GoneRow]).
  */
 @Composable
-internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<String, AnswerNote>, answering: Boolean, actions: ChatActions) {
+internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<RequestRef, AnswerNote>, answering: Boolean, actions: ChatActions) {
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         if (live != null) {
             val polling = live.connection == Connection.POLLING
@@ -120,10 +121,7 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Str
             if ((reply.text.isEmpty() && pending == null) || polling) Dots(if (polling) R.string.chat_catching_up else null)
             if (live.connection == Connection.RECONNECTING) Label(R.string.chat_reconnecting)
             if (pending != null) {
-                val changed = notes.any { (id, note) ->
-                    note.result == AnswerResult.CHANGED && id != pending.requestId &&
-                        note.replacedBy == pending.requestId && note.replacedGeneration == pending.executionGeneration
-                }
+                val changed = showsChanged(notes, pending)
                 // A request with another id or generation is a new block: an open menu or typed answer never carries over.
                 key(pending.requestId, pending.executionGeneration) {
                     when (pending.kind) {
@@ -142,6 +140,12 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Str
             null -> Unit
         }
     }
+}
+
+/** True when [pending] is the request that replaced an answered one (same id with a new generation included). */
+internal fun showsChanged(notes: Map<RequestRef, AnswerNote>, pending: PendingControl): Boolean {
+    val shown = RequestRef(pending.requestId, pending.executionGeneration)
+    return notes.any { (answered, note) -> note.result == AnswerResult.CHANGED && note.successor == shown && answered != shown }
 }
 
 /** The static three-dot indicator (motion comes later); [label] is shown beside it. */

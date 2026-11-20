@@ -41,7 +41,7 @@ data class ChatUiState(
     val draft: String,
     val host: String = "",
     val live: LiveReply? = null, // the run in progress: its pending approval or clarify, connection and status
-    val notes: Map<String, AnswerNote> = emptyMap(), // by the answered request id, kept until the next message is sent
+    val notes: Map<RequestRef, AnswerNote> = emptyMap(), // by the answered request, kept until the next message is sent
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null, // the failed send whose retry waits for the user's consent
     val composerNote: ComposerNote? = null, // one line above the composer about the last send or cancel
@@ -49,11 +49,14 @@ data class ChatUiState(
     val confirmCancel: String? = null, // the idempotency key of the unsent message the user asked to remove
 )
 
+/** A request Hermes waits on, by id and execution generation: a new generation is a different request. */
+data class RequestRef(val requestId: String, val executionGeneration: Long)
+
 /**
- * What came of an answer that was not sent. CHANGED names the request that replaced the answered one
- * ([replacedBy], [replacedGeneration]); the note shows only with that request's block.
+ * What came of an answer that was not sent. CHANGED names the request displayed right after the refusal
+ * ([successor]); the note shows only with that request's block.
  */
-data class AnswerNote(val result: AnswerResult, val replacedBy: String? = null, val replacedGeneration: Long = 0)
+data class AnswerNote(val result: AnswerResult, val successor: RequestRef? = null)
 
 enum class StatusLine { IDLE, WORKING, QUEUED, OFFLINE, UNREACHABLE, KEY_REJECTED, SERVER_ERROR, CHAT_GONE, LOAD_FAILED }
 
@@ -93,7 +96,7 @@ private enum class Failure { NETWORK, UNAUTHORIZED, SERVER, GONE }
 
 private data class Local(
     val failure: Failure? = null,
-    val notes: Map<String, AnswerNote> = emptyMap(),
+    val notes: Map<RequestRef, AnswerNote> = emptyMap(),
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null,
     val composerNote: ComposerNote? = null,
@@ -255,14 +258,17 @@ class ChatViewModel(
         local.update { it.copy(answering = true) }
         request {
             try {
+                val answered = RequestRef(requestId, executionGeneration)
                 val note = when (post()) {
                     AnswerResult.SENT -> null
                     AnswerResult.GONE -> AnswerNote(AnswerResult.GONE)
+                    // Recorded once, now: the request displayed right after the refusal, never a later one.
                     AnswerResult.CHANGED -> follower.live(sessionKey).value?.pending
-                        ?.takeIf { it.requestId != requestId || it.executionGeneration != executionGeneration }
-                        ?.let { AnswerNote(AnswerResult.CHANGED, it.requestId, it.executionGeneration) }
+                        ?.let { RequestRef(it.requestId, it.executionGeneration) }
+                        ?.takeIf { it != answered }
+                        ?.let { AnswerNote(AnswerResult.CHANGED, it) }
                 }
-                if (note != null) local.update { it.copy(notes = it.notes + (requestId to note)) }
+                if (note != null) local.update { it.copy(notes = it.notes + (answered to note)) }
             } finally {
                 local.update { it.copy(answering = false) }
             }
@@ -301,23 +307,30 @@ class ChatViewModel(
 internal class LiveMerger {
     private var transcript: List<ChatItem>? = null
     private var runId: String? = null
-    private var start = -1
-    private var head: List<ChatItem> = emptyList()
+    private var stored: List<ChatItem> = emptyList() // stage 1: the stored items shown while streaming
+    private var liveKey = "live"
     private var since = 0.0
 
     fun merge(transcript: List<ChatItem>, live: LiveReply?): List<ChatItem> {
         if (live == null) return transcript
+        // Stage 1, only when the transcript or the run changes; a streamed token reads no stored item.
         if (transcript !== this.transcript || live.runId != runId) {
             if (live.runId != runId) since = System.currentTimeMillis() / 1000.0
             this.transcript = transcript
             runId = live.runId
-            start = transcript.indexOfLast { it is UserMessage && it.runId == live.runId }
-            head = if (start < 0) transcript else transcript.subList(0, start + 1)
+            val start = transcript.indexOfLast { it is UserMessage && it.runId == live.runId }
+            if (start < 0) {
+                stored = transcript
+                liveKey = "live"
+            } else {
+                val after = transcript.subList(start + 1, transcript.size)
+                stored = transcript.subList(0, start + 1) + after.filterIsInstance<UserMessage>()
+                liveKey = after.firstOrNull { it is AssistantReply }?.key ?: "live"
+            }
         }
+        // Stage 2: the stored part as it is, then one item.
         if (live.connection == Connection.POLLING) return Joined(transcript, listOf(AssistantReply("live", emptyList(), "", since, live = true)))
-        val after = if (start < 0) emptyList() else transcript.subList(start + 1, transcript.size)
-        val key = after.firstOrNull { it is AssistantReply }?.key ?: "live"
-        return Joined(head, after.filterIsInstance<UserMessage>() + AssistantReply(key, live.steps, live.text, since, live = true))
+        return Joined(stored, listOf(AssistantReply(liveKey, live.steps, live.text, since, live = true)))
     }
 }
 
