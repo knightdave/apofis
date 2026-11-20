@@ -2,6 +2,7 @@ package xyz.rycerz.apofis.ui.chat
 
 import java.time.ZoneId
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -11,11 +12,10 @@ import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 
 class BlocksTest {
-    private fun blocks(text: String) = ArrayList<Block>().also { splitBlocks(text, 0, it) }
+    private fun split(text: String) = parseBlocks(text).map { Triple(text.substring(it.start, it.end), it.code, it.lang) }
 
-    private fun split(text: String) = blocks(text).map { Triple(text.substring(it.start, it.end), it.code, it.lang) }
-
-    private fun LiveBlocks.texts() = blocks.indices.map { text(it) }
+    /** What a fresh parse of [text] renders: (text, code) per row. */
+    private fun fresh(text: String) = ReplyText().update("x", text).map { it.text to it.code }
 
     @Test
     fun paragraphsAndFencedCode() {
@@ -36,87 +36,93 @@ class BlocksTest {
     }
 
     @Test
-    fun streamingMatchesAFullSplit() {
-        val full = "One\n\n```sh\necho hi\n```\n\nTwo words here\n\nThree"
-        val live = LiveBlocks()
-        for (end in 1..full.length) live.update("r1", full.substring(0, end))
-        assertEquals(split(full).map { it.first }, live.texts())
-    }
-
-    @Test
-    fun anotherReplyStartsOver() {
-        val live = LiveBlocks()
-        live.update("live", "Old first\n\nOld second\n\nOld third")
-        live.update("r9", "Old first\n\nNew")
-        assertEquals(listOf("Old first", "New"), live.texts())
-    }
-
-    @Test
-    fun blocksParsedPerTokenAreBounded() {
-        val live = LiveBlocks()
-        var text = "word ".repeat(19).trimEnd().plus("!!!!\n\n").repeat(1000) // 1000 paragraphs, 100000 characters
-        live.update("live", text)
-        val kept = live.blocks.first()
-        var most = 0
-        repeat(1000) {
-            text += if (it % 50 == 49) "\n\n" else "more "
-            live.update("live", text)
-            most = maxOf(most, live.parsed)
+    fun streamingMatchesAFreshParseAtEveryLength() {
+        val full = "One\n\n```sh\necho hi\n```\n\nTwo words here\n  \nThree\n```\nopen"
+        val live = ReplyText()
+        for (end in 1..full.length) {
+            val text = full.substring(0, end)
+            assertEquals("at $end", fresh(text), live.update("r1", text).map { it.text to it.code })
         }
-        assertTrue("parsed $most blocks for one token", most <= 2)
-        assertSame(kept, live.blocks.first()) // earlier blocks are reused, not rebuilt
+    }
+
+    @Test
+    fun appendingOneCharacterKeepsEveryClosedRow() {
+        val text = "word ".repeat(19).trimEnd().plus("!!!!\n\n").repeat(1000) // 1000 closed paragraphs
+        val live = ReplyText()
+        val before = live.update("r1", text)
+        assertEquals(1000, before.size)
+        val after = live.update("r1", text + "x")
+        assertTrue("parsed ${live.parsed} blocks for one character", live.parsed <= 2)
+        for (i in 0 until 999) assertSame("row $i", before[i], after[i])
+        assertEquals("x", after.last().text)
+        assertEquals((0..1000).map { "r1/b$it/c0" }, after.map { it.key })
+    }
+
+    @Test
+    fun sameKeyReplacementSharesNothing() {
+        val live = ReplyText()
+        val before = live.update("r1", "AAA\n\nend\n\n")
+        val after = live.update("r1", "BBB\n\nend!")
+        assertEquals(listOf("BBB", "end!"), after.map { it.text })
+        assertTrue(after.none { a -> before.any { it === a } })
+    }
+
+    @Test
+    fun closingFenceAtAChunkBoundaryEndsTheCode() {
+        val start = "```\n" + "x".repeat(CHUNK - 1) + "\n`"
+        val full = start + "``\nplain"
+        val live = ReplyText()
+        live.update("r1", start)
+        val rows = live.update("r1", full)
+        assertEquals(fresh(full), rows.map { it.text to it.code })
+        assertEquals("plain" to false, rows.last().let { it.text to it.code })
+        assertFalse(rows.any { it.text.contains("```") })
     }
 
     @Test
     fun longSingleParagraphIsChunked() {
         val text = "word ".repeat(20_000) // 100000 characters, no line break
-        val chunks = blocks(text)
-        assertTrue(chunks.all { it.end - it.start <= CHUNK })
-        assertEquals(text, chunks.joinToString("") { text.substring(it.start, it.end) })
-        assertEquals(listOf(true), chunks.map { it.first }.distinct().take(1))
-        assertTrue(chunks.drop(1).none { it.first })
-
-        val live = LiveBlocks()
-        var most = 0
-        for (end in 5..text.length step 5) {
-            live.update("live", text.substring(0, end))
-            most = maxOf(most, live.parsed)
-        }
-        assertTrue(most <= 2)
-        assertEquals(text, live.texts().joinToString(""))
+        val rows = ReplyText().update("r1", text)
+        assertTrue(rows.size > 1)
+        assertTrue(rows.all { it.text.length <= CHUNK })
+        assertEquals(text, rows.joinToString("") { it.text })
+        assertEquals(listOf(true) + List(rows.size - 1) { false }, rows.map { it.first })
+        assertEquals(List(rows.size - 1) { true } + false, rows.map { it.joinBelow })
     }
 
     @Test
     fun longCodeBlockIsChunkedAndStaysCode() {
         val body = (1..3000).joinToString("\n") { "line $it of the listing" }
         val text = "```txt\n$body\n```\nDone"
-        val chunks = blocks(text)
-        val code = chunks.filter { it.code }
+        val rows = ReplyText().update("r1", text)
+        val code = rows.filter { it.code }
         assertTrue(code.size > 1)
-        assertTrue(code.all { it.end - it.start <= CHUNK && it.lang == "txt" })
-        assertEquals(body, code.joinToString("\n") { text.substring(it.start, it.end) })
-        assertEquals("Done", text.substring(chunks.last().start, chunks.last().end))
+        assertTrue(code.all { it.text.length <= CHUNK && it.lang == "txt" })
+        assertEquals(body, code.joinToString("\n") { it.text })
+        assertEquals("Done" to false, rows.last().let { it.text to it.code })
 
-        val live = LiveBlocks()
-        for (end in 1..text.length step 7) live.update("live", text.substring(0, end))
-        live.update("live", text)
-        assertEquals(chunks.map { text.substring(it.start, it.end) }, live.texts())
+        val live = ReplyText()
+        for (end in 1..text.length step 7) live.update("r1", text.substring(0, end))
+        assertEquals(rows, live.update("r1", text))
     }
 
     @Test
-    fun historyIsNotMappedAgainWhenOnlyLiveTextChanges() {
+    fun oneCharacterChangesOnlyTheTailRowsOfTheList() {
+        val now = System.currentTimeMillis() / 1000.0 // the same day as the live item: no date row in between
         val history = (1..500).flatMap {
-            listOf(UserMessage("u$it", "question $it", false, 1.0), AssistantReply("r$it", emptyList(), "answer $it", 1.0))
-        } + UserMessage("u999", "latest", false, 1.0)
+            listOf(UserMessage("u$it", "question $it", false, now), AssistantReply("r$it", emptyList(), "answer $it", now))
+        } + UserMessage("u999", "latest", false, now, runId = "run")
         val merger = LiveMerger()
         val rows = ChatRows(ZoneId.of("UTC"))
-        var text = ""
-        rows.rows(merger.merge(history, LiveReply("run", "running", text, emptyList(), null, Connection.LIVE)))
+        fun live(text: String) = LiveReply("run", "running", text, emptyList(), null, Connection.LIVE)
+        var text = "paragraph\n\n".repeat(1000)
+        val before = rows.rows(merger.merge(history, live(text)))
         val mapped = rows.mapped
-        repeat(200) {
-            text += "token "
-            rows.rows(merger.merge(history, LiveReply("run", "running", text, emptyList(), null, Connection.LIVE)))
-        }
-        assertEquals(mapped, rows.mapped)
+        text += "x"
+        val after = rows.rows(merger.merge(history, live(text)))
+        assertEquals(mapped, rows.mapped) // history was not mapped again
+        assertEquals(before.size + 1, after.size)
+        val changed = after.indices.filter { i -> before.getOrNull(i) !== after[i] }
+        assertTrue("changed rows $changed", changed.size <= 2) // the new paragraph and the reply's footer
     }
 }

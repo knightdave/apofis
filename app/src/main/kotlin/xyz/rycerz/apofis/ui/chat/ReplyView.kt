@@ -20,6 +20,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
@@ -107,11 +108,11 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
 }
 
 /**
- * Under a reply: the live indicators, the pending request, notes about earlier answers and the outcome notice.
- * [notes] are by request id: CHANGED shows inside the block of that request, GONE as a notice once its block is gone.
+ * Under a reply: the live indicators, the pending request and the outcome notice. A CHANGED note shows inside the
+ * block of the request that replaced the answered one, and only while that request is drawn (GONE notes: [GoneRow]).
  */
 @Composable
-internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<String, AnswerResult>, answering: Boolean, actions: ChatActions) {
+internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<String, AnswerNote>, answering: Boolean, actions: ChatActions) {
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         if (live != null) {
             val polling = live.connection == Connection.POLLING
@@ -119,15 +120,18 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Str
             if ((reply.text.isEmpty() && pending == null) || polling) Dots(if (polling) R.string.chat_catching_up else null)
             if (live.connection == Connection.RECONNECTING) Label(R.string.chat_reconnecting)
             if (pending != null) {
-                val changed = notes[pending.requestId] == AnswerResult.CHANGED
-                when (pending.kind) {
-                    "approval" -> ApprovalBlock(pending, changed, answering, actions::onApproval)
-                    "clarify" -> ClarifyBlock(pending, changed, answering, actions::onClarify)
-                    else -> UnsupportedBlock()
+                val changed = notes.any { (id, note) ->
+                    note.result == AnswerResult.CHANGED && id != pending.requestId &&
+                        note.replacedBy == pending.requestId && note.replacedGeneration == pending.executionGeneration
                 }
-            }
-            for ((id, note) in notes) {
-                if (note == AnswerResult.GONE && id != pending?.requestId) Notice(R.string.chat_answer_gone)
+                // A request with another id or generation is a new block: an open menu or typed answer never carries over.
+                key(pending.requestId, pending.executionGeneration) {
+                    when (pending.kind) {
+                        "approval" -> ApprovalBlock(pending, changed, answering, actions::onApproval)
+                        "clarify" -> ClarifyBlock(pending, changed, answering, actions::onClarify)
+                        else -> UnsupportedBlock()
+                    }
+                }
             }
             if (live.status == "unknown") Notice(R.string.chat_unknown_notice, R.string.chat_unknown_action, actions::onResolveUnknown)
         }

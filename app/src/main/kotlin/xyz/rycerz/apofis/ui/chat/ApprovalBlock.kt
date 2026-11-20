@@ -69,7 +69,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             OutlinedButton(onClick = { choose(ApprovalChoice.DENY) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_deny)) }
             if (command != null) {
                 Button(onClick = { choose(ApprovalChoice.ONCE) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_once)) }
-                var menu by rememberSaveable(control.requestId) { mutableStateOf(false) }
+                var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
                     IconButton(onClick = { menu = true }, enabled = !answering) {
                         Icon(painterResource(R.drawable.lucide_ellipsis_vertical), stringResource(R.string.chat_approval_more), Modifier.size(20.dp))
@@ -95,7 +95,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
 internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, onAnswer: (String, Long, String) -> Unit) {
     ControlCard(R.string.chat_clarify_title, changed) {
         control.question?.let { Text(it, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface) }
-        var answer by rememberSaveable(control.requestId) { mutableStateOf("") }
+        var answer by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf("") }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 answer,

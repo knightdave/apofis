@@ -54,7 +54,6 @@ import androidx.compose.runtime.key
 import xyz.rycerz.apofis.chat.SendState
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
-import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
@@ -76,8 +75,7 @@ fun ChatScreen(
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    var cancelling by remember { mutableStateOf<String?>(null) } // the idempotency key the dialog was opened for
-    var detail by remember { mutableStateOf<ToolStep?>(null) }
+    var detail by remember { mutableStateOf<String?>(null) } // the call id of the tool step shown in the sheet
     val pendingId = state.live?.pending?.requestId
     LaunchedEffect(pendingId) { if (pendingId != null) listState.animateScrollToItem(0) } // the request sits at the bottom
 
@@ -100,10 +98,11 @@ fun ChatScreen(
                     if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
                     actions::onDraftChange,
                     onSend = {
-                        actions.onSendClick(state.draft)
+                        actions.onSendClick()
                         scope.launch { listState.scrollToItem(0) }
                     },
                     onStop = actions::onStopClick,
+                    busy = state.sending,
                 )
             }
         },
@@ -122,8 +121,8 @@ fun ChatScreen(
                 state.notes,
                 state.answering,
                 actions,
-                onCancel = { cancelling = it.idempotencyKey },
-                onStep = { detail = it },
+                onCancel = { it.idempotencyKey?.let(actions::onCancel) },
+                onStep = { detail = it.callId },
                 listState = listState,
                 contentPadding = PaddingValues(vertical = 8.dp),
             )
@@ -152,25 +151,25 @@ fun ChatScreen(
         }
     }
 
-    cancelling?.let { key ->
+    state.confirmCancel?.let { id ->
         // The dialog follows its own row: it rewords once a request may have gone out, and closes once the row is
-        // gone or has started sending, so it never promises what is no longer true.
-        val row = state.items.asReversed().firstOrNull { it is UserMessage && it.idempotencyKey == key } as UserMessage?
+        // gone or has started sending. Confirm says which wording was shown; the view model deletes only if it still holds.
+        val row = state.items.asReversed().firstOrNull { it is UserMessage && it.idempotencyKey == id } as UserMessage?
         val open = row != null && (row.state == SendState.QUEUED || row.state == SendState.FAILED)
-        LaunchedEffect(open) { if (!open) cancelling = null }
+        LaunchedEffect(id, open) { if (!open) actions.onDismissCancel(id) }
         if (open) {
-            ConfirmDialog(
-                title = R.string.chat_cancel_title,
-                text = if (row.attempted) R.string.chat_cancel_text_attempted else R.string.chat_cancel_text,
-                quote = row.text,
-                confirm = R.string.chat_cancel_confirm,
-                dismiss = R.string.chat_keep,
-                onConfirm = {
-                    cancelling = null
-                    actions.onCancel(key)
-                },
-                onDismiss = { cancelling = null },
-            )
+            key(id) {
+                val attempted = row.attempted
+                ConfirmDialog(
+                    title = R.string.chat_cancel_title,
+                    text = if (attempted) R.string.chat_cancel_text_attempted else R.string.chat_cancel_text,
+                    quote = row.text,
+                    confirm = R.string.chat_cancel_confirm,
+                    dismiss = R.string.chat_keep,
+                    onConfirm = { actions.onConfirmCancel(id, mayHaveSentShown = attempted) },
+                    onDismiss = { actions.onDismissCancel(id) },
+                )
+            }
         }
     }
     state.confirmRetry?.let { message ->
@@ -187,7 +186,12 @@ fun ChatScreen(
             )
         }
     }
-    detail?.let { ToolDetailSheet(it, onDismiss = { detail = null }) }
+    detail?.let { callId ->
+        // Looked up on every change, so full arguments and the result show as soon as they exist.
+        val found = findStep(state.items, callId)
+        LaunchedEffect(found == null) { if (found == null) detail = null }
+        found?.let { (step, live) -> ToolDetailSheet(step, live, onDismiss = { detail = null }) }
+    }
 }
 
 @Composable

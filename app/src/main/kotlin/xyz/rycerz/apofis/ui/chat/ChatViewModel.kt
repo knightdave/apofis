@@ -41,11 +41,19 @@ data class ChatUiState(
     val draft: String,
     val host: String = "",
     val live: LiveReply? = null, // the run in progress: its pending approval or clarify, connection and status
-    val notes: Map<String, AnswerResult> = emptyMap(), // by request id, for the run in progress: CHANGED or GONE
+    val notes: Map<String, AnswerNote> = emptyMap(), // by the answered request id, kept until the next message is sent
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null, // the failed send whose retry waits for the user's consent
     val composerNote: ComposerNote? = null, // one line above the composer about the last send or cancel
+    val sending: Boolean = false, // a send is being stored; the send button is disabled meanwhile
+    val confirmCancel: String? = null, // the idempotency key of the unsent message the user asked to remove
 )
+
+/**
+ * What came of an answer that was not sent. CHANGED names the request that replaced the answered one
+ * ([replacedBy], [replacedGeneration]); the note shows only with that request's block.
+ */
+data class AnswerNote(val result: AnswerResult, val replacedBy: String? = null, val replacedGeneration: Long = 0)
 
 enum class StatusLine { IDLE, WORKING, QUEUED, OFFLINE, UNREACHABLE, KEY_REJECTED, SERVER_ERROR, CHAT_GONE, LOAD_FAILED }
 
@@ -60,12 +68,20 @@ enum class ComposerNote {
 /** Everything the chat screen can ask for; no-ops by default so previews and screenshots need no view model. */
 interface ChatActions {
     fun onDraftChange(text: String) {}
-    fun onSendClick(text: String) {}
+
+    /** Sends the current draft; ignored while a send is being stored. */
+    fun onSendClick() {}
     fun onStopClick() {}
     fun onRetry(idempotencyKey: String) {}
     fun onConfirmRetry(idempotencyKey: String) {}
     fun onDismissRetry(idempotencyKey: String) {}
+
+    /** Asks before removing an unsent message ([ChatUiState.confirmCancel]). */
     fun onCancel(idempotencyKey: String) {}
+
+    /** [mayHaveSentShown]: the dialog said it may already have been sent. Removes only if that still describes the row. */
+    fun onConfirmCancel(idempotencyKey: String, mayHaveSentShown: Boolean) {}
+    fun onDismissCancel(idempotencyKey: String) {}
 
     /** Answers the request the block was drawing, by its own ids. */
     fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) {}
@@ -77,11 +93,12 @@ private enum class Failure { NETWORK, UNAUTHORIZED, SERVER, GONE }
 
 private data class Local(
     val failure: Failure? = null,
-    val notesRun: String? = null, // the run [notes] belong to; they vanish with it
-    val notes: Map<String, AnswerResult> = emptyMap(),
+    val notes: Map<String, AnswerNote> = emptyMap(),
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null,
     val composerNote: ComposerNote? = null,
+    val sending: Boolean = false,
+    val confirmCancel: String? = null,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean)
@@ -129,10 +146,12 @@ class ChatViewModel(
             draft = d,
             host = host,
             live = live,
-            notes = if (live != null && live.runId == l.notesRun) l.notes else emptyMap(),
+            notes = l.notes,
             answering = l.answering,
             confirmRetry = l.confirmRetry,
             composerNote = l.composerNote,
+            sending = l.sending,
+            confirmCancel = l.confirmCancel,
         )
     }.stateIn(
         viewModelScope,
@@ -155,19 +174,28 @@ class ChatViewModel(
         if (local.value.composerNote != null) local.update { it.copy(composerNote = null) }
     }
 
-    override fun onSendClick(text: String) {
+    override fun onSendClick() {
+        val text = draft.value
         if (text.isBlank()) return
-        draft.value = ""
-        local.update { it.copy(composerNote = null) }
+        var claimed = false
+        local.update {
+            claimed = !it.sending
+            if (claimed) it.copy(sending = true, composerNote = null) else it
+        }
+        if (!claimed) return // one send at a time: a second tap before the redraw sends nothing
+        draft.compareAndSet(text, "")
         viewModelScope.launch {
             try {
                 repo.send(sessionKey, text) // stored before any request; delivery problems show on the bubble
+                local.update { it.copy(notes = emptyMap()) }
             } catch (e: CancellationException) {
-                throw e
+                throw e // the message is stored, or this screen is gone: nothing to give back
             } catch (_: Exception) {
                 // The repository's contract: a throw means nothing was stored. Never overwrite what was typed since.
                 draft.update { if (it.isEmpty()) text else text + "\n" + it }
                 local.update { it.copy(composerNote = ComposerNote.SEND_FAILED) }
+            } finally {
+                local.update { it.copy(sending = false) }
             }
         }
     }
@@ -191,43 +219,50 @@ class ChatViewModel(
     override fun onDismissRetry(idempotencyKey: String) =
         local.update { if (it.confirmRetry?.idempotencyKey == idempotencyKey) it.copy(confirmRetry = null) else it }
 
-    override fun onCancel(idempotencyKey: String) = request {
-        val note = when (repo.cancelSend(idempotencyKey)) {
+    override fun onCancel(idempotencyKey: String) = local.update { it.copy(confirmCancel = idempotencyKey) }
+
+    override fun onDismissCancel(idempotencyKey: String) =
+        local.update { if (it.confirmCancel == idempotencyKey) it.copy(confirmCancel = null) else it }
+
+    override fun onConfirmCancel(idempotencyKey: String, mayHaveSentShown: Boolean) = request {
+        val note = when (repo.cancelSend(idempotencyKey, mayHaveSentShown)) {
+            // Tried since the dialog said it was not: the dialog stays open and rewords as the row redraws.
+            CancelResult.NOW_ATTEMPTED -> return@request
             CancelResult.REMOVED_MAY_HAVE_SENT -> ComposerNote.REMOVED_MAY_HAVE_SENT
             CancelResult.STARTED -> ComposerNote.CANCEL_TOO_LATE
             CancelResult.REMOVED, CancelResult.NOT_FOUND -> null
         }
-        local.update { it.copy(composerNote = note) }
+        local.update { it.copy(composerNote = note, confirmCancel = it.confirmCancel.takeIf { k -> k != idempotencyKey }) }
     }
 
     override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) =
-        answer(requestId) { follower.answerApproval(sessionKey, requestId, executionGeneration, choice) }
+        answer(requestId, executionGeneration) { follower.answerApproval(sessionKey, requestId, executionGeneration, choice) }
 
     override fun onClarify(requestId: String, executionGeneration: Long, answer: String) {
         if (answer.isBlank()) return
-        answer(requestId) { follower.answerClarify(sessionKey, requestId, executionGeneration, answer) }
+        answer(requestId, executionGeneration) { follower.answerClarify(sessionKey, requestId, executionGeneration, answer) }
     }
 
     override fun onResolveUnknown() = request { follower.resolveUnknown(sessionKey) }
 
     /**
-     * Sends one answer at a time. GONE is noted against the answered request and stays as a notice in the reply;
-     * CHANGED is noted against the request now waiting, so it shows with that block and never with a later one.
+     * Sends one answer at a time. Notes are kept by the answered request (the one drawn when tapped). CHANGED records
+     * the request waiting once the answer was refused, so it shows with that block only, never with a later one.
      */
-    private fun answer(requestId: String, post: suspend () -> AnswerResult) {
+    private fun answer(requestId: String, executionGeneration: Long, post: suspend () -> AnswerResult) {
         if (local.value.answering) return
-        val run = follower.live(sessionKey).value?.runId ?: return
+        if (follower.live(sessionKey).value == null) return
         local.update { it.copy(answering = true) }
         request {
             try {
                 val note = when (post()) {
                     AnswerResult.SENT -> null
-                    AnswerResult.GONE -> requestId to AnswerResult.GONE
-                    AnswerResult.CHANGED -> follower.live(sessionKey).value?.pending?.let { it.requestId to AnswerResult.CHANGED }
+                    AnswerResult.GONE -> AnswerNote(AnswerResult.GONE)
+                    AnswerResult.CHANGED -> follower.live(sessionKey).value?.pending
+                        ?.takeIf { it.requestId != requestId || it.executionGeneration != executionGeneration }
+                        ?.let { AnswerNote(AnswerResult.CHANGED, it.requestId, it.executionGeneration) }
                 }
-                if (note != null) {
-                    local.update { l -> l.copy(notesRun = run, notes = (if (l.notesRun == run) l.notes else emptyMap()) + note) }
-                }
+                if (note != null) local.update { it.copy(notes = it.notes + (requestId to note)) }
             } finally {
                 local.update { it.copy(answering = false) }
             }
@@ -256,38 +291,33 @@ class ChatViewModel(
 }
 
 /**
- * Puts the live reply into the transcript as its own item. Everything after the last user message (stored or
- * unsent) belongs to the run in progress: stored replies there are replaced by the live item, which takes the
- * first one's key so the swap at run end does not move the list; with none it is appended as "live". A reply
- * before the latest user message is never touched. The part before that message is reused as the same list object
- * while the transcript is unchanged, so a streamed token costs only the items after it.
+ * Puts the live reply into the transcript. The run's turn starts at the user message that started it (the one whose
+ * [UserMessage.runId] is the run's). While streaming, stored replies and notices after that message are the stored
+ * part of the same reply and are not shown; messages after it stay; one live item built only from [LiveReply] comes
+ * last, keyed like the first stored part so nothing moves when the run ends. Without a known turn start every stored
+ * item stays. While polling, the stored items are shown exactly as they are, with a "catching up" item after them.
+ * The part up to the turn start is reused as the same list object while the transcript is unchanged.
  */
 internal class LiveMerger {
     private var transcript: List<ChatItem>? = null
-    private var cut = -1
+    private var runId: String? = null
+    private var start = -1
     private var head: List<ChatItem> = emptyList()
+    private var since = 0.0
 
     fun merge(transcript: List<ChatItem>, live: LiveReply?): List<ChatItem> {
         if (live == null) return transcript
-        var lastUser = transcript.size - 1
-        while (lastUser >= 0 && transcript[lastUser] !is UserMessage) lastUser--
-        if (transcript !== this.transcript || lastUser + 1 != cut) {
+        if (transcript !== this.transcript || live.runId != runId) {
+            if (live.runId != runId) since = System.currentTimeMillis() / 1000.0
             this.transcript = transcript
-            cut = lastUser + 1
-            head = transcript.subList(0, cut)
+            runId = live.runId
+            start = transcript.indexOfLast { it is UserMessage && it.runId == live.runId }
+            head = if (start < 0) transcript else transcript.subList(0, start + 1)
         }
-        val after = transcript.subList(cut, transcript.size)
-        val stored = after.firstOrNull { it is AssistantReply } as AssistantReply?
-        // While polling, the synced rows already hold the stored part, so the streamed text is not repeated.
-        val polling = live.connection == Connection.POLLING
-        val reply = AssistantReply(
-            key = stored?.key ?: "live",
-            steps = if (polling && stored != null) stored.steps else live.steps,
-            text = if (polling) stored?.text.orEmpty() else live.text,
-            timestamp = stored?.timestamp ?: (System.currentTimeMillis() / 1000.0),
-            live = true,
-        )
-        return Joined(head, after.filter { it !is AssistantReply } + reply)
+        if (live.connection == Connection.POLLING) return Joined(transcript, listOf(AssistantReply("live", emptyList(), "", since, live = true)))
+        val after = if (start < 0) emptyList() else transcript.subList(start + 1, transcript.size)
+        val key = after.firstOrNull { it is AssistantReply }?.key ?: "live"
+        return Joined(head, after.filterIsInstance<UserMessage>() + AssistantReply(key, live.steps, live.text, since, live = true))
     }
 }
 

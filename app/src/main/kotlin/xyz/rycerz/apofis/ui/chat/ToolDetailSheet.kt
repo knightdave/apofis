@@ -18,12 +18,24 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ToolStep
 
-/** A tool step in full: name, arguments and the (display-truncated) result. */
+/** The tool step with [callId] in [items], newest first, and whether it belongs to the live reply. */
+internal fun findStep(items: List<ChatItem>, callId: String): Pair<ToolStep, Boolean>? {
+    for (item in items.asReversed()) {
+        if (item !is AssistantReply) continue
+        val step = item.steps.firstOrNull { it is ToolStep && it.callId == callId } as ToolStep? ?: continue
+        return step to item.live
+    }
+    return null
+}
+
+/** A tool step in full: name, arguments and the (display-truncated) result. [live]: from the reply still running. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun ToolDetailSheet(step: ToolStep, onDismiss: () -> Unit) {
+internal fun ToolDetailSheet(step: ToolStep, live: Boolean, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             Modifier
@@ -44,7 +56,7 @@ internal fun ToolDetailSheet(step: ToolStep, onDismiss: () -> Unit) {
             } else {
                 // Live steps carry only the server's short preview; the stored transcript has the full arguments.
                 Section(stringResource(R.string.tool_arguments), step.argsPreview)
-                if (step.argsPreview.isNotEmpty()) Hint(stringResource(R.string.tool_args_later))
+                if (live) Hint(stringResource(R.string.tool_args_later))
             }
             val result = step.result
             Section(

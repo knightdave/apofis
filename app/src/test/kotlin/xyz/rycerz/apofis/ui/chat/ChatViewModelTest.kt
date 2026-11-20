@@ -20,6 +20,8 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
+import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -50,7 +52,9 @@ import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.Notice
 import xyz.rycerz.apofis.chat.SendState
+import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
@@ -117,7 +121,10 @@ class ChatViewModelTest {
         latches.forEach { it.countDown() }
         // Every coroutine must end before the next test: the repository and send locks are process-wide, and a
         // view model coroutine left suspended on the reset main dispatcher would hold them for good.
+        // A send or drain still running in a view model would otherwise meet a closed database while holding those locks.
+        val jobs = vms.map { it.viewModelScope.coroutineContext.job }
         store.clear()
+        runBlocking { withTimeout(10_000) { jobs.joinAll() } }
         follower.pauseAll()
         runBlocking { withTimeout(10_000) { scope.coroutineContext.job.cancelAndJoin() } }
         db.close()
@@ -127,8 +134,10 @@ class ChatViewModelTest {
 
     private var created = 0
 
+    private val vms = mutableListOf<ChatViewModel>()
+
     private fun vm(): ChatViewModel = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected, online) } })
-        .get("vm${created++}", ChatViewModel::class)
+        .get("vm${created++}", ChatViewModel::class).also { vms += it }
 
     private fun json(body: String, code: Int = 200) =
         { _: RecordedRequest -> MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build() }
@@ -231,7 +240,7 @@ class ChatViewModelTest {
         val vm = vm()
         vm.onDraftChange("What is on my calendar?")
         vm.await { it.draft.isNotEmpty() }
-        vm.onSendClick("What is on my calendar?")
+        vm.onSendClick()
         vm.await { it.draft.isEmpty() }
         val sent = vm.await { s -> s.items.any { it is UserMessage } }
         assertEquals("What is on my calendar?", (sent.items.single() as UserMessage).text)
@@ -247,7 +256,7 @@ class ChatViewModelTest {
         vm.await { it.live != null }
         vm.onDraftChange("Also check tomorrow")
         vm.await { it.composer == ComposerMode.STEER }
-        vm.onSendClick("Also check tomorrow")
+        vm.onSendClick()
         vm.await { it.draft.isEmpty() }
 
         val steered = vm.await { s -> s.items.any { it is UserMessage && it.steered && it.state == SendState.SENT && it.text == "Also check tomorrow" } }
@@ -331,13 +340,13 @@ class ChatViewModelTest {
         vm.onApproval("ctl_1", 2, ApprovalChoice.ONCE)
         val after = vm.await { !it.answering && it.notes.isNotEmpty() }
         assertTrue(requests.none { it.target.endsWith("/approval") })
-        assertEquals(mapOf("ctl_2" to AnswerResult.CHANGED), after.notes) // shown with the block now waiting
+        assertEquals(mapOf("ctl_1" to AnswerNote(AnswerResult.CHANGED, "ctl_2", 2)), after.notes) // shown with the block now waiting
 
         routes[STATUS] = status("running")
         vm.onApproval("ctl_2", 2, ApprovalChoice.DENY) // settled meanwhile elsewhere
-        val gone = vm.await { it.notes["ctl_2"] == AnswerResult.GONE }
+        val gone = vm.await { it.notes["ctl_2"]?.result == AnswerResult.GONE }
         assertTrue(requests.none { it.target.endsWith("/approval") })
-        assertEquals(mapOf("ctl_2" to AnswerResult.GONE), gone.notes)
+        assertEquals(AnswerNote(AnswerResult.GONE), gone.notes["ctl_2"])
     }
 
     @Test
@@ -350,14 +359,14 @@ class ChatViewModelTest {
         locked.await()
         vm.onDraftChange("first")
         vm.await { it.draft == "first" }
-        vm.onSendClick("first")
-        vm.await { it.draft.isEmpty() }
+        vm.onSendClick()
+        vm.await { it.draft.isEmpty() && it.sending }
         vm.onDraftChange("second")
         vm.await { it.draft == "second" }
         held.complete(Unit)
         lock.join()
 
-        val back = vm.await { it.composerNote != null }
+        val back = vm.await { it.composerNote != null && !it.sending }
         assertEquals("first\nsecond", back.draft)
         assertEquals(ComposerNote.SEND_FAILED, back.composerNote)
         assertTrue(db.pendingSendDao().rows(KEY).isEmpty())
@@ -402,35 +411,125 @@ class ChatViewModelTest {
         val vm = vm()
         vm.await { it.items.isNotEmpty() }
         vm.onCancel("q1")
+        assertEquals("q1", vm.await { it.confirmCancel != null }.confirmCancel)
+        vm.onConfirmCancel("q1", mayHaveSentShown = true)
         assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, vm.await { it.composerNote != null }.composerNote)
         assertTrue(vm.await { it.items.isEmpty() }.items.isEmpty())
+    }
+
+    @Test
+    fun sendIsSingleFlightAndTakesTheCurrentDraft() = runTest {
+        addSession()
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("fir")
+        vm.onDraftChange("first") // edited after the button was drawn: the send takes what is typed now
+        vm.onSendClick()
+        vm.onSendClick() // a second tap before the screen redraws
+        vm.await { it.sending && it.draft.isEmpty() }
+        vm.onDraftChange("second")
+        vm.onSendClick() // still in flight: ignored, the new draft stays
+        held.complete(Unit)
+        lock.join()
+
+        val done = vm.await { !it.sending && it.items.isNotEmpty() }
+        assertEquals("second", done.draft)
+        assertEquals(listOf("first"), db.pendingSendDao().rows(KEY).map { it.text })
+    }
+
+    @Test
+    fun goneNoteOutlivesTheRunUntilTheNextSend() = runTest {
+        addSession()
+        val release = latch()
+        routes["/v1/runs/$RUN/approval"] = json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_1"}""")
+        val vm = vm()
+        heldRun(release, first = listOf(approvalEvent), runStatus = status("waiting_for_approval", control))
+        vm.await { it.live?.pending?.requestId == "ctl_1" }
+        routes[STATUS] = status("running") // settled elsewhere before the answer
+        vm.onApproval("ctl_1", 2, ApprovalChoice.DENY)
+        vm.await { it.notes["ctl_1"]?.result == AnswerResult.GONE }
+        release.countDown()
+
+        val ended = vm.await { it.live == null }
+        assertEquals(AnswerNote(AnswerResult.GONE), ended.notes["ctl_1"])
+        vm.onDraftChange("next")
+        vm.onSendClick()
+        vm.await { it.notes.isEmpty() && !it.sending }
+    }
+
+    @Test
+    fun cancelAsksAgainWhenTheMessageWasTriedSinceTheDialogOpened() = runTest {
+        addSession()
+        db.pendingSendDao().upsert(PendingSendEntity("q1", KEY, "later", "{}", System.currentTimeMillis(), "queued", null, null))
+        val vm = vm()
+        vm.await { it.items.isNotEmpty() }
+        vm.onCancel("q1")
+        vm.await { it.confirmCancel == "q1" }
+        db.pendingSendDao().update(db.pendingSendDao().get("q1")!!.copy(attempted = true)) // a drain tried it meanwhile
+
+        vm.onConfirmCancel("q1", mayHaveSentShown = false) // the dialog still showed the weaker wording
+        val asked = vm.await { s -> (s.items.single() as UserMessage).attempted }
+        assertEquals("q1", asked.confirmCancel) // still open, now with the stronger wording
+        assertNotNull(db.pendingSendDao().get("q1"))
+
+        vm.onConfirmCancel("q1", mayHaveSentShown = true)
+        val done = vm.await { it.items.isEmpty() && it.confirmCancel == null }
+        assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, done.composerNote)
+    }
+
+    @Test
+    fun toolSheetFollowsTheStepByCallId() {
+        val preview = ToolStep("c1", "terminal", "command=ls", null, false, error = false, running = true)
+        val full = preview.copy(args = "{\n    \"command\": \"ls\"\n}", result = "a", running = false)
+        val live = listOf(user("u1"), AssistantReply("live", listOf(preview), "", 1.0, live = true))
+        assertEquals(preview to true, findStep(live, "c1"))
+        assertEquals(full to false, findStep(listOf(user("u1"), AssistantReply("r2", listOf(full), "", 1.0)), "c1"))
+        assertEquals(null, findStep(listOf(user("u1")), "c1"))
     }
 
     private fun user(key: String, text: String = key) = UserMessage(key, text, false, 1.0)
     private fun reply(key: String, text: String = key) = AssistantReply(key, emptyList(), text, 1.0)
     private fun liveReply(text: String, connection: Connection = Connection.LIVE) = LiveReply("run", "running", text, emptyList(), null, connection)
 
+    private fun turn(key: String, run: String = "run") = UserMessage(key, key, false, 1.0, runId = run)
+    private fun notice(key: String) = Notice(key, "info", key)
+
     @Test
-    fun liveReplyNeverHidesAnEarlierAnswer() {
-        val transcript = listOf(user("u1"), reply("r2", "old answer"), user("p3", "new question"))
-        val items = LiveMerger().merge(transcript, liveReply("new ans"))
-        assertEquals(listOf("u1", "r2", "p3", "live"), items.map { it.key })
-        assertFalse((items[1] as AssistantReply).live)
+    fun liveReplyStartsAtItsOwnTurn() {
+        val transcript = listOf(user("u1"), reply("r2", "old answer"), turn("u3"), reply("r4", "stored part"), notice("n5"),
+            user("s6").copy(steered = true), reply("r7", "more"))
+        val items = LiveMerger().merge(transcript, liveReply("streamed"))
+        assertEquals(listOf("u1", "r2", "u3", "s6", "r4"), items.map { it.key }) // the live item takes the first hidden key
         assertEquals("old answer", (items[1] as AssistantReply).text)
-        assertEquals("new ans", (items[3] as AssistantReply).text)
+        assertFalse((items[1] as AssistantReply).live)
+        assertEquals("streamed", (items.last() as AssistantReply).text)
+        assertTrue((items.last() as AssistantReply).live)
     }
 
     @Test
-    fun liveReplyTakesOverRowsSyncedDuringPolling() {
-        val transcript = listOf(user("u1"), reply("r2", "old answer"), user("u3", "new question"), reply("r4", "stored part"))
-        val polling = LiveMerger().merge(transcript, liveReply("streamed", Connection.POLLING))
-        assertEquals(listOf("u1", "r2", "u3", "r4"), polling.map { it.key })
-        val live = polling.last() as AssistantReply
-        assertTrue(live.live)
-        assertEquals("stored part", live.text) // the streamed text is not repeated while polling
+    fun liveReplyNeverTakesOverAnotherTurn() {
+        // The previous question and answer, and a queued message: none of them started this run.
+        val transcript = listOf(user("u1"), reply("r2", "old answer"), user("pq", "later"))
+        val items = LiveMerger().merge(transcript, liveReply("new"))
+        assertEquals(listOf("u1", "r2", "pq", "live"), items.map { it.key })
+        assertEquals("old answer", (items[1] as AssistantReply).text)
+        assertEquals(listOf("u1", "r2", "live"), LiveMerger().merge(transcript.take(2), liveReply("new")).map { it.key })
+        // A turn of another run is not this run's turn either.
+        val other = listOf(turn("u1", run = "older"), reply("r2", "old answer"))
+        assertEquals(listOf("u1", "r2", "live"), LiveMerger().merge(other, liveReply("new")).map { it.key })
+    }
 
-        val streaming = LiveMerger().merge(transcript, liveReply("streamed and more"))
-        assertEquals("r4", streaming.last().key) // the stored key: no jump when the run ends
-        assertEquals("streamed and more", (streaming.last() as AssistantReply).text)
+    @Test
+    fun pollingShowsStoredItemsAsTheyAre() {
+        val transcript = listOf(user("u1"), turn("u3"), reply("r2", "one"), notice("n3"), reply("r4", "two"))
+        val items = LiveMerger().merge(transcript, liveReply("streamed", Connection.POLLING))
+        assertEquals(transcript, items.dropLast(1))
+        val indicator = items.last() as AssistantReply
+        assertTrue(indicator.live)
+        assertEquals("", indicator.text)
+        assertTrue(indicator.steps.isEmpty())
     }
 }
