@@ -804,13 +804,11 @@ end_local() {
   local r=0
   drop_incoming || r=1
   if [ -n "$wd_pid" ]; then
-    # Its process group (the watchdog and its sleep) and its pid: before setsid has made the group, the pid alone is
-    # the watchdog, which has not started its sleep yet.
-    kill -KILL -- "-$wd_pid" "$wd_pid" 2>/dev/null
+    kill -KILL "$wd_pid" 2>/dev/null # one signal that cannot be caught or lost; the watchdog has no child
     wait "$wd_pid" 2>/dev/null
     wd_pid=''
   fi
-  if [ -n "$tmp" ]; then rm -f "$tmp/in" "$tmp/out" "$tmp/before.txt" "$tmp/after.txt" "$tmp/files"; rmdir "$tmp"; tmp=''; fi
+  if [ -n "$tmp" ]; then rm -f "$tmp/in" "$tmp/out" "$tmp/wd" "$tmp/before.txt" "$tmp/after.txt" "$tmp/files"; rmdir "$tmp"; tmp=''; fi
   return "$r"
 }
 
@@ -830,11 +828,14 @@ local_cleanup() {
   # A signal can end the run inside a function call whose output is redirected (to /dev/null): the cleanup's own
   # messages go to the original terminal.
   [ -z "$orig_err" ] || exec 1>&"$orig_out" 2>&"$orig_err"
-  # The whole cleanup is bounded: a watchdog interrupts it after TRAP_LIMIT seconds. It runs in its own process group
-  # (setsid does not fork here: a background child is never a group leader), which end_local kills as a whole.
+  # The whole cleanup is bounded: a watchdog interrupts it after TRAP_LIMIT seconds. It waits with the read builtin on
+  # a FIFO nobody writes, so it never has a child (no sleep to leave behind), and end_local cancels it with KILL, which
+  # no state of it can catch or lose (a catchable signal can be swallowed between its fork and exec). If the FIFO
+  # cannot be made or opened, the read fails at once and the cleanup reports an overrun: never an unbounded cleanup.
   trap cleanup_overrun ALRM
+  mkfifo -m 600 "$tmp/wd" 2>/dev/null
   # shellcheck disable=SC2016 # expanded by the inner bash
-  setsid bash -c 'sleep "$1" && kill -ALRM "$2"' _ "$TRAP_LIMIT" $$ </dev/null >/dev/null 2>&1 &
+  bash -c 'exec 9<>"$3"; read -r -t "$1" -u 9 _; kill -ALRM "$2"' _ "$TRAP_LIMIT" $$ "$tmp/wd" </dev/null >/dev/null 2>&1 &
   wd_pid=$!
   if [ -n "$remote_pid" ]; then stop_pid "$remote_pid" && wait "$remote_pid" 2>/dev/null; fi
   [ -z "$rin" ] || exec {rin}>&-
@@ -971,11 +972,12 @@ real_dir() {
   [ -d "$1" ] && [ ! -L "$1" ] && [ "$(realpath -e -- "$1")" = "$2" ]
 }
 
-# Positive evidence that <path> does not exist: its parent was listed and the name is not in it (a failed lookup is
-# not absence).
+# Positive evidence that <path> does not exist: its parent is a readable real directory, find listed it without any
+# error and found no entry of that literal name (incoming names hold no pattern characters). Any error is not absence.
 listed_absent() {
-  local l
-  l=$(ls -A -- "${1%/*}" 2>/dev/null) && ! grep -qxF -- "${1##*/}" <<<"$l"
+  local par=${1%/*} l
+  [ -d "$par" ] && [ ! -L "$par" ] && [ -r "$par" ] && [ -x "$par" ] &&
+    l=$(find "$par" -mindepth 1 -maxdepth 1 -name "${1##*/}" -print 2>/dev/null) && [ -z "$l" ]
 }
 
 # Removes everything inside this run's incoming directory, whatever its name (partial and temporary files of the copy

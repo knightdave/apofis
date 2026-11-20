@@ -443,6 +443,18 @@ command chmod 700 "$t/eacc/build/e2e"
 o=$(cat "$t/outE")
 check "lookup error during the delete: fails, names the directory, keeps the record" '[ "$rc" = 1 ] && has "$o" ".incoming-runE" && has "$o" "by hand" && [ "$incoming" = "$t/eacc/build/e2e/.incoming-runE" ] && [ -e "$t/eacc/build/e2e/.incoming-runE/.logcat.txt.Ab12Cd" ]'
 E2E_ROOT=$saved_root E2E_OUT=$saved_out incoming=''
+# Absence needs a successful listing that lacks the literal name: not formatted ls output, not a failed listing.
+mkdir -p "$E2E_OUT/.incoming-runQ"
+touch "$E2E_OUT/.incoming-runQ/.logcat.txt.Ab12Cd"
+check "a present entry under QUOTING_STYLE=shell-always is not reported gone" '! QUOTING_STYLE=shell-always listed_absent "$E2E_OUT/.incoming-runQ"'
+# shellcheck disable=SC2329 # listings that fail
+check "a failing listing is not reported gone" '! (find() { return 1; }; ls() { return 2; }; listed_absent "$E2E_OUT/.incoming-runQ") && ! (find() { return 1; }; ls() { return 2; }; listed_absent "$E2E_OUT/.incoming-none")'
+run_id=runQ incoming=$E2E_OUT/.incoming-runQ rc=0
+export QUOTING_STYLE=shell-always
+drop_incoming >/dev/null 2>&1 || rc=$?
+unset QUOTING_STYLE
+check "QUOTING_STYLE=shell-always: the incoming directory is still deleted" '[ "$rc" = 0 ] && [ -z "$incoming" ] && [ ! -e "$E2E_OUT/.incoming-runQ" ]'
+check "absence proved by a listing that lacks the name" 'listed_absent "$E2E_OUT/.incoming-runQ"'
 # An import whose delete fails never claims that nothing was kept.
 make_export "$t/srcE"
 printf 'planted change\n' >>"$t/srcE/logcat.txt"
@@ -473,21 +485,41 @@ APOFIS_E2E_LIB=1 bash -c '
   trap local_cleanup EXIT
   exit 0' _ "$here" >"$t/out12" 2>&1 || rc=$?
 check "cleanup over its limit: exit 1 with the fixed message within 10 s" '[ "$rc" = 1 ] && has "$(cat "$t/out12")" "did not finish within 2s" && [ $((SECONDS - s)) -le 10 ]'
-# 12b. A cleanup with nothing to do stops its watchdog at once (before or after it has its own process group): exit 0
-# well before the limit, and no sleep of it left. Three times, as the race is with the watchdog's start.
-wd_ok=1
-for i in 1 2 3; do
-  lim=4.$i$$ s=$SECONDS rc=0
-  APOFIS_E2E_LIB=1 bash -c '
+# 12b. The watchdog's cancel works and leaves no sleep behind, whatever the interleaving. Fakes: a sleep that records
+# its pid (the only processes this test signals), a bash that starts late (the cancel arrives before the watchdog
+# runs), a setsid that acts late, and a kill that delivers each target separately, 1 s apart (as if the cleanup were
+# descheduled between them: the earlier group-then-pid cancel left the sleep running here).
+real_bash=$(command -v bash) real_sleep=$(command -v sleep) real_setsid=$(command -v setsid)
+mkdir -p "$t/wdbin" "$t/wdlate"
+mkfifo "$t/wdfifo"
+printf '#!/bin/sh\necho $$ >>"$WD_PIDS"\nexec %s "$@"\n' "$real_sleep" >"$t/wdbin/sleep"
+printf '#!%s\nexec 9<>"$WD_FIFO"; read -r -t 1.5 -u 9 _; exec %s "$@"\n' "$real_bash" "$real_setsid" >"$t/wdbin/setsid"
+printf '#!%s\nexec 9<>"$WD_FIFO"; read -r -t 1.5 -u 9 _; exec %s "$@"\n' "$real_bash" "$real_bash" >"$t/wdlate/bash"
+chmod +x "$t/wdbin/sleep" "$t/wdbin/setsid" "$t/wdlate/bash"
+wd_case() { # <name> <extra PATH dir or ""> <split kill: 1 or "">
+  : >"$t/wdpids-$1"
+  s=$SECONDS rc=0
+  WD_PIDS=$t/wdpids-$1 WD_FIFO=$t/wdfifo APOFIS_E2E_LIB=1 bash -c '
     source "$1/run-e2e.sh"
     set +e
-    TRAP_LIMIT=$2 tmp=$(mktemp -d)
+    TRAP_LIMIT=6 tmp=$(mktemp -d)
+    PATH=$2$3:$PATH
+    if [ -n "$4" ]; then
+      exec 9<>"$WD_FIFO"
+      kill() { local sig=$1 a; shift; [ "$1" != -- ] || shift; for a; do read -r -t 1 -u 9 _; builtin kill "$sig" -- "$a"; done; }
+    fi
     trap local_cleanup EXIT
-    exit 0' _ "$here" "$lim" >"$t/out12b" 2>&1 || rc=$?
-  { [ "$rc" = 0 ] && [ $((SECONDS - s)) -lt 3 ] && ! pgrep -fx "sleep $lim" >/dev/null; } || wd_ok=''
-  pkill -fx "sleep $lim" || true
-done
-check "quick cleanup: the watchdog is stopped, exit 0 at once, no sleep left (3 runs)" "[ -n '$wd_ok' ]"
+    exit 0' _ "$here" "${2:+$2:}" "$t/wdbin" "$3" >"$t/out-$1" 2>&1 || rc=$?
+  # shellcheck disable=SC2034 # read by check
+  el=$((SECONDS - s))
+  read -r -t 2.5 -u 8 _ 8<>"$t/wdfifo" || true # past every fake delay: a surviving watchdog would have started its sleep
+  alive_sleeps=''
+  while read -r p; do if kill -0 "$p" 2>/dev/null; then alive_sleeps+=" $p"; kill -KILL "$p"; fi; done <"$t/wdpids-$1"
+}
+wd_case wd-late "$t/wdlate" ''
+check "watchdog cancelled before it starts: exit 0 at once, no sleep ever left" '[ "$rc" = 0 ] && [ "$el" -lt 3 ] && [ -z "$alive_sleeps" ]'
+wd_case wd-split '' 1
+check "watchdog cancel delayed past its start (split signals, late setsid): exit 0, no sleep left" '[ "$rc" = 0 ] && [ "$el" -lt 5 ] && [ -z "$alive_sleeps" ]'
 
 # 13. Every instrumentation test class writes its own result rows (Evidence), which the cleanup requires.
 for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
