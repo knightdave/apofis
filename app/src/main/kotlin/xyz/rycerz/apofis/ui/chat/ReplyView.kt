@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.annotation.StringRes
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -27,6 +28,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -42,28 +44,35 @@ import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.run.AnswerResult
 import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
+import xyz.rycerz.apofis.ui.markdown.BlockKind
+import xyz.rycerz.apofis.ui.markdown.DisplayChunk
+import xyz.rycerz.apofis.ui.markdown.MarkdownChunk
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.scaled
 import xyz.rycerz.apofis.ui.theme.wash
 
 /**
- * One chunk of a paragraph (flat, full width) or of a fenced code block (monospace, scrolls sideways). Chunks of one
- * block sit flush against each other: only the first has the top spacing and label, only the last the bottom.
+ * One display chunk of a logical block: markdown (flat, full width) or a fenced code block (monospace, scrolls
+ * sideways). Chunks of one block sit flush against each other: only the first has the top spacing and label, only the
+ * last the bottom. [tableScroll] is shared by the slices of one table.
  */
 @Composable
-internal fun TextBlock(row: TextRow) {
-    val top = if (row.first) 6.dp else 0.dp
-    val bottom = if (row.joinBelow) 0.dp else 6.dp
-    if (!row.code) {
-        Text(
-            row.text,
-            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = top, bottom = bottom),
-            style = scaled(ChatText.assistant),
-            color = MaterialTheme.colorScheme.onSurface,
+internal fun TextBlock(row: TextRow, onLink: (String) -> Unit = {}, tableScroll: ScrollState = rememberScrollState()) {
+    if (row.kind != BlockKind.CODE) {
+        // Half the 0.9 b block spacing above and below each block.
+        val half = with(LocalDensity.current) { (scaled(ChatText.assistant).fontSize * 0.45f).toDp() }
+        MarkdownChunk(
+            row.chunk,
+            onLink,
+            Modifier.padding(start = 20.dp, end = 20.dp, top = if (row.first) half else 0.dp, bottom = if (row.joinBelow) 0.dp else half),
+            tableScroll,
         )
         return
     }
+    val text = (row.chunk as? DisplayChunk.Code)?.text ?: ""
+    val top = if (row.first) 6.dp else 0.dp
+    val bottom = if (row.joinBelow) 0.dp else 6.dp
     val radius = 16.dp
     val shape = RoundedCornerShape(
         topStart = if (row.first) radius else 0.dp,
@@ -88,7 +97,7 @@ internal fun TextBlock(row: TextRow) {
             )
         }
         Text(
-            row.text,
+            text,
             Modifier
                 .horizontalScroll(rememberScrollState())
                 .padding(start = 12.dp, end = 12.dp, top = if (row.first) 8.dp else 0.dp, bottom = if (row.joinBelow) 0.dp else 8.dp),

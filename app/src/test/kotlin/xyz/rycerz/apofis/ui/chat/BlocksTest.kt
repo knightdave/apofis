@@ -10,12 +10,25 @@ import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
+import xyz.rycerz.apofis.ui.markdown.BlockKind
+import xyz.rycerz.apofis.ui.markdown.BlockMode
+import xyz.rycerz.apofis.ui.markdown.DisplayChunk
+import xyz.rycerz.apofis.ui.markdown.MdBlock
 
 class BlocksTest {
-    private fun split(text: String) = parseBlocks(text).map { Triple(text.substring(it.start, it.end), it.code, it.lang) }
+    private fun split(text: String) = parseBlocks(text).map { Triple(text.substring(it.start, it.end), it.kind == BlockKind.CODE, it.lang) }
 
-    /** What a fresh parse of [text] renders: (text, code) per row. */
-    private fun fresh(text: String) = ReplyText().update("x", text).map { it.text to it.code }
+    /** The plain text a row shows (paragraphs only, which is all these tests use). */
+    private val TextRow.text: String
+        get() = when (val c = chunk) {
+            is DisplayChunk.Literal -> c.text
+            is DisplayChunk.Code -> c.text
+            is DisplayChunk.Blocks -> c.blocks.joinToString("\n\n") { (it as MdBlock.Paragraph).text.text }
+            is DisplayChunk.TableSlice -> error("no tables here")
+        }
+
+    /** What a fresh parse of [text] renders: chunk and kind per row. */
+    private fun fresh(text: String) = ReplyText().update("x", text).map { it.chunk to it.kind }
 
     @Test
     fun paragraphsAndFencedCode() {
@@ -42,7 +55,7 @@ class BlocksTest {
         val live = ReplyText()
         for (end in 1..full.length) {
             val text = full.substring(0, end)
-            assertEquals("at $end", fresh(text), live.update("r1", text).map { it.text to it.code })
+            assertEquals("at $end", fresh(text), live.update("r1", text).map { it.chunk to it.kind })
         }
     }
 
@@ -67,7 +80,7 @@ class BlocksTest {
             val built = Work.rowsBuilt
             val rows = live.update("r1", text + "x")
             assertTrue("built ${Work.rowsBuilt - built} rows for one character", Work.rowsBuilt - built <= 2)
-            assertEquals(fresh(text + "x"), rows.map { it.text to it.code })
+            assertEquals(fresh(text + "x"), rows.map { it.chunk to it.kind })
             live.update("other", "") // start over for the next text
         }
     }
@@ -79,7 +92,7 @@ class BlocksTest {
         val built = Work.rowsBuilt
         val rows = live.update("r1", after)
         val cost = Work.rowsBuilt - built
-        assertEquals(fresh(after), rows.map { it.text to it.code })
+        assertEquals(fresh(after), rows.map { it.chunk to it.kind })
         for (i in 0 until kept) assertSame("row $i", old[i], rows[i])
         return cost
     }
@@ -95,9 +108,17 @@ class BlocksTest {
     }
 
     @Test
-    fun aLongOpenParagraphEndingAtAFenceKeepsItsRows() {
-        val para = "a line of prose\n".repeat(100_000) + "``" // one paragraph, about 1000 rows
-        assertTrue(appendCost(para, para + "`", kept = 990) <= 3)
+    fun aLongOpenParagraphEndingAtAFenceIsParsedOnce() {
+        // Literal while open (over the limit); a fence on its last line makes it stable, so it is parsed once, whole.
+        val para = "a line of prose\n".repeat(20_000) + "``"
+        val live = ReplyText()
+        val open = live.update("r1", para)
+        assertTrue(open.all { it.chunk is DisplayChunk.Literal })
+        val parses = Work.markdownParses
+        val rows = live.update("r1", para + "`")
+        assertEquals(1, Work.markdownParses - parses)
+        assertEquals(fresh(para + "`"), rows.map { it.chunk to it.kind })
+        assertEquals(BlockKind.CODE, rows.last().kind)
     }
 
     @Test
@@ -126,8 +147,8 @@ class BlocksTest {
         val live = ReplyText()
         live.update("r1", start)
         val rows = live.update("r1", full)
-        assertEquals(fresh(full), rows.map { it.text to it.code })
-        assertEquals("plain" to false, rows.last().let { it.text to it.code })
+        assertEquals(fresh(full), rows.map { it.chunk to it.kind })
+        assertEquals("plain" to BlockKind.TEXT, rows.last().let { it.text to it.kind })
         assertFalse(rows.any { it.text.contains("```") })
     }
 
@@ -147,11 +168,11 @@ class BlocksTest {
         val body = (1..3000).joinToString("\n") { "line $it of the listing" }
         val text = "```txt\n$body\n```\nDone"
         val rows = ReplyText().update("r1", text)
-        val code = rows.filter { it.code }
+        val code = rows.filter { it.kind == BlockKind.CODE }
         assertTrue(code.size > 1)
         assertTrue(code.all { it.text.length <= CHUNK && it.lang == "txt" })
         assertEquals(body, code.joinToString("\n") { it.text })
-        assertEquals("Done" to false, rows.last().let { it.text to it.code })
+        assertEquals("Done" to BlockKind.TEXT, rows.last().let { it.text to it.kind })
 
         val live = ReplyText()
         for (end in 1..text.length step 7) live.update("r1", text.substring(0, end))
@@ -176,5 +197,56 @@ class BlocksTest {
         assertEquals(before.size + 1, after.size)
         val changed = after.indices.filter { i -> before.getOrNull(i) !== after[i] }
         assertTrue("changed rows $changed", changed.size <= 2) // the new paragraph and the reply's footer
+    }
+
+    @Test
+    fun boundedWorkPerToken() {
+        for ((length, maxParses) in listOf(7000 to 1L, 9000 to 0L)) {
+            val text = "Intro.\n\n" + "word ".repeat(length / 5)
+            val live = ReplyText()
+            live.update("r1", text)
+            val open = parseBlocks(text).last()
+            assertEquals(length, open.end - open.start)
+            assertEquals(if (length > 8000) BlockMode.LITERAL else BlockMode.PARSED, open.mode)
+            val parses = Work.markdownParses
+            val rows = live.update("r1", text + "x")
+            assertTrue("$length: ${Work.markdownParses - parses} parses", Work.markdownParses - parses <= maxParses)
+            assertEquals(fresh(text + "x"), rows.map { it.chunk to it.kind })
+        }
+    }
+
+    @Test
+    fun fenceClosedAtEof() {
+        val block = parseBlocks("```sh\nls\n```").single()
+        assertEquals(BlockKind.CODE, block.kind)
+        assertTrue(block.fenceClosed)
+        assertFalse(block.stable)
+        assertFalse(parseBlocks("```sh\nls\n``").single().fenceClosed)
+        assertTrue(parseBlocks("```sh\nls\n```\n").single().stable)
+    }
+
+    @Test
+    fun aLooseListStaysOneBlockUntilALineEndsIt() {
+        assertEquals(1, parseBlocks("- a\n\n- b\n\n  more").size)
+        assertFalse(parseBlocks("- a\n\n").single().stable) // the next line may still continue the list
+        assertFalse(parseBlocks("- a\n\n1").single().stable) // "1" may become "1. b"
+        val ended = parseBlocks("- a\n\n1 apple")
+        assertEquals(listOf(true, false), ended.map { it.stable })
+        assertTrue(parseBlocks("para\n\n").single().stable) // a paragraph without a list ends at the blank line
+    }
+
+    @Test
+    fun longCodeLinesStayWholeUpToTheTableLimit() {
+        val line = "y".repeat(5000)
+        val text = "```\n$line\nshort\n```\n"
+        val code = ReplyText().update("r1", text).map { (it.chunk as DisplayChunk.Code).text }
+        assertEquals(listOf(line, "short"), code)
+        val huge = "z".repeat(45_000)
+        val pieces = ReplyText().update("r1", "```\n$huge").map { (it.chunk as DisplayChunk.Code).text }
+        assertEquals(listOf(20_000, 20_000, 5_000), pieces.map { it.length })
+        // Streamed, including a closing fence right after a long line: always what a fresh parse gives.
+        val streamed = "```\n" + "y".repeat(1600) + "\n```\nafter"
+        val live = ReplyText()
+        for (end in 1..streamed.length) assertEquals("at $end", fresh(streamed.substring(0, end)), live.update("r1", streamed.substring(0, end)).map { it.chunk to it.kind })
     }
 }

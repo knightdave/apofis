@@ -1,0 +1,362 @@
+package xyz.rycerz.apofis.ui.markdown
+
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.isSpecified
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.sp
+import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.theme.ChatText
+import xyz.rycerz.apofis.ui.theme.scaled
+
+/**
+ * One display chunk of a reply. Links open only through [onLink], on a tap; nothing is fetched. [tableScroll] is
+ * shared by every slice of one table, so they scroll sideways together.
+ */
+@Composable
+fun MarkdownChunk(chunk: DisplayChunk, onLink: (String) -> Unit, modifier: Modifier = Modifier, tableScroll: ScrollState = rememberScrollState()) {
+    val body = scaled(ChatText.assistant)
+    val link by rememberUpdatedState(onLink)
+    val open: (String) -> Unit = { link(it) }
+    when (chunk) {
+        is DisplayChunk.Blocks -> Blocks(chunk.blocks, body, MaterialTheme.colorScheme.onSurface, false, open, modifier)
+        is DisplayChunk.TableSlice -> Table(chunk.table, chunk.from, chunk.to, chunk.widths, chunk.first, chunk.last, tableScroll, open, modifier)
+        is DisplayChunk.Literal -> Text(chunk.text, modifier.fillMaxWidth(), style = body, color = MaterialTheme.colorScheme.onSurface)
+        is DisplayChunk.Code -> Text(
+            chunk.text,
+            modifier.horizontalScroll(rememberScrollState()),
+            style = scaled(ChatText.code),
+            color = MaterialTheme.colorScheme.onSurface,
+            softWrap = false,
+        )
+    }
+}
+
+/**
+ * Blocks 0.9 times the body size apart, or [itemGap] apart inside a list item; [strike] and [color] come from a checked
+ * task item or a quote.
+ */
+@Composable
+private fun Blocks(blocks: List<MdBlock>, body: TextStyle, color: Color, strike: Boolean, onLink: (String) -> Unit, modifier: Modifier = Modifier, itemGap: Dp? = null) {
+    val gap = itemGap ?: with(LocalDensity.current) { (body.fontSize * 0.9f).toDp() }
+    Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(gap)) {
+        for (b in blocks) Block(b, body, color, strike, onLink)
+    }
+}
+
+@Composable
+private fun Block(b: MdBlock, body: TextStyle, color: Color, strike: Boolean, onLink: (String) -> Unit) {
+    val colors = ApofisTheme.colors
+    when (b) {
+        is MdBlock.Paragraph -> MdTextView(b.text, body, color, strike, onLink)
+        is MdBlock.Heading -> {
+            val size = body.fontSize
+            val style = when (b.level) {
+                1 -> body.copy(fontSize = size * 1.45f, fontWeight = FontWeight.Medium, lineHeight = 1.3.em)
+                2 -> body.copy(fontSize = size * 1.27f, fontWeight = FontWeight.Medium, lineHeight = 1.35.em)
+                3 -> body.copy(fontSize = size * 1.13f, fontWeight = FontWeight.Medium, lineHeight = 1.4.em)
+                4 -> body
+                5 -> body.copy(fontSize = size * 0.94f)
+                else -> body.copy(fontSize = size * 0.88f)
+            }
+            val tone = if (b.level >= 6 && color == MaterialTheme.colorScheme.onSurface) colors.muted else color
+            MdTextView(b.text, style, tone, strike, onLink, Modifier.padding(top = 4.dp).semantics { heading() })
+        }
+        is MdBlock.Quote -> {
+            val bar = colors.quoteBar
+            Blocks(
+                b.blocks,
+                body,
+                colors.quoteText,
+                strike,
+                onLink,
+                Modifier
+                    .drawBehind { drawRoundRect(bar, size = Size(3.dp.toPx(), size.height), cornerRadius = CornerRadius(1.5.dp.toPx())) }
+                    .padding(start = 12.dp),
+            )
+        }
+        is MdBlock.ListBlock -> ListView(b, body, color, strike, onLink)
+        is MdBlock.Table -> Table(b, 0, b.rows.size, remember(b) { tableWidths(b) }, first = true, last = true, rememberScrollState(), onLink)
+        is MdBlock.Image -> ImageTile(b, onLink)
+        MdBlock.Rule -> Box(Modifier.fillMaxWidth().padding(vertical = 12.dp).height(1.dp).background(colors.hairline))
+    }
+}
+
+/** Text with its inline styles; inline code gets a rounded box drawn behind each line fragment, no characters added. */
+@Composable
+private fun MdTextView(text: MdText, style: TextStyle, color: Color, strike: Boolean, onLink: (String) -> Unit, modifier: Modifier = Modifier, align: TextAlign = TextAlign.Unspecified) {
+    val primary = MaterialTheme.colorScheme.primary
+    val annotated = remember(text, primary, strike) { annotate(text, primary, strike, onLink) }
+    val codes = remember(text) { text.spans.filter { it.kind == SpanKind.CODE } }
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val fill = ApofisTheme.colors.inlineCodeFill
+    val border = ApofisTheme.colors.hairline
+    val codeSize = with(LocalDensity.current) { (style.fontSize * 0.86f).toPx() }
+    Text(
+        annotated,
+        modifier
+            .fillMaxWidth()
+            .then(
+                if (codes.isEmpty()) Modifier else Modifier.drawBehind {
+                    val l = layout ?: return@drawBehind
+                    val padX = 4.dp.toPx()
+                    val padY = 3.dp.toPx()
+                    val radius = CornerRadius(6.dp.toPx())
+                    val stroke = Stroke(1.dp.toPx())
+                    for (span in codes) {
+                        if (span.end > l.layoutInput.text.length) continue
+                        for (line in l.getLineForOffset(span.start)..l.getLineForOffset(span.end - 1)) {
+                            val a = maxOf(span.start, l.getLineStart(line))
+                            val z = minOf(span.end, l.getLineEnd(line, visibleEnd = true))
+                            if (a >= z) continue
+                            val left = l.getBoundingBox(a).left - padX
+                            val right = l.getBoundingBox(z - 1).right + padX
+                            val baseline = l.getLineBaseline(line)
+                            // Glyph bounds of the code font: about 0.9 em above the baseline and 0.25 em below.
+                            val top = baseline - codeSize * 0.9f - padY
+                            val bottom = baseline + codeSize * 0.25f + padY
+                            drawRoundRect(fill, Offset(left, top), Size(right - left, bottom - top), radius)
+                            drawRoundRect(border, Offset(left, top), Size(right - left, bottom - top), radius, style = stroke)
+                        }
+                    }
+                },
+            ),
+        style = style,
+        color = color,
+        textAlign = align,
+        onTextLayout = { layout = it },
+    )
+}
+
+private fun annotate(text: MdText, primary: Color, strike: Boolean, onLink: (String) -> Unit): AnnotatedString = buildAnnotatedString {
+    append(text.text)
+    for (span in text.spans) {
+        when (span.kind) {
+            SpanKind.STRONG -> addStyle(SpanStyle(fontWeight = FontWeight.Medium), span.start, span.end)
+            SpanKind.EMPHASIS -> addStyle(SpanStyle(fontStyle = FontStyle.Italic), span.start, span.end)
+            SpanKind.STRIKE -> addStyle(SpanStyle(textDecoration = TextDecoration.LineThrough), span.start, span.end)
+            SpanKind.CODE -> addStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 0.86.em), span.start, span.end)
+            SpanKind.LINK -> {
+                val url = span.url ?: continue
+                val styles = TextLinkStyles(SpanStyle(color = primary, textDecoration = TextDecoration.Underline))
+                addLink(LinkAnnotation.Clickable(url, styles) { onLink(url) }, span.start, span.end)
+            }
+        }
+    }
+    if (strike) addStyle(SpanStyle(textDecoration = TextDecoration.LineThrough), 0, text.text.length)
+}
+
+@Composable
+private fun ListView(list: MdBlock.ListBlock, body: TextStyle, color: Color, strike: Boolean, onLink: (String) -> Unit) {
+    val density = LocalDensity.current
+    val measurer = rememberTextMeasurer()
+    val widest = if (list.ordered) "${list.start + list.items.size - 1}." else "•"
+    val textWidth = with(density) { remember(widest, body) { measurer.measure(widest, body).size.width }.toDp() }
+    val marker = if (list.items.any { it.task }) maxOf(textWidth, 16.dp) else textWidth
+    val line = with(density) { (body.fontSize * 1.5f).toDp() }
+    val muted = ApofisTheme.colors.muted
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(ItemGap)) {
+        list.items.forEachIndexed { i, item ->
+            Row(Modifier.fillMaxWidth()) {
+                Box(Modifier.width(marker), contentAlignment = Alignment.TopEnd) {
+                    if (item.task) {
+                        TaskBox(item.checked, Modifier.padding(top = (line - 16.dp) / 2))
+                    } else {
+                        Text(if (list.ordered) "${list.start + i}." else "•", style = body, color = color)
+                    }
+                }
+                Box(Modifier.width(6.dp))
+                val done = item.task && item.checked
+                Blocks(item.blocks, body, if (done) muted else color, strike || done, onLink, Modifier.weight(1f), ItemGap)
+            }
+        }
+    }
+}
+
+private val ItemGap = 4.dp
+
+/** A read-only task checkbox: no press state. */
+@Composable
+private fun TaskBox(checked: Boolean, modifier: Modifier) {
+    val colors = ApofisTheme.colors
+    val shape = RoundedCornerShape(4.dp)
+    Box(
+        modifier
+            .size(16.dp)
+            .then(if (checked) Modifier.background(colors.muted, shape) else Modifier.border(1.5.dp, colors.muted, shape)),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (checked) Icon(painterResource(R.drawable.lucide_check), null, Modifier.size(12.dp), tint = MaterialTheme.colorScheme.surface)
+    }
+}
+
+@Composable
+private fun ImageTile(image: MdBlock.Image, onLink: (String) -> Unit) {
+    val colors = ApofisTheme.colors
+    val shape = RoundedCornerShape(12.dp)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clip(shape)
+            .background(colors.codeFill)
+            .then(if (image.url.isNotEmpty()) Modifier.clickable(role = Role.Button) { onLink(image.url) } else Modifier)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(painterResource(R.drawable.lucide_image), null, Modifier.size(20.dp), tint = colors.muted)
+        Box(Modifier.width(8.dp))
+        Text(image.alt.ifEmpty { stringResource(R.string.md_image) }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+    }
+}
+
+private val TableRadius = 12.dp
+private val CellPadX = 12.dp
+private val MaxColumn = 280.dp
+
+/**
+ * Rows [from, to) of [table] with the toolbar and header on the first slice. The frame is drawn so that slices of one
+ * table join into one rounded block: only the first has the top corners, only the last the bottom ones.
+ */
+@Composable
+private fun Table(
+    table: MdBlock.Table,
+    from: Int,
+    to: Int,
+    widths: List<Int>,
+    first: Boolean,
+    last: Boolean,
+    scroll: ScrollState,
+    onLink: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = ApofisTheme.colors
+    val headerStyle = scaled(TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Medium, lineHeight = 1.4.em))
+    val bodyStyle = scaled(TextStyle(fontSize = 13.5.sp, lineHeight = 1.4.em))
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val charWidth = with(density) { remember(bodyStyle) { measurer.measure("0", bodyStyle).size.width }.toDp() }
+    Column(modifier.fillMaxWidth().tableFrame(first, last, colors.tableBorder)) {
+        if (first) {
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(painterResource(R.drawable.lucide_table), null, Modifier.size(16.dp), tint = colors.codeLabel)
+                Box(Modifier.width(6.dp))
+                Text(stringResource(R.string.md_table), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel)
+            }
+        }
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val columns = widths.map { (charWidth * it + CellPadX * 2).coerceIn(48.dp, MaxColumn) }
+            val total = columns.fold(0.dp) { a, w -> a + w } + 1.dp * (columns.size - 1).coerceAtLeast(0)
+            // A narrow table still fills the frame: the last column takes the rest.
+            val fitted = if (total < maxWidth && columns.isNotEmpty()) columns.dropLast(1) + (columns.last() + (maxWidth - total)) else columns
+            Column(Modifier.horizontalScroll(scroll)) {
+                if (first) TableRow(table.header, table.align, fitted, headerStyle, MaterialTheme.colorScheme.onSurface, colors.tableHeaderFill, colors.tableDivider, onLink)
+                for (r in from until to) TableRow(table.rows[r], table.align, fitted, bodyStyle, colors.tableBody, Color.Unspecified, colors.tableDivider, onLink)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TableRow(cells: List<MdText>, align: List<Align>, widths: List<Dp>, style: TextStyle, color: Color, fill: Color, divider: Color, onLink: (String) -> Unit) {
+    Row(
+        Modifier
+            .height(IntrinsicSize.Min)
+            .then(if (fill.isSpecified) Modifier.background(fill) else Modifier)
+            .drawBehind { drawRect(divider, size = Size(size.width, 1.dp.toPx())) }, // the line above every row
+    ) {
+        cells.forEachIndexed { c, cell ->
+            if (c > 0) Box(Modifier.width(1.dp).fillMaxHeight().background(divider))
+            val textAlign = when (align.getOrNull(c)) {
+                Align.CENTER -> TextAlign.Center
+                Align.END -> TextAlign.End
+                else -> TextAlign.Start
+            }
+            Box(Modifier.width(widths[c]).padding(horizontal = CellPadX, vertical = 8.dp)) {
+                MdTextView(cell, style, color, false, onLink, align = textAlign)
+            }
+        }
+    }
+}
+
+/** Clips to a rounded frame and draws its outline; an edge that continues in the next or previous slice is open. */
+private fun Modifier.tableFrame(first: Boolean, last: Boolean, color: Color) = clipToBounds().drawWithCache {
+    val r = TableRadius.toPx()
+    val stroke = 1.dp.toPx()
+    val top = if (first) 0f else -r
+    val bottom = if (last) size.height else size.height + r
+    val clip = Path().apply { addRoundRect(RoundRect(0f, top, size.width, bottom, CornerRadius(r))) }
+    val outline = Path().apply {
+        addRoundRect(RoundRect(stroke / 2, top + stroke / 2, size.width - stroke / 2, bottom - stroke / 2, CornerRadius(r - stroke / 2)))
+    }
+    onDrawWithContent {
+        clipPath(clip) { this@onDrawWithContent.drawContent() }
+        drawPath(outline, color, style = Stroke(stroke))
+    }
+}

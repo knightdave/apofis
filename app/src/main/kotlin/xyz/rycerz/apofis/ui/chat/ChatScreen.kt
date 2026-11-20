@@ -42,6 +42,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -88,6 +89,8 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
     val steps = remember { StepIndex() }
+    val uriHandler = LocalUriHandler.current
+    var linkFailed by remember { mutableStateOf(false) } // shown until the next send or the next link that opens
     val pendingId = state.live?.pending?.requestId
     LaunchedEffect(pendingId) { if (pendingId != null) listState.animateScrollToItem(0) } // the request sits at the bottom
 
@@ -105,12 +108,14 @@ fun ChatScreen(
         bottomBar = {
             Column(Modifier.navigationBarsPadding().imePadding()) {
                 state.composerNote?.let { ComposerNoteLine(it) }
+                if (linkFailed) NoteLine(R.string.settings_link_no_app)
                 state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                 Composer(
                     state.draft,
                     if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
                     { actions.onDraftChange(it, state.draftRevision) },
                     onSend = {
+                        linkFailed = false
                         actions.onSendClick()
                         scope.launch { listState.scrollToItem(0) }
                     },
@@ -140,6 +145,7 @@ fun ChatScreen(
                 contentPadding = PaddingValues(vertical = 8.dp),
                 zone = zone,
                 today = today,
+                onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
             )
             val away by remember { derivedStateOf { listState.canScrollBackward } }
             if (away) {
@@ -220,11 +226,16 @@ fun ChatScreen(
 }
 
 @Composable
-private fun ComposerNoteLine(note: ComposerNote) {
-    val text = when (note) {
+private fun ComposerNoteLine(note: ComposerNote) = NoteLine(
+    when (note) {
         ComposerNote.REMOVED_MAY_HAVE_SENT -> R.string.chat_note_removed_may_have_sent
         ComposerNote.CANCEL_TOO_LATE -> R.string.chat_note_cancel_too_late
-    }
+    },
+)
+
+/** A one-line note above the composer. */
+@Composable
+private fun NoteLine(text: Int) {
     Text(
         stringResource(text),
         Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(top = 6.dp).semantics { liveRegion = LiveRegionMode.Polite },
