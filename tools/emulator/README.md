@@ -34,8 +34,9 @@ shell user. Tests:
 
 `--app-test <Class>` runs one of the app's own instrumented tests (`app/src/androidTest`, runner
 `xyz.rycerz.apofis.test/androidx.test.runner.AndroidJUnitRunner`) instead of the `:e2e` module: it builds
-`:app:assembleDebugAndroidTest`, opens no tunnel and never sends the key (the build host refuses the request in this
-mode; the key is read only for the scan patterns), so no server session can exist. The test writes its files to the
+`:app:assembleDebugAndroidTest`, opens no tunnel and never reads the real key: a disposable per-run canary stands in
+for it, so the key request (refused in this mode anyway), the scan patterns sent to the emulator host and the local
+scans carry nothing derived from the real key, and no server session can exist. It runs without `~/.hermes/.env`. The test writes its files to the
 app's external files directory (`files/blur`), which is pulled with the device files; only the fixed names in
 `APP_FILES` are staged, scanned and copied back like every other export. `ChatLookupE2eTest` (in `:e2e`, run with
 `--test`) checks the chat screen's tags and labels and types without sending: no model run.

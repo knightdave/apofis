@@ -585,6 +585,46 @@ for f in blur-on.png blur-off.png blur-on-keyboard.png blur-off-keyboard.png; do
 rc=0; o=$(mode=app arg=BlurCostTest; evaluate "$t/app-eval" 2>&1) || rc=$?
 check "app test: complete files pass and the numbers are printed" '[ "$rc" = 0 ] && has "$o" "pass  BlurCostTest#measure" && has "$o" "accepted=yes"'
 
+# 12e. --app-test sends no credential by any path. A fake emulator host asks for the key AND the scan patterns (the
+# export stage always does) and records every reply; a fake home holds a "real" key canary in its credentials file.
+REAL=APOFISrealKEYcanary0123456789abcdefREALKEY
+mkdir -p "$t/home/.hermes" "$t/nohome" "$t/peer"
+printf 'API_SERVER_KEY=%s\n' "$REAL" >"$t/home/.hermes/.env"
+cat >"$t/peer/ssh" <<'EOF2'
+#!/usr/bin/env bash
+echo '@@KEY@@'
+IFS= read -r -t 5 k; printf 'KEY %s\n' "$k" >>"$PEER_LOG"
+echo '@@PATTERNS@@'
+IFS= read -r -t 5 n; printf 'N %s\n' "$n" >>"$PEER_LOG"
+for ((i = 0; i < n; i++)); do IFS= read -r -t 5 p; printf 'P %s\n' "$p" >>"$PEER_LOG"; done
+echo "@@COMPLETE $PEER_RUN 0@@"
+exit 0
+EOF2
+chmod +x "$t/peer/ssh"
+# peer_case <mode> <home>: loads the credential as main does, serves the fake peer; the peer's log is in $t/peer-<mode>.
+peer_case() {
+  rm -f "$tmp/in" "$tmp/out" "$t/peer-$1"
+  (
+    mode=$1 HOME=$2 key='' interrupted='' export_files=() export_state='' last_line='' remote_pid='' remote_shell_pid=''
+    run_id=20261120-131313-abcd
+    load_key || exit 7
+    PEER_LOG=$t/peer-$1 PEER_RUN=$run_id PATH="$t/peer:$PATH" run_remote "$( [ "$1" = app ] && echo app:BlurCostTest || echo smoke )" >/dev/null 2>&1
+    exit 0
+  )
+}
+real_leaked() { # any form of the real key in the peer's log: raw, URL-encoded or base64 (what key_patterns sends)
+  local f=$1 p
+  while IFS= read -r p; do grep -qF -- "$p" "$f" && return 0; done < <(key=$REAL; key_patterns | tail -n +2)
+  return 1
+}
+rc=0; peer_case app "$t/home" || rc=$?
+check "app test: the peer asked for the key and the scan patterns and got an answer to both" '[ "$rc" = 0 ] && grep -qx "KEY " "$t/peer-app" && grep -Eq "^N [1-9]" "$t/peer-app"'
+check "app test: no form of the real key reaches the emulator host (key request and scan patterns)" '! real_leaked "$t/peer-app"'
+rc=0; peer_case smoke "$t/home" || rc=$?
+check "authenticated mode (control): the same peer does receive the real key, so the check above can see it" '[ "$rc" = 0 ] && real_leaked "$t/peer-smoke"'
+check "app test: runs without any credentials file" '(mode=app HOME=$t/nohome key=""; load_key && [ "${#key}" -ge 16 ])'
+check "authenticated mode: refuses to start without the credentials file" '! (mode=smoke HOME=$t/nohome key=""; load_key)'
+
 # 13. Every instrumentation test class writes its own result rows (Evidence), which the cleanup requires.
 for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
   grep -q '^ *@Test' "$f" || continue

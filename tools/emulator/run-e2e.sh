@@ -128,6 +128,18 @@ instrument_target() {
   esac
 }
 
+# The credential in $key. --app-test needs none, so the real key is never read in that mode: a disposable per-run
+# canary stands in. Everything that answers the emulator host (the key request, the scan patterns) and the local scans
+# then use the canary, and nothing derived from the real key can leave this host.
+load_key() {
+  if [ "$mode" = app ]; then
+    key=apofis-app-canary-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    return 0
+  fi
+  key=$(grep -E '^API_SERVER_KEY=' ~/.hermes/.env 2>/dev/null | cut -d= -f2- | tr -d "\"'") || key=''
+  [ "${#key}" -ge 16 ]
+}
+
 # The build host answers the emulator host's key request only in modes that need it: never for --app-test.
 key_allowed() { [ -z "$interrupted" ] && [ "$mode" != app ]; }
 allowed() { allowlist | grep -qxF -- "$1"; }
@@ -1198,8 +1210,7 @@ main() {
   trap 'on_signal 143' TERM
   trap 'on_signal 129' HUP
   trap ':' PIPE
-  key=$(grep -E '^API_SERVER_KEY=' ~/.hermes/.env | cut -d= -f2- | tr -d "\"'")
-  [ "${#key}" -ge 16 ] || die "API_SERVER_KEY not found in ~/.hermes/.env"
+  load_key || die "API_SERVER_KEY not found in ~/.hermes/.env"
   log "run $run_id, nonce $nonce"
 
   log "stage 0: the emulator host's lock"
