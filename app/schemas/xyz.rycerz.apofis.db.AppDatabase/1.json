@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "7b2242e7698166261e9687960563787b",
+    "identityHash": "add08af10c6b1b173053908b466cd34c",
     "entities": [
       {
         "tableName": "SessionEntity",
@@ -172,7 +172,7 @@
       },
       {
         "tableName": "PendingSendEntity",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`idempotencyKey` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `text` TEXT NOT NULL, `requestBody` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `state` TEXT NOT NULL, `runId` TEXT, `error` TEXT, PRIMARY KEY(`idempotencyKey`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`idempotencyKey` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `text` TEXT NOT NULL, `requestBody` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `state` TEXT NOT NULL, `runId` TEXT, `error` TEXT, `attempted` INTEGER NOT NULL, PRIMARY KEY(`idempotencyKey`))",
         "fields": [
           {
             "fieldPath": "idempotencyKey",
@@ -219,6 +219,12 @@
             "fieldPath": "error",
             "columnName": "error",
             "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "attempted",
+            "columnName": "attempted",
+            "affinity": "INTEGER",
+            "notNull": true
           }
         ],
         "primaryKey": {
@@ -308,7 +314,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '7b2242e7698166261e9687960563787b')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'add08af10c6b1b173053908b466cd34c')"
     ]
   }
 }

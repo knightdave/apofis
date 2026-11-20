@@ -115,6 +115,9 @@ interface PendingSendDao {
     @Query("SELECT * FROM PendingSendEntity WHERE state = 'queued' ORDER BY createdAt")
     suspend fun allQueued(): List<PendingSendEntity>
 
+    @Query("SELECT * FROM PendingSendEntity WHERE state = :state ORDER BY createdAt")
+    suspend fun withState(state: String): List<PendingSendEntity>
+
     @Query("SELECT * FROM PendingSendEntity WHERE idempotencyKey = :idempotencyKey")
     suspend fun get(idempotencyKey: String): PendingSendEntity?
 

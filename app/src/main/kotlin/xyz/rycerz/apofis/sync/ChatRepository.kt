@@ -160,30 +160,22 @@ class ChatRepository(
         }
     }
 
-    /** Steers the session's running run; otherwise queues [text] and tries to start it at once. */
+    /**
+     * Steers the session's running run, else queues [text] and tries to start it at once. The message is stored
+     * before any request. A hidden chat fails locally; an unknown one throws IllegalArgumentException.
+     */
     suspend fun send(sessionKey: String, text: String) {
         requireAppKey(sessionKey)
-        val queue = checkNotNull(sendQueue) { "no send queue" }
-        val run = db.activeRunDao().forSession(sessionKey)
-        if (run?.status == "running") {
-            try {
-                api.steer(run.runId, text)
-            } catch (_: ApiError) {
-                queue.enqueueFailed(sessionKey, text, "steer_failed")
-            }
-            return
-        }
-        queue.enqueue(sessionKey, text)
-        queue.drain()
+        queue().submit(sessionKey, text)
     }
 
-    suspend fun cancelSend(idempotencyKey: String) = checkNotNull(sendQueue) { "no send queue" }.cancel(idempotencyKey)
+    suspend fun cancelSend(idempotencyKey: String) = queue().cancel(idempotencyKey)
 
-    suspend fun retrySend(idempotencyKey: String) {
-        val queue = checkNotNull(sendQueue) { "no send queue" }
-        queue.retry(idempotencyKey)
-        queue.drain()
-    }
+    /** See [SendQueue.retry]; a send queued again is started at once when possible. */
+    suspend fun retrySend(idempotencyKey: String, confirmedDuplicateRisk: Boolean = false): RetryResult =
+        queue().retry(idempotencyKey, confirmedDuplicateRisk).also { if (it == RetryResult.STARTED) queue().drain() }
+
+    private fun queue() = checkNotNull(sendQueue) { "no send queue" }
 
     suspend fun resolveKey(serverSessionId: String): String? =
         if (isReservedId(serverSessionId)) null else sessionDao.findByAnyId(serverSessionId)?.key
@@ -258,10 +250,12 @@ private fun MessageEntity.toDto() = MessageDto(
 )
 
 private fun PendingSendEntity.toItem() = UserMessage(
-    key = "p$idempotencyKey", text = text, steered = false, timestamp = createdAt / 1000.0,
+    key = "p$idempotencyKey", text = text, steered = state == PendingState.STEERING || state == PendingState.STEERED,
+    timestamp = createdAt / 1000.0,
     state = when (state) {
-        "sending" -> SendState.SENDING
-        "failed" -> SendState.FAILED
+        PendingState.SENDING, PendingState.STEERING -> SendState.SENDING
+        PendingState.STEERED -> SendState.SENT
+        PendingState.FAILED -> SendState.FAILED
         else -> SendState.QUEUED
     },
     idempotencyKey = idempotencyKey,

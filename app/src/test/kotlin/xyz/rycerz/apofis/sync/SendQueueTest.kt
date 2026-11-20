@@ -21,6 +21,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -32,6 +33,7 @@ import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
+import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
 
 private const val RUN_ID = "run_ef57074dc1694db39e37045230b1425c"
@@ -43,7 +45,7 @@ class SendQueueTest {
     private lateinit var api: HermesApi
     private lateinit var queue: SendQueue
     private val started = mutableListOf<Pair<String, String>>()
-    private var clock = 10_000_000L
+    @Volatile private var clock = 10_000_000L
 
     @Before
     fun setUp() {
@@ -85,6 +87,11 @@ class SendQueueTest {
         )
 
     private suspend fun pending(key: String) = db.pendingSendDao().get(key)!!
+
+    private suspend fun rows(sessionKey: String) = db.pendingSendDao().observe(sessionKey).first()
+
+    private suspend fun running(sessionKey: String, runId: String = "run_1") =
+        db.activeRunDao().upsert(ActiveRunEntity(runId, sessionKey, null, "running", 1L))
 
     @Test
     fun happyPathCreatesSessionThenRun() = runTest {
@@ -195,7 +202,8 @@ class SendQueueTest {
         val key = queue.enqueue("apofis-a", "old")
         clock += SEND_EXPIRY_MS + 1
         queue.drain()
-        queue.retry(key)
+        assertEquals("expired", pending(key).error)
+        assertEquals(RetryResult.STARTED, queue.retry(key))
         assertNull(db.pendingSendDao().get(key))
         val row = db.pendingSendDao().observe("apofis-a").first().single()
         assertEquals("queued", row.state)
@@ -226,8 +234,9 @@ class SendQueueTest {
 
     @Test
     fun hiddenSessionFailsWithoutRequest() = runTest {
-        addSession("apofis-a", hidden = true)
+        addSession("apofis-a")
         val key = queue.enqueue("apofis-a", "hi")
+        addSession("apofis-a", hidden = true) // hidden by a refresh after the send was queued
         assertTrue(queue.drain())
         assertEquals("session_unavailable", pending(key).error)
         assertEquals(0, server.requestCount)
@@ -252,35 +261,42 @@ class SendQueueTest {
     @Test
     fun sendSteersWhenRunActive() = runTest {
         addSession("apofis-a")
-        db.activeRunDao().upsert(ActiveRunEntity("run_1", "apofis-a", null, "running", 1L))
+        running("apofis-a")
         respond(fixture("steer_response.json"))
         val repo = ChatRepository(api, db, { clock }, queue)
         repo.send("apofis-a", "also this")
         val steer = take()
         assertEquals("/v1/runs/run_1/steer", steer.target)
         assertTrue(steer.body!!.utf8().contains("also this"))
-        assertTrue(db.pendingSendDao().observe("apofis-a").first().isEmpty())
+        val row = rows("apofis-a").single()
+        assertEquals("steered", row.state)
+        assertEquals("run_1", row.runId)
+        assertEquals(buildRunBody("apofis-a", "also this"), row.requestBody)
+        val item = repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single()
+        assertTrue(item.steered)
+        assertEquals(SendState.SENT, item.state)
+        assertEquals(1, server.requestCount)
     }
 
     @Test
     fun failedSteerBecomesFailedMessageThatRetryQueues() = runTest {
         addSession("apofis-a")
-        db.activeRunDao().upsert(ActiveRunEntity("run_1", "apofis-a", null, "running", 1L))
+        running("apofis-a")
         respond("{}", 500)
         val repo = ChatRepository(api, db, { clock }, queue)
         repo.send("apofis-a", "also this")
         val item = repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single()
         assertEquals(SendState.FAILED, item.state)
-        assertEquals("steer_failed", pending(item.idempotencyKey!!).error)
+        assertEquals("http_error", pending(item.idempotencyKey!!).error)
         assertEquals("also this", item.text)
 
         db.activeRunDao().delete("run_1") // the run ended
         respond(fixture("run_start.json"), 202)
-        repo.retrySend(item.idempotencyKey!!)
+        assertEquals(RetryResult.STARTED, repo.retrySend(item.idempotencyKey))
         val run = recorded().last()
         assertEquals("/v1/runs", run.target)
         assertEquals(buildRunBody("apofis-a", "also this"), run.body!!.utf8())
-        assertEquals("sending", pending(item.idempotencyKey!!).state)
+        assertEquals("sending", pending(item.idempotencyKey).state)
     }
 
     @Test
@@ -318,6 +334,179 @@ class SendQueueTest {
         assertEquals(buildRunBody("apofis-a", "second"), take().body!!.utf8())
         assertEquals("sending", pending(second).state)
         assertEquals(listOf("apofis-a" to "run_1", "apofis-a" to "run_2"), started)
+    }
+
+    @Test
+    fun attemptedExpiryNeedsConfirmation() = runTest {
+        addSession("apofis-a")
+        dropConnection()
+        val key = queue.enqueue("apofis-a", "maybe sent")
+        assertFalse(queue.drain())
+        assertTrue(pending(key).attempted)
+        clock += SEND_EXPIRY_MS + 1
+        queue.drain()
+        assertEquals("failed", pending(key).state)
+        assertEquals("expired_uncertain", pending(key).error)
+
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, queue.retry(key))
+        assertEquals("expired_uncertain", pending(key).error)
+        assertEquals(RetryResult.STARTED, queue.retry(key, confirmedDuplicateRisk = true))
+        assertNull(db.pendingSendDao().get(key))
+        val row = rows("apofis-a").single()
+        assertEquals("queued", row.state)
+        assertFalse(row.attempted)
+        assertEquals(clock, row.createdAt)
+        assertEquals(RetryResult.NOT_FOUND, queue.retry(key))
+    }
+
+    @Test
+    fun steerIsStoredBeforeTheRequest() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        server.enqueue(
+            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json")
+                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val job = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
+        take()
+        val row = rows("apofis-a").single()
+        assertEquals("steering", row.state)
+        assertTrue(row.attempted)
+        assertEquals("run_1", row.runId)
+        assertEquals(SendState.SENDING, repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single().state)
+        job.join()
+        assertEquals("steered", rows("apofis-a").single().state)
+    }
+
+    @Test
+    fun steerNotFoundBecomesQueuedRunSend() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        respond("{}", 404)
+        ChatRepository(api, db, { clock }, queue).send("apofis-a", "late steer")
+        val row = rows("apofis-a").single()
+        assertEquals("queued", row.state)
+        assertNull(row.runId)
+        assertFalse(row.attempted)
+        assertEquals(1, server.requestCount) // the session is still busy until the follower clears the run
+    }
+
+    @Test
+    fun steerNetworkFailureIsUncertain() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        dropConnection()
+        val repo = ChatRepository(api, db, { clock }, queue)
+        repo.send("apofis-a", "lost ack")
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals("steer_uncertain", row.error)
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, repo.retrySend(row.idempotencyKey))
+        assertEquals("steer_uncertain", pending(row.idempotencyKey).error)
+        assertEquals(RetryResult.STARTED, repo.retrySend(row.idempotencyKey, confirmedDuplicateRisk = true))
+        val again = rows("apofis-a").single()
+        assertEquals("queued", again.state)
+        assertNull(again.runId)
+        assertFalse(again.idempotencyKey == row.idempotencyKey)
+    }
+
+    @Test
+    fun interruptedSteerIsUncertainOnDrain() = runTest {
+        addSession("apofis-a")
+        db.pendingSendDao().upsert(
+            PendingSendEntity(
+                idempotencyKey = "k", sessionKey = "apofis-a", text = "t", requestBody = buildRunBody("apofis-a", "t"),
+                createdAt = clock, state = "steering", runId = "run_1", error = null, attempted = true,
+            ),
+        )
+        assertTrue(queue.drain())
+        assertEquals("failed", pending("k").state)
+        assertEquals("steer_uncertain", pending("k").error)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun hiddenSessionFailsLocallyOnBothPaths() = runTest {
+        addSession("apofis-a", hidden = true)
+        val repo = ChatRepository(api, db, { clock }, queue)
+        repo.send("apofis-a", "run path")
+        running("apofis-a")
+        repo.send("apofis-a", "steer path")
+        val all = rows("apofis-a")
+        assertEquals(2, all.size)
+        assertTrue(all.all { it.state == "failed" && it.error == "session_unavailable" })
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun sendToMissingSessionInsertsNothing() = runTest {
+        val repo = ChatRepository(api, db, { clock }, queue)
+        try {
+            repo.send("apofis-gone", "hi")
+            fail("expected IllegalArgumentException")
+        } catch (_: IllegalArgumentException) {
+        }
+        assertTrue(rows("apofis-gone").isEmpty())
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun expiryIsCheckedAgainAfterSlowSessionCreate() = runTest {
+        addSession("apofis-a", existsOnServer = false)
+        server.enqueue(
+            MockResponse.Builder().code(200).body(fixture("session_create.json")).addHeader("Content-Type", "application/json")
+                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        val key = queue.enqueue("apofis-a", "slow")
+        val job = launch(Dispatchers.Default) { queue.drain() }
+        take()
+        clock += SEND_EXPIRY_MS + 1 // the deadline passes while the session is being created
+        job.join()
+        assertEquals("failed", pending(key).state)
+        assertEquals("expired", pending(key).error)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun throwingRunStarterKeepsTheStartedSend() = runTest {
+        val throwing = SendQueue(api, db, { _, _ -> throw IllegalStateException("follower broke") }, { clock })
+        addSession("apofis-a")
+        addSession("apofis-b")
+        respond(runStart("run_1"), 202)
+        respond(runStart("run_2"), 202)
+        val a = throwing.enqueue("apofis-a", "one")
+        clock += 1
+        val b = throwing.enqueue("apofis-b", "two")
+        assertTrue(throwing.drain())
+        assertEquals("sending", pending(a).state)
+        assertEquals("run_1", pending(a).runId)
+        assertEquals("sending", pending(b).state)
+        assertEquals("run_2", pending(b).runId)
+    }
+
+    @Test
+    fun serverErrorStoresFixedCode() = runTest {
+        addSession("apofis-a")
+        respond("""{"error":{"code":"weird_thing"}}""", 500)
+        val key = queue.enqueue("apofis-a", "hi")
+        assertTrue(queue.drain())
+        assertEquals("failed", pending(key).state)
+        assertEquals("http_error", pending(key).error)
+    }
+
+    @Test
+    fun drainStopsAtFirstUnauthorized() = runTest {
+        addSession("apofis-a")
+        addSession("apofis-b")
+        respond(fixture("error_401.json"), 401)
+        val a = queue.enqueue("apofis-a", "one")
+        clock += 1
+        val b = queue.enqueue("apofis-b", "two")
+        assertFalse(queue.drain())
+        assertEquals("unauthorized", pending(a).error)
+        assertEquals("queued", pending(b).state)
+        assertEquals(1, server.requestCount)
     }
 
     @Test
