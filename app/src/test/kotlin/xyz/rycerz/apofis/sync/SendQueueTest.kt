@@ -7,11 +7,14 @@ import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
@@ -382,6 +385,55 @@ class SendQueueTest {
         assertFalse(row.attempted)
         assertEquals(clock, row.createdAt)
         assertEquals(RetryResult.NOT_FOUND, queue.retry(key))
+    }
+
+    @Test
+    fun sendIsStoredWhileARequestHoldsTheRepositoryLock() = runTest {
+        addSession("apofis-a")
+        val dto = """{"id":"apofis-a","source":"api_server","title":"t","pinned":false,"archived":false,"hidden":false,""" +
+            """"started_at":1.0,"last_active":2.0,"message_count":1,"preview":"p","_lineage_ids":[]}"""
+        val list = holding.hold(
+            MockResponse.Builder().code(200).body("""{"object":"list","data":[$dto],"has_more":false}""")
+                .addHeader("Content-Type", "application/json").build(),
+        )
+        respond(fixture("run_start.json"), 202)
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
+        take() // the drawer's list request is in flight and holds the repository lock
+        val send = launch(Dispatchers.Default) { repo.send("apofis-a", "kept") }
+
+        // Bounded only so a regression fails instead of hanging: the row must commit while the request is still held.
+        val stored = withContext(Dispatchers.Default) { withTimeout(5_000) { db.pendingSendDao().observe("apofis-a").first { it.isNotEmpty() } } }
+        assertEquals("kept", stored.single().text)
+        assertEquals(1, server.requestCount)
+        list.countDown()
+        refresh.join()
+        send.join()
+        assertEquals("sending", rows("apofis-a").single().state)
+    }
+
+    @Test
+    fun wakeupIsArmedBeforeTheRowAndAWorkerStartingAtOnceSeesIt() = runTest {
+        addSession("apofis-a")
+        respond(fixture("run_start.json"), 202)
+        val scope = this
+        lateinit var q: SendQueue
+        var rowsWhenArmed = -1
+        var worker: Deferred<String>? = null
+        q = SendQueue(api, db, { _, _ -> }, { clock }, schedule = {
+            rowsWhenArmed = rows("apofis-a").size
+            // A worker WorkManager starts at once: undispatched, so its drain begins while the send is being handed off.
+            worker = scope.async(Dispatchers.Default, CoroutineStart.UNDISPATCHED) {
+                q.drain()
+                rows("apofis-a").single().state
+            }
+        })
+
+        q.submit("apofis-a", "durable")
+
+        assertEquals(0, rowsWhenArmed) // armed before the row exists: a death after the commit still has a worker
+        assertEquals("sending", worker!!.await()) // the worker's drain did not end on an empty queue
+        assertEquals(1, server.requestCount)
     }
 
     @Test

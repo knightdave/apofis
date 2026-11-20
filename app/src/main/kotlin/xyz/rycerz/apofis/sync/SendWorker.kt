@@ -9,6 +9,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.await
 import java.util.concurrent.TimeUnit
 
 /** Implemented by the Application class; [sendQueue] is null while the app is not connected (no credentials). */
@@ -32,9 +33,9 @@ class SendWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request())
 
         // REPLACE starts the drain at once with a fresh backoff. Cancelling a running drain is safe: an interrupted
-        // start stays queued and is retried with the same body and idempotency key.
-        fun schedule(context: Context) {
-            WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request())
+        // start stays queued and is retried with the same body and idempotency key. Returns once WorkManager stored it.
+        suspend fun schedule(context: Context) {
+            WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request()).await()
         }
 
         private fun request() = OneTimeWorkRequestBuilder<SendWorker>()

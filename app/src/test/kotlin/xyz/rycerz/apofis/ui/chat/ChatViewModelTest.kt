@@ -98,6 +98,9 @@ class ChatViewModelTest {
     /** A gate for a held stream; every gate is opened in tearDown, so a failed test never blocks the next. */
     private fun latch() = CountDownLatch(1).also { latches += it }
 
+    /** When set, a send waits at the start of its store (before anything is stored) until it completes. */
+    @Volatile private var storeGate: CompletableDeferred<Unit>? = null
+
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
@@ -114,7 +117,7 @@ class ChatViewModelTest {
             .build()
         val api = HermesApi(server.url("/").toString(), "secret-key")
         lateinit var f: RunFollower
-        val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, {})
+        val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, { storeGate?.await() })
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue)
         f = RunFollower(api, db, repo, scope, delayMs = { delay(minOf(it, 20L)) })
         follower = f
@@ -124,6 +127,7 @@ class ChatViewModelTest {
     @After
     fun tearDown() {
         latches.forEach { it.countDown() }
+        storeGate?.complete(Unit)
         // Every coroutine must end before the next test: the repository and send locks are process-wide, and a
         // view model coroutine left suspended on the reset main dispatcher would hold them for good.
         // A send or drain still running in a view model would otherwise meet a closed database while holding those locks.
@@ -512,16 +516,12 @@ class ChatViewModelTest {
     fun failedSendAfterLeavingGoesBackToTheDraft() = runTest {
         // No session row: send refuses before storing anything.
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it } // the send waits before storing anything
         vm.onDraftChange("first")
         vm.onSendClick()
         vm.await { it.sending }
         store.clear()
         held.complete(Unit)
-        lock.join()
 
         awaitTrue { connected.composer.current(KEY).unsent != null }
         assertEquals("first", connected.composer.current(KEY).unsent?.text)
@@ -532,10 +532,7 @@ class ChatViewModelTest {
     fun sendFailingAfterTheChatReopenedReachesTheVisibleComposer() = runTest {
         // No session row: send refuses before storing anything.
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it } // the send waits before storing anything
         vm.onDraftChange("first")
         vm.onSendClick()
         vm.await { it.sending }
@@ -543,7 +540,6 @@ class ChatViewModelTest {
         val again = vm() // and opened again before it failed
         again.onDraftChange("second")
         held.complete(Unit)
-        lock.join()
 
         val failed = again.await { !it.sending && it.unsent != null }
         assertEquals("second", failed.draft)

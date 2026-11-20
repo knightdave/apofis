@@ -62,6 +62,9 @@ enum class CancelResult {
 // Lock order: drainLock, then the repository lock.
 private val drainLock = Mutex()
 
+// Held only while a send is armed and stored; never while a request is in flight. Taken after drainLock, never before.
+private val handoff = Mutex()
+
 private enum class Attempt { STARTED, FAILED, STOP }
 
 /** Thrown inside the locks once the owning connection is closed. Writes pass it on; [SendQueue.drain] returns false. */
@@ -80,45 +83,45 @@ class SendQueue(
     private val db: AppDatabase,
     private val starter: RunStarter,
     private val now: () -> Long,
-    private val schedule: () -> Unit = {},
+    private val schedule: suspend () -> Unit = {},
     private val active: () -> Boolean = { true },
 ) {
     private val pendingDao = db.pendingSendDao()
 
     /** Stores [text] as a queued send for [sessionKey]; returns its idempotency key. */
-    suspend fun enqueue(sessionKey: String, text: String): String =
-        withRepositoryLock {
-            ensureOpen()
-            insert(sessionKey, text, steer = false)
-        }.idempotencyKey.also { schedule() }
+    suspend fun enqueue(sessionKey: String, text: String): String = store(sessionKey, text).idempotencyKey
 
     /**
-     * For ChatRepository.send: steers the session's running run, else queues [text] and drains. The row is stored
-     * before any request; a hidden session fails locally; an unknown session throws IllegalArgumentException.
-     * The repository lock is held from the session check through the steer request, so a refresh cannot hide
-     * the session and a delete cannot remove the row in between.
+     * For ChatRepository.send: stores [text] (see [store]), then steers the session's running run with it, else drains.
+     * A hidden session fails locally; an unknown session throws IllegalArgumentException. The steer holds the repository
+     * lock from the run check through the request, so a refresh cannot hide the session and a delete cannot remove the
+     * row in between.
      */
     internal suspend fun submit(sessionKey: String, text: String) {
-        var stored = false
+        // Contract: a throw here means nothing was stored, so the caller may offer the text again.
+        val row = store(sessionKey, text)
+        if (row.state != PendingState.QUEUED) return
         try {
-            val queued = drainLock.withLock {
-                withRepositoryLock {
-                    ensureOpen()
-                    val row = insert(sessionKey, text, steer = true)
-                    stored = true
-                    if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
-                }
-            }
-            if (queued) {
-                schedule()
-                drain()
-            }
+            val queued = drainLock.withLock { withRepositoryLock { steerIfRunning(row) } }
+            if (queued) drain()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            // Contract: a throw means nothing was stored, so the caller may offer the text again. Once the row
-            // exists it is the message: whatever fails later shows on its bubble or is retried by a later drain.
-            if (!stored) throw e
+        } catch (_: Exception) {
+            // Once the row exists it is the message: whatever fails later shows on its bubble or is retried by a later drain.
+        }
+    }
+
+    /**
+     * Accepts a send as a short local handoff that waits for no request in flight: the durable worker is armed first,
+     * then the row is stored in one transaction, so the text is never held only in memory behind a slow request, and a
+     * death right after the commit still leaves a worker to send it. A drain waits for [handoff], so a worker the arming
+     * started at once cannot find the queue empty and end before the row is in it.
+     */
+    private suspend fun store(sessionKey: String, text: String): PendingSendEntity = handoff.withLock {
+        schedule()
+        db.withTransaction {
+            ensureOpen()
+            insert(sessionKey, text)
         }
     }
 
@@ -127,6 +130,7 @@ class SendQueue(
      * send starts on a later drain, as the server runs one turn per session at a time. True when nothing is left queued.
      */
     suspend fun drain(): Boolean = drainLock.withLock {
+        handoff.withLock { } // a send being stored now is in the queue read below
         try {
             ensureOpen()
             // Steers run under drainLock, so a row still steering here was cut off by process death.
@@ -195,24 +199,29 @@ class SendQueue(
         return RetryResult.STARTED
     }
 
-    /** Called under the repository lock that checked the session, so a concurrent delete cannot leave an orphan row. */
-    private suspend fun insert(sessionKey: String, text: String, steer: Boolean): PendingSendEntity {
+    /** In the transaction that checked the session, so a concurrent delete or refresh cannot leave an orphan row. */
+    private suspend fun insert(sessionKey: String, text: String): PendingSendEntity {
         require(!isReservedId(sessionKey)) { "reserved session id" }
         val session = requireNotNull(db.sessionDao().get(sessionKey)) { "unknown session" }
-        val run = if (steer) db.activeRunDao().forSession(sessionKey)?.takeIf { it.status == "running" } else null
         val row = PendingSendEntity(
             idempotencyKey = UUID.randomUUID().toString(), sessionKey = sessionKey, text = text,
             requestBody = buildRunBody(session.currentId, text), createdAt = now(), state = PendingState.QUEUED,
             runId = null, error = null,
-        ).let {
-            when {
-                session.hidden -> it.copy(state = PendingState.FAILED, error = SendError.SESSION_UNAVAILABLE)
-                run != null -> it.copy(state = PendingState.STEERING, runId = run.runId)
-                else -> it
-            }
-        }
+        ).let { if (session.hidden) it.copy(state = PendingState.FAILED, error = SendError.SESSION_UNAVAILABLE) else it }
         pendingDao.upsert(row)
         return row
+    }
+
+    /**
+     * Under both locks: steers the stored [row] into its chat's running run. True when it is left queued for a drain.
+     * A drain may have started or tried it since it was stored, or a delete removed it: then it is not steered.
+     */
+    private suspend fun steerIfRunning(row: PendingSendEntity): Boolean {
+        ensureOpen()
+        val current = pendingDao.get(row.idempotencyKey)?.takeIf { it.state == PendingState.QUEUED } ?: return false
+        val run = db.activeRunDao().forSession(row.sessionKey)?.takeIf { it.status == "running" }
+        if (run == null || current.attempted) return true
+        return steer(current.copy(state = PendingState.STEERING, runId = run.runId))
     }
 
     /** Under both locks. Returns true when the steer was refused and the row became a queued run send. */
