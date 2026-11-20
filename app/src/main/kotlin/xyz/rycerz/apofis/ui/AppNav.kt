@@ -5,15 +5,10 @@ import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -24,18 +19,21 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.viewmodel.compose.rememberViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.ui.chat.ChatScreen
+import xyz.rycerz.apofis.ui.chat.ChatViewModel
+import xyz.rycerz.apofis.ui.chat.onlineFlow
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
@@ -91,7 +89,7 @@ fun AppNav(container: AppContainer) {
             BackHandler(enabled = canGoBack || busy, onBack = leave)
             ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
-        Screen.CHAT -> ChatPlaceholder(conn, onSettings = { chosen = Screen.SETTINGS })
+        Screen.CHAT -> if (conn != null) ChatRoute(conn, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })
         Screen.SETTINGS -> {
             BackHandler { chosen = Screen.CHAT }
             val scope = rememberCoroutineScope()
@@ -119,26 +117,35 @@ fun AppNav(container: AppContainer) {
     }
 }
 
-/** Replaced by the chat screen in the next task. */
-@OptIn(ExperimentalMaterial3Api::class)
+/** The chat: until the drawer exists, the most recent chat, or a new local one when there is none. */
 @Composable
-private fun ChatPlaceholder(conn: Connected?, onSettings: () -> Unit) {
-    val host = conn?.credentials?.baseUrl?.toHttpUrlOrNull()?.host.orEmpty()
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.app_name)) },
-                actions = {
-                    IconButton(onClick = onSettings) {
-                        Icon(painterResource(R.drawable.lucide_settings), contentDescription = stringResource(R.string.settings_title))
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
-            )
-        },
-    ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-            Text(stringResource(R.string.chat_placeholder, host), color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun ChatRoute(conn: Connected, onSettings: () -> Unit, onConnection: () -> Unit) {
+    var chatKey by rememberSaveable(conn) { mutableStateOf<String?>(null) }
+    LaunchedEffect(conn) {
+        if (chatKey == null) {
+            chatKey = runCatching { conn.repo.sessions().first().firstOrNull()?.key ?: conn.repo.createLocalSession() }.getOrNull()
         }
+    }
+    val sessionKey = chatKey
+    if (sessionKey == null) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface))
+        return
+    }
+    key(conn, sessionKey) {
+        // Scoped to this chat: switching chats or servers clears the view model and its flows.
+        val owner = rememberViewModelStoreOwner()
+        val context = LocalContext.current.applicationContext
+        val vm = viewModel(viewModelStoreOwner = owner) { ChatViewModel(sessionKey, conn, context.onlineFlow()) }
+        val state by vm.state.collectAsState()
+        ChatScreen(
+            state,
+            vm,
+            onOpenConnection = onConnection,
+            appBarActions = {
+                IconButton(onClick = onSettings) {
+                    Icon(painterResource(R.drawable.lucide_settings), contentDescription = stringResource(R.string.settings_title), Modifier.size(20.dp))
+                }
+            },
+        )
     }
 }

@@ -9,6 +9,8 @@ data class UserMessage(
     val timestamp: Double,
     val state: SendState = SendState.SENT,
     val idempotencyKey: String? = null,
+    val error: String? = null, // unsent only: a fixed SendError code when FAILED
+    val attempted: Boolean = false, // unsent only: a request for it may already have reached the server
 ) : ChatItem
 
 enum class SendState { QUEUED, SENDING, FAILED, SENT }

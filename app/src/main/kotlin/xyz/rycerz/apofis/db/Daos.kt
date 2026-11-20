@@ -20,6 +20,9 @@ interface SessionDao {
     @Query("SELECT * FROM SessionEntity WHERE `key` = :key")
     suspend fun get(key: String): SessionEntity?
 
+    @Query("SELECT * FROM SessionEntity WHERE `key` = :key")
+    fun observeOne(key: String): Flow<SessionEntity?>
+
     // instr instead of LIKE: server ids contain '_', which LIKE treats as a wildcard.
     @Query(
         "SELECT * FROM SessionEntity WHERE :id != '' AND (`key` = :id OR currentId = :id " +

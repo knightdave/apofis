@@ -190,6 +190,35 @@ class ChatRepositorySyncTest {
     }
 
     @Test
+    fun pendingRowsCarryStateErrorAndAttempted() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        val base = pending("apofis-s", "a")
+        db.pendingSendDao().upsert(base.copy(state = "failed", error = "unconfirmed", attempted = true, createdAt = 1L))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "b", state = "steering", createdAt = 2L))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "c", state = "steered", createdAt = 3L))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "d", attempted = true, createdAt = 4L))
+
+        val (failed, steering, steered, queued) = repo.transcript("apofis-s").first().map { it as UserMessage }
+        assertEquals(SendState.FAILED, failed.state)
+        assertEquals("unconfirmed", failed.error)
+        assertTrue(failed.attempted)
+        assertEquals(SendState.SENDING, steering.state)
+        assertTrue(steering.steered)
+        assertEquals(SendState.SENT, steered.state)
+        assertTrue(steered.steered)
+        assertEquals(SendState.QUEUED, queued.state)
+        assertNull(queued.error)
+        assertTrue(queued.attempted)
+    }
+
+    @Test
+    fun sessionFlowFollowsRow() = runTest {
+        assertNull(repo.session("apofis-s").first())
+        db.sessionDao().upsert(session("apofis-s"))
+        assertEquals("t", repo.session("apofis-s").first()!!.title)
+    }
+
+    @Test
     fun transcriptShapeChange() = runTest {
         db.sessionDao().upsert(session("apofis-s").copy(stale = true))
         respond(messagesJson("apofis-s", (1L..6L).toList()))

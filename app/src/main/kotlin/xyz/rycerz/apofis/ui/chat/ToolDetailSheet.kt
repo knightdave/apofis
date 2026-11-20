@@ -1,0 +1,81 @@
+package xyz.rycerz.apofis.ui.chat
+
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.dp
+import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.chat.ToolStep
+
+/** A tool step in full: name, arguments and the (display-truncated) result. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun ToolDetailSheet(step: ToolStep, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(start = 16.dp, end = 16.dp, bottom = 16.dp)
+                .navigationBarsPadding(),
+        ) {
+            Text(
+                step.name,
+                Modifier.semantics { heading() },
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Section(stringResource(R.string.tool_arguments), step.argsPreview)
+            val result = step.result
+            Section(
+                stringResource(R.string.tool_result),
+                result ?: stringResource(if (step.running) R.string.chat_tool_running else R.string.tool_no_result),
+                code = result != null,
+            )
+            if (step.resultTruncated) {
+                Text(
+                    stringResource(R.string.tool_truncated),
+                    Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun Section(title: String, body: String, code: Boolean = true) {
+    Text(
+        title,
+        Modifier.padding(top = 16.dp, bottom = 6.dp).semantics { heading() },
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    if (!code || body.isEmpty()) {
+        Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+        return
+    }
+    CodeSurface {
+        Text(
+            body,
+            Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+            style = codeStyle,
+            color = MaterialTheme.colorScheme.onSurface,
+            softWrap = false,
+        )
+    }
+}

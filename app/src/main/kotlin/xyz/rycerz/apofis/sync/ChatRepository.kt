@@ -53,6 +53,9 @@ class ChatRepository(
 
     fun sessions(archived: Boolean = false): Flow<List<SessionEntity>> = sessionDao.observe(archived)
 
+    /** One chat's row, or null once it is gone. */
+    fun session(sessionKey: String): Flow<SessionEntity?> = sessionDao.observeOne(sessionKey).distinctUntilChanged()
+
     /** Server rows, then pending sends (oldest first) as unsent [UserMessage]s, with reply outcomes attached. */
     fun transcript(sessionKey: String): Flow<List<ChatItem>> {
         requireAppKey(sessionKey)
@@ -338,6 +341,8 @@ private fun PendingSendEntity.toItem() = UserMessage(
         else -> SendState.QUEUED
     },
     idempotencyKey = idempotencyKey,
+    error = error,
+    attempted = attempted,
 )
 
 /**
