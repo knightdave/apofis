@@ -1552,4 +1552,28 @@ class RunFollowerTest {
 
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
     }
+
+    @Test
+    fun cancelledRefreshStaysRequestedUntilApplied() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl), status("waiting_for_approval", otherControl))
+        on("/v1/runs/$RUN/approval", resolvedBody)
+        heldOpen(f, release)
+        val cancelled = AtomicBoolean(false)
+        f.beforeStatusApply = {
+            if (requestsTo(STATUS).size == 2 && cancelled.compareAndSet(false, true)) {
+                pauseAll() // cancels the refresh read after it returned the replacement, before it is applied
+                yield()
+            }
+        }
+
+        assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        awaitUntil { cancelled.get() }
+        assertEquals("ctl_prompt", f.live(KEY).value!!.pending!!.requestId)
+        assertTrue(f.refreshOwed(RUN))
+        f.resumeAll()
+        f.live(KEY).first { it?.pending?.requestId == "ctl_other" }
+        release.countDown()
+    }
 }

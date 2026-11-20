@@ -87,7 +87,11 @@ private class ReplyBuilder(first: MessageDto) {
             val id = obj.str("id") ?: obj.str("call_id") ?: continue
             val name = fn?.str("name") ?: obj.str("name") ?: ""
             waiting[id] = this to steps.size
-            steps += ToolStep(id, name, argsPreview(fn?.get("arguments")), null, false, false, true)
+            val args = fullArgs(fn?.get("arguments"))
+            steps += ToolStep(
+                id, name, argsPreview(fn?.get("arguments")), null, false, false, true,
+                args = args.take(TOOL_RESULT_DISPLAY_LIMIT), argsTruncated = args.length > TOOL_RESULT_DISPLAY_LIMIT,
+            )
         }
         row.content.takeIf { it.isNotBlank() }?.let { texts += it }
     }
@@ -171,6 +175,17 @@ private fun isNonZeroInteger(literal: String): Boolean {
     val digits = literal.removePrefix("-")
     return digits.isNotEmpty() && digits.all { it in '0'..'9' } && digits.any { it != '0' }
 }
+
+private val prettyJson = Json { prettyPrint = true }
+
+/** The arguments as the user should read them: pretty JSON when they parse, else the text as sent. */
+private fun fullArgs(arguments: JsonElement?): String = when (arguments) {
+    null, JsonNull -> ""
+    is JsonPrimitive -> if (!arguments.isString) arguments.content else parse(arguments.content)?.let(::pretty) ?: arguments.content
+    else -> pretty(arguments)
+}
+
+private fun pretty(element: JsonElement) = prettyJson.encodeToString(JsonElement.serializer(), element)
 
 private fun argsPreview(arguments: JsonElement?): String {
     val args = when (arguments) {

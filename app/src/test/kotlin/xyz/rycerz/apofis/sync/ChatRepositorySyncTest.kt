@@ -190,6 +190,72 @@ class ChatRepositorySyncTest {
     }
 
     @Test
+    fun pendingRowsCarryStateErrorAndAttempted() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        val base = pending("apofis-s", "a")
+        db.pendingSendDao().upsert(base.copy(state = "failed", error = "unconfirmed", attempted = true, createdAt = 1L))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "b", state = "steering", createdAt = 2L))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "c", state = "steered", createdAt = 3L))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "d", attempted = true, createdAt = 4L))
+
+        val (failed, steering, steered, queued) = repo.transcript("apofis-s").first().map { it as UserMessage }
+        assertEquals(SendState.FAILED, failed.state)
+        assertEquals("unconfirmed", failed.error)
+        assertTrue(failed.attempted)
+        assertEquals(SendState.SENDING, steering.state)
+        assertTrue(steering.steered)
+        assertEquals(SendState.SENT, steered.state)
+        assertTrue(steered.steered)
+        assertEquals(SendState.QUEUED, queued.state)
+        assertNull(queued.error)
+        assertTrue(queued.attempted)
+    }
+
+    @Test
+    fun deliveredPendingRowIsHiddenOnceTheServerShowsIt() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        // The repository clock is 1 s; rows are confirmed by the follower's rule: text, kind and the last minute.
+        respond(rawMessages("apofis-s", listOf("""{"id":1,"role":"user","content":"hello ","timestamp":1.0}""")))
+        repo.syncMessages("apofis-s")
+        val base = pending("apofis-s", "a", createdAt = 1_000L)
+        db.pendingSendDao().upsert(base.copy(text = "hello", state = "sending", runId = "run_1"))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "b", text = "hello", createdAt = 2_000L)) // queued: always shown
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "c", text = "other", state = "sending", runId = "run_1", createdAt = 3_000L))
+
+        assertEquals(listOf("u1", "pb", "pc"), repo.transcript("apofis-s").first().map { it.key })
+    }
+
+    @Test
+    fun runStartIsMarkedOnTheBubbleThatShowsIt() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        respond(rawMessages("apofis-s", listOf("""{"id":1,"role":"user","content":"hello","timestamp":1.0}""")))
+        repo.syncMessages("apofis-s")
+        val base = pending("apofis-s", "a", createdAt = 1_000L)
+        db.pendingSendDao().upsert(base.copy(text = "hello", state = "sending", runId = "run_1")) // shown by u1
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "c", text = "other", state = "sending", runId = "run_2", createdAt = 3_000L))
+        db.pendingSendDao().upsert(base.copy(idempotencyKey = "d", text = "steer", state = "steering", runId = "run_2", createdAt = 4_000L))
+
+        val items = repo.transcript("apofis-s").first().map { it as UserMessage }
+        assertEquals(listOf("u1" to "run_1", "pc" to "run_2", "pd" to null), items.map { it.key to it.runId })
+    }
+
+    @Test
+    fun cachedMessagesAreKnown() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        assertFalse(repo.hasCachedMessages("apofis-s"))
+        respond(messagesJson("apofis-s", listOf(1L)))
+        repo.syncMessages("apofis-s")
+        assertTrue(repo.hasCachedMessages("apofis-s"))
+    }
+
+    @Test
+    fun sessionFlowFollowsRow() = runTest {
+        assertNull(repo.session("apofis-s").first())
+        db.sessionDao().upsert(session("apofis-s"))
+        assertEquals("t", repo.session("apofis-s").first()!!.title)
+    }
+
+    @Test
     fun transcriptShapeChange() = runTest {
         db.sessionDao().upsert(session("apofis-s").copy(stale = true))
         respond(messagesJson("apofis-s", (1L..6L).toList()))

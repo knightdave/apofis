@@ -763,4 +763,42 @@ class SendQueueTest {
         assertEquals(before, rows("apofis-a"))
         assertEquals(0, server.requestCount)
     }
+
+    @Test
+    fun submitNeverThrowsOnceTheRowIsStored() = runTest {
+        var checks = 0
+        val closing = SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }) // closes right after the insert
+        addSession("apofis-a")
+        running("apofis-a")
+        closing.submit("apofis-a", "kept") // must not throw: the caller would offer the text again
+        assertEquals("kept", rows("apofis-a").single().text)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun cancelReportsWhatHappened() = runTest {
+        addSession("apofis-a")
+        val fresh = queue.enqueue("apofis-a", "fresh")
+        val tried = queue.enqueue("apofis-a", "tried")
+        db.pendingSendDao().update(pending(tried).copy(attempted = true))
+        val sending = queue.enqueue("apofis-a", "sending")
+        db.pendingSendDao().update(pending(sending).copy(state = "sending", runId = "run_1"))
+
+        assertEquals(CancelResult.REMOVED, queue.cancel(fresh))
+        assertEquals(CancelResult.REMOVED_MAY_HAVE_SENT, queue.cancel(tried))
+        assertEquals(CancelResult.STARTED, queue.cancel(sending))
+        assertEquals(CancelResult.NOT_FOUND, queue.cancel("missing"))
+        assertEquals(listOf("sending"), rows("apofis-a").map { it.text })
+    }
+
+    @Test
+    fun cancelKeepsARowAttemptedSinceTheWeakerWarning() = runTest {
+        addSession("apofis-a")
+        val key = queue.enqueue("apofis-a", "later")
+        db.pendingSendDao().update(pending(key).copy(attempted = true)) // a drain tried it while the dialog was open
+
+        assertEquals(CancelResult.NOW_ATTEMPTED, queue.cancel(key, mayHaveSentShown = false))
+        assertEquals(listOf("later"), rows("apofis-a").map { it.text })
+        assertEquals(CancelResult.REMOVED_MAY_HAVE_SENT, queue.cancel(key, mayHaveSentShown = true))
+    }
 }

@@ -40,6 +40,7 @@ import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.PendingState
 import xyz.rycerz.apofis.sync.RunStarter
 import xyz.rycerz.apofis.sync.SendError
+import xyz.rycerz.apofis.sync.deliveredIn
 import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private val TERMINAL = setOf("completed", "failed", "cancelled", "interrupted")
@@ -57,7 +58,6 @@ private const val POLL_MS = 3_000L
 private const val SAVE_EVERY_EVENTS = 20
 private const val SAVE_EVERY_NS = 500_000_000L
 private const val FINISH_ATTEMPTS = 5 // per resume, for a transcript sync that keeps failing transiently
-private const val DELIVERY_WINDOW_S = 60.0
 
 /** The result of answering an approval or clarify request. */
 enum class AnswerResult {
@@ -105,6 +105,9 @@ class RunFollower(
 
     /** Test-only: runs after a status read has returned and been recorded, before its result is applied. */
     internal var beforeStatusApply: suspend RunFollower.() -> Unit = {}
+
+    /** True while a status read for [runId] is requested and not yet applied; for tests. */
+    internal fun refreshOwed(runId: String): Boolean = refreshers[runId]?.owed == true
 
     /** Run ids with a follower job; for tests. */
     internal val following: Set<String> get() = synchronized(jobs) { jobs.keys.toSet() }
@@ -221,7 +224,6 @@ class RunFollower(
         suspend fun read(): RunStatus {
             val ticket = tickets.incrementAndGet()
             val s = io(run.runId) { api.runStatus(run.runId) }
-            synchronized(this) { if (ticket > owedAfter) owedAfter = -1L }
             // Stored before taking the lock, which a pause could interrupt: the send queue must never steer into it.
             if (s.status in TERMINAL) storeTerminal(s.status)
             beforeStatusApply()
@@ -231,6 +233,8 @@ class RunFollower(
                     applyStatus(run, s, store = !terminal)
                 }
             }
+            // Only now: a read cancelled before its result was applied leaves the request standing.
+            synchronized(this) { if (ticket > owedAfter) owedAfter = -1L }
             return s
         }
 
@@ -251,6 +255,8 @@ class RunFollower(
         /** Notes that a read starting from now is wanted, without asking for one yet. */
         fun owe(): Unit = synchronized(this) { owedAfter = tickets.get() }
 
+        val owed: Boolean get() = synchronized(this) { owedAfter >= 0 }
+
         /**
          * Asks for a read (after the backoff when [retry]: one just failed); requests are coalesced, and any read
          * started after a request serves it. Failures retry with backoff until one succeeds, the app leaves the
@@ -264,7 +270,7 @@ class RunFollower(
         /** On return to the foreground: an unserved request, or a displayed control, is read again. */
         fun resume() {
             val shown = state(run.sessionKey).value?.let { it.runId == run.runId && it.pending != null } == true
-            if (shown || synchronized(this) { owedAfter >= 0 }) request()
+            if (shown || owed) request()
         }
 
         fun stopWorker() {
@@ -598,15 +604,7 @@ class RunFollower(
             val used = HashSet<String>() // one bubble confirms one send; a merged steer bubble confirms every steer in it
             val pendingDao = db.pendingSendDao()
             for (p in pendingDao.forRun(id)) {
-                val text = p.text.trim()
-                val since = p.createdAt / 1000.0 - DELIVERY_WINDOW_S
-                val confirmed = when (p.state) {
-                    PendingState.SENDING -> shown.firstOrNull { !it.steered && it.key !in used && it.timestamp >= since && it.text.trim() == text }
-                        ?.also { used += it.key } != null
-                    PendingState.STEERED -> shown.any { it.steered && it.timestamp >= since && it.text.contains(text) }
-                    else -> false
-                }
-                if (confirmed) {
+                if (deliveredIn(p, shown, used)) {
                     pendingDao.delete(p.idempotencyKey)
                 } else {
                     pendingDao.update(p.copy(state = PendingState.FAILED, error = SendError.UNCONFIRMED, runId = null))
