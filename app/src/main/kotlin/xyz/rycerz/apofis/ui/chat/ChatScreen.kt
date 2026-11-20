@@ -82,7 +82,7 @@ fun ChatScreen(
     LaunchedEffect(pendingId) { if (pendingId != null) listState.animateScrollToItem(0) } // the request sits at the bottom
 
     Scaffold(
-        modifier,
+        modifier.testTag("chat.key:${state.sessionKey}"), // the end-to-end tests read the open chat's key here
         containerColor = MaterialTheme.colorScheme.surface,
         topBar = {
             TopAppBar(

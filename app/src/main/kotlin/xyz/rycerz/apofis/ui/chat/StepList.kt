@@ -33,7 +33,7 @@ import xyz.rycerz.apofis.chat.ToolStep
 private const val MIN_SHOWN_DURATION_S = 0.1
 
 /** The reply's steps as a simple list in a pale card: tool name, one-line preview, running or error state. */
-/** [onStep] gets the tapped step's index in [steps]; step i is tagged "[tag]:i" for the end-to-end tests. */
+/** [onStep] gets the tapped step's index in [steps]; tool step i is tagged "[tag]:i:<tool name>", a reasoning step "[tag]:i", for the end-to-end tests. */
 @Composable
 internal fun StepList(steps: List<Step>, tag: String = "step", onStep: (Int) -> Unit) {
     val scheme = MaterialTheme.colorScheme
@@ -47,7 +47,7 @@ internal fun StepList(steps: List<Step>, tag: String = "step", onStep: (Int) -> 
     ) {
         steps.forEachIndexed { i, step ->
             when (step) {
-                is ToolStep -> ToolRow(step, Modifier.testTag("$tag:$i")) { onStep(i) }
+                is ToolStep -> ToolRow(step, Modifier.testTag("$tag:$i:${step.name}")) { onStep(i) }
                 is ReasoningStep -> StepRow(null, stringResource(R.string.chat_reasoning), step.text.trim().lineSequence().firstOrNull().orEmpty(), null, null, Modifier.testTag("$tag:$i"))
             }
         }
