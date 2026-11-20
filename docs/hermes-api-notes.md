@@ -267,7 +267,7 @@ so the boundaries between steers cannot be recovered: show the inner text as one
 | `reasoning.available` | Could not provoke: a run with `model_options.reasoning.effort: "high"` produced no such event and that run stored no `reasoning` (the Stop run did store commentary text in `reasoning`, see above). In canonical mode `/v1/runs` wires only text, tool start and tool complete callbacks (`gateway/platforms/api_server_runs.py:1078-1089`), so the event is not emitted. Non-canonical shape: `{event: "reasoning.available", run_id, timestamp, text}` (`api_server_runs.py:102`). |
 | Compressed session | Not provoked (needs a long chat). Source: see "Compression" below. |
 | PATCH/DELETE on foreign-source sessions | Live, on a probe id created with `source: "cli"`: PATCH 200, DELETE 200, `POST /v1/runs` 409 `permission_denied`. |
-| Push plugin reading registration rows from a hook | Deferred to milestone 3 (push); outside this task. |
+| Push plugin reading registration rows from a hook | Milestone 3: a shell hook, not a plugin. See "Push hook (milestone 3)" below and `server/apofis-push/README.md`. |
 | Foreground service type on GrapheneOS | Deferred, and superseded by decision "No foreground service" (spec section 11); any device check happens in a later milestone. |
 
 ## Decisions (reviewer acting as decider, 2026-11-19)
@@ -325,3 +325,36 @@ When a prompt is answered or expires the stream gets `approval.settled` or `clar
   from the requested id (`api_server.py:3230-3256`).
 - `/v1/runs` with an old segment id adopts the live tip (`api_server_runs.py:788-790`), and
   the run status's `session_id` reports the id actually used.
+
+## Push hook (milestone 3)
+
+Source-derived at `a8fed44bbe`, not observed live (the owner's handoff checks it). The script is
+`server/apofis-push/apofis_push.py`.
+
+- **Runner.** `hooks: <event>: [{command, timeout}]`. Hermes applies `os.path.expanduser` to the
+  whole command string and splits it without a shell, so only a leading `~` expands; the hook runs
+  in its own process group with stdin, stdout and stderr piped, and `communicate(timeout)` waits for
+  EOF on both outputs, so a detached child must not inherit them (`agent/shell_hooks.py:479-531`).
+  Timeouts and non-zero exits of observer hooks are only logged (`:554-610`). Consent is the exact
+  `(event, command)` pair in `~/.hermes/shell-hooks-allowlist.json` (`:305-325`); the gateway
+  re-reads configuration and allowlist about every 30 s (`sync_from_config`, `:180-234`).
+  `hermes hooks test` and `doctor` execute allowed hooks with sample payloads (`platform: "cli"`
+  for `on_session_end`, no `kind` for `on_human_input_request`; `hermes_cli/hooks.py:100-130`).
+- **Stdin.** `{hook_event_name, tool_name, tool_input, session_id, cwd, profile, extra}`;
+  `session_id` is top level, every other keyword argument is under `extra` (`shell_hooks.py:49,87-102`).
+- **`on_session_end`** (`agent/turn_finalizer.py:794-812`): `extra` has `task_id, turn_id, completed,
+  failed, interrupted, turn_exit_reason, model, platform`; not fired when persistence is disabled.
+  The script pushes `finished` only when `completed` or `failed` is `true`.
+- **`on_human_input_request`** (`tools/human_input_hooks.py:38-72`): `extra` has `kind`
+  (`approval`, `clarify`, `sudo`), `request_id`, `session_key`, `platform`, `prompt` (force-redacted,
+  still not sent). A failed identity lookup empties both `session_id` and `platform`; otherwise
+  `platform` falls back to `cli`.
+- **Registration records** (the app writes them in Task 2): session id
+  `apofis-push-<installId>-<seq>` (lowercase UUID, seq `[1-9][0-9]{0,5}`), `source = 'api_server'`,
+  `hidden = 1`, prompt `{"v":1,"endpoint":"<url>"}` of at most 1024 characters, read as
+  `COALESCE(system_prompts.prompt, sessions.system_prompt)` (`hermes_state_sessions.py:1579-1584`).
+- **Lineage.** A row continues its parent when the parent's `end_reason = 'compression'`, the row's
+  source is not `tool`, and none of `_branched_from`, `_delegate_from`, `_reset_from` in its
+  `model_config` equals the parent id; an unparsable `model_config` counts as no marker
+  (`hermes_state_messages.py:1878-1897`, `hermes_state_compression.py:906-925`). The push names the
+  root reached this way, only through visible, non-reserved `api_server` rows.
