@@ -598,10 +598,26 @@ class ChatViewModelTest {
         val vm = vm()
         vm.await { it.items.isNotEmpty() } // the first transcript is committed (rows and stale = false in one transaction)
         assertEquals(1, requests.count { it.target.startsWith(MESSAGES) })
-        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true))
         routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
-        vm.onOpened()
+        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true)) // a refresh saw it change: fetched at once
         assertEquals(StatusLine.SERVER_ERROR, vm.await { it.status == StatusLine.SERVER_ERROR }.status)
+        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
+        vm.onOpened() // still stale after the failure: opening it again fetches again
+        awaitTrue { requests.count { it.target.startsWith(MESSAGES) } == 3 }
+        assertEquals(StatusLine.SERVER_ERROR, vm.state.value.status)
+    }
+
+    @Test
+    fun shownChatMarkedStaleIsFetchedWithoutReopening() = runTest {
+        addSession(onServer = true)
+        routes[MESSAGES] = json("""{"session_id":"$KEY","data":[{"id":10,"role":"user","content":"hello","timestamp":$now}]}""")
+        val vm = vm()
+        vm.await { it.items.size == 1 } // the first transcript is committed
+        routes[MESSAGES] = json(serverRows) // another client added a turn
+
+        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true)) // as a session refresh marks it
+
+        vm.await { it.items.any { i -> i.key == "r11" } }
         assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
     }
 

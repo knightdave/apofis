@@ -214,6 +214,23 @@ class AppContainerTest {
     }
 
     @Test
+    fun returningToTheForegroundRefreshesTheChatList() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val server = recordingServer(requests)
+        try {
+            container.connect(Credentials(server.url("/").toString(), "k1"))
+            container.onStart()
+            container.awaitLifecycle()
+            // Another client may have added turns while the phone slept: the list (and with it stale flags) is read again.
+            eventually("session refresh") { synchronized(requests) { "GET /api/sessions" in requests } }
+        } finally {
+            container.onStop()
+            container.awaitLifecycle()
+            server.close()
+        }
+    }
+
+    @Test
     fun newKeyForTheSameServerKeepsDraftsAndTheSendBeingStored() = runTest {
         val requests = Collections.synchronizedList(mutableListOf<String>())
         val server = recordingServer(requests)

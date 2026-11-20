@@ -9,6 +9,7 @@ import androidx.room.Room
 import androidx.work.WorkManager
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -74,6 +75,7 @@ class Connected internal constructor(
     internal suspend fun resume() {
         liveFollower.resumeAll()
         scope.launch { sendQueue.drain() } // may outlast a stop: the follower's closed gate then attaches no stream
+        scope.launch { refreshQuietly(liveRepo, composer) } // other clients may have changed chats meanwhile
     }
 
     internal fun pause() = liveFollower.pauseAll()
@@ -94,6 +96,17 @@ internal const val SWITCH_MARKER = "switch_in_progress" // present from the firs
 
 private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity")
 private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
+
+/** Session metadata from the server; a failure changes nothing (no send rolled back, no history evicted). */
+private suspend fun refreshQuietly(repo: ChatRepository, composer: Composer) {
+    try {
+        repo.refreshSessions(onCached = composer::retain)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        // the next foreground, drawer open or finished run tries again
+    }
+}
 
 // ApiError causes can carry server or transport text, so only the class name is ever logged.
 private fun logFailure(e: Throwable) = Log.w(TAG, "Background task failed: ${e.javaClass.name}")
@@ -315,7 +328,12 @@ class AppContainer(
             settle = { if (open.get()) follower.settle(it) },
         )
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
-        follower = RunFollower(api, db, repo, runScope, onRunFinished = { if (open.get()) queue.drain() })
+        follower = RunFollower(api, db, repo, runScope, onRunFinished = {
+            if (open.get()) {
+                queue.drain()
+                runScope.launch { refreshQuietly(repo, composer) } // not on the follower's own, non-cancellable path
+            }
+        })
         return Connected(c, api, db, repo, queue, follower, open, runScope, composer)
     }
 }
