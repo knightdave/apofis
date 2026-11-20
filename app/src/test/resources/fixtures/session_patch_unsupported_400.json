@@ -1,0 +1,1 @@
+{"error": {"message": "Unsupported session fields: color", "type": "invalid_request_error", "param": null, "code": "unsupported_session_field"}}

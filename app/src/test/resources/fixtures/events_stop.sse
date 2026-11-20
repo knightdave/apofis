@@ -1,0 +1,13 @@
+: open
+
+id: 0
+data: {"event": "tool.started", "run_id": "run_7684e1b6046c41759c50b3ee7c103661", "timestamp": 1795131459.6891031, "tool": "terminal", "preview": "sleep 40 + 1 command", "tool_call_id": "call_afcfca8cee5642a595112f574dc8c6d3", "seq": 0}
+
+id: 1
+data: {"event": "tool.completed", "run_id": "run_7684e1b6046c41759c50b3ee7c103661", "timestamp": 1795131461.8794081, "tool": "terminal", "duration": 0, "error": true, "tool_call_id": "call_afcfca8cee5642a595112f574dc8c6d3", "preview": "", "seq": 1}
+
+id: 2
+data: {"event": "run.cancelled", "run_id": "run_7684e1b6046c41759c50b3ee7c103661", "timestamp": 1795131461.9146245, "completed": false, "partial": false, "interrupted": true, "turn_exit_reason": "interrupted_by_user", "seq": 2}
+
+: stream closed
+

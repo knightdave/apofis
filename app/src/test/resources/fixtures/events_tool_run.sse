@@ -1,0 +1,47 @@
+: open
+
+id: 0
+data: {"event": "tool.started", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131287.0361226, "tool": "terminal", "preview": "sleep 20 + 1 command", "tool_call_id": "call_bcfa62f8a89f42adb149a971df2bb7cf", "seq": 0}
+
+: open
+
+: keepalive
+
+id: 1
+data: {"event": "tool.completed", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131307.3678918, "tool": "terminal", "duration": 0, "error": false, "tool_call_id": "call_bcfa62f8a89f42adb149a971df2bb7cf", "preview": "", "seq": 1}
+
+id: 2
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.1151524, "delta": "\n\nThe", "seq": 2}
+
+id: 3
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.1168022, "delta": " command", "seq": 3}
+
+id: 4
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.1172202, "delta": " completed", "seq": 4}
+
+id: 5
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.1176667, "delta": " successfully", "seq": 5}
+
+id: 6
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.1180196, "delta": ":", "seq": 6}
+
+id: 7
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.1184528, "delta": " ap", "seq": 7}
+
+id: 8
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.201483, "delta": "of", "seq": 8}
+
+id: 9
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.2019064, "delta": "is", "seq": 9}
+
+id: 10
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.2022612, "delta": "-marker", "seq": 10}
+
+id: 11
+data: {"event": "message.delta", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.2028065, "delta": ".", "seq": 11}
+
+id: 12
+data: {"event": "run.completed", "run_id": "run_ef57074dc1694db39e37045230b1425c", "timestamp": 1795131309.469619, "output": "The command completed successfully: apofis-marker.", "usage": {"input_tokens": 1000, "output_tokens": 100, "total_tokens": 1100}, "runtime": {"provider": "", "model": "", "route_source": "global"}, "completed": true, "partial": false, "interrupted": false, "seq": 12}
+
+: stream closed
+
