@@ -24,8 +24,8 @@ data class UiNode(
 )
 
 /**
- * One chat item as the app tags it (`user:<key>`, `reply:<replyKey>/<row>`, `step:<replyKey>:<index>`,
- * `notice:<key>`): [kind] is user, reply or notice; a reply's steps and text rows share the reply's [key].
+ * One chat item as the app tags it (`user:<key>`, `reply:<replyKey>/<row>`, `step:<replyKey>:<index>:<tool>`
+ * (a reasoning step has no tool part), `notice:<key>`; item keys never contain a colon): [kind] is user, reply or notice; a reply's steps and text rows share the reply's [key].
  */
 data class Item(val kind: String, val key: String, val node: UiNode)
 
@@ -58,11 +58,15 @@ class UiTree(val nodes: List<UiNode>) {
         when {
             id.startsWith("user:") -> Item("user", id.removePrefix("user:"), n)
             id.startsWith("reply:") -> Item("reply", id.removePrefix("reply:").substringBefore('/'), n)
-            id.startsWith("step:") -> Item("reply", id.removePrefix("step:").substringBeforeLast(':'), n)
+            id.startsWith("step:") -> Item("reply", id.removePrefix("step:").substringBefore(':'), n)
             id.startsWith("notice:") -> Item("notice", id.removePrefix("notice:"), n)
             else -> null
         }
     }.sortedBy { it.node.top }
+
+    /** The key of the chat on screen, from the chat screen's own tag `chat.key:<key>`; null unless exactly one. */
+    fun chatKey(): String? = nodes.mapNotNull { it.resId?.takeIf { id -> id.startsWith("chat.key:") }?.removePrefix("chat.key:") }
+        .distinct().singleOrNull()?.takeIf(String::isNotEmpty)
 
     /** The one user message item whose own bubble text is exactly [text]; null when absent or shown more than once. */
     fun user(text: String): Item? = items().filter { it.kind == "user" && text in texts(it.node) }.singleOrNull()
@@ -82,10 +86,25 @@ class UiTree(val nodes: List<UiNode>) {
     /** The reply right after the user message [text], when its text contains [marker]. */
     fun replyWith(text: String, marker: String): String? = replyAfter(text)?.takeIf { marker in replyText(it) }
 
-    /** The steps of reply [key] in [state] that show exactly [command] as one of their own texts. */
+    /** The terminal tool steps of reply [key] (tag `step:<key>:<i>:terminal`) in [state] showing exactly [command] as one of their own texts. */
     fun steps(key: String, state: String, command: String): List<UiNode> = nodes.filter { n ->
         val id = n.resId ?: return@filter false
-        id.startsWith("step:$key:") && id.removePrefix("step:$key:").all(Char::isDigit) && n.state == state && command in texts(n)
+        Regex("step:${Regex.escape(key)}:\\d+:terminal").matches(id) && n.state == state && command in texts(n)
+    }
+
+    /**
+     * The final reply of a steered turn: the items must be the user message [prompt], then only its reply's items, then
+     * the steering message [steering], then only the items of one reply, which is returned. Any other user item after
+     * [prompt], or anything else after the steering message, means this is not that turn's final reply (null).
+     */
+    fun steerReply(prompt: String, steering: String): String? {
+        val items = items()
+        val u = items.indexOf(user(prompt) ?: return null)
+        val s = items.indexOf(user(steering) ?: return null)
+        if (s <= u || items.drop(u + 1).any { it.kind != "reply" && items.indexOf(it) != s }) return null
+        val after = items.drop(s + 1)
+        val key = after.firstOrNull()?.key ?: return null
+        return key.takeIf { after.all { it.kind == "reply" && it.key == key } }
     }
 }
 
@@ -128,6 +147,28 @@ fun steers(rows: List<JSONObject>): List<String?> = rows.filter { it.str("role")
     val start = c.indexOf("]\n")
     if (!c.startsWith(STEER_OPEN) || !c.endsWith(STEER_CLOSE) || start < 0 || start + 2 > c.length - STEER_CLOSE.length) null
     else c.substring(start + 2, c.length - STEER_CLOSE.length)
+}
+
+private fun JSONObject.isFinal() = str("role") == "assistant" && str("finish_reason") == "stop" && !str("content").isNullOrBlank()
+
+/**
+ * True when [rows] hold one steered turn in order: the user message [prompt] (once), the terminal call of exactly
+ * [command], exactly one steer row of exactly [steering], and after both the turn's final answer, holding [marker] and
+ * ending with the word BANANA. No other user turn may follow the prompt, and no final answer may follow that one.
+ */
+fun steeredTurn(rows: List<JSONObject>, prompt: String, command: String, steering: String, marker: String): Boolean {
+    fun JSONObject.isSteer() = str("role") == "user" && str("display_kind") == "steer"
+    val p = rows.indices.filter { rows[it].str("role") == "user" && !rows[it].isSteer() && prompt in (rows[it].str("content") ?: "") }.singleOrNull() ?: return false
+    val turn = rows.drop(p + 1)
+    if (turn.any { it.str("role") == "user" && !it.isSteer() }) return false
+    if (steers(rows) != listOf(steering)) return false
+    val i = turn.indexOfFirst { it.isSteer() }
+    if (i < 0) return false
+    val s = p + 1 + i
+    val c = rows.indices.firstOrNull { it > p && command in terminalCommands(listOf(rows[it])) } ?: return false
+    val f = rows.indices.lastOrNull { rows[it].isFinal() } ?: return false
+    val final = rows[f].str("content") ?: return false
+    return f > s && f > c && marker in final && SurvivalE2eTest.BANANA.containsMatchIn(final)
 }
 
 /** Final assistant answers in [rows] (the stored reply text of each turn). */

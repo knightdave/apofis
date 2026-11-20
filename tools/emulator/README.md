@@ -16,16 +16,20 @@ shell user. Tests:
 - `SurvivalE2eTest` (one model run each): `connectAndChat`, `replySurvivesAirplaneMode`, `replySurvivesScreenOff`,
   `replySurvivesProcessDeath`, `offlineMessageSendsItself`, `steerDuringRun`, `stopDuringRun`. Each starts from
   cleared app data (`pm clear`, checked), grants `ACCESS_LOCAL_NETWORK` and connects. Every prompt's first line
-  carries the run's nonce, so the chat's server title does. Right after each send, and again after the reply, the test
-  journals its chat's ids: only rows of the app's own database created after the run started whose title (as the app
-  gave it to the server: the first line of the chat's first message) contains the nonce. Chat items are found only by
-  the app's test tags (`user:<key>`, `reply:<key>/...`, `step:<replyKey>:<i>`, `notice:<key>`, `composer.send`,
-  `composer.stop`, `status.line`, exposed as resource ids): a reply counts only as the reply item right after this
-  scenario's user message item, holding the marker; the running step must be a step of that reply whose own text is
-  exactly the command. Interruptions are asserted positively (airplane mode setting on and the status line saying
+  carries the run's nonce, so the chat's server title does. The chat's identity comes from the chat the test opened:
+  it reads the open chat's key K from the chat screen's tag `chat.key:<K>` before sending, journals `send <K>
+  <scenario>` before pressing Send, and then, from the app's database, only the row whose key is K, once the app has
+  created it on the server (`session <K> <id> <scenario>` for its current and earlier ids), and again after the reply.
+  No other row is read or journaled. Chat items are found only by the app's test tags (`user:<key>`,
+  `reply:<key>/...`, `step:<replyKey>:<i>:<tool>`, `notice:<key>`, `composer.send`, `composer.stop`, `status.line`,
+  `chat.key:<key>`, exposed as resource ids): a reply counts only as the reply item right after this scenario's user
+  message item, holding the marker; the running step must be a `terminal` step of that reply whose own text is exactly
+  the command. For steer, the items must be the prompt, its reply, the steering message, then one final reply, and
+  that final reply is the one checked. Interruptions are asserted positively (airplane mode setting on and the status line saying
   Offline; `dumpsys power` read and not Awake; the pid read, then `pidof` succeeding with no result and `/proc/<pid>`
   gone). The server's record must agree (prompt once, one final answer with the marker, the exact terminal command;
-  for stop, that call's own result interrupted; for steer, exactly one steer row with exactly the steering text). The
+  for stop, that call's own result interrupted; for steer, in this order: the prompt, the command, exactly one steer
+  row of exactly the steering text, then the last final answer ending with BANANA, with no other user turn). The
   harness never approves anything: an approval block on screen fails the scenario without being touched.
 
 ## The two hosts
@@ -36,11 +40,13 @@ shell user. Tests:
 
 ## What a run does
 
-0. Takes this host's lock (`flock`), then the emulator host's lock: `mkdir ~/tmp/apofis-e2e/.state/lock.d` (atomic)
-   with `<run id> <start time>` inside. It does not depend on any connection and is removed in the cleanup once no e2e
-   process is left. A lock older than 4 hours is taken over only when no e2e process (emulator, either remote mode of
-   this script, our adb server) exists on the emulator host; a younger one rejects the run before anything changes.
-   Records the listeners in the port ranges (5037, 5554-5585, 18642-18662) for the postcheck.
+0. Takes this host's lock (`flock`), then the emulator host's lock `~/tmp/apofis-e2e/.state/lock.d`: a directory
+   holding one file, `owner`, with the run id. It is created complete (a new directory renamed into place, which never
+   replaces an existing lock) and does not depend on any connection. Taking it again with the same run id succeeds, so
+   a lost answer is simply asked again. A lock of another run is never taken over: the run stops before changing
+   anything and prints how to check that run's processes and remove its lock by hand (see below). The cleanup removes
+   the lock only when it holds this run's id. Records the listeners in the port ranges (5037, 5554-5585, 18642-18662)
+   for the postcheck.
 1. `rsync`s the working tree (minus `.git`, `.claude/` and everything in `.gitignore`) to `~/tmp/apofis-e2e/` and
    `git add`s it there, so the flake sees exactly the tracked and new files.
 2. Opens a reverse tunnel `ssh -R 127.0.0.1:<port>:127.0.0.1:8642` (first free port from 18642) and checks with `ss`
@@ -65,19 +71,33 @@ shell user. Tests:
    allowlist in `.state/runs/<run-id>/export/`: `instrument.txt`, `results.txt` (one line per test result file),
    `logcat.txt` and the screenshots named in the scenario list. Everything else of the run is deleted. The staged files
    are scanned for the key in raw, URL-encoded and base64 forms (patterns sent by the build host at that moment), then
-   hashed and made read-only; the checksums go to the build host. Without patterns (SSH lost), on a scan error or a
-   match, the staged files are deleted and only a fixed message naming the stage is printed.
-7. The build host copies exactly those names into `build/e2e/<run-id>/`, verifies every checksum, that nothing else
-   arrived, and scans the copy. If any check fails, it deletes the files it copied in this run (by name, `rm -f`, then
-   `rmdir`), prints a fixed message and exits non-zero. Then it removes the run directory on the emulator host.
+   hashed and made read-only. Only when all of this succeeded does it send the checksums and, as its very last line,
+   the completion token `COMPLETE <run id> <count>`. Without patterns (SSH lost), on a scan error or a match, the staged
+   files are deleted and only a fixed code naming the stage is sent.
+7. The build host copies the export only when the remote stage exited 0, its last output line is exactly this run's
+   completion token and the checksum lines before it parse. A timeout, a dropped connection, a line after the token or
+   anything else copies nothing. It copies exactly those names into `build/e2e/.incoming-<run-id>/` (never descending
+   into a directory), verifies every checksum, that nothing else arrived, and scans the copy, then renames it to
+   `build/e2e/<run-id>/` in one step. On any failure or interrupt it deletes the incoming files (by name, `rm -f`, then
+   `rmdir`), so a `build/e2e/<run-id>/` exists only when fully verified.
 8. Deletes the journaled sessions: each only after a `GET` on that exact id returns the same id, an `apofis-` id,
    with the run's nonce in its title (a turn still running is retried). For the steer scenario's session it also
-   requires exactly one steer row with exactly the steering text; for the journaled stopped run, `GET /v1/runs/<id>`
-   must name that session and say `cancelled`. Anything else is left alone and fails. A missing or unreadable journal
-   fails the run ("sessions may remain") and reads nothing on the server.
-9. Checks the emulator host unconditionally, within 240 s: no e2e process, no AVD, no run directory, no listener in the
-   port ranges that was not there before ("could not check" fails). Then releases the lock, and compares `~`,
-   `~/.android`, `~/.config`, `~/.cache`, `~/.local` and the user's `/tmp` entries with before the run.
+   requires the steered turn in order (exactly one steer row with exactly the steering text, every ordinary user row
+   before it, the last final answer after it ending with BANANA); for the journaled stopped run, `GET /v1/runs/<id>`
+   must name that session and say `cancelled`. Anything else is left alone and fails. A missing or unreadable journal,
+   or a `send <K>` without any journaled id of chat K, fails the run ("sessions may remain").
+9. Within one 240 s deadline: waits until no e2e process is left on the emulator host, removes this run's directory,
+   releases the lock (only if it holds this run's id), and requires one token per fact with its expected value:
+   `EMULATOR=absent ADB=absent REMOTE=absent AVD=absent RUNDIR=absent LOCK=released PORTS=closed DONE` (PORTS: no
+   listener in the port ranges that was not there before). A missing token, an `error` value or running out of time
+   fails. Then it compares `~`, `~/.android`, `~/.config`, `~/.cache`, `~/.local` and the user's `/tmp` entries with
+   before the run. The whole cleanup on the build host is limited to 15 minutes; past that it reports failure and
+   exits instead of hanging.
+
+No output of the emulator host ever reaches the terminal: every SSH call's output is captured and never printed (the
+remote's stderr is discarded). The emulator host reports progress and failures as fixed codes, which the build host
+prints as its own text; anything else is shown only as "an unexpected line (not shown)". The listing comparison
+reports only a count. Test failures' stack traces are printed from the verified copy of `instrument.txt`.
 
 `--full` passes only when every smoke test, every self-test (by name) and all seven scenarios ran and passed, and each
 smoke and scenario test left its screenshot, a PASS line in `results.txt`, the interruption screenshots
@@ -115,10 +135,17 @@ minutes) and Gradle's dependencies into `~/tmp/apofis-e2e/.state/gradle`. Later 
 
 ## Cleaning up by hand
 
-Normally nothing is left: the script verifies it. If the postcheck reports e2e processes left on the emulator host,
-the lock stays in place (`~/tmp/apofis-e2e/.state/lock.d`); stop those processes, then the next run takes the lock over
-once it is older than 4 hours, or remove `lock.d/owner` and `rmdir lock.d` by hand. Leftover run directories are
-removed by the next run. The AVD is deleted at the end of every run; a run finding one left behind deletes it first.
+Normally nothing is left: the script verifies it. If the postcheck cannot verify that the run's processes are gone,
+the lock stays in place (`~/tmp/apofis-e2e/.state/lock.d`) and the script prints these commands. The script never
+removes a lock it does not own, so a lock left by a dead run stays until you remove it:
+
+```sh
+ssh obi-one "pgrep -u \$(id -u) -af -- '-avd apofis-e2e|run-e2e\.sh --(remote|in-shell)|adb -P 5037 nodaemon'" # must print nothing
+ssh obi-one 'rm -f ~/tmp/apofis-e2e/.state/lock.d/owner && rmdir ~/tmp/apofis-e2e/.state/lock.d'
+```
+
+Leftover run directories are removed by the next run. The AVD is deleted at the end of every run; a run finding one
+left behind deletes it first.
 
 To remove everything from the emulator host:
 

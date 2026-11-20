@@ -39,7 +39,8 @@ class HarnessSelfTest {
         }
 
         fun user(key: String, text: String) = item("user:$key", text)
-        fun step(reply: String, i: Int, preview: String, state: String? = "Running") = item("step:$reply:$i", "terminal", preview, state = state)
+        fun step(reply: String, i: Int, preview: String, state: String? = "Running", tool: String = "terminal") =
+            item("step:$reply:$i:$tool", tool, preview, state = state)
         fun text(reply: String, text: String, row: String = "b0/c0") = item("reply:$reply/$row", text)
         fun tree() = UiTree(nodes)
     }
@@ -93,12 +94,58 @@ class HarnessSelfTest {
             step("live", 2, "command=$COMMAND")
             step("live", 3, COMMAND, state = null)
             step("other", 0, COMMAND)
+            // Another tool running with the same preview, and a step tagged without a tool, do not count.
+            step("live", 4, COMMAND, tool = "execute_code")
+            item("step:live:5", "terminal", COMMAND, state = "Running")
         }
         val t = s.tree()
         assertEquals("live", t.replyAfter(PROMPT))
         assertTrue(t.steps("live", "Running", COMMAND).isEmpty())
         val ok = Screen().apply { user("u1", PROMPT); step("live", 0, "sleep 25 + 1 command"); step("live", 1, COMMAND) }.tree()
-        assertEquals(listOf("step:live:1"), ok.steps("live", "Running", COMMAND).map { it.resId })
+        assertEquals(listOf("step:live:1:terminal"), ok.steps("live", "Running", COMMAND).map { it.resId })
+    }
+
+    @Test
+    fun chatKeyIsReadFromTheChatScreensTagOnly() {
+        val key = "apofis-0a1b2c3d-0000-4000-8000-000000000001"
+        assertEquals(key, Screen().apply { item("chat.key:$key"); user("u1", key) }.tree().chatKey())
+        assertNull(Screen().apply { user("u1", key) }.tree().chatKey())
+        assertNull(Screen().apply { item("chat.key:$key"); item("chat.key:apofis-0a1b2c3d-0000-4000-8000-000000000002") }.tree().chatKey())
+    }
+
+    @Test
+    fun steerReplyIsTheFinalReplyOfThisTurnOnly() {
+        val steer = "Steer: end with BANANA"
+        val ok = Screen().apply { user("u1", PROMPT); step("r2", 0, COMMAND, state = null); user("s3", steer); text("r4", "Done $MARKER BANANA") }
+        assertEquals("r4", ok.tree().steerReply(PROMPT, steer))
+        // A reply of another turn: another user item after the prompt, or more after the reply that follows the steer.
+        val otherTurn = Screen().apply { user("u1", PROMPT); user("s3", steer); text("r4", "x"); user("u5", "Next"); text("r6", "BANANA") }
+        assertNull(otherTurn.tree().steerReply(PROMPT, steer))
+        val between = Screen().apply { user("u1", PROMPT); user("u2", "Other"); user("s3", steer); text("r4", "BANANA") }
+        assertNull(between.tree().steerReply(PROMPT, steer))
+        val wrongOrder = Screen().apply { user("s3", steer); user("u1", PROMPT); text("r4", "BANANA") }
+        assertNull(wrongOrder.tree().steerReply(PROMPT, steer))
+        val noticeAfter = Screen().apply { user("u1", PROMPT); user("s3", steer); text("r4", "BANANA"); item("notice:n5", "Stopped") }
+        assertNull(noticeAfter.tree().steerReply(PROMPT, steer))
+    }
+
+    @Test
+    fun steeredTurnOnTheServerMustBeInOrderAndAlone() {
+        val steer = "Steer: end with BANANA"
+        val wrapped = "[OUT-OF-BAND USER MESSAGE - a direct message from the user]\n$steer\n[/OUT-OF-BAND USER MESSAGE]"
+        fun user(c: String) = JSONObject().put("role", "user").put("content", c)
+        fun steerRow() = JSONObject().put("role", "user").put("display_kind", "steer").put("content", wrapped)
+        fun call() = JSONObject(
+            """{"role":"assistant","content":"","tool_calls":[{"id":"a","function":{"name":"terminal","arguments":"{\"command\": \"$COMMAND\"}"}}]}""",
+        )
+        fun final(c: String) = JSONObject().put("role", "assistant").put("finish_reason", "stop").put("content", c)
+        val good = listOf(user(PROMPT), call(), steerRow(), final("Done $MARKER BANANA"))
+        assertTrue(steeredTurn(good, PROMPT, COMMAND, steer, MARKER))
+        // The final before the steer, a new user turn in between, or a later final of another turn do not count.
+        assertFalse(steeredTurn(listOf(user(PROMPT), call(), final("Done $MARKER BANANA"), steerRow()), PROMPT, COMMAND, steer, MARKER))
+        assertFalse(steeredTurn(listOf(user(PROMPT), call(), steerRow(), user("Another"), final("Done $MARKER BANANA")), PROMPT, COMMAND, steer, MARKER))
+        assertFalse(steeredTurn(good + final("Something else"), PROMPT, COMMAND, steer, MARKER))
+        assertFalse(steeredTurn(listOf(user(PROMPT), steerRow(), final("Done $MARKER BANANA")), PROMPT, COMMAND, steer, MARKER))
     }
 
     @Test

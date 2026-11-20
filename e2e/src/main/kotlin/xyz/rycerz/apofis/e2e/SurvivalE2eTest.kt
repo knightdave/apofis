@@ -13,7 +13,8 @@ import org.junit.runner.RunWith
 /**
  * The milestone's survival scenarios against the real Hermes server (each costs one model run). Every scenario starts
  * from cleared app data, connects to the emulator's host alias (a private address, so local network access is
- * granted through adb), journals this run's chat right after each send and again after the reply, asserts on the
+ * granted through adb), reads the open chat's key from the chat screen's tag, journals that chat's ids (and only
+ * that chat's) right after each send and again after the reply, asserts on the
  * screen (chat items found by the app's test tags) and on the server's record of that chat, and saves a screenshot.
  * run-e2e.sh deletes the journaled sessions after checking each one's identity, and checks the steer and the
  * stopped run against the server once more from the build host.
@@ -124,7 +125,7 @@ class SurvivalE2eTest {
         app.waitFor("airplane mode on and the status line showing Offline", 30_000) { app.airplaneOn() && offline() }
         val marker = "apofis-e2e-5"
         val prompt = "Test ${app.nonce}-5. Reply with exactly: $marker"
-        val chat = sendPrompt(prompt)
+        val chat = sendPrompt(prompt, online = false)
         app.waitFor("the message bubble waiting to send", 15_000) { queued(prompt) }
         // Stays offline long enough that a send that ignored the network would have failed or gone out by now.
         SystemClock.sleep(15_000)
@@ -145,19 +146,19 @@ class SurvivalE2eTest {
         val steering = steeringText(app.nonce)
         val chat = sendPrompt(prompt)
         awaitToolStep(prompt, command)
-        app.send(steering, button = app.str("chat_steer"))
+        app.send(chat, steering, button = app.str("chat_steer"))
         app.waitFor("the steering text as a user message", 30_000) { app.snapshot().user(steering) != null }
-        // Proves the steer changed the reply: the reply right after the steering message holds the marker and ends
-        // with the word BANANA.
-        app.waitFor("a finished reply after the steer with $marker, ending with BANANA", reply, meanwhile = app::failOnApproval) {
-            idle() && app.snapshot().replyWith(steering, marker)?.let { BANANA.containsMatchIn(app.snapshot().replyText(it)) } == true
+        // Proves the steer changed this turn's reply: the items are the prompt, its reply, the steering message, then
+        // one final reply, and that final reply holds the marker and ends with the word BANANA.
+        app.waitFor("this turn's final reply after the steer with $marker, ending with BANANA", reply, meanwhile = app::failOnApproval) {
+            val t = app.snapshot()
+            idle() && t.steerReply(prompt, steering)?.let { marker in t.replyText(it) && BANANA.containsMatchIn(t.replyText(it)) } == true
         }
-        app.journalOwned()
-        // Proves the server did it: the command was called, exactly one steer row holding exactly the steering text,
-        // and the stored final answer holds the marker and ends with BANANA.
-        serverAgrees(chat, "the command, the steer row with exactly the steering text and a final answer ending with BANANA") { rows ->
-            command in terminalCommands(rows) && steers(rows) == listOf(steering) &&
-                finals(rows).lastOrNull()?.let { marker in it && BANANA.containsMatchIn(it) } == true
+        journalAfterReply(chat)
+        // Proves the server did it in this turn and in order: the prompt, the command, exactly one steer row of exactly
+        // the steering text, then the turn's final answer with the marker ending with BANANA, and no other turn.
+        serverAgrees(chat, "one steered turn: the command, the steer row, then a final answer ending with BANANA") { rows ->
+            steeredTurn(rows, prompt, command, steering, marker)
         }
         app.screenshot(name.methodName)
     }
@@ -170,7 +171,7 @@ class SurvivalE2eTest {
         app.journalRun(chat) // the build host checks this run's final status on the server
         app.clickTag("composer.stop", app.str("chat_stop"))
         app.waitFor("the Stopped notice and the composer back in send mode", 60_000) { app.has(app.str("chat_outcome_stopped")) && idle() }
-        app.journalOwned()
+        journalAfterReply(chat)
         // Proves the stop reached the server: the scenario's own terminal call has its own result marked interrupted.
         serverAgrees(chat, "the command called and its own result interrupted") { rows -> interruptedCall(rows, command) }
         app.screenshot(name.methodName)
@@ -195,8 +196,13 @@ class SurvivalE2eTest {
     private fun wakefulness(): String =
         Regex("mWakefulness=(\\w+)").find(app.shell("dumpsys power"))?.groupValues?.get(1) ?: fail("dumpsys power did not report mWakefulness")
 
-    /** Sends [prompt] in the chat this scenario connected to; the journaled chat must be that one. */
-    private fun sendPrompt(prompt: String): String = app.send(prompt).also { if (it != session) fail("The message went to another chat than the one connected") }
+    /** Sends [prompt] in the chat this scenario opened (its key read from the chat screen's tag); returns that key. */
+    private fun sendPrompt(prompt: String, online: Boolean = true): String = session.also { app.send(it, prompt, online = online) }
+
+    /** Journals the chat's ids again after the reply (compression can give it a new id); it must be on the server. */
+    private fun journalAfterReply(chat: String) {
+        if (!app.journalChat(chat)) fail("The chat is not on the server after the reply; its ids were never journaled")
+    }
 
     /** The composer is back to Send: no run is going on. */
     private fun idle(): Boolean {
@@ -226,7 +232,7 @@ class SurvivalE2eTest {
             idle() && app.snapshot().replyWith(prompt, marker) != null
         }
         app.log("reply with $marker shown")
-        app.journalOwned() // once more after the reply: compression can give the chat a new id
+        journalAfterReply(session)
     }
 
     /** Polls the server's record of this chat until [check] holds (rows may be written just after the run ends). */

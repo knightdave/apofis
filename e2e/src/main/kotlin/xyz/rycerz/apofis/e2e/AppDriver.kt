@@ -28,8 +28,8 @@ fun fail(message: String): Nothing = throw AssertionError(message)
 /**
  * Drives the app from this separate test process: shell commands, accessibility actions and the app's own string
  * resources. Arguments: apofisUrl (loopback, through adb reverse), apofisDirectUrl (the emulator's host alias,
- * 10.0.2.2), apofisNonce (this run's id, put into every prompt's first line, so into the chat's server title),
- * apofisStart (the device clock in epoch seconds just before the instrumentation started) and apofisKey.
+ * 10.0.2.2), apofisNonce (this run's id, put into every prompt's first line, so into the chat's server title) and
+ * apofisKey.
  */
 class AppDriver {
     val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -42,7 +42,6 @@ class AppDriver {
     val url get() = arg("apofisUrl")
     val directUrl get() = arg("apofisDirectUrl")
     val nonce get() = arg("apofisNonce").also { require(Regex("[0-9a-f]{8}").matches(it)) { "Bad apofisNonce" } }
-    private val runStart get() = arg("apofisStart").toLong()
     private val key get() = arg("apofisKey")
 
     /** The scenario now running, written into each journal line. */
@@ -235,47 +234,58 @@ class AppDriver {
         device.waitForIdle()
     }
 
-    /** Waits for the chat and asserts it is a new, empty one (the only chat in the app's database); returns its id. */
+    /**
+     * Waits for the chat and asserts it is a new, empty one: the chat screen's tag names its key, and that key's row is
+     * the only one in the app's database, local only, with no other id. Returns the key.
+     */
     fun awaitChat(serverUrl: String): String {
         waitFor("the chat after connecting to $serverUrl", 30_000) { hasDesc(str("settings_title")) && !has(str("connect_title")) }
         // A fresh install has no synced chats, so the app must open a new local one; never write into another chat.
         waitFor("a new, empty chat", 10_000) { has(str("chat_new_title")) && nodes { it.className == "android.widget.EditText" }.size == 1 }
         log("connected to $serverUrl")
-        var rows = emptyList<List<String>>()
-        waitFor("the new chat in the app's database", 10_000) { appSessions().also { rows = it }.isNotEmpty() }
-        if (rows.size != 1 || rows[0][2].isNotEmpty() || rows[0][0] != rows[0][1]) fail("Expected one new chat in the app's database, found $rows")
-        return rows[0][1]
+        val key = openChatKey()
+        var row: ChatRow? = null
+        waitFor("the new chat in the app's database", 10_000) { chatRow(key).also { row = it } != null }
+        val count = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT count(*) FROM SessionEntity;\n").trim()
+        val r = row!!
+        if (count != "1" || r.currentId != key || r.lineage.isNotEmpty() || r.onServer) fail("Expected one new local chat in the app's database ($count rows)")
+        return key
     }
 
-    /** Rows of the app's sessions table matching [where]: key, currentId, lineageIds. Fails on anything it cannot parse. */
-    fun appSessions(where: String = "1"): List<List<String>> {
-        val out = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT key, currentId, lineageIds FROM SessionEntity WHERE $where;\n")
-        return out.lines().filter { it.isNotBlank() }.map { line ->
-            val cols = line.split('|')
-            if (cols.size != 3 || !SESSION_ID.matches(cols[0]) || !SESSION_ID.matches(cols[1]) ||
-                cols[2].split(',').any { it.isNotEmpty() && !SESSION_ID.matches(it) }
-            ) {
-                fail("Unexpected output reading the app's sessions")
-            }
-            cols
+    /** The key of the chat open on screen, from the chat screen's tag; fails unless exactly one, an app session id. */
+    fun openChatKey(): String {
+        var key: String? = null
+        waitFor("the open chat's key on the chat screen", 10_000) { snapshot().chatKey().also { key = it } != null }
+        return key?.takeIf(SESSION_ID::matches) ?: fail("The open chat's key is not an app session id")
+    }
+
+    /** One row of the app's sessions table: its current server id, earlier ids, and whether the server has it. */
+    data class ChatRow(val currentId: String, val lineage: List<String>, val onServer: Boolean)
+
+    /** The app's database row of chat [key], and no other row; null when there is none. Fails on anything it cannot parse. */
+    fun chatRow(key: String): ChatRow? {
+        if (!SESSION_ID.matches(key)) fail("Not an app session id")
+        val out = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT currentId, lineageIds, existsOnServer FROM SessionEntity WHERE key = '$key';\n")
+        val lines = out.lines().filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+        val cols = lines.single().split('|')
+        val lineage = cols.getOrNull(1)?.split(',')?.filter(String::isNotEmpty).orEmpty()
+        if (lines.size != 1 || cols.size != 3 || !SESSION_ID.matches(cols[0]) || lineage.any { !SESSION_ID.matches(it) } || cols[2] !in setOf("0", "1")) {
+            fail("Unexpected output reading the app's chat")
         }
+        return ChatRow(cols[0], lineage, cols[2] == "1")
     }
 
     /**
-     * Journals the ids of this run's own chat: rows of the app's own database created after the run started whose
-     * title, as the app gave it to the server (the first line of the chat's first message, cut to 60 characters,
-     * read from the app's own pending send or stored user row), contains this run's nonce. The app keeps the title
-     * column empty until it refreshes the chat list, which it does not do in this milestone. Returns the chat keys.
+     * Journals the server ids of chat [key] (the chat this test opened and read from the screen), once the app has
+     * created it on the server: its current id and earlier ids, as "session <key> <id> <scenario>". Nothing else of the
+     * app's database is read. Returns false while the chat is not on the server yet.
      */
-    fun journalOwned(): List<String> {
-        val n = nonce
-        val titled = "instr(substr(ltrim(%1\$s), 1, 60), '$n') > 0 AND (instr(%1\$s, char(10)) = 0 OR instr(%1\$s, char(10)) > instr(%1\$s, '$n'))"
-        val rows = appSessions(
-            "startedAt >= $runStart AND (key IN (SELECT sessionKey FROM PendingSendEntity WHERE ${titled.format("text")}) OR " +
-                "key IN (SELECT sessionKey FROM MessageEntity WHERE role = 'user' AND ${titled.format("content")}))",
-        )
-        rows.flatMap { (listOf(it[0], it[1]) + it[2].split(',')).filter(String::isNotEmpty) }.distinct().forEach { journal("session $it $scenario") }
-        return rows.map { it[0] }
+    fun journalChat(key: String): Boolean {
+        val row = chatRow(key) ?: fail("The chat $key is gone from the app's database")
+        if (!row.onServer) return false
+        (listOf(row.currentId) + row.lineage).distinct().forEach { journal("session $key $it $scenario") }
+        return true
     }
 
     /** Journals the id of the run the app is following for chat [sessionKey] (exactly one), with that chat's id. */
@@ -294,9 +304,10 @@ class AppDriver {
      */
     private fun journal(line: String) {
         val p = line.split(' ')
-        val ok = p.size == 3 && when (p[0]) {
-            "session" -> SESSION_ID.matches(p[1]) && SCENARIO.matches(p[2])
-            "run" -> RUN_ID.matches(p[1]) && SESSION_ID.matches(p[2])
+        val ok = when (p[0]) {
+            "send" -> p.size == 3 && SESSION_ID.matches(p[1]) && SCENARIO.matches(p[2])
+            "session" -> p.size == 4 && SESSION_ID.matches(p[1]) && SESSION_ID.matches(p[2]) && SCENARIO.matches(p[3])
+            "run" -> p.size == 3 && RUN_ID.matches(p[1]) && SESSION_ID.matches(p[2])
             else -> false
         }
         if (!ok) fail("Not a journal line")
@@ -306,18 +317,20 @@ class AppDriver {
     }
 
     /**
-     * Types [text] into the composer and presses the send button showing [button] (Send, or Send to the running
-     * reply); then journals this run's chat, which must exist in the app's database by then. Returns its key.
+     * Sends [text] in the open chat, which must be [chat] (read from the chat screen's tag first): journals "send <chat>
+     * <scenario>" before pressing the button showing [button] (Send, or Send to the running reply), so the build host
+     * knows a message may have created a session. When [online], waits until the chat is on the server and journals its
+     * ids; offline, that happens after the reply.
      */
-    fun send(text: String, button: String = str("chat_send")): String {
+    fun send(chat: String, text: String, button: String = str("chat_send"), online: Boolean = true) {
+        if (openChatKey() != chat) fail("The open chat is not the one this test opened")
         val composer = nodes { it.className == "android.widget.EditText" }.singleOrNull() ?: fail("No composer. Screen: ${screen()}")
         setField(composer, text)
         device.waitForIdle()
+        journal("send $chat $scenario")
         clickTag("composer.send", button)
         log("sent: $text")
-        var keys = emptyList<String>()
-        waitFor("this run's chat in the app's database after sending", 10_000) { journalOwned().also { keys = it }.isNotEmpty() }
-        return keys.singleOrNull() ?: fail("Expected one chat of this run in the app's database, found ${keys.size}")
+        if (online) waitFor("the chat on the server, its ids journaled", 15_000) { journalChat(chat) }
     }
 
     /**
@@ -343,8 +356,15 @@ class AppDriver {
 
     // ---- the server's record (read only; deletion is run-e2e.sh's job)
 
-    /** The rows of session [id] on the server, oldest first; fails unless the answer names exactly [id]. */
+    /**
+     * The rows of session [id] on the server, oldest first. First proves the session is this run's (a GET on [id]
+     * names [id], an app id, with this run's nonce in its title); fails unless both answers name exactly [id].
+     */
     fun serverMessages(id: String): List<JSONObject> {
+        if (!SESSION_ID.matches(id)) fail("Not an app session id")
+        val (sc, sb) = http("GET", "api/sessions/$id")
+        val s = if (sc == 200) runCatching { JSONObject(sb).getJSONObject("session") }.getOrNull() else null
+        if (s?.optString("id") != id || !s.optString("title").contains(nonce)) fail("GET $id returned $sc without this run's identity")
         val (code, body) = http("GET", "api/sessions/$id/messages?order=oldest&include_compacted=true")
         if (code != 200) fail("GET messages of $id returned $code")
         val json = JSONObject(body)
