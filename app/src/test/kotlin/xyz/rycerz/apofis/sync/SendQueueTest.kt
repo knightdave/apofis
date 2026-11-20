@@ -611,6 +611,30 @@ class SendQueueTest {
     }
 
     @Test
+    fun workerStoppedByARefusedKeyDoesNotSettleOrDrainAgain() = runTest {
+        addSession("apofis-a")
+        addSession("apofis-b")
+        addSession("apofis-c")
+        running("apofis-c") // an unrelated chat whose next send waits for its run
+        var settled = 0
+        val worker = SendQueue(api, db, { _, _ -> }, { clock }, settle = { settled++ })
+        worker.enqueue("apofis-a", "refused")
+        clock += 1
+        val waiting = worker.enqueue("apofis-b", "waits for a fixed key")
+        clock += 1
+        worker.enqueue("apofis-c", "behind the run")
+        respond("""{"error":{"code":"invalid_api_key"}}""", 401)
+
+        assertFalse(worker.drainSettlingRuns())
+
+        assertEquals(1, server.requestCount)
+        assertEquals(0, settled)
+        val b = pending(waiting)
+        assertEquals("queued", b.state) // still waiting for credentials, never tried under the refused key
+        assertFalse(b.attempted)
+    }
+
+    @Test
     fun steerIsStoredBeforeTheRequest() = runTest {
         addSession("apofis-a")
         running("apofis-a")

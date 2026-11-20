@@ -70,6 +70,9 @@ private val handoff = Mutex()
 
 private enum class Attempt { STARTED, FAILED, STOP }
 
+/** How a drain ended: nothing left queued; sends left only behind busy chats; or stopped at a failure that stops all. */
+private enum class Drained { EMPTY, BLOCKED, STOPPED }
+
 private val UNCERTAIN_ERRORS = setOf(SendError.STEER_UNCERTAIN, SendError.UNCONFIRMED, SendError.EXPIRED_UNCERTAIN)
 
 /**
@@ -147,7 +150,9 @@ class SendQueue(
      * Starts queued sends oldest first. A session with a send in progress or an active run is skipped; its next
      * send starts on a later drain, as the server runs one turn per session at a time. True when nothing is left queued.
      */
-    suspend fun drain(): Boolean = drainLock.withLock {
+    suspend fun drain(): Boolean = drainOnce() == Drained.EMPTY
+
+    private suspend fun drainOnce(): Drained = drainLock.withLock {
         handoff.withLock { } // a send being stored now is in the queue read below
         try {
             ensureOpen()
@@ -166,21 +171,26 @@ class SendQueue(
                 when (attempt(send)) {
                     Attempt.STARTED -> busy += send.sessionKey
                     Attempt.FAILED -> Unit
-                    Attempt.STOP -> return@withLock false
+                    Attempt.STOP -> return@withLock Drained.STOPPED
                 }
             }
-            pendingDao.allQueued().isEmpty()
+            if (pendingDao.allQueued().isEmpty()) Drained.EMPTY else Drained.BLOCKED
         } catch (_: QueueClosed) {
-            false
+            Drained.STOPPED
         }
     }
 
     /**
      * For SendWorker: [drain]; when queued sends still wait behind an active run (in the background no follower sees it
      * end), [settle] checks each such run once, outside the drain lock since its Finish drains on its own, then drains again.
+     * A drain that stopped (refused key, no network, closed queue) is left to the worker's backoff: nothing more is tried.
      */
     suspend fun drainSettlingRuns(): Boolean {
-        if (drain()) return true
+        when (drainOnce()) {
+            Drained.EMPTY -> return true
+            Drained.STOPPED -> return false
+            Drained.BLOCKED -> Unit
+        }
         val blocking = db.activeRunDao().blockingQueued()
         if (blocking.isEmpty()) return false
         for (runId in blocking) {
