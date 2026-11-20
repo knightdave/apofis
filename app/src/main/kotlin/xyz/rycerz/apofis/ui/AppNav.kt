@@ -1,7 +1,6 @@
 package xyz.rycerz.apofis.ui
 
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.RowScope
@@ -81,20 +80,15 @@ fun AppNav(container: AppContainer) {
                     willClearCache = container::willClearCache,
                     save = container::connect,
                     failedBefore = !reconnect && container.consumeSwitchFailure(),
+                    back = container.connectBack,
                 )
             }
             LaunchedEffect(vm.state) { if (vm.state == ConnectState.Connected) chosen = Screen.CHAT }
-            // Back cancels a running check synchronously before leaving; while saving, cancel() refuses and Back is
-            // swallowed. On first run, leaving means sending the app to the background, as the system would.
-            val activity = LocalActivity.current
+            // Back cancels a running check synchronously before returning to Settings; while saving, cancel() refuses
+            // and Back is swallowed. Without a screen to return to, the activity's callback handles a busy Back.
             val canGoBack = reconnect && conn != null
-            val busy = vm.state == ConnectState.Testing || vm.state == ConnectState.Saving
-            val leave = {
-                if (vm.cancel()) {
-                    if (canGoBack) chosen = Screen.SETTINGS else activity?.moveTaskToBack(true)
-                }
-            }
-            BackHandler(enabled = canGoBack || busy, onBack = leave)
+            val leave = { if (vm.cancel()) chosen = Screen.SETTINGS }
+            BackHandler(enabled = canGoBack, onBack = leave)
             ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
         Screen.CHAT -> if (conn != null) ChatRoute(conn, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })

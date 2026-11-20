@@ -2,11 +2,13 @@ package xyz.rycerz.apofis
 
 import android.app.Application
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.testing.WorkManagerTestInitHelper
+import java.io.IOException
 import java.security.GeneralSecurityException
 import javax.crypto.KeyGenerator
 import java.util.Collections
@@ -200,11 +202,8 @@ class AppContainerTest {
         fail("timed out waiting for $what")
     }
 
-    @Test
-    fun stopDuringASlowResumeLeavesNoStreamAndLaterRunsAttachNone() = runTest {
-        val requests = Collections.synchronizedList(mutableListOf<String>())
-        val server = MockWebServer()
-        server.dispatcher = object : Dispatcher() {
+    private fun recordingServer(requests: MutableList<String>) = MockWebServer().apply {
+        dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 requests += "${request.method} ${request.url.encodedPath}"
                 return if (request.method == "POST" && request.url.encodedPath == "/v1/runs") {
@@ -214,7 +213,45 @@ class AppContainerTest {
                 }
             }
         }
-        server.start()
+        start()
+    }
+
+    @Test
+    fun stopReturnsWithTheGateClosedWhileAResumeIsInFlight() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val server = recordingServer(requests)
+        try {
+            container.connect(Credentials(server.url("/").toString(), "k"))
+            val c = container.connected()!!
+            val inResume = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            container.afterResume = { // resumeAll has opened the gate; the resume has not returned yet
+                inResume.complete(Unit)
+                release.await()
+            }
+            container.onStart()
+            inResume.await()
+            addSession("apofis-a")
+            db.activeRunDao().upsert(ActiveRunEntity("run_late", "apofis-a", null, "running", 1L))
+
+            container.onStop()
+            c.follower.onRunStarted("apofis-a", "run_late") // the first thing that can happen after ON_STOP returns
+
+            assertTrue(c.follower.following.toString(), c.follower.following.isEmpty())
+            release.complete(Unit)
+            container.awaitLifecycle()
+            withContext(Dispatchers.IO) { Thread.sleep(1_500) } // past the follower's 1 s first status read
+            val seen = synchronized(requests) { requests.toList() }
+            assertTrue(seen.toString(), seen.none { it.contains("run_late") })
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun aResumeThatOutlivesTheStopClosesTheGateAgain() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val server = recordingServer(requests)
         try {
             container.connect(Credentials(server.url("/").toString(), "k"))
             val c = container.connected()!!
@@ -229,9 +266,10 @@ class AppContainerTest {
 
             container.onStart()
             inResume.await()
-            container.onStop() // arrives while the resume is still in flight
+            container.onStop() // after the resume checked it is started, before it opens the gate
             release.complete(Unit)
             container.awaitLifecycle()
+            assertTrue(c.follower.following.toString(), c.follower.following.isEmpty()) // closed again
 
             // A run the send queue starts after the stop is stored but gets no stream.
             addSession("apofis-b")
@@ -241,7 +279,9 @@ class AppContainerTest {
 
             val seen = synchronized(requests) { requests.toList() }
             assertTrue(seen.toString(), "POST /v1/runs" in seen)
-            assertTrue(seen.toString(), seen.none { it.contains("/events") || it.contains("run_stored") || it.startsWith("GET /v1/runs/") })
+            assertTrue(c.follower.following.toString(), c.follower.following.isEmpty())
+            // The stored run may be read in the moment the late resume had the gate open; the started one never is.
+            assertTrue(seen.toString(), seen.none { it.contains("/events") || it.contains("run_ef57074dc1694db39e37045230b1425c") })
         } finally {
             server.close()
         }
@@ -287,5 +327,52 @@ class AppContainerTest {
         container.beforeSwitch = {}
         container.connect(B) // not stuck switching
         assertEquals(B, container.connected()!!.credentials)
+    }
+
+    @Test
+    fun throwingCleanupStillEndsDisconnected() = runTest {
+        val flaky = FlakyCacheApp(app)
+        container = AppContainer(flaky, store) { db }
+        container.connect(A)
+        flaky.failCommits = true // the marker write fails, and so does removing it during cleanup
+
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: IOException) {
+        } catch (_: IllegalStateException) {
+        }
+
+        assertNull(container.connection.value) // the Connect screen shows
+        assertNull(container.connected())
+        assertNull(store.load())
+        flaky.failCommits = false
+        container.connect(B)
+        assertEquals(B, container.connected()!!.credentials)
+    }
+}
+
+/** The real app, except that commits to the cache preferences throw while [failCommits] is set. */
+private class FlakyCacheApp(base: Application) : Application() {
+    @Volatile var failCommits = false
+
+    init {
+        attachBaseContext(base)
+    }
+
+    override fun getSharedPreferences(name: String, mode: Int): SharedPreferences {
+        val real = super.getSharedPreferences(name, mode)
+        if (name != CACHE_PREFS) return real
+        return object : SharedPreferences by real {
+            override fun edit(): SharedPreferences.Editor {
+                val e = real.edit()
+                return object : SharedPreferences.Editor by e {
+                    override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor = also { e.putBoolean(key, value) }
+                    override fun putString(key: String, value: String?): SharedPreferences.Editor = also { e.putString(key, value) }
+                    override fun remove(key: String): SharedPreferences.Editor = also { e.remove(key) }
+                    override fun commit(): Boolean = if (failCommits) throw IllegalStateException("disk") else e.commit()
+                }
+            }
+        }
     }
 }
