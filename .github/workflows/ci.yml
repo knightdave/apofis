@@ -22,7 +22,7 @@ jobs:
         with:
           packages: ${{ steps.sdk.outputs.packages }}
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew lintDebug testDebugUnitTest assembleDebug
+      - run: ./gradlew lintDebug testDebugUnitTest verifyRoborazziDebug assembleDebug
       - run: scripts/check-apk-permissions-test.sh
       - run: scripts/release-lock-test.sh
       - run: scripts/check-apk-permissions.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/aapt2" app/build/outputs/apk/debug/app-debug.apk
