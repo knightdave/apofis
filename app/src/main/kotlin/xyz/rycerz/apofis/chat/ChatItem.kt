@@ -20,6 +20,7 @@ data class AssistantReply(
     val timestamp: Double,
     val live: Boolean = false,
     val outcome: ReplyOutcome? = null,
+    val rowIds: List<Long> = emptyList(), // every assistant and tool row grouped into this reply
 ) : ChatItem
 
 data class Notice(override val key: String, val kind: String, val text: String) : ChatItem

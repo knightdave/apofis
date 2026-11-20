@@ -3,7 +3,11 @@ package xyz.rycerz.apofis.sync
 import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.runTest
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -62,16 +66,31 @@ class ChatRepositorySyncTest {
         archived: Boolean = false,
         pinned: Boolean = false,
         root: String? = null,
+        lastActive: Double? = 2.0,
+        lineage: List<String> = emptyList(),
     ) = """{"id":"$id","source":"$source","title":"t $id","pinned":$pinned,"archived":$archived,"hidden":$hidden,""" +
-        """"started_at":1.0,"last_active":2.0,"message_count":3,"preview":"p"""" +
-        (if (root != null) ""","_lineage_root_id":"$root"""" else "") + "}"
+        """"started_at":1.0,"last_active":$lastActive,"message_count":3,"preview":${if (lastActive == null) "null" else "\"p\""}""" +
+        (if (root != null) ""","_lineage_root_id":"$root"""" else "") +
+        ""","_lineage_ids":[${lineage.joinToString(",") { "\"$it\"" }}]}"""
 
     private fun page(vararg rows: String, hasMore: Boolean = false) =
         """{"object":"list","data":[${rows.joinToString(",")}],"has_more":$hasMore}"""
 
     private fun messagesJson(sessionId: String, ids: List<Long>, role: (Long) -> String = { "user" }) =
-        """{"object":"list","session_id":"$sessionId","data":[""" +
-            ids.joinToString(",") { """{"id":$it,"role":"${role(it)}","content":"m$it","timestamp":$it.0}""" } + "]}"
+        rawMessages(sessionId, ids.map { """{"id":$it,"role":"${role(it)}","content":"m$it","timestamp":$it.0}""" })
+
+    private fun rawMessages(sessionId: String, rows: List<String>) =
+        """{"object":"list","session_id":"$sessionId","data":[${rows.joinToString(",")}]}"""
+
+    private suspend fun expectError(block: suspend () -> Unit): Throwable {
+        try {
+            block()
+        } catch (e: Exception) {
+            return e
+        }
+        fail("expected an error")
+        throw AssertionError()
+    }
 
     private fun session(
         key: String,
@@ -236,6 +255,155 @@ class ChatRepositorySyncTest {
         assertTrue(row.pinned && row.archived)
         assertFalse(row.existsOnServer)
         assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun reservedIdsAreNeverAppSessions() = runTest {
+        respond(
+            page(
+                sessionJson("apofis-push-9", root = "apofis-a"),
+                sessionJson("tip-1", root = "apofis-b", lineage = listOf("apofis-b", "apofis-probe-1")),
+                sessionJson("apofis-c"),
+            ),
+        )
+        repo.refreshSessions()
+        assertEquals(listOf("apofis-c"), repo.sessions().first().map { it.key })
+        assertTrue(expectError { repo.rename("apofis-push-1", "x") } is IllegalArgumentException)
+        assertTrue(expectError { repo.syncMessages("apofis-probe-1") } is IllegalArgumentException)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun syncRefusesReservedTip() = runTest {
+        db.sessionDao().upsert(session("apofis-s").copy(stale = true))
+        respond(messagesJson("apofis-push-2", listOf(1L)))
+        assertEquals(ApiError.Protocol, expectError { repo.syncMessages("apofis-s") })
+        val row = db.sessionDao().get("apofis-s")!!
+        assertEquals("apofis-s", row.currentId)
+        assertTrue(row.stale)
+        assertTrue(db.messageDao().observe("apofis-s").first().isEmpty())
+    }
+
+    @Test
+    fun hiddenSessionKeepsUnsentWorkButIsNotShown() = runTest {
+        db.sessionDao().upsert(session("apofis-h"))
+        respond(messagesJson("apofis-h", listOf(1L, 2L)))
+        repo.syncMessages("apofis-h")
+        db.pendingSendDao().upsert(pending("apofis-h", "idem-h"))
+
+        respond(page(sessionJson("apofis-h", hidden = true)))
+        repo.refreshSessions()
+
+        assertTrue(repo.sessions().first().isEmpty())
+        assertTrue(db.sessionDao().get("apofis-h")!!.hidden)
+        assertTrue(db.messageDao().observe("apofis-h").first().isEmpty())
+        assertEquals(listOf("idem-h"), db.pendingSendDao().observe("apofis-h").first().map { it.idempotencyKey })
+        repo.syncMessages("apofis-h")
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun emptyPageWithHasMoreFailsWithoutWriting() = runTest {
+        db.sessionDao().upsert(session("apofis-old"))
+        respond(page(sessionJson("apofis-a"), hasMore = true))
+        respond(page(hasMore = true))
+        assertEquals(ApiError.Protocol, expectError { repo.refreshSessions() })
+        assertEquals(listOf("apofis-old"), repo.sessions().first().map { it.key })
+    }
+
+    @Test
+    fun endlessPagingFails() = runTest {
+        db.sessionDao().upsert(session("apofis-old"))
+        repeat(100) { respond(page(sessionJson("apofis-p$it"), hasMore = true)) }
+        assertEquals(ApiError.Protocol, expectError { repo.refreshSessions() })
+        assertEquals(listOf("apofis-old"), repo.sessions().first().map { it.key })
+    }
+
+    @Test
+    fun tipChangeBetweenPagesRestartsOnce() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        val full = (1L..500L).toList()
+        respond(messagesJson("apofis-s", full))
+        respond(messagesJson("tip-2", listOf(501L)))
+        respond(messagesJson("tip-2", full))
+        respond(messagesJson("tip-2", listOf(600L)))
+        repo.syncMessages("apofis-s")
+        assertEquals(501, db.messageDao().observe("apofis-s").first().size)
+        assertEquals(600L, db.messageDao().observe("apofis-s").first().last().id)
+        assertEquals("tip-2", db.sessionDao().get("apofis-s")!!.currentId)
+        assertEquals("0", (1..3).map { server.takeRequest() }.last().url.queryParameter("offset"))
+    }
+
+    @Test
+    fun tipChangingTwiceFailsWithoutWriting() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        val full = (1L..500L).toList()
+        respond(messagesJson("apofis-s", full))
+        respond(messagesJson("tip-2", listOf(501L)))
+        respond(messagesJson("tip-2", full))
+        respond(messagesJson("tip-3", listOf(600L)))
+        assertEquals(ApiError.Protocol, expectError { repo.syncMessages("apofis-s") })
+        assertTrue(db.messageDao().observe("apofis-s").first().isEmpty())
+        assertEquals("apofis-s", db.sessionDao().get("apofis-s")!!.currentId)
+    }
+
+    @Test
+    fun slowRefreshDoesNotResurrectDeletedChat() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        server.enqueue(
+            MockResponse.Builder().code(200).body(page(sessionJson("apofis-s"))).addHeader("Content-Type", "application/json")
+                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        respond(fixture("session_delete.json"))
+        val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
+        withContext(Dispatchers.IO) { server.takeRequest() } // the refresh is fetching
+        val delete = launch(Dispatchers.Default) { repo.delete("apofis-s") }
+        refresh.join()
+        delete.join()
+        assertNull(db.sessionDao().get("apofis-s"))
+    }
+
+    @Test
+    fun outcomeFollowsRowOwnership() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        val call = """[{"id":"c1","type":"function","function":{"name":"t","arguments":"{}"}}]"""
+        respond(
+            rawMessages(
+                "apofis-s",
+                listOf(
+                    """{"id":1,"role":"user","content":"hi","timestamp":1.0}""",
+                    """{"id":2,"role":"assistant","content":"","tool_calls":$call,"timestamp":2.0}""",
+                    """{"id":3,"role":"system","display_kind":"model_switch","content":"switch","timestamp":3.0}""",
+                    """{"id":4,"role":"assistant","content":"newer","timestamp":4.0}""",
+                    """{"id":5,"role":"tool","tool_call_id":"c1","content":"late","timestamp":5.0}""",
+                ),
+            ),
+        )
+        repo.syncMessages("apofis-s")
+        db.replyOutcomeDao().upsert(ReplyOutcomeEntity("apofis-s", 5L, "interrupted", null))
+        val replies = repo.transcript("apofis-s").first().filterIsInstance<AssistantReply>()
+        assertEquals(listOf("r2", "r4"), replies.map { it.key })
+        assertEquals(listOf(ReplyOutcome.INTERRUPTED, null), replies.map { it.outcome })
+    }
+
+    @Test
+    fun serverNullsOverwriteCacheAndMarkStale() = runTest {
+        db.sessionDao().upsert(session("apofis-s").copy(preview = "old"))
+        respond(page(sessionJson("apofis-s", lastActive = null)))
+        repo.refreshSessions()
+        val row = db.sessionDao().get("apofis-s")!!
+        assertNull(row.lastActiveAt)
+        assertNull(row.preview)
+        assertTrue(row.stale)
+    }
+
+    @Test
+    fun listedArchivedChatNeedsNoDetailRead() = runTest {
+        db.sessionDao().upsert(session("apofis-arch", archived = true, pinned = true))
+        respond(page(sessionJson("apofis-arch", archived = true, pinned = true)))
+        repo.refreshSessions()
+        assertEquals(listOf("apofis-arch"), repo.sessions(archived = true).first().map { it.key })
+        assertEquals(1, server.requestCount)
     }
 
     @Test

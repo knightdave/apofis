@@ -9,9 +9,12 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface SessionDao {
-    // Sessions never active sort by their start time.
-    @Query("SELECT * FROM SessionEntity WHERE archived = :archived ORDER BY pinned DESC, COALESCE(lastActiveAt, startedAt) DESC")
+    // Sessions never active sort by their start time. Hidden rows are kept only for their unsent work, never shown.
+    @Query("SELECT * FROM SessionEntity WHERE archived = :archived AND hidden = 0 ORDER BY pinned DESC, COALESCE(lastActiveAt, startedAt) DESC")
     fun observe(archived: Boolean): Flow<List<SessionEntity>>
+
+    @Query("SELECT * FROM SessionEntity")
+    suspend fun all(): List<SessionEntity>
 
     @Query("SELECT * FROM SessionEntity WHERE `key` = :key")
     suspend fun get(key: String): SessionEntity?

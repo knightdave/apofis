@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "0705f2853fc623165a1efd636c928974",
+    "identityHash": "7b2242e7698166261e9687960563787b",
     "entities": [
       {
         "tableName": "SessionEntity",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `currentId` TEXT NOT NULL, `lineageIds` TEXT NOT NULL, `title` TEXT, `pinned` INTEGER NOT NULL, `archived` INTEGER NOT NULL, `startedAt` REAL NOT NULL, `lastActiveAt` REAL, `messageCount` INTEGER NOT NULL, `preview` TEXT, `stale` INTEGER NOT NULL, `existsOnServer` INTEGER NOT NULL, PRIMARY KEY(`key`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `currentId` TEXT NOT NULL, `lineageIds` TEXT NOT NULL, `title` TEXT, `pinned` INTEGER NOT NULL, `archived` INTEGER NOT NULL, `startedAt` REAL NOT NULL, `lastActiveAt` REAL, `messageCount` INTEGER NOT NULL, `preview` TEXT, `stale` INTEGER NOT NULL, `existsOnServer` INTEGER NOT NULL, `hidden` INTEGER NOT NULL, PRIMARY KEY(`key`))",
         "fields": [
           {
             "fieldPath": "key",
@@ -74,6 +74,12 @@
           {
             "fieldPath": "existsOnServer",
             "columnName": "existsOnServer",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hidden",
+            "columnName": "hidden",
             "affinity": "INTEGER",
             "notNull": true
           }
@@ -302,7 +308,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '0705f2853fc623165a1efd636c928974')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '7b2242e7698166261e9687960563787b')"
     ]
   }
 }
