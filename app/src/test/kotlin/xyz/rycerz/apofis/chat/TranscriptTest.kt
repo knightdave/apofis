@@ -69,7 +69,7 @@ class TranscriptTest {
 
     @Test
     fun unwrapSteerKeepsMalformedContent() {
-        assertEquals("plain text", unwrapSteer("  plain text \n"))
+        assertEquals("  plain text \n", unwrapSteer("  plain text \n"))
         val noClose = "[OUT-OF-BAND USER MESSAGE - x]\nhello"
         assertEquals(noClose, unwrapSteer(noClose))
         assertEquals("[OUT-OF-BAND USER MESSAGE - x][/OUT-OF-BAND USER MESSAGE]", unwrapSteer("[OUT-OF-BAND USER MESSAGE - x][/OUT-OF-BAND USER MESSAGE]"))
@@ -116,7 +116,7 @@ class TranscriptTest {
             assertFalse(step.running)
             assertEquals(result, step.result)
         }
-        for (result in listOf("""{"error": null}""", """{"error": false}""", """{"error": ""}""", """{"exit_code": 0}""", "plain text")) {
+        for (result in listOf("""{"error": null}""", """{"error": false}""", """{"error": ""}""", """{"exit_code": 0}""", """{"exit_code": "2"}""", "plain text")) {
             assertFalse(result, stepFor(result).error)
         }
     }
@@ -138,6 +138,27 @@ class TranscriptTest {
         assertTrue(stepFor("""{"output": "${"x".repeat(3_000_000)}", "exit_code": 0, "error": true}""").error)
         assertFalse(stepFor("""{"meta": {"exit_code": 2}, "output": "${"x".repeat(3_000_000)}", "exit_code": 0}""").error)
         assertFalse(stepFor("""{"output": "${"x".repeat(3_000_000)}", "meta": {"exit_code": 2}}""").error)
+        val big = "x".repeat(3_000_000)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": "${"ab\\\"".repeat(950)}"}""").error) // 3800 chars with escaped quotes
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": "${"e".repeat(6000)}"}""").error)
+        assertFalse(stepFor("""{"output": "$big", "exit_code": 0, "error": ""}""").error)
+        assertFalse(stepFor("""{"output": "$big", "error": null, "exit_code":"2"}""").error)
+        assertTrue(stepFor("""{"output": "$big", "error": null, "exit_code":-1}""").error)
+    }
+
+    @Test
+    fun manyTurnsStayLinear() {
+        val calls = (0 until 100_000).joinToString(",", "[", "]") { """{"id":"p$it","function":{"name":"t","arguments":"{}"}}""" }
+        val input = mutableListOf(row(0, "assistant", toolCallsJson = calls))
+        for (i in 1..20_000) {
+            input += row(2L * i, "user", "q")
+            input += row(2L * i + 1, "assistant", toolCallsJson = call("c$i")) // left running, so each turn has a waiting call
+        }
+        val started = System.nanoTime()
+        val items = buildTranscript(input)
+        val seconds = (System.nanoTime() - started) / 1e9
+        assertEquals(40_001, items.size)
+        assertTrue("took $seconds s", seconds < 1.5) // about 0.5 s linear, over 2 s with a reused cleared map
     }
 
     @Test
