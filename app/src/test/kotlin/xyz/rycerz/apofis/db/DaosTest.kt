@@ -250,5 +250,21 @@ class DaosTest {
         assertEquals("queued", dao.forSession("t")!!.status)
         assertEquals(false, dao.forSession("t")!!.polling)
         assertEquals(false, dao.forSession("t")!!.stopRequested)
+
+        dao.setStatus("run_2", "completed")
+        dao.setStatus("run_2", "running") // a terminal status is final
+        dao.setStatus("run_2", "cancelled")
+        assertEquals("completed", dao.forSession("t")!!.status)
+        dao.setStopRequested("run_2")
+        dao.clearStopRequested("run_2")
+        assertEquals(false, dao.forSession("t")!!.stopRequested)
+        dao.clearStopRequested("gone")
+        assertNull(dao.get("gone"))
+
+        dao.upsert(ActiveRunEntity("run_3", "u", null, "running", 1L))
+        assertEquals("queued", dao.storeStatus("run_3", "queued"))
+        assertEquals("failed", dao.storeStatus("run_3", "failed"))
+        assertEquals("failed", dao.storeStatus("run_3", "running")) // rejected: returns what the row holds
+        assertNull(dao.storeStatus("gone", "running"))
     }
 }
