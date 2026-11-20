@@ -41,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -83,7 +84,7 @@ fun ChatScreen(
     LaunchedEffect(pendingId) { if (pendingId != null) listState.animateScrollToItem(0) } // the request sits at the bottom
 
     Scaffold(
-        modifier,
+        modifier.testTag("chat.key:${state.sessionKey}"), // the end-to-end tests read the open chat's key here
         containerColor = MaterialTheme.colorScheme.surface,
         topBar = {
             TopAppBar(
@@ -265,6 +266,7 @@ private fun Title(state: ChatUiState, onOpenConnection: () -> Unit, onRetryLoad:
     ) {
         Text(
             state.title.ifEmpty { stringResource(R.string.chat_new_title) },
+            Modifier.testTag("chat.title"), // the end-to-end tests read the open chat's title here
             style = MaterialTheme.typography.titleMedium,
             color = scheme.onSurface,
             maxLines = 1,
@@ -287,7 +289,7 @@ private fun Title(state: ChatUiState, onOpenConnection: () -> Unit, onRetryLoad:
 
 @Composable
 private fun StatusText(@DrawableRes icon: Int?, text: String, color: Color, tappable: Boolean) {
-    Row(Modifier.semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }, verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.testTag("status.line").semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }, verticalAlignment = Alignment.CenterVertically) {
         if (icon != null) {
             Icon(painterResource(icon), null, Modifier.size(12.dp), tint = color)
             Box(Modifier.width(4.dp))

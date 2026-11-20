@@ -2,6 +2,8 @@ package xyz.rycerz.apofis.ui.connect
 
 import android.view.WindowManager
 import androidx.activity.compose.LocalActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,6 +34,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -58,6 +61,7 @@ private fun Reason.text() = when (this) {
     Reason.KEY_INVALID -> R.string.connect_error_key_invalid
     Reason.KEY_REJECTED -> R.string.connect_error_key_rejected
     Reason.SAVE_FAILED -> R.string.connect_error_save_failed
+    Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK -> R.string.connect_error_unreachable_local_network
 }
 
 /** First-run connect screen, and the Connection row of Settings when [onBack] is set. */
@@ -66,11 +70,14 @@ private fun Reason.text() = when (this) {
 fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
     val state = vm.state
     val saving = state == ConnectState.Saving
-    val testing = state == ConnectState.Testing || saving
+    val asking = state == ConnectState.NeedsLocalNetwork
+    val testing = state == ConnectState.Testing || saving || asking
     val failed = state as? ConnectState.Failed
     val urlError = failed?.takeIf { it.field == Field.URL }?.reason?.text()?.let { stringResource(it) }
     val keyError = failed?.takeIf { it.field == Field.KEY }?.reason?.text()?.let { stringResource(it) }
     var keyVisible by rememberSaveable { mutableStateOf(false) }
+    val localNetwork = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.onLocalNetworkResult() }
+    LaunchedEffect(asking) { if (asking) localNetwork.launch(LOCAL_NETWORK_PERMISSION) }
 
     // The key can be shown here, so the window is secure while this screen is up: it never appears in Recents,
     // and screenshots and screen recordings of this screen are blocked.
@@ -118,7 +125,17 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                 singleLine = true,
                 enabled = !testing,
                 isError = urlError != null,
-                supportingText = urlError?.let { { Text(it) } },
+                supportingText = when {
+                    failed?.reason == Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK -> ({
+                        Column {
+                            Text(urlError.orEmpty())
+                            TextButton(onClick = vm::retryWithLocalNetwork) { Text(stringResource(R.string.connect_local_network_retry)) }
+                        }
+                    })
+                    urlError != null -> ({ Text(urlError) })
+                    asking -> ({ Text(stringResource(R.string.connect_local_network_rationale)) })
+                    else -> null
+                },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false, imeAction = ImeAction.Next),
                 modifier = Modifier
                     .fillMaxWidth()

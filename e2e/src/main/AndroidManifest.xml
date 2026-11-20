@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The tests delete the sessions they created through the Hermes API (plain HTTP over adb reverse). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Package visibility: the tests read the app's string resources. -->
+    <queries>
+        <package android:name="xyz.rycerz.apofis" />
+    </queries>
+    <application android:usesCleartextTraffic="true" />
+</manifest>

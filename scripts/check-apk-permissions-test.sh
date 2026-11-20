@@ -1,6 +1,6 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Self-test for check-apk-permissions.sh using fake aapt2 outputs.
-set -eu
+set -euo pipefail
 check="$(cd "$(dirname "$0")" && pwd)/check-apk-permissions.sh"
 tmp="$(mktemp -d)"
 trap 'rm -f "$tmp"/fake && rmdir "$tmp"' EXIT
@@ -24,6 +24,12 @@ uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
 uses-permission: name='android.permission.WAKE_LOCK'
 uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'
 uses-permission: name='xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'"
+# Android 17 needs ACCESS_LOCAL_NETWORK to reach a server on a LAN or private address.
+expect 0 local-network "package: xyz.rycerz.apofis
+uses-permission: name='android.permission.INTERNET'
+uses-permission: name='android.permission.ACCESS_LOCAL_NETWORK'"
+expect 1 nearby-wifi "uses-permission: name='android.permission.INTERNET'
+uses-permission: name='android.permission.NEARBY_WIFI_DEVICES'"
 expect 1 foreground-service "uses-permission: name='android.permission.INTERNET'
 uses-permission: name='android.permission.WAKE_LOCK'
 uses-permission: name='android.permission.FOREGROUND_SERVICE'"

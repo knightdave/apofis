@@ -30,11 +30,15 @@ enum class Reason {
     KEY_INVALID, // a character an HTTP header cannot carry
     KEY_REJECTED,
     SAVE_FAILED,
+    UNREACHABLE_WITHOUT_LOCAL_NETWORK, // a network error while local network access is not granted: offers it
 }
 
 sealed interface ConnectState {
     data object Idle : ConnectState
     data object Testing : ConnectState // cancellable: Back cancels it first
+
+    /** The screen asks the system for local network access, then calls back; the connection is tried either way. */
+    data object NeedsLocalNetwork : ConnectState
 
     /** Writing the switch; runs to the end, and Back is ignored meanwhile. */
     data object Saving : ConnectState
@@ -57,6 +61,7 @@ class ConnectViewModel(
     private val save: suspend (Credentials) -> Unit,
     failedBefore: Boolean = false,
     private val back: ConnectBack? = null,
+    private val localNetworkGranted: () -> Boolean = { true },
     /** Asks the server whether it is Hermes; replaceable so a test needs no network. */
     private val check: suspend (HermesApi) -> Unit = { it.capabilities() },
 ) : ViewModel() {
@@ -99,7 +104,9 @@ class ConnectViewModel(
     }
 
     /** Returns the test's job, or null when the input was rejected without a request. */
-    fun connect(): Job? {
+    fun connect(): Job? = start(askFirst = true)
+
+    private fun start(askFirst: Boolean): Job? {
         if (state == ConnectState.Testing || state == ConnectState.Saving) return null
         val baseUrl = url.trim()
         if (!baseUrl.startsWith("http://", true) && !baseUrl.startsWith("https://", true)) return fail(Field.URL, Reason.MISSING_SCHEME)
@@ -113,6 +120,10 @@ class ConnectViewModel(
             HermesApi(baseUrl, key)
         } catch (_: IllegalArgumentException) {
             return fail(Field.URL, Reason.MALFORMED_URL)
+        }
+        if (askFirst && asksForLocalNetworkFirst(parsed.host, localNetworkGranted())) {
+            state = ConnectState.NeedsLocalNetwork
+            return null
         }
         state = ConnectState.Testing
         val mine = ++attempt
@@ -131,7 +142,11 @@ class ConnectViewModel(
         } catch (e: ApiError) {
             return when (e) {
                 ApiError.Unauthorized -> ConnectState.Failed(Field.KEY, Reason.KEY_REJECTED)
-                is ApiError.Network -> ConnectState.Failed(Field.URL, Reason.UNREACHABLE)
+                // The platform's block usually looks like a plain timeout, so without the grant the error offers it.
+                is ApiError.Network -> ConnectState.Failed(
+                    Field.URL,
+                    if (localNetworkGranted()) Reason.UNREACHABLE else Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK,
+                )
                 else -> ConnectState.Failed(Field.URL, Reason.NOT_HERMES)
             }
         } catch (_: Exception) {
@@ -149,6 +164,20 @@ class ConnectViewModel(
             return ConnectState.ConfirmServerChange
         }
         return saveOrFail(c, mine)
+    }
+
+    /**
+     * The system's answer to the local network request. The connection is tried either way: a refusal does not mean
+     * the server is unreachable (a VPN route needs no permission), and a failure offers the permission again.
+     */
+    fun onLocalNetworkResult(): Job? {
+        if (state != ConnectState.NeedsLocalNetwork) return null
+        return start(askFirst = false)
+    }
+
+    /** "Allow local network access and retry" under a failed attempt: the screen asks, then [onLocalNetworkResult]. */
+    fun retryWithLocalNetwork() {
+        if (state == ConnectState.Failed(Field.URL, Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK)) state = ConnectState.NeedsLocalNetwork
     }
 
     fun confirmServerChange(): Job? {

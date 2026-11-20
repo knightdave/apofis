@@ -65,6 +65,50 @@ class ConnectViewModelTest {
     }
 
     @Test
+    fun privateAddressAsksFirstAndTriesEvenWhenRefused() {
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false })
+        vm.submit("http://10.0.2.2:18642", "k")
+        assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
+        vm.onLocalNetworkResult() // refused: a VPN route may still work, so the check starts anyway
+        assertEquals(ConnectState.Testing, vm.state) // not waited for, it would go to the network
+        vm.cancel()
+        assertTrue(saved.isEmpty())
+    }
+
+    @Test
+    fun networkErrorWithoutTheGrantOffersItAndRetries() {
+        var granted = false
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { granted })
+        val down = server.url("/").toString()
+        server.close() // nothing listens there now: a network error
+        vm.submit(down, "k") // 127.0.0.1 is tried without asking
+        assertEquals(ConnectState.Failed(Field.URL, Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK), vm.state)
+        vm.retryWithLocalNetwork()
+        assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
+        granted = true
+        runTest { vm.onLocalNetworkResult()?.join() }
+        assertEquals(ConnectState.Failed(Field.URL, Reason.UNREACHABLE), vm.state) // granted: the ordinary error
+    }
+
+    @Test
+    fun hostNameIsTriedWithoutAsking() {
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false })
+        vm.submit(server.url("/").toString().replace("127.0.0.1", "localhost"), "k")
+        assertEquals(ConnectState.Connected, vm.state)
+    }
+
+    @Test
+    fun grantedLocalNetworkIsNotAskedAgain() {
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { true })
+        vm.onUrlChange("http://192.168.1.5:8642")
+        vm.onKeyChange("k")
+        vm.connect()
+        assertEquals(ConnectState.Testing, vm.state)
+        vm.cancel()
+    }
+
+    @Test
     fun malformedUrl() {
         val vm = vm()
         vm.submit("hermes.example:8642", "k")
