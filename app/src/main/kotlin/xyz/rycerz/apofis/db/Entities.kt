@@ -44,9 +44,10 @@ data class PendingSendEntity(
     val text: String,
     val requestBody: String,
     val createdAt: Long,
-    val state: String, // queued|sending|failed
+    val state: String, // queued|sending|failed|steering|steered (see SendState in sync/SendQueue.kt)
     val runId: String?,
-    val error: String?,
+    val error: String?, // one of the fixed codes in SendError, never server text
+    val attempted: Boolean = false, // a startRun or steer request for this row may have reached the server
 )
 
 @Entity

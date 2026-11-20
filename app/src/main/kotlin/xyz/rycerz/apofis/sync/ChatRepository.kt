@@ -30,12 +30,21 @@ private const val MAX_PAGES = 100
 // Process-wide: the app has a single database, so every repository instance must share one lock.
 private val lock = Mutex()
 
+/** For the send pipeline: runs [block] under the repository lock (taken after SendQueue's own lock, never before). */
+internal suspend fun <T> withRepositoryLock(block: suspend () -> T): T = lock.withLock { block() }
+
 /**
  * The only data source of the UI. The server transcript is the truth; Room caches it next to the user's unsent
  * messages. Sync calls fetch everything first and write once, so an [ApiError] leaves the cache untouched.
  * Every mutating call holds one lock across its fetch and write, so a slow call never undoes a later one.
+ * [sendQueue] is needed only by [send], [cancelSend] and [retrySend].
  */
-class ChatRepository(private val api: HermesApi, private val db: AppDatabase, private val now: () -> Long = System::currentTimeMillis) {
+class ChatRepository(
+    private val api: HermesApi,
+    private val db: AppDatabase,
+    private val now: () -> Long = System::currentTimeMillis,
+    private val sendQueue: SendQueue? = null,
+) {
     private val sessionDao = db.sessionDao()
 
     fun sessions(archived: Boolean = false): Flow<List<SessionEntity>> = sessionDao.observe(archived)
@@ -151,6 +160,23 @@ class ChatRepository(private val api: HermesApi, private val db: AppDatabase, pr
         }
     }
 
+    /**
+     * Steers the session's running run, else queues [text] and tries to start it at once. The message is stored
+     * before any request. A hidden chat fails locally; an unknown one throws IllegalArgumentException.
+     */
+    suspend fun send(sessionKey: String, text: String) {
+        requireAppKey(sessionKey)
+        queue().submit(sessionKey, text)
+    }
+
+    suspend fun cancelSend(idempotencyKey: String) = queue().cancel(idempotencyKey)
+
+    /** See [SendQueue.retry]; a send queued again is started at once when possible. */
+    suspend fun retrySend(idempotencyKey: String, confirmedDuplicateRisk: Boolean = false): RetryResult =
+        queue().retry(idempotencyKey, confirmedDuplicateRisk).also { if (it == RetryResult.STARTED) queue().drain() }
+
+    private fun queue() = checkNotNull(sendQueue) { "no send queue" }
+
     suspend fun resolveKey(serverSessionId: String): String? =
         if (isReservedId(serverSessionId)) null else sessionDao.findByAnyId(serverSessionId)?.key
 
@@ -224,10 +250,12 @@ private fun MessageEntity.toDto() = MessageDto(
 )
 
 private fun PendingSendEntity.toItem() = UserMessage(
-    key = "p$idempotencyKey", text = text, steered = false, timestamp = createdAt / 1000.0,
+    key = "p$idempotencyKey", text = text, steered = state == PendingState.STEERING || state == PendingState.STEERED,
+    timestamp = createdAt / 1000.0,
     state = when (state) {
-        "sending" -> SendState.SENDING
-        "failed" -> SendState.FAILED
+        PendingState.SENDING, PendingState.STEERING -> SendState.SENDING
+        PendingState.STEERED -> SendState.SENT
+        PendingState.FAILED -> SendState.FAILED
         else -> SendState.QUEUED
     },
     idempotencyKey = idempotencyKey,
