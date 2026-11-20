@@ -236,7 +236,7 @@ class AppDriver {
 
     /**
      * Waits for the chat and asserts it is a new, empty one: the chat screen's tag names its key, and that key's row is
-     * the only one in the app's database, local only, with no other id. Returns the key.
+     * the only local-only one in the app's database, with no other id. Returns the key.
      */
     fun awaitChat(serverUrl: String): String {
         waitFor("the chat after connecting to $serverUrl", 30_000) { hasDesc(str("drawer_open")) && !has(str("connect_title")) }
@@ -249,9 +249,11 @@ class AppDriver {
         val key = openChatKey()
         var row: ChatRow? = null
         waitFor("the new chat in the app's database", 10_000) { chatRow(key).also { row = it } != null }
-        val count = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT count(*) FROM SessionEntity;\n").trim()
+        // Other rows may exist: the app lists the server's app chats on every return to the foreground, which includes
+        // earlier scenarios' chats not yet deleted. None of them may be local only.
+        val local = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT count(*) FROM SessionEntity WHERE existsOnServer = 0;\n").trim()
         val r = row!!
-        if (count != "1" || r.currentId != key || r.lineage.isNotEmpty() || r.onServer) fail("Expected one new local chat in the app's database ($count rows)")
+        if (local != "1" || r.currentId != key || r.lineage.isNotEmpty() || r.onServer) fail("Expected one new local chat in the app's database ($local local rows)")
         return key
     }
 
