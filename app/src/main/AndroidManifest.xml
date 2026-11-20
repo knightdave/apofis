@@ -19,9 +19,11 @@
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             tools:node="remove" />
+        <!-- singleTask: a second instance would take over the app-wide Back target the Connect screen uses. -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
