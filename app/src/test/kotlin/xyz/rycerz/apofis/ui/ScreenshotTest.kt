@@ -198,4 +198,13 @@ class ScreenshotTest {
             title = "Największe pliki",
         ),
     )
+
+    @Test
+    fun chat_approval_without_command() = chatShot(
+        "chat_approval_without_command",
+        chat(listOf(question), StatusLine.WORKING, ComposerMode.STOP, live = live(pending = PendingControl("approval", "ctl_1", 2, null, null))),
+    )
+
+    @Test
+    fun chat_load_failed() = chatShot("chat_load_failed", ChatUiState("", "", StatusLine.LOAD_FAILED, emptyList(), ComposerMode.SEND_DISABLED, ""))
 }

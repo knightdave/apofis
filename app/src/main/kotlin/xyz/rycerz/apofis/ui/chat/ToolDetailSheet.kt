@@ -38,23 +38,28 @@ internal fun ToolDetailSheet(step: ToolStep, onDismiss: () -> Unit) {
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onSurface,
             )
-            Section(stringResource(R.string.tool_arguments), step.argsPreview)
+            if (step.args.isNotEmpty()) {
+                Section(stringResource(R.string.tool_arguments), step.args)
+                if (step.argsTruncated) Hint(stringResource(R.string.tool_args_truncated))
+            } else {
+                // Live steps carry only the server's short preview; the stored transcript has the full arguments.
+                Section(stringResource(R.string.tool_arguments), step.argsPreview)
+                if (step.argsPreview.isNotEmpty()) Hint(stringResource(R.string.tool_args_later))
+            }
             val result = step.result
             Section(
                 stringResource(R.string.tool_result),
                 result ?: stringResource(if (step.running) R.string.chat_tool_running else R.string.tool_no_result),
                 code = result != null,
             )
-            if (step.resultTruncated) {
-                Text(
-                    stringResource(R.string.tool_truncated),
-                    Modifier.padding(top = 8.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+            if (step.resultTruncated) Hint(stringResource(R.string.tool_truncated))
         }
     }
+}
+
+@Composable
+private fun Hint(text: String) {
+    Text(text, Modifier.padding(top = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
 @Composable

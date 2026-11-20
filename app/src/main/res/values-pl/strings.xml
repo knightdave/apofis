@@ -49,12 +49,12 @@
     <string name="chat_reconnecting">Ponowne łączenie</string>
     <string name="chat_queued">Czeka na wysłanie</string>
     <string name="chat_sending">Wysyłanie</string>
-    <string name="chat_steered">Dodane w trakcie odpowiedzi</string>
+    <string name="chat_steered">Dodano do trwającej odpowiedzi</string>
     <string name="chat_cancel_send">Anuluj wysyłanie</string>
     <string name="chat_remove_failed">Usuń wiadomość</string>
     <string name="chat_cancel_title">Usunąć tę wiadomość?</string>
     <string name="chat_cancel_text">Nie została wysłana i zostanie usunięta z tego telefonu.</string>
-    <string name="chat_cancel_text_attempted">Ta wiadomość mogła już dotrzeć do serwera. Usunięcie usunie ją tylko z tego telefonu.</string>
+    <string name="chat_cancel_text_attempted">Ta wiadomość mogła już dotrzeć do serwera. Zniknie tylko z tego telefonu.</string>
     <string name="chat_cancel_confirm">Usuń</string>
     <string name="chat_keep">Zostaw</string>
     <string name="chat_retry">Ponów</string>
@@ -97,6 +97,21 @@
     <string name="tool_result">Wynik</string>
     <string name="tool_no_result">Brak wyniku</string>
     <string name="tool_truncated">Wynik jest tu skrócony. Pełny wynik jest na serwerze.</string>
+
+    <string name="chat_steering">Wysyłanie do trwającej odpowiedzi</string>
+    <string name="chat_approval_no_command">Polecenie jest niedostępne, więc można tylko odmówić.</string>
+    <string name="chat_unsupported_title">Hermes czeka na odpowiedź</string>
+    <string name="chat_unsupported_text">Ta wersja aplikacji nie potrafi udzielić takiej odpowiedzi.</string>
+    <string name="chat_note_send_failed">Nie udało się zapisać wiadomości. Jej tekst wrócił do pola.</string>
+    <string name="chat_note_removed_may_have_sent">Usunięto z tego telefonu. Mogła już dotrzeć do serwera.</string>
+    <string name="chat_note_cancel_too_late">Za późno na anulowanie: wiadomość jest już wysyłana.</string>
+    <string name="chat_status_server_error">Błąd serwera</string>
+    <string name="chat_status_chat_gone">Czatu nie ma już na serwerze</string>
+    <string name="chat_status_load_failed">Nie udało się otworzyć czatu</string>
+    <string name="chat_load_failed_text">Nie udało się otworzyć tego czatu.</string>
+    <string name="chat_load_retry">Spróbuj ponownie</string>
+    <string name="tool_args_later">Skrócone. Pełne argumenty będą dostępne po zakończeniu odpowiedzi.</string>
+    <string name="tool_args_truncated">Argumenty są tu skrócone.</string>
 
     <string name="settings_title">Ustawienia</string>
     <string name="settings_connection">Połączenie</string>

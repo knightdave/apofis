@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Icon
@@ -14,6 +15,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -26,12 +28,18 @@ import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.viewmodel.compose.rememberViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.sync.ChatRepository
+import xyz.rycerz.apofis.ui.chat.ChatActions
 import xyz.rycerz.apofis.ui.chat.ChatScreen
+import xyz.rycerz.apofis.ui.chat.ChatUiState
+import xyz.rycerz.apofis.ui.chat.ComposerMode
+import xyz.rycerz.apofis.ui.chat.StatusLine
 import xyz.rycerz.apofis.ui.chat.ChatViewModel
 import xyz.rycerz.apofis.ui.chat.onlineFlow
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
@@ -117,18 +125,44 @@ fun AppNav(container: AppContainer) {
     }
 }
 
-/** The chat: until the drawer exists, the most recent chat, or a new local one when there is none. */
+/**
+ * The chat: until the drawer exists, the restored chat while it still exists, else the most recent one, else a new
+ * local chat. Choosing never leaves a blank screen: while loading, or after a failure (with Retry), the chat screen
+ * itself is shown, so Settings stays reachable.
+ */
 @Composable
 private fun ChatRoute(conn: Connected, onSettings: () -> Unit, onConnection: () -> Unit) {
     var chatKey by rememberSaveable(conn) { mutableStateOf<String?>(null) }
-    LaunchedEffect(conn) {
-        if (chatKey == null) {
-            chatKey = runCatching { conn.repo.sessions().first().firstOrNull()?.key ?: conn.repo.createLocalSession() }.getOrNull()
+    var chosen by remember(conn) { mutableStateOf<String?>(null) } // chatKey once checked against the database
+    var failed by remember(conn) { mutableStateOf(false) }
+    var attempt by remember(conn) { mutableIntStateOf(0) }
+    LaunchedEffect(conn, attempt) {
+        failed = false
+        try {
+            val key = pickChat(conn.repo, chatKey)
+            chatKey = key
+            chosen = key
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            failed = true
         }
     }
-    val sessionKey = chatKey
+    val settings: @Composable RowScope.() -> Unit = {
+        IconButton(onClick = onSettings) {
+            Icon(painterResource(R.drawable.lucide_settings), contentDescription = stringResource(R.string.settings_title), Modifier.size(20.dp))
+        }
+    }
+    val sessionKey = chosen
     if (sessionKey == null) {
-        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface))
+        val status = if (failed) StatusLine.LOAD_FAILED else StatusLine.IDLE
+        ChatScreen(
+            ChatUiState("", "", status, emptyList(), ComposerMode.SEND_DISABLED, ""),
+            object : ChatActions {},
+            onOpenConnection = onConnection,
+            onRetryLoad = { attempt++ },
+            appBarActions = settings,
+        )
         return
     }
     key(conn, sessionKey) {
@@ -137,15 +171,13 @@ private fun ChatRoute(conn: Connected, onSettings: () -> Unit, onConnection: () 
         val context = LocalContext.current.applicationContext
         val vm = viewModel(viewModelStoreOwner = owner) { ChatViewModel(sessionKey, conn, context.onlineFlow()) }
         val state by vm.state.collectAsState()
-        ChatScreen(
-            state,
-            vm,
-            onOpenConnection = onConnection,
-            appBarActions = {
-                IconButton(onClick = onSettings) {
-                    Icon(painterResource(R.drawable.lucide_settings), contentDescription = stringResource(R.string.settings_title), Modifier.size(20.dp))
-                }
-            },
-        )
+        ChatScreen(state, vm, onOpenConnection = onConnection, appBarActions = settings)
     }
+}
+
+/** A restored key whose chat is gone becomes a new local chat; without one, the most recent chat or a new one. */
+private suspend fun pickChat(repo: ChatRepository, saved: String?): String = when {
+    saved == null -> repo.sessions().first().firstOrNull()?.key ?: repo.createLocalSession()
+    repo.session(saved).first() != null -> saved
+    else -> repo.createLocalSession()
 }

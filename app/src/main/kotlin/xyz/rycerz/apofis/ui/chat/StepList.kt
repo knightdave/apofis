@@ -91,5 +91,6 @@ private fun StepRow(step: ToolStep?, title: String, preview: String, trailing: S
             }
         }
         if (trailing != null) Text(trailing, Modifier.padding(start = 8.dp), style = MaterialTheme.typography.labelSmall, color = strong)
+        if (step != null) Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.padding(start = 4.dp).size(16.dp), tint = strong)
     }
 }

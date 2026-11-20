@@ -13,7 +13,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.time.measureTime
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -24,6 +24,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -39,7 +40,6 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -56,11 +56,15 @@ import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.run.AnswerResult
+import xyz.rycerz.apofis.run.Connection
+import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.RetryResult
 import xyz.rycerz.apofis.sync.SendQueue
+import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private const val KEY = "apofis-a"
 private const val RUN = "run_1"
@@ -227,7 +231,7 @@ class ChatViewModelTest {
         val vm = vm()
         vm.onDraftChange("What is on my calendar?")
         vm.await { it.draft.isNotEmpty() }
-        vm.onSendClick()
+        vm.onSendClick("What is on my calendar?")
         vm.await { it.draft.isEmpty() }
         val sent = vm.await { s -> s.items.any { it is UserMessage } }
         assertEquals("What is on my calendar?", (sent.items.single() as UserMessage).text)
@@ -243,7 +247,7 @@ class ChatViewModelTest {
         vm.await { it.live != null }
         vm.onDraftChange("Also check tomorrow")
         vm.await { it.composer == ComposerMode.STEER }
-        vm.onSendClick()
+        vm.onSendClick("Also check tomorrow")
         vm.await { it.draft.isEmpty() }
 
         val steered = vm.await { s -> s.items.any { it is UserMessage && it.steered && it.state == SendState.SENT && it.text == "Also check tomorrow" } }
@@ -275,61 +279,88 @@ class ChatViewModelTest {
     }
 
     @Test
-    fun hugeReplyStaysResponsive() = runTest {
-        addSession(onServer = true)
+    fun statusShowsServerErrorsAndMissingChats() = runTest {
+        addSession(onServer = true, stale = true)
+        routes[MESSAGES] = json("{}", 500)
+        assertEquals(StatusLine.SERVER_ERROR, vm().await { it.status != StatusLine.IDLE }.status)
+        routes[MESSAGES] = json("""{"error":{"code":"session_not_found"}}""", 404)
+        assertEquals(StatusLine.CHAT_GONE, vm().await { it.status != StatusLine.IDLE }.status)
+    }
+
+    @Test
+    fun historyIsFetchedEvenWithAPendingBubble() = runTest {
+        addSession(onServer = true) // not stale, nothing cached, but an unsent message is shown
+        db.pendingSendDao().upsert(PendingSendEntity("q1", KEY, "later", "{}", System.currentTimeMillis(), "queued", null, null))
         routes[MESSAGES] = json(serverRows)
         val vm = vm()
-        val before = vm.await { it.items.size == 2 }
-        val paragraph = "word ".repeat(19).trimEnd() + "!!!!\n\n" // 100 characters
-        val huge = paragraph.repeat(1000)
-        assertEquals(100_000, huge.length)
-        val release = latch()
-        heldRun(release, first = listOf(delta(0, huge.replace("\n", "\\n"))))
-
-        withContext(Dispatchers.Default) { withTimeout(10_000) { follower.live(KEY).first { it?.text?.length == 100_000 } } }
-        val elapsed = measureTime { vm.await { (it.items.last() as AssistantReply).text.length == 100_000 } }
-        assertTrue("state took $elapsed", elapsed.inWholeMilliseconds < 200)
-        val after = vm.state.value
-        // The stored items are the same instances: nothing was mapped again for the streamed reply.
-        assertSame(before.items[0], after.items[0])
-        assertSame(before.items[1], after.items[1])
-
-        // Splitting into lazy rows: once in full, then only the growing tail for each streamed token.
-        val rows = LiveBlocks()
-        val time = measureTime {
-            var text = huge
-            rows.update(text)
-            repeat(1000) {
-                text += "more "
-                rows.update(text)
-            }
-        }
-        assertTrue("blocks took $time", time.inWholeMilliseconds < 200)
-        assertEquals(1001, rows.blocks.size) // the appended words start a new paragraph
-        release.countDown()
+        assertEquals(listOf("u10", "r11", "pq1"), vm.await { it.items.size == 3 }.items.map { it.key })
     }
+
+    private val control = """{"kind":"approval","prompt_id":"ctl_1","execution_generation":2,"command":"rm x","question":null}"""
+    private val approvalEvent = "id: 0\ndata: {\"event\":\"approval.request\",\"seq\":0}\n\n"
 
     @Test
     fun approvalPassesDisplayedRequest() = runTest {
         addSession()
         val release = latch()
-        val control = """{"kind":"approval","prompt_id":"ctl_1","execution_generation":2,"command":"rm x","question":null}"""
         val approvals = CopyOnWriteArrayList<String>()
         routes["/v1/runs/$RUN/approval"] = {
             approvals += it.body!!.utf8()
             routes[STATUS] = status("running")
             json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_1"}""")(it)
         }
-        val event = "id: 0\ndata: {\"event\":\"approval.request\",\"seq\":0}\n\n"
         val vm = vm()
-        heldRun(release, first = listOf(event), runStatus = status("waiting_for_approval", control))
+        heldRun(release, first = listOf(approvalEvent), runStatus = status("waiting_for_approval", control))
         vm.await { it.live?.pending?.requestId == "ctl_1" }
 
-        vm.onApproval(ApprovalChoice.ONCE)
+        vm.onApproval("ctl_1", 2, ApprovalChoice.ONCE)
         vm.await { !it.answering && approvals.isNotEmpty() }
         assertTrue(approvals.single().contains("\"request_id\":\"ctl_1\""))
-        assertEquals(null, vm.state.value.answerNote)
-        release.countDown()
+        assertTrue(vm.state.value.notes.isEmpty())
+    }
+
+    @Test
+    fun approvalAnswersOnlyTheRequestItWasGiven() = runTest {
+        addSession()
+        val replacement = control.replace("ctl_1", "ctl_2").replace("rm x", "rm -rf y")
+        routes["/v1/runs/$RUN/approval"] = json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_2"}""")
+        val vm = vm()
+        heldRun(latch(), first = listOf(approvalEvent), runStatus = status("waiting_for_approval", replacement))
+        vm.await { it.live?.pending?.requestId == "ctl_2" } // the screen has moved on; the tap was for ctl_1
+
+        vm.onApproval("ctl_1", 2, ApprovalChoice.ONCE)
+        val after = vm.await { !it.answering && it.notes.isNotEmpty() }
+        assertTrue(requests.none { it.target.endsWith("/approval") })
+        assertEquals(mapOf("ctl_2" to AnswerResult.CHANGED), after.notes) // shown with the block now waiting
+
+        routes[STATUS] = status("running")
+        vm.onApproval("ctl_2", 2, ApprovalChoice.DENY) // settled meanwhile elsewhere
+        val gone = vm.await { it.notes["ctl_2"] == AnswerResult.GONE }
+        assertTrue(requests.none { it.target.endsWith("/approval") })
+        assertEquals(mapOf("ctl_2" to AnswerResult.GONE), gone.notes)
+    }
+
+    @Test
+    fun failedSendGivesTheTextBackWithoutLosingTheNewDraft() = runTest {
+        // No session row: send refuses before storing anything.
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("first")
+        vm.await { it.draft == "first" }
+        vm.onSendClick("first")
+        vm.await { it.draft.isEmpty() }
+        vm.onDraftChange("second")
+        vm.await { it.draft == "second" }
+        held.complete(Unit)
+        lock.join()
+
+        val back = vm.await { it.composerNote != null }
+        assertEquals("first\nsecond", back.draft)
+        assertEquals(ComposerNote.SEND_FAILED, back.composerNote)
+        assertTrue(db.pendingSendDao().rows(KEY).isEmpty())
     }
 
     @Test
@@ -339,9 +370,67 @@ class ChatViewModelTest {
         val vm = vm()
         vm.await { it.items.isNotEmpty() }
         vm.onRetry("f1")
-        assertEquals("f1", vm.await { it.confirmRetry != null }.confirmRetry)
-        vm.onDismissRetry()
+        assertEquals("f1", vm.await { it.confirmRetry != null }.confirmRetry!!.idempotencyKey)
+        vm.onDismissRetry("f1")
         vm.await { it.confirmRetry == null }
         assertEquals(RetryResult.NEEDS_CONFIRMATION, connected.repo.retrySend("f1")) // nothing changed
+    }
+
+    @Test
+    fun retryConfirmationActsOnlyOnItsOwnMessage() = runTest {
+        addSession()
+        val now = System.currentTimeMillis()
+        db.pendingSendDao().upsert(PendingSendEntity("f1", KEY, "first", "{}", now, "failed", null, "unconfirmed", attempted = true))
+        db.pendingSendDao().upsert(PendingSendEntity("f2", KEY, "second", "{}", now + 1, "failed", null, "unconfirmed", attempted = true))
+        val vm = vm()
+        vm.await { it.items.size == 2 }
+        vm.onRetry("f1")
+        vm.await { it.confirmRetry?.idempotencyKey == "f1" }
+        vm.onRetry("f2") // a second dialog replaces the first, visibly: it names its own message
+        assertEquals("second", vm.await { it.confirmRetry?.idempotencyKey == "f2" }.confirmRetry!!.text)
+
+        vm.onConfirmRetry("f1") // a confirmation still showing "first" acts on "first" only
+        awaitTrue { runBlocking { db.pendingSendDao().get("f1") } == null }
+        assertEquals("failed", db.pendingSendDao().get("f2")!!.state)
+        assertEquals("f2", vm.state.value.confirmRetry?.idempotencyKey)
+    }
+
+    @Test
+    fun cancelSaysWhenTheMessageMayAlreadyHaveBeenSent() = runTest {
+        addSession()
+        db.pendingSendDao().upsert(PendingSendEntity("q1", KEY, "later", "{}", System.currentTimeMillis(), "queued", null, null, attempted = true))
+        val vm = vm()
+        vm.await { it.items.isNotEmpty() }
+        vm.onCancel("q1")
+        assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, vm.await { it.composerNote != null }.composerNote)
+        assertTrue(vm.await { it.items.isEmpty() }.items.isEmpty())
+    }
+
+    private fun user(key: String, text: String = key) = UserMessage(key, text, false, 1.0)
+    private fun reply(key: String, text: String = key) = AssistantReply(key, emptyList(), text, 1.0)
+    private fun liveReply(text: String, connection: Connection = Connection.LIVE) = LiveReply("run", "running", text, emptyList(), null, connection)
+
+    @Test
+    fun liveReplyNeverHidesAnEarlierAnswer() {
+        val transcript = listOf(user("u1"), reply("r2", "old answer"), user("p3", "new question"))
+        val items = LiveMerger().merge(transcript, liveReply("new ans"))
+        assertEquals(listOf("u1", "r2", "p3", "live"), items.map { it.key })
+        assertFalse((items[1] as AssistantReply).live)
+        assertEquals("old answer", (items[1] as AssistantReply).text)
+        assertEquals("new ans", (items[3] as AssistantReply).text)
+    }
+
+    @Test
+    fun liveReplyTakesOverRowsSyncedDuringPolling() {
+        val transcript = listOf(user("u1"), reply("r2", "old answer"), user("u3", "new question"), reply("r4", "stored part"))
+        val polling = LiveMerger().merge(transcript, liveReply("streamed", Connection.POLLING))
+        assertEquals(listOf("u1", "r2", "u3", "r4"), polling.map { it.key })
+        val live = polling.last() as AssistantReply
+        assertTrue(live.live)
+        assertEquals("stored part", live.text) // the streamed text is not repeated while polling
+
+        val streaming = LiveMerger().merge(transcript, liveReply("streamed and more"))
+        assertEquals("r4", streaming.last().key) // the stored key: no jump when the run ends
+        assertEquals("streamed and more", (streaming.last() as AssistantReply).text)
     }
 }

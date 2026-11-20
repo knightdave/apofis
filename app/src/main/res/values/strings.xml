@@ -50,12 +50,12 @@
     <string name="chat_reconnecting">Reconnecting</string>
     <string name="chat_queued">Waiting to send</string>
     <string name="chat_sending">Sending</string>
-    <string name="chat_steered">Added during the reply</string>
+    <string name="chat_steered">Added to the running reply</string>
     <string name="chat_cancel_send">Cancel sending</string>
     <string name="chat_remove_failed">Remove message</string>
     <string name="chat_cancel_title">Remove this message?</string>
     <string name="chat_cancel_text">It has not been sent and will be removed from this phone.</string>
-    <string name="chat_cancel_text_attempted">This message may already have reached the server. Removing it only removes it from this phone.</string>
+    <string name="chat_cancel_text_attempted">This message may already have reached the server. It will only be removed from this phone.</string>
     <string name="chat_cancel_confirm">Remove</string>
     <string name="chat_keep">Keep</string>
     <string name="chat_retry">Retry</string>
@@ -99,6 +99,21 @@
     <string name="tool_no_result">No result yet</string>
     <string name="tool_truncated">The result is shortened here. The full result is on the server.</string>
     <string name="chat_tool_duration" translatable="false">%1$.1f s</string>
+
+    <string name="chat_steering">Sending to the running reply</string>
+    <string name="chat_approval_no_command">The command is not available, so it can only be denied.</string>
+    <string name="chat_unsupported_title">Hermes is waiting for an answer</string>
+    <string name="chat_unsupported_text">This version of the app cannot give this kind of answer.</string>
+    <string name="chat_note_send_failed">The message could not be saved. Its text is back in the box.</string>
+    <string name="chat_note_removed_may_have_sent">Removed from this phone. It may already have reached the server.</string>
+    <string name="chat_note_cancel_too_late">Too late to cancel: the message is already being sent.</string>
+    <string name="chat_status_server_error">Server error</string>
+    <string name="chat_status_chat_gone">Chat no longer on server</string>
+    <string name="chat_status_load_failed">Could not open this chat</string>
+    <string name="chat_load_failed_text">This chat could not be opened.</string>
+    <string name="chat_load_retry">Try again</string>
+    <string name="tool_args_later">Shortened. The full arguments are available after the reply finishes.</string>
+    <string name="tool_args_truncated">The arguments are shortened here.</string>
 
     <string name="settings_title">Settings</string>
     <string name="settings_connection">Connection</string>
