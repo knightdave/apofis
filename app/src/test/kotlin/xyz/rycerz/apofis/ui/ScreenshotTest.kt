@@ -2,6 +2,7 @@ package xyz.rycerz.apofis.ui
 
 import android.os.Looper
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -38,9 +39,6 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import xyz.rycerz.apofis.api.PendingControl
-import mockwebserver3.MockResponse
-import mockwebserver3.MockWebServer
-import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ComposeError
 import xyz.rycerz.apofis.chat.UnsentText
@@ -102,26 +100,14 @@ class ScreenshotTest {
 
     @Test
     fun connect_server_change() {
-        val server = MockWebServer()
-        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
-        server.start()
-        try {
-            val vm = ConnectViewModel(current = null, willClearCache = { true }, save = {})
-            vm.onUrlChange(server.url("/").toString())
-            vm.onKeyChange("sk-123")
-            vm.connect()
-            // The check resumes on the main looper, which runs only when idled here.
-            for (i in 0 until 2000) {
-                shadowOf(Looper.getMainLooper()).idle()
-                if (vm.state == ConnectState.ConfirmServerChange) break
-                Thread.sleep(5)
-            }
-            assertEquals(ConnectState.ConfirmServerChange, vm.state)
-            vm.onUrlChange("https://hermes.example:8642") // a fixed address in the image; the dialog stays open
-            windowShot("connect_server_change") { ConnectScreen(vm, onBack = null) }
-        } finally {
-            server.close()
-        }
+        val vm = ConnectViewModel(current = null, willClearCache = { true }, save = {}, check = {}) // the server answers at once
+        vm.onUrlChange("https://hermes.example:8642")
+        vm.onKeyChange("sk-123")
+        val check = vm.connect()!!
+        shadowOf(Looper.getMainLooper()).idle() // runs what is queued now, then returns
+        assertTrue(check.isCompleted)
+        assertEquals(ConnectState.ConfirmServerChange, vm.state)
+        windowShot("connect_server_change") { ConnectScreen(vm, onBack = null) }
     }
 
     @Composable
