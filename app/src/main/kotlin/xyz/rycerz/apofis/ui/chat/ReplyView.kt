@@ -20,6 +20,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
@@ -44,34 +45,55 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
 internal val codeStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 1.5.em)
 
-/** One paragraph of a reply (flat, full width) or one fenced code block (monospace, scrolls sideways). */
+/**
+ * One chunk of a paragraph (flat, full width) or of a fenced code block (monospace, scrolls sideways). Chunks of one
+ * block sit flush against each other: only the first has the top spacing and label, only the last the bottom.
+ */
 @Composable
 internal fun TextBlock(row: TextRow) {
+    val top = if (row.first) 6.dp else 0.dp
+    val bottom = if (row.joinBelow) 0.dp else 6.dp
     if (!row.code) {
         Text(
             row.text,
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp),
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = top, bottom = bottom),
             style = MaterialTheme.typography.bodyLarge.copy(fontSize = 15.7.sp, lineHeight = 1.5.em),
             color = MaterialTheme.colorScheme.onSurface,
         )
-    } else {
-        CodeSurface(Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-            if (row.lang.isNotEmpty()) {
-                Text(
-                    row.lang,
-                    Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp),
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+        return
+    }
+    val radius = 16.dp
+    val shape = RoundedCornerShape(
+        topStart = if (row.first) radius else 0.dp,
+        topEnd = if (row.first) radius else 0.dp,
+        bottomStart = if (row.joinBelow) 0.dp else radius,
+        bottomEnd = if (row.joinBelow) 0.dp else radius,
+    )
+    Column(
+        Modifier
+            .padding(start = 16.dp, end = 16.dp, top = top, bottom = bottom)
+            .fillMaxWidth()
+            .background(ApofisTheme.colors.cardFill, shape)
+            // A border per chunk would draw lines across a long block, so only a block of one chunk has it.
+            .then(if (row.first && !row.joinBelow) Modifier.border(1.dp, ApofisTheme.colors.hairline, shape) else Modifier),
+    ) {
+        if (row.first && row.lang.isNotEmpty()) {
             Text(
-                row.text,
-                Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
-                style = codeStyle,
-                color = MaterialTheme.colorScheme.onSurface,
-                softWrap = false,
+                row.lang,
+                Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp),
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        Text(
+            row.text,
+            Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(start = 12.dp, end = 12.dp, top = if (row.first) 8.dp else 0.dp, bottom = if (row.joinBelow) 0.dp else 8.dp),
+            style = codeStyle,
+            color = MaterialTheme.colorScheme.onSurface,
+            softWrap = false,
+        )
     }
 }
 
@@ -86,22 +108,29 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
     ) { content() }
 }
 
-/** Under a reply: the live indicators, the pending approval or question, and the outcome notice. */
+/**
+ * Under a reply: the live indicators, the pending request and the outcome notice. A CHANGED note shows inside the
+ * block of the request that replaced the answered one, and only while that request is drawn (GONE notes: [GoneRow]).
+ */
 @Composable
-internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, note: AnswerResult?, answering: Boolean, actions: ChatActions) {
+internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<RequestRef, AnswerNote>, answering: Boolean, actions: ChatActions) {
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         if (live != null) {
             val polling = live.connection == Connection.POLLING
-            if ((reply.text.isEmpty() && live.pending == null) || polling) Dots(if (polling) R.string.chat_catching_up else null)
+            val pending = live.pending
+            if ((reply.text.isEmpty() && pending == null) || polling) Dots(if (polling) R.string.chat_catching_up else null)
             if (live.connection == Connection.RECONNECTING) Label(R.string.chat_reconnecting)
-            live.pending?.let { pending ->
-                if (pending.isClarify()) {
-                    ClarifyBlock(pending, note.takeIf { it == AnswerResult.CHANGED }, answering, actions::onClarify)
-                } else {
-                    ApprovalBlock(pending, note.takeIf { it == AnswerResult.CHANGED }, answering, actions::onApproval)
+            if (pending != null) {
+                val changed = showsChanged(notes, pending)
+                // A request with another id or generation is a new block: an open menu or typed answer never carries over.
+                key(pending.requestId, pending.executionGeneration) {
+                    when (pending.kind) {
+                        "approval" -> ApprovalBlock(pending, changed, answering, actions::onApproval)
+                        "clarify" -> ClarifyBlock(pending, changed, answering, actions::onClarify)
+                        else -> UnsupportedBlock()
+                    }
                 }
             }
-            if (note == AnswerResult.GONE) Notice(R.string.chat_answer_gone)
             if (live.status == "unknown") Notice(R.string.chat_unknown_notice, R.string.chat_unknown_action, actions::onResolveUnknown)
         }
         when (reply.outcome) {
@@ -113,7 +142,11 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, note: AnswerRe
     }
 }
 
-internal fun PendingControl.isClarify() = kind == "clarify"
+/** True when [pending] is the request that replaced an answered one (same id with a new generation included). */
+internal fun showsChanged(notes: Map<RequestRef, AnswerNote>, pending: PendingControl): Boolean {
+    val shown = RequestRef(pending.requestId, pending.executionGeneration)
+    return notes.any { (answered, note) -> note.result == AnswerResult.CHANGED && note.successor == shown && answered != shown }
+}
 
 /** The static three-dot indicator (motion comes later); [label] is shown beside it. */
 @Composable

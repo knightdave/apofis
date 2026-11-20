@@ -104,6 +104,9 @@ interface MessageDao {
     @Query("SELECT * FROM MessageEntity WHERE sessionKey = :sessionKey ORDER BY position")
     suspend fun rows(sessionKey: String): List<MessageEntity>
 
+    @Query("SELECT EXISTS(SELECT 1 FROM MessageEntity WHERE sessionKey = :sessionKey)")
+    suspend fun hasRows(sessionKey: String): Boolean
+
     @Query("SELECT * FROM MessageEntity WHERE sessionKey = :sessionKey AND role = 'user' ORDER BY position")
     suspend fun userRows(sessionKey: String): List<MessageEntity>
 

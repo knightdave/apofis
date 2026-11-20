@@ -40,14 +40,19 @@ import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.PendingControl
-import xyz.rycerz.apofis.run.AnswerResult
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
-/** The command waiting for approval, in full, with Deny and Allow once; the wider grants sit behind an overflow. */
+/**
+ * The command waiting for approval, in full, with Deny and Allow once; the wider grants sit behind an overflow.
+ * Every answer carries this block's own request id and generation. Without command text there is nothing to judge,
+ * so only Deny is offered.
+ */
 @Composable
-internal fun ApprovalBlock(control: PendingControl, note: AnswerResult?, answering: Boolean, onChoice: (ApprovalChoice) -> Unit) {
-    ControlCard(R.string.chat_approval_title, note) {
-        control.command?.let { command ->
+internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, onChoice: (String, Long, ApprovalChoice) -> Unit) {
+    val command = control.command?.takeIf { it.isNotBlank() }
+    val choose = { choice: ApprovalChoice -> onChoice(control.requestId, control.executionGeneration, choice) }
+    ControlCard(R.string.chat_approval_title, changed) {
+        if (command != null) {
             CodeSurface {
                 Text(
                     command,
@@ -57,36 +62,40 @@ internal fun ApprovalBlock(control: PendingControl, note: AnswerResult?, answeri
                     softWrap = false,
                 )
             }
+        } else {
+            Text(stringResource(R.string.chat_approval_no_command), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
-            var menu by rememberSaveable { mutableStateOf(false) }
-            OutlinedButton(onClick = { onChoice(ApprovalChoice.DENY) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_deny)) }
-            Button(onClick = { onChoice(ApprovalChoice.ONCE) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_once)) }
-            Box {
-                IconButton(onClick = { menu = true }, enabled = !answering) {
-                    Icon(painterResource(R.drawable.lucide_ellipsis_vertical), stringResource(R.string.chat_approval_more), Modifier.size(20.dp))
-                }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_session)) }, onClick = {
-                        menu = false
-                        onChoice(ApprovalChoice.SESSION)
-                    })
-                    DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_always)) }, onClick = {
-                        menu = false
-                        onChoice(ApprovalChoice.ALWAYS)
-                    })
+            OutlinedButton(onClick = { choose(ApprovalChoice.DENY) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_deny)) }
+            if (command != null) {
+                Button(onClick = { choose(ApprovalChoice.ONCE) }, enabled = !answering) { Text(stringResource(R.string.chat_approval_once)) }
+                var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
+                Box {
+                    IconButton(onClick = { menu = true }, enabled = !answering) {
+                        Icon(painterResource(R.drawable.lucide_ellipsis_vertical), stringResource(R.string.chat_approval_more), Modifier.size(20.dp))
+                    }
+                    DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_session)) }, onClick = {
+                            menu = false
+                            choose(ApprovalChoice.SESSION)
+                        })
+                        DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_always)) }, onClick = {
+                            menu = false
+                            choose(ApprovalChoice.ALWAYS)
+                        })
+                    }
                 }
             }
         }
     }
 }
 
-/** A question from Hermes, answered right here. */
+/** A question from Hermes, answered right here, by this block's own request id and generation. */
 @Composable
-internal fun ClarifyBlock(control: PendingControl, note: AnswerResult?, answering: Boolean, onAnswer: (String) -> Unit) {
-    ControlCard(R.string.chat_clarify_title, note) {
+internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, onAnswer: (String, Long, String) -> Unit) {
+    ControlCard(R.string.chat_clarify_title, changed) {
         control.question?.let { Text(it, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface) }
-        var answer by rememberSaveable(control.requestId) { mutableStateOf("") }
+        var answer by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf("") }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 answer,
@@ -96,15 +105,23 @@ internal fun ClarifyBlock(control: PendingControl, note: AnswerResult?, answerin
                 maxLines = 5,
                 enabled = !answering,
             )
-            IconButton(onClick = { onAnswer(answer) }, enabled = !answering && answer.isNotBlank()) {
+            IconButton(onClick = { onAnswer(control.requestId, control.executionGeneration, answer) }, enabled = !answering && answer.isNotBlank()) {
                 Icon(painterResource(R.drawable.lucide_arrow_up), stringResource(R.string.chat_clarify_send), Modifier.size(20.dp))
             }
         }
     }
 }
 
+/** A request of a kind this version does not know: said plainly, with nothing that could grant anything. */
 @Composable
-private fun ControlCard(@StringRes title: Int, note: AnswerResult?, content: @Composable () -> Unit) {
+internal fun UnsupportedBlock() {
+    ControlCard(R.string.chat_unsupported_title, changed = false) {
+        Text(stringResource(R.string.chat_unsupported_text), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun ControlCard(@StringRes title: Int, changed: Boolean, content: @Composable () -> Unit) {
     val shape = RoundedCornerShape(16.dp)
     Column(
         Modifier
@@ -125,7 +142,7 @@ private fun ControlCard(@StringRes title: Int, note: AnswerResult?, content: @Co
             )
         }
         content()
-        if (note == AnswerResult.CHANGED) {
+        if (changed) {
             Text(
                 stringResource(R.string.chat_answer_changed),
                 Modifier.padding(top = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },

@@ -11,6 +11,7 @@ data class UserMessage(
     val idempotencyKey: String? = null,
     val error: String? = null, // unsent only: a fixed SendError code when FAILED
     val attempted: Boolean = false, // unsent only: a request for it may already have reached the server
+    val runId: String? = null, // the run this message started, while its send is still pending (bubble or the server row showing it)
 ) : ChatItem
 
 enum class SendState { QUEUED, SENDING, FAILED, SENT }
@@ -40,6 +41,8 @@ data class ToolStep(
     val error: Boolean,
     val running: Boolean,
     val durationSeconds: Double? = null, // live steps only: the stored transcript has no timing
+    val args: String = "", // stored steps only: the full arguments (pretty JSON when they parse), cut to the display limit
+    val argsTruncated: Boolean = false,
 ) : Step
 
 enum class ReplyOutcome { STOPPED, FAILED, INTERRUPTED }

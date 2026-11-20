@@ -26,9 +26,24 @@ import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
-/** One row: the text (1 to 5 lines), then the send button whose look and label follow [mode]. */
+/** Whether the main button works: a send in flight ([busy]) blocks another send or steer, never Stop. */
+internal fun primaryEnabled(mode: ComposerMode, busy: Boolean) = when (mode) {
+    ComposerMode.SEND_DISABLED -> false
+    ComposerMode.SEND, ComposerMode.STEER -> !busy
+    ComposerMode.STOP -> true
+}
+
+/** One row: the text (1 to 5 lines), then the button whose look and label follow [mode]; [busy]: see [primaryEnabled]. */
 @Composable
-internal fun Composer(draft: String, mode: ComposerMode, onDraftChange: (String) -> Unit, onSend: () -> Unit, onStop: () -> Unit, modifier: Modifier = Modifier) {
+internal fun Composer(
+    draft: String,
+    mode: ComposerMode,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier,
+    busy: Boolean = false,
+) {
     val shape = RoundedCornerShape(20.dp)
     val scheme = MaterialTheme.colorScheme
     Row(
@@ -62,9 +77,9 @@ internal fun Composer(draft: String, mode: ComposerMode, onDraftChange: (String)
         if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, onClick = onStop)
         when (mode) {
             ComposerMode.SEND_DISABLED -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_send, enabled = false, onClick = onSend)
-            ComposerMode.SEND -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_send, enabled = true, onClick = onSend)
-            ComposerMode.STEER -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_steer, enabled = true, onClick = onSend)
-            ComposerMode.STOP -> RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, onClick = onStop)
+            ComposerMode.SEND -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_send, enabled = primaryEnabled(mode, busy), onClick = onSend)
+            ComposerMode.STEER -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_steer, enabled = primaryEnabled(mode, busy), onClick = onSend)
+            ComposerMode.STOP -> RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = primaryEnabled(mode, busy), onClick = onStop)
         }
     }
 }

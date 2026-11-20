@@ -57,7 +57,7 @@ internal fun UserBubble(message: UserMessage, onRetry: (String) -> Unit, onCance
                 color = scheme.onSurface,
             )
         }
-        if (message.steered) Caption(R.string.chat_steered)
+        if (message.steered && message.state == SendState.SENT) Caption(R.string.chat_steered) // delivered
         val key = message.idempotencyKey ?: return@Column
         when (message.state) {
             SendState.QUEUED -> Row(verticalAlignment = Alignment.CenterVertically) {
@@ -69,7 +69,7 @@ internal fun UserBubble(message: UserMessage, onRetry: (String) -> Unit, onCance
             SendState.SENDING -> Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(painterResource(R.drawable.lucide_loader_circle), null, Modifier.size(14.dp), tint = scheme.primary) // static: motion comes later
                 Box(Modifier.width(6.dp))
-                Caption(R.string.chat_sending, padded = false)
+                Caption(if (message.steered) R.string.chat_steering else R.string.chat_sending, padded = false)
             }
             SendState.FAILED -> Row(
                 Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },

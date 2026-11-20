@@ -34,54 +34,105 @@ import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.run.AnswerResult
 import xyz.rycerz.apofis.run.LiveReply
 
-/** A paragraph or a fenced code block of a reply's text, as offsets; [origin] is where its first line starts. */
-internal data class Block(val origin: Int, val start: Int, val end: Int, val code: Boolean, val lang: String = "")
+/** Longest chunk of text laid out as one row, so one streamed token never re-lays out a whole long block. */
+internal const val CHUNK = 1500
+
+/**
+ * A paragraph or a fenced code block; [start] and [end] bound its content in the reply text. [closed]: nothing
+ * appended to the text can change it (a paragraph ended by a finished blank line or a fence, a fence closed by a
+ * finished line); parsing then resumes at [next] between blocks.
+ */
+internal data class Block(val start: Int, val end: Int, val code: Boolean, val lang: String, val closed: Boolean, val next: Int)
 
 private const val FENCE = "```"
 
-/** Appends the blocks of [text] from offset [from] (a line start) to [out]. Paragraphs are split at blank lines. */
-internal fun splitBlocks(text: String, from: Int, out: MutableList<Block>) {
+/** The blocks of [text] from [from], which must be a line start between blocks. Correct at any length. */
+internal fun parseBlocks(text: String, from: Int = 0): List<Block> {
+    val out = ArrayList<Block>()
     var i = from
-    var para = -1
+    var paraStart = -1
     var paraEnd = -1
-    fun closePara() {
-        if (para >= 0) out += Block(para, para, paraEnd, code = false)
-        para = -1
+    fun endPara(closed: Boolean, next: Int) {
+        if (paraStart >= 0) out += Block(paraStart, paraEnd, false, "", closed, next)
+        paraStart = -1
     }
     while (i < text.length) {
         val nl = lineEnd(text, i)
         val first = firstNonSpace(text, i, nl)
-        when {
-            first == nl -> closePara()
-            text.startsWith(FENCE, first) -> {
-                closePara()
-                val bodyStart = minOf(nl + 1, text.length)
-                var j = bodyStart
-                var bodyEnd = text.length // an unclosed fence (still streaming) runs to the end
-                var next = text.length
-                while (j < text.length) {
-                    val e = lineEnd(text, j)
-                    val f = firstNonSpace(text, j, e)
-                    if (text.startsWith(FENCE, f) && firstNonSpace(text, f + FENCE.length, e) == e) {
-                        bodyEnd = maxOf(bodyStart, j - 1)
-                        next = e
-                        break
-                    }
-                    j = e + 1
-                }
-                out += Block(i, bodyStart, bodyEnd, code = true, lang = text.substring(first + FENCE.length, nl).trim())
-                i = next + 1
-                continue
-            }
-            else -> {
-                if (para < 0) para = i
-                paraEnd = nl
-            }
+        if (first == nl) { // a blank line; it ends the paragraph for good only once the line itself is finished
+            endPara(closed = nl < text.length, next = nl + 1)
+            i = nl + 1
+            continue
         }
+        if (text.startsWith(FENCE, first)) {
+            endPara(closed = true, next = i)
+            i = parseFence(text, nl, first, out)
+            continue
+        }
+        if (paraStart < 0) paraStart = i
+        paraEnd = nl
         i = nl + 1
     }
-    closePara()
+    endPara(closed = false, next = text.length)
+    return out
 }
+
+/** Adds the fence opened on the line ending at [openEnd] (backticks at [first]); returns where parsing continues. */
+private fun parseFence(text: String, openEnd: Int, first: Int, out: MutableList<Block>): Int {
+    val lang = text.substring(first + FENCE.length, openEnd).trim()
+    val body = minOf(openEnd + 1, text.length)
+    var j = body
+    while (j < text.length) {
+        val e = lineEnd(text, j)
+        val f = firstNonSpace(text, j, e)
+        if (text.startsWith(FENCE, f) && firstNonSpace(text, f + FENCE.length, e) == e) {
+            out += Block(body, maxOf(body, j - 1), true, lang, closed = e < text.length, next = e + 1)
+            return e + 1
+        }
+        j = e + 1
+    }
+    out += Block(body, text.length, true, lang, closed = false, next = text.length) // still streaming: runs to the end
+    return text.length
+}
+
+/** Work counters for tests: characters inspected by [chunkRanges] and [TextRow]s built. */
+internal object Work {
+    var chunkSteps = 0L
+    var rowsBuilt = 0L
+}
+
+/**
+ * Cuts text[start, end) into pieces of at most [CHUNK] characters, after the last line break within the bound (the
+ * break itself is dropped) or else at the bound, and calls [emit] for each with whether it is the last. One forward
+ * pass: every character is inspected at most once. Pieces before the last depend only on characters before their
+ * cut, so text appended at [end] never moves them.
+ */
+internal fun chunkRanges(text: String, start: Int, end: Int, emit: (start: Int, end: Int, last: Boolean) -> Unit) {
+    var s = start
+    var i = start
+    var lastBreak = -1
+    while (end - s > CHUNK) {
+        val limit = s + CHUNK
+        while (i <= limit) {
+            if (text[i] == '\n') lastBreak = i
+            i++
+            Work.chunkSteps++
+        }
+        if (lastBreak > s) {
+            emit(s, lastBreak, false)
+            s = lastBreak + 1
+        } else {
+            val cut = if (Character.isHighSurrogate(text[limit - 1])) limit - 1 else limit
+            emit(s, cut, false)
+            s = cut
+        }
+    }
+    emit(s, end, true)
+}
+
+/** [content] cut as by [chunkRanges]. */
+internal fun chunks(content: String): List<String> =
+    ArrayList<String>().also { out -> chunkRanges(content, 0, content.length) { s, e, _ -> out += content.substring(s, e) } }
 
 private fun lineEnd(text: String, from: Int) = text.indexOf('\n', from).let { if (it < 0) text.length else it }
 
@@ -92,32 +143,122 @@ private fun firstNonSpace(text: String, from: Int, end: Int): Int {
 }
 
 /**
- * The blocks of a growing text. While the text only grows at its end, each update re-splits only from the start of
- * the last block, so a streamed token costs the length of that block, not of the whole reply.
+ * Adds to [out] the rows of block number [index] of reply [key], from its content offset [from] (a piece start),
+ * numbering pieces from [firstPiece]; each row's start offset goes to [starts] when given.
  */
-internal class LiveBlocks {
+private fun blockRows(key: String, index: Int, text: String, b: Block, from: Int, firstPiece: Int, out: MutableList<TextRow>, starts: MutableList<Int>? = null) {
+    var c = firstPiece
+    chunkRanges(text, from, b.end) { s, e, last ->
+        Work.rowsBuilt++
+        out += TextRow("$key/b$index/c$c", text.substring(s, e), b.code, b.lang, first = c == 0, joinBelow = !last)
+        starts?.add(s)
+        c++
+    }
+}
+
+/** Every text row of a reply, parsed from scratch. */
+internal fun replyRows(key: String, text: String): List<TextRow> {
+    val out = ArrayList<TextRow>()
+    parseBlocks(text).forEachIndexed { i, b -> blockRows(key, i, text, b, b.start, 0, out) }
+    return out
+}
+
+/**
+ * The text rows of one streamed reply. While the same key's text grows at its end, closed blocks keep their rows
+ * and an open block keeps the rows of every piece that is unchanged (whether the block grew, or shrank because a
+ * fence started on its last line); only the rest is built. An append without a line break to an open paragraph or
+ * fence is not even parsed again. Any other change (another key, or the text replaced) starts from scratch and
+ * shares nothing with the previous parse.
+ */
+internal class ReplyText {
+    /** An open block, its rows and where each row's text starts. Mutated only here. */
+    private class Open(var block: Block, val rows: ArrayList<TextRow>, val starts: ArrayList<Int>)
+
+    private var key: String? = null
     private var text = ""
-    private val list = ArrayList<Block>()
-    private val texts = ArrayList<String>()
-    val blocks: List<Block> get() = list
+    private var closedRows = ArrayList<TextRow>()
+    private var closedBlocks = 0
+    private var stable = 0 // where the open tail starts
+    private var tail: List<Open> = emptyList()
+    private var lineStart = 0 // where the text's last line starts
+    private var rows: List<TextRow> = emptyList()
 
-    fun text(index: Int): String = texts[index]
+    /** Blocks parsed by the last [update]; for tests. */
+    var parsed = 0
+        private set
 
-    fun update(new: String) {
-        if (new === text) return
-        val last = list.lastOrNull()
-        val from = last?.origin ?: 0
-        if (last != null && new.length >= text.length && new.regionMatches(from, text, from, text.length - from)) {
-            list.removeAt(list.size - 1)
-            texts.removeAt(texts.size - 1)
-        } else {
-            list.clear()
-            texts.clear()
+    fun update(key: String, new: String): List<TextRow> {
+        parsed = 0
+        if (key == this.key && new == text) return rows
+        val appended = key == this.key && new.startsWith(text)
+        if (!appended) {
+            closedRows = ArrayList()
+            closedBlocks = 0
+            stable = 0
+            tail = emptyList()
+            lineStart = 0
         }
-        val kept = list.size
-        splitBlocks(new, if (kept == 0) 0 else from, list)
-        for (k in kept until list.size) texts += new.substring(list[k].start, list[k].end)
+        val old = if (appended) text else ""
+        var newLineStart = lineStart
+        for (i in new.length - 1 downTo old.length) {
+            if (new[i] == '\n') {
+                newLineStart = i + 1
+                break
+            }
+        }
+        val grown = if (appended && newLineStart == lineStart) grown(old, new.length) else null
+        val blocks = grown ?: parseBlocks(new, stable).also { parsed = it.size }
+        lineStart = newLineStart
+        val nextTail = ArrayList<Open>()
+        val firstIndex = closedBlocks
+        blocks.forEachIndexed { n, b ->
+            val prev = tail.getOrNull(n)
+            val open = if (prev != null && prev.block.start == b.start && prev.block.code == b.code && prev.block.lang == b.lang) {
+                // A piece is unchanged when its cut was decided before both the old and the new end (see chunkRanges).
+                val end = minOf(prev.block.end, b.end)
+                var k = prev.rows.size
+                while (k > 0 && prev.starts[k - 1] + CHUNK >= end) k--
+                val from = if (k < prev.rows.size) prev.starts[k] else b.start
+                while (prev.rows.size > k) {
+                    prev.rows.removeAt(prev.rows.size - 1)
+                    prev.starts.removeAt(prev.starts.size - 1)
+                }
+                blockRows(key, firstIndex + n, new, b, from, k, prev.rows, prev.starts)
+                prev.block = b
+                prev
+            } else {
+                Open(b, ArrayList(), ArrayList()).also { blockRows(key, firstIndex + n, new, b, b.start, 0, it.rows, it.starts) }
+            }
+            if (b.closed && nextTail.isEmpty()) {
+                closedRows.addAll(open.rows)
+                closedBlocks++
+                stable = b.next
+            } else {
+                nextTail += open
+            }
+        }
+        tail = nextTail
+        rows = ArrayList<TextRow>(closedRows.size + nextTail.sumOf { it.rows.size }).apply {
+            addAll(closedRows)
+            nextTail.forEach { addAll(it.rows) }
+        }
+        this.key = key
         text = new
+        return rows
+    }
+
+    /**
+     * The tail after characters without a line break were appended to [old], when that provably only lengthens one
+     * open paragraph or fence to [length]: its last line is that block's, and no appended character could turn the
+     * line into a fence opening (paragraph) or closing (fence). Else null.
+     */
+    private fun grown(old: String, length: Int): List<Block>? {
+        val b = tail.singleOrNull()?.block ?: return null
+        if (b.closed || b.end != old.length || lineStart < b.start) return null
+        val f = firstNonSpace(old, lineStart, old.length)
+        val ticks = old.length - f <= FENCE.length && (f until old.length).all { old[it] == '`' }
+        if (if (b.code) ticks else (f == old.length || ticks)) return null
+        return listOf(b.copy(end = length))
     }
 }
 
@@ -133,7 +274,16 @@ internal data class UserRow(val message: UserMessage) : Row {
 internal data class StepsRow(val reply: AssistantReply) : Row {
     override val key get() = reply.key
 }
-internal data class TextRow(override val key: String, val text: String, val code: Boolean, val lang: String) : Row
+
+/** One chunk of a block; [first] and [joinBelow] tell whether it starts its block and whether the block goes on below. */
+internal data class TextRow(
+    override val key: String,
+    val text: String,
+    val code: Boolean,
+    val lang: String,
+    val first: Boolean = true,
+    val joinBelow: Boolean = false,
+) : Row
 internal data class FooterRow(val reply: AssistantReply) : Row {
     override val key get() = reply.key + "/end"
 }
@@ -141,16 +291,27 @@ internal data class NoticeRow(val notice: Notice) : Row {
     override val key get() = notice.key
 }
 
+/** At the very bottom: answers that came too late, kept until the next message is sent. */
+internal data object GoneRow : Row {
+    override val key get() = "notes/gone"
+}
+
 /**
  * Turns chat items into rows. Stored items are mapped once and reused while the same instances come back; the live
- * reply at the end (see [withLive]) is re-split incrementally. Per streamed token the work is that reply's blocks only.
+ * reply (see [LiveMerger]) goes through [ReplyText]. Per streamed token the work is that reply's open tail and a copy
+ * of the references to its rows, never the history.
  */
 internal class ChatRows(private val zone: ZoneId) {
     private var head: List<ChatItem>? = null
     private var headRows: List<Row> = emptyList()
     private var headDay: LocalDate? = null
     private var cache = IdentityHashMap<ChatItem, List<Row>>()
-    private val live = LiveBlocks()
+    private var tailCache = IdentityHashMap<ChatItem, List<Row>>()
+    private val live = ReplyText()
+
+    /** Items mapped to rows so far; for tests. */
+    var mapped = 0
+        private set
 
     fun rows(items: List<ChatItem>): List<Row> {
         val joined = items as? Joined<*>
@@ -163,9 +324,9 @@ internal class ChatRows(private val zone: ZoneId) {
             var day: LocalDate? = null
             for (item in stored) {
                 day = separate(item, day, out)
-                val mapped = cache[item] ?: rowsOf(item)
-                next[item] = mapped
-                out += mapped
+                val rows = cache[item] ?: tailCache[item] ?: rowsOf(item)
+                next[item] = rows
+                out += rows
             }
             cache = next
             headRows = out
@@ -175,18 +336,21 @@ internal class ChatRows(private val zone: ZoneId) {
         val tail = joined?.tail as List<ChatItem>? ?: emptyList()
         if (tail.isEmpty()) return headRows
         val out = ArrayList<Row>()
+        val nextTail = IdentityHashMap<ChatItem, List<Row>>()
         var day = headDay
         for (item in tail) {
             day = separate(item, day, out)
-            if (item is AssistantReply) {
-                live.update(item.text)
+            if (item is AssistantReply && item.live) {
                 if (item.steps.isNotEmpty()) out += StepsRow(item)
-                live.blocks.forEachIndexed { i, b -> out += TextRow("${item.key}/b$i", live.text(i), b.code, b.lang) }
+                out += live.update(item.key, item.text)
                 out += FooterRow(item)
             } else {
-                out += rowsOf(item)
+                val rows = tailCache[item] ?: cache[item] ?: rowsOf(item)
+                nextTail[item] = rows
+                out += rows
             }
         }
+        tailCache = nextTail
         return Joined(headRows, out)
     }
 
@@ -201,14 +365,16 @@ internal class ChatRows(private val zone: ZoneId) {
         return day
     }
 
-    private fun rowsOf(item: ChatItem): List<Row> = when (item) {
-        is UserMessage -> listOf(UserRow(item))
-        is Notice -> listOf(NoticeRow(item))
-        is AssistantReply -> buildList {
-            if (item.steps.isNotEmpty()) add(StepsRow(item))
-            val blocks = ArrayList<Block>().also { splitBlocks(item.text, 0, it) }
-            blocks.forEachIndexed { i, b -> add(TextRow("${item.key}/b$i", item.text.substring(b.start, b.end), b.code, b.lang)) }
-            if (item.live || item.outcome != null) add(FooterRow(item))
+    private fun rowsOf(item: ChatItem): List<Row> {
+        mapped++
+        return when (item) {
+            is UserMessage -> listOf(UserRow(item))
+            is Notice -> listOf(NoticeRow(item))
+            is AssistantReply -> buildList {
+                if (item.steps.isNotEmpty()) add(StepsRow(item))
+                addAll(replyRows(item.key, item.text))
+                if (item.live || item.outcome != null) add(FooterRow(item))
+            }
         }
     }
 }
@@ -218,18 +384,21 @@ internal class ChatRows(private val zone: ZoneId) {
 internal fun MessageList(
     items: List<ChatItem>,
     live: LiveReply?,
-    answerNote: AnswerResult?,
+    notes: Map<RequestRef, AnswerNote>,
     answering: Boolean,
     actions: ChatActions,
     onCancel: (UserMessage) -> Unit,
-    onStep: (ToolStep) -> Unit,
+    onStep: (StepSubject) -> Unit,
     listState: LazyListState,
     contentPadding: PaddingValues,
     modifier: Modifier = Modifier,
 ) {
     val zone = remember { ZoneId.systemDefault() }
     val builder = remember(zone) { ChatRows(zone) }
-    val rows = builder.rows(items)
+    val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
+    // An answer that came too late shows under the reply, live or stored, unless that request is somehow drawn again.
+    val gone = notes.any { (ref, note) -> note.result == AnswerResult.GONE && ref != pendingId }
+    val rows = builder.rows(items).let { if (gone) Joined(it, listOf(GoneRow)) else it }
     LazyColumn(modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
         items(
             count = rows.size,
@@ -241,10 +410,14 @@ internal fun MessageList(
                     when (val row = rows[rows.size - 1 - index]) {
                         is DateRow -> DateSeparator(row.day, zone)
                         is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
-                        is StepsRow -> StepList(row.reply.steps, onStep)
+                        is StepsRow -> StepList(row.reply.steps) { i ->
+                            val step = row.reply.steps[i] as ToolStep
+                            onStep(StepSubject(row.reply.key, i, step.callId.ifEmpty { null }, step.name))
+                        }
                         is TextRow -> TextBlock(row)
-                        is FooterRow -> ReplyFooter(row.reply, live.takeIf { row.reply.live }, answerNote, answering, actions)
+                        is FooterRow -> ReplyFooter(row.reply, live.takeIf { row.reply.live }, notes, answering, actions)
                         is NoticeRow -> NoticeLine(row.notice.text)
+                        GoneRow -> Notice(R.string.chat_answer_gone)
                     }
                 }
             }

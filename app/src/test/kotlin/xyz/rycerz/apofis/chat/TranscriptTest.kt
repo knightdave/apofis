@@ -280,4 +280,19 @@ class TranscriptTest {
         val input = rows("messages_steer.json") + rows("messages_tool_run.json")
         assertEquals(buildTranscript(input).map { it.key }, buildTranscript(input).map { it.key })
     }
+
+    @Test
+    fun fullArgumentsArePrettyPrinted() {
+        val step = toolSteps(buildTranscript(listOf(row(1, "assistant", toolCallsJson = call("c1", """{\"command\":\"ls -la\",\"timeout\":30}"""))))).single()
+        assertEquals("{\n    \"command\": \"ls -la\",\n    \"timeout\": 30\n}", step.args)
+        assertFalse(step.argsTruncated)
+    }
+
+    @Test
+    fun longArgumentsAreCutWithAFlag() {
+        val long = "x".repeat(TOOL_RESULT_DISPLAY_LIMIT + 10)
+        val step = toolSteps(buildTranscript(listOf(row(1, "assistant", toolCallsJson = call("c1", long))))).single()
+        assertEquals(TOOL_RESULT_DISPLAY_LIMIT, step.args.length)
+        assertTrue(step.argsTruncated)
+    }
 }

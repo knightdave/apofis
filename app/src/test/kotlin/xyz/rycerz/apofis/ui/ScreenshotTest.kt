@@ -9,7 +9,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.rememberDrawerState
-import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import com.github.takahirom.roborazzi.captureScreenRoboImage
 import java.time.Duration
@@ -28,6 +27,7 @@ import xyz.rycerz.apofis.ui.drawer.PromptActions
 import xyz.rycerz.apofis.ui.drawer.PromptHost
 import xyz.rycerz.apofis.ui.drawer.PromptKind
 import xyz.rycerz.apofis.ui.drawer.groupSessions
+import androidx.compose.runtime.Composable
 import com.github.takahirom.roborazzi.RoborazziOptions
 import com.github.takahirom.roborazzi.captureRoboImage
 import kotlinx.coroutines.test.runTest
@@ -225,6 +225,15 @@ class ScreenshotTest {
             title = "Największe pliki",
         ),
     )
+
+    @Test
+    fun chat_approval_without_command() = chatShot(
+        "chat_approval_without_command",
+        chat(listOf(question), StatusLine.WORKING, ComposerMode.STOP, live = live(pending = PendingControl("approval", "ctl_1", 2, null, null))),
+    )
+
+    @Test
+    fun chat_load_failed() = chatShot("chat_load_failed", ChatUiState("", "", StatusLine.LOAD_FAILED, emptyList(), ComposerMode.SEND_DISABLED, ""))
 
     // ---- drawer ----
 
