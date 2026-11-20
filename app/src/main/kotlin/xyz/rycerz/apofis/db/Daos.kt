@@ -98,6 +98,12 @@ interface MessageDao {
         insertAll(rows)
     }
 
+    @Query("SELECT * FROM MessageEntity WHERE sessionKey = :sessionKey ORDER BY position")
+    suspend fun rows(sessionKey: String): List<MessageEntity>
+
+    @Query("SELECT * FROM MessageEntity WHERE sessionKey = :sessionKey AND role = 'user' ORDER BY position")
+    suspend fun userRows(sessionKey: String): List<MessageEntity>
+
     @Query("SELECT MAX(id) FROM MessageEntity WHERE sessionKey = :sessionKey")
     suspend fun maxId(sessionKey: String): Long?
 
@@ -112,6 +118,9 @@ interface MessageDao {
 interface PendingSendDao {
     @Query("SELECT * FROM PendingSendEntity WHERE sessionKey = :sessionKey ORDER BY createdAt")
     fun observe(sessionKey: String): Flow<List<PendingSendEntity>>
+
+    @Query("SELECT * FROM PendingSendEntity WHERE sessionKey = :sessionKey ORDER BY createdAt")
+    suspend fun rows(sessionKey: String): List<PendingSendEntity>
 
     @Query("SELECT * FROM PendingSendEntity WHERE state = 'queued' ORDER BY createdAt")
     suspend fun allQueued(): List<PendingSendEntity>
@@ -138,10 +147,10 @@ interface PendingSendDao {
 
     /**
      * The send that started the run and the steers delivered to it. Failed steers have no run id, and a steer cut off
-     * mid-request (still `steering`) may not have been delivered, so both stay.
+     * mid-request (still `steering`) may not have been delivered, so neither is listed.
      */
-    @Query("DELETE FROM PendingSendEntity WHERE runId = :runId AND state IN ('sending', 'steered')")
-    suspend fun deleteForRun(runId: String): Int
+    @Query("SELECT * FROM PendingSendEntity WHERE runId = :runId AND state IN ('sending', 'steered') ORDER BY createdAt")
+    suspend fun forRun(runId: String): List<PendingSendEntity>
 }
 
 @Dao
@@ -151,6 +160,9 @@ interface ActiveRunDao {
 
     @Query("SELECT * FROM ActiveRunEntity ORDER BY startedAt")
     suspend fun all(): List<ActiveRunEntity>
+
+    @Query("SELECT * FROM ActiveRunEntity WHERE runId = :runId")
+    suspend fun get(runId: String): ActiveRunEntity?
 
     @Query("SELECT * FROM ActiveRunEntity WHERE sessionKey = :sessionKey ORDER BY startedAt DESC LIMIT 1")
     suspend fun forSession(sessionKey: String): ActiveRunEntity?
@@ -167,12 +179,21 @@ interface ActiveRunDao {
 
     @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId")
     suspend fun setStatus(runId: String, status: String)
+
+    @Query("UPDATE ActiveRunEntity SET stopRequested = 1 WHERE runId = :runId")
+    suspend fun setStopRequested(runId: String)
+
+    @Query("UPDATE ActiveRunEntity SET polling = 1 WHERE runId = :runId")
+    suspend fun setPolling(runId: String)
 }
 
 @Dao
 interface ReplyOutcomeDao {
     @Query("SELECT * FROM ReplyOutcomeEntity WHERE sessionKey = :sessionKey ORDER BY afterMessageId")
     fun observe(sessionKey: String): Flow<List<ReplyOutcomeEntity>>
+
+    @Query("SELECT * FROM ReplyOutcomeEntity WHERE sessionKey = :sessionKey ORDER BY afterMessageId")
+    suspend fun rows(sessionKey: String): List<ReplyOutcomeEntity>
 
     @Upsert
     suspend fun upsert(o: ReplyOutcomeEntity)

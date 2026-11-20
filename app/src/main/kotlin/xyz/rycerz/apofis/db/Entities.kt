@@ -57,6 +57,8 @@ data class ActiveRunEntity(
     val lastSeq: Long?,
     val status: String,
     val startedAt: Long,
+    val polling: Boolean = false, // the event stream is gone for good (truncated or 404): follow by polling only
+    val stopRequested: Boolean = false, // this app asked the server to stop the run (apart from what the server reports)
 )
 
 @Entity(primaryKeys = ["sessionKey", "afterMessageId"])

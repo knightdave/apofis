@@ -36,6 +36,7 @@ object SendError {
     const val EXPIRED = "expired"
     const val EXPIRED_UNCERTAIN = "expired_uncertain" // expired after a request the server may have accepted
     const val STEER_UNCERTAIN = "steer_uncertain" // the only error of a failed steer the server may have delivered
+    const val UNCONFIRMED = "unconfirmed" // its run ended but the stored transcript does not show the message
     const val PERMISSION_DENIED = "permission_denied"
     const val SESSION_DELETED = "session_deleted"
     const val SESSION_UNAVAILABLE = "session_unavailable"
@@ -140,16 +141,17 @@ class SendQueue(
     /**
      * Queues a failed send again as a normal run send. Within 24 hours a run send keeps its key and body, which is
      * always safe. Where the message may already have reached the server and the key cannot protect it (an attempted
-     * steer, or an attempted run send past 24 hours), nothing changes until the user confirms [confirmedDuplicateRisk].
+     * steer, an unconfirmed send, or an attempted run send past 24 hours), nothing changes until the user confirms [confirmedDuplicateRisk].
      * A confirmed or expired retry gets a new key and creation time.
      */
     suspend fun retry(idempotencyKey: String, confirmedDuplicateRisk: Boolean = false): RetryResult {
         drainLock.withLock {
             ensureOpen()
             val send = pendingDao.get(idempotencyKey)?.takeIf { it.state == PendingState.FAILED } ?: return RetryResult.NOT_FOUND
-            val steer = send.error == SendError.STEER_UNCERTAIN // a failed steer keeps attempted only with this error
+            // A failed steer keeps attempted only with STEER_UNCERTAIN; an unconfirmed send may already be on the server.
+            val uncertain = send.error == SendError.STEER_UNCERTAIN || send.error == SendError.UNCONFIRMED
             val old = expired(send)
-            val unsafe = send.attempted && (steer || old)
+            val unsafe = send.attempted && (uncertain || old)
             if (unsafe && !confirmedDuplicateRisk) return RetryResult.NEEDS_CONFIRMATION
             val queued = send.copy(state = PendingState.QUEUED, error = null, runId = null)
             // The chat may have been deleted since the read: a write that changes no row means nothing was queued.

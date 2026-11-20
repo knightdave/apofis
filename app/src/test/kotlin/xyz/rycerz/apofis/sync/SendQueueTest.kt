@@ -417,6 +417,25 @@ class SendQueueTest {
     }
 
     @Test
+    fun unconfirmedRetryNeedsConfirmation() = runTest {
+        addSession("apofis-a")
+        db.pendingSendDao().upsert(
+            PendingSendEntity(
+                idempotencyKey = "k", sessionKey = "apofis-a", text = "t", requestBody = buildRunBody("apofis-a", "t"),
+                createdAt = clock, state = "failed", runId = null, error = SendError.UNCONFIRMED, attempted = true,
+            ),
+        )
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, queue.retry("k"))
+        assertEquals("unconfirmed", pending("k").error)
+
+        assertEquals(RetryResult.STARTED, queue.retry("k", confirmedDuplicateRisk = true))
+        assertNull(db.pendingSendDao().get("k"))
+        val again = rows("apofis-a").single()
+        assertEquals("queued", again.state)
+        assertFalse(again.attempted)
+    }
+
+    @Test
     fun interruptedSteerIsUncertainOnDrain() = runTest {
         addSession("apofis-a")
         db.pendingSendDao().upsert(

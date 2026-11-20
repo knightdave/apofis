@@ -414,7 +414,9 @@ class HermesApiTest {
     @Test
     fun controlRequests() = runTest {
         serve("session_patch.json")
-        repeat(4) { respond(200, "{}") }
+        respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p1"}""")
+        respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p2"}""")
+        repeat(2) { respond(200, "{}") }
         serve("messages_tool_run.json")
         api.patchSession("a b", pinned = true)
         api.approve("r1", "p1", 3, ApprovalChoice.SESSION)
@@ -430,5 +432,40 @@ class HermesApiTest {
         assertEquals("POST /v1/runs/r1/resolve-unknown" to """{"admission_id":"adm","execution_generation":4}""", next())
         assertEquals("POST /v1/runs/r1/steer" to """{"text":"more"}""", next())
         assertEquals("GET /api/sessions/s1/messages?limit=500&offset=0&order=oldest&include_compacted=true" to "", next())
+    }
+
+    @Test
+    fun controlAnswersReportAlreadyResolved() = runTest {
+        respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p1"}""")
+        respond(200, """{"run_id":"r1","status":"already_resolved","prompt_id":"p1"}""")
+        respond(200, """{"run_id":"r1","status":"already_resolved","prompt_id":"p2"}""")
+        assertEquals(ControlResult.RESOLVED, api.approve("r1", "p1", 3, ApprovalChoice.ONCE))
+        assertEquals(ControlResult.ALREADY_RESOLVED, api.approve("r1", "p1", 3, ApprovalChoice.ONCE))
+        assertEquals(ControlResult.ALREADY_RESOLVED, api.clarify("r1", "p2", 3, "blue"))
+    }
+
+    @Test
+    fun controlAnswersRejectUndocumentedBodies() = runTest {
+        for (body in listOf("not json", "{}", """{"run_id":"r1"}""", """{"run_id":"r1","status":"weird"}""", """{"status":"reso""")) {
+            respond(200, body)
+            assertEquals(body, ApiError.Protocol, runCatching { api.approve("r1", "p1", 3, ApprovalChoice.ONCE) }.exceptionOrNull())
+        }
+    }
+
+    @Test
+    fun controlAnswersRequireMatchingIds() = runTest {
+        for (
+            body in listOf(
+                """{"status":"resolved"}""",
+                """{"run_id":"r1","status":"resolved"}""",
+                """{"status":"resolved","prompt_id":"p1"}""",
+                """{"run_id":"r1","status":"resolved","prompt_id":"p2"}""",
+                """{"run_id":"r2","status":"resolved","prompt_id":"p1"}""",
+                """{"run_id":"r1","status":"already_resolved","prompt_id":"p2"}""",
+            )
+        ) {
+            respond(200, body)
+            assertEquals(body, ApiError.Protocol, runCatching { api.clarify("r1", "p1", 3, "x") }.exceptionOrNull())
+        }
     }
 }

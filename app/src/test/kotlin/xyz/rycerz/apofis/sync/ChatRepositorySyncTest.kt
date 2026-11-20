@@ -2,9 +2,13 @@ package xyz.rycerz.apofis.sync
 
 import android.content.Context
 import androidx.room.Room
+import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -510,5 +514,70 @@ class ChatRepositorySyncTest {
         assertEquals("real", titleFrom("\n   \n  real  \nmore"))
         assertEquals("a".repeat(60), titleFrom("a".repeat(200)))
         assertEquals("", titleFrom(""))
+    }
+
+    @Test
+    fun syncWithBlockRunsInsideTheReplace() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        db.pendingSendDao().upsert(pending("apofis-s", "k"))
+        respond(messagesJson("apofis-s", listOf(1, 2)))
+
+        val seen = mutableListOf<Long>()
+        var committed = false
+        assertTrue(
+            repo.syncMessages("apofis-s", afterCommit = { committed = true }) { rows ->
+                seen += rows.map { it.id }
+                assertEquals(2L, db.messageDao().maxId("apofis-s")) // the new rows are already written
+                db.pendingSendDao().delete("k")
+            },
+        )
+        assertEquals(listOf(1L, 2L), seen)
+        assertNull(db.pendingSendDao().get("k"))
+        assertTrue(committed)
+
+        // A failing block rolls the replace back too.
+        respond(messagesJson("apofis-s", listOf(1, 2, 3)))
+        assertTrue(expectError { repo.syncMessages("apofis-s", afterCommit = { fail("rolled back") }) { error("boom") } } is IllegalStateException)
+        assertEquals(2L, db.messageDao().maxId("apofis-s"))
+
+        // No server copy to read: no request, the block does not run.
+        db.sessionDao().upsert(session("apofis-l", existsOnServer = false))
+        assertFalse(repo.syncMessages("apofis-l") { fail("must not run") })
+        assertFalse(repo.syncMessages("apofis-l"))
+    }
+
+    @Test
+    fun ordinarySyncIsCancellableDuringItsWrite() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        server.enqueue(
+            MockResponse.Builder().body(messagesJson("apofis-s", listOf(1, 2))).addHeader("Content-Type", "application/json")
+                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        val sync = async(Dispatchers.Default) { repo.syncMessages("apofis-s") }
+        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS)!! }
+        // Holds the database while the response is on its way, so the sync's write has to wait after its fetch.
+        val holding = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val holder = launch(Dispatchers.Default) {
+            db.withTransaction {
+                holding.complete(Unit)
+                release.await()
+            }
+        }
+        holding.await()
+        withContext(Dispatchers.IO) { Thread.sleep(1000) } // the response has arrived; the write is waiting
+        sync.cancel()
+        release.complete(Unit)
+        holder.join()
+
+        assertTrue(runCatching { sync.await() }.exceptionOrNull() is CancellationException)
+        assertNull(db.messageDao().maxId("apofis-s"))
+    }
+
+    @Test
+    fun syncReportsWhetherARequestSucceeded() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        respond(messagesJson("apofis-s", listOf(1)))
+        assertTrue(repo.syncMessages("apofis-s"))
     }
 }
