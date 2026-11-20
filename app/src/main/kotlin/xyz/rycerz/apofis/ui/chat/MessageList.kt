@@ -144,18 +144,16 @@ private fun firstNonSpace(text: String, from: Int, end: Int): Int {
 
 /**
  * Adds to [out] the rows of block number [index] of reply [key], from its content offset [from] (a piece start),
- * numbering pieces from [firstPiece]. Returns where the last piece starts.
+ * numbering pieces from [firstPiece]; each row's start offset goes to [starts] when given.
  */
-private fun blockRows(key: String, index: Int, text: String, b: Block, from: Int, firstPiece: Int, out: MutableList<TextRow>): Int {
+private fun blockRows(key: String, index: Int, text: String, b: Block, from: Int, firstPiece: Int, out: MutableList<TextRow>, starts: MutableList<Int>? = null) {
     var c = firstPiece
-    var lastStart = from
     chunkRanges(text, from, b.end) { s, e, last ->
         Work.rowsBuilt++
         out += TextRow("$key/b$index/c$c", text.substring(s, e), b.code, b.lang, first = c == 0, joinBelow = !last)
+        starts?.add(s)
         c++
-        lastStart = s
     }
-    return lastStart
 }
 
 /** Every text row of a reply, parsed from scratch. */
@@ -166,14 +164,15 @@ internal fun replyRows(key: String, text: String): List<TextRow> {
 }
 
 /**
- * The text rows of one streamed reply. While the same key's text grows at its end, closed blocks keep their rows,
- * an open block keeps the rows of every piece but its last, and only the rest is built; an append without a line
- * break to an open paragraph or fence is not even parsed again. Any other change (another key, or the text
- * replaced) starts from scratch and shares nothing with the previous parse.
+ * The text rows of one streamed reply. While the same key's text grows at its end, closed blocks keep their rows
+ * and an open block keeps the rows of every piece that is unchanged (whether the block grew, or shrank because a
+ * fence started on its last line); only the rest is built. An append without a line break to an open paragraph or
+ * fence is not even parsed again. Any other change (another key, or the text replaced) starts from scratch and
+ * shares nothing with the previous parse.
  */
 internal class ReplyText {
-    /** An open block and its rows; [lastPiece] is where its last row's text starts. Mutated only here. */
-    private class Open(var block: Block, val rows: ArrayList<TextRow>, var lastPiece: Int)
+    /** An open block, its rows and where each row's text starts. Mutated only here. */
+    private class Open(var block: Block, val rows: ArrayList<TextRow>, val starts: ArrayList<Int>)
 
     private var key: String? = null
     private var text = ""
@@ -214,14 +213,21 @@ internal class ReplyText {
         val firstIndex = closedBlocks
         blocks.forEachIndexed { n, b ->
             val prev = tail.getOrNull(n)
-            val open = if (prev != null && prev.block.start == b.start && prev.block.code == b.code && prev.block.lang == b.lang && b.end >= prev.block.end) {
-                prev.rows.removeAt(prev.rows.size - 1)
-                prev.lastPiece = blockRows(key, firstIndex + n, new, b, prev.lastPiece, prev.rows.size, prev.rows)
+            val open = if (prev != null && prev.block.start == b.start && prev.block.code == b.code && prev.block.lang == b.lang) {
+                // A piece is unchanged when its cut was decided before both the old and the new end (see chunkRanges).
+                val end = minOf(prev.block.end, b.end)
+                var k = prev.rows.size
+                while (k > 0 && prev.starts[k - 1] + CHUNK >= end) k--
+                val from = if (k < prev.rows.size) prev.starts[k] else b.start
+                while (prev.rows.size > k) {
+                    prev.rows.removeAt(prev.rows.size - 1)
+                    prev.starts.removeAt(prev.starts.size - 1)
+                }
+                blockRows(key, firstIndex + n, new, b, from, k, prev.rows, prev.starts)
                 prev.block = b
                 prev
             } else {
-                val made = ArrayList<TextRow>()
-                Open(b, made, blockRows(key, firstIndex + n, new, b, b.start, 0, made))
+                Open(b, ArrayList(), ArrayList()).also { blockRows(key, firstIndex + n, new, b, b.start, 0, it.rows, it.starts) }
             }
             if (b.closed && nextTail.isEmpty()) {
                 closedRows.addAll(open.rows)

@@ -72,6 +72,34 @@ class BlocksTest {
         }
     }
 
+    /** Rows built when [before] grows to [after]; checks the result against a fresh parse and keeps the first [kept] rows. */
+    private fun appendCost(before: String, after: String, kept: Int): Long {
+        val live = ReplyText()
+        val old = live.update("r1", before)
+        val built = Work.rowsBuilt
+        val rows = live.update("r1", after)
+        val cost = Work.rowsBuilt - built
+        assertEquals(fresh(after), rows.map { it.text to it.code })
+        for (i in 0 until kept) assertSame("row $i", old[i], rows[i])
+        return cost
+    }
+
+    private val closed = "word ".repeat(19).plus("!!!!\n\n").repeat(1000) // 1000 closed paragraphs
+
+    @Test
+    fun aFenceOpeningOrClosingBuildsOnlyTheTail() {
+        assertTrue(appendCost(closed + "``", closed + "```", kept = 1000) <= 2) // the third backtick opens a fence
+        assertTrue(appendCost(closed + "```\ncode\n``", closed + "```\ncode\n```", kept = 1000) <= 2) // and one closes it
+        assertTrue(appendCost(closed + "```\ncode\n```", closed + "```\ncode\n```x", kept = 1000) <= 2) // no longer a closing line
+        assertTrue(appendCost(closed + "tail\n ", closed + "tail\n x", kept = 1000) <= 2) // the blank line turns back into prose
+    }
+
+    @Test
+    fun aLongOpenParagraphEndingAtAFenceKeepsItsRows() {
+        val para = "a line of prose\n".repeat(100_000) + "``" // one paragraph, about 1000 rows
+        assertTrue(appendCost(para, para + "`", kept = 990) <= 3)
+    }
+
     @Test
     fun chunkingIsOneForwardPass() {
         val line = "x".repeat(200_000)

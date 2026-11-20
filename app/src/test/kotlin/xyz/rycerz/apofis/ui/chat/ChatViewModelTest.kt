@@ -54,6 +54,7 @@ import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Notice
+import xyz.rycerz.apofis.chat.ReasoningStep
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
@@ -493,6 +494,19 @@ class ChatViewModelTest {
         val stored = listOf(user("u1"), AssistantReply("r2", listOf(full), "", 1.0))
         assertEquals(StepIndex.Found(full, false, StepRef("r2", 0, "c1", live = false)), index.find(stored, ref))
         assertEquals(null, index.find(listOf(user("u1")), ref))
+    }
+
+    @Test
+    fun toolSheetStaysOnItsStepWhenAStepIsInsertedBeforeIt() {
+        val a = ToolStep("c1", "terminal", "", "A", false, error = false, running = false)
+        val b = a.copy(callId = "c2", result = "B")
+        val index = StepIndex()
+        val ref = StepRef("r2", 1, "c2", live = false)
+        assertEquals("B", index.find(listOf(AssistantReply("r2", listOf(a, b), "", 1.0)), ref)!!.step.result)
+        val moved = index.find(listOf(AssistantReply("r2", listOf(a, ReasoningStep("thinking"), b), "", 1.0)), ref)!!
+        assertEquals("B", moved.step.result)
+        assertEquals(2, moved.ref.index)
+        assertEquals(null, index.find(listOf(AssistantReply("r2", listOf(a), "", 1.0)), ref)) // gone: the sheet closes
     }
 
     @Test
