@@ -58,27 +58,36 @@ class ConnectViewModelTest {
     }
 
     @Test
-    fun privateAddressAsksForLocalNetworkFirst() {
-        var granted = false
-        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { granted })
+    fun privateAddressAsksFirstAndTriesEvenWhenRefused() {
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false })
         vm.submit("http://10.0.2.2:18642", "k")
         assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
-        vm.onLocalNetworkResult(false)
-        assertEquals(ConnectState.Failed(Field.URL, Reason.LOCAL_NETWORK_DENIED), vm.state)
-        vm.submit("http://10.0.2.2:18642", "k") // Connect again asks again
-        assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
-        granted = true
-        vm.onLocalNetworkResult(true)
-        assertEquals(ConnectState.Testing, vm.state) // the check starts; not waited for, it would go to the network
+        vm.onLocalNetworkResult() // refused: a VPN route may still work, so the check starts anyway
+        assertEquals(ConnectState.Testing, vm.state) // not waited for, it would go to the network
         vm.cancel()
         assertTrue(saved.isEmpty())
     }
 
     @Test
-    fun publicAddressNeedsNoLocalNetwork() {
+    fun networkErrorWithoutTheGrantOffersItAndRetries() {
+        var granted = false
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { granted })
+        val down = server.url("/").toString()
+        server.close() // nothing listens there now: a network error
+        vm.submit(down, "k") // 127.0.0.1 is tried without asking
+        assertEquals(ConnectState.Failed(Field.URL, Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK), vm.state)
+        vm.retryWithLocalNetwork()
+        assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
+        granted = true
+        runTest { vm.onLocalNetworkResult()?.join() }
+        assertEquals(ConnectState.Failed(Field.URL, Reason.UNREACHABLE), vm.state) // granted: the ordinary error
+    }
+
+    @Test
+    fun hostNameIsTriedWithoutAsking() {
         server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
-        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false }, resolvesLocal = { false })
-        vm.submit(server.url("/").toString(), "k") // 127.0.0.1: loopback is not local network
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false })
+        vm.submit(server.url("/").toString().replace("127.0.0.1", "localhost"), "k")
         assertEquals(ConnectState.Connected, vm.state)
     }
 

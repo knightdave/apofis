@@ -1,6 +1,6 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Self-test for check-apk-permissions.sh using fake aapt2 outputs.
-set -eu
+set -euo pipefail
 check="$(cd "$(dirname "$0")" && pwd)/check-apk-permissions.sh"
 tmp="$(mktemp -d)"
 trap 'rm -f "$tmp"/fake && rmdir "$tmp"' EXIT

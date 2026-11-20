@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Usage: check-apk-permissions.sh <aapt2> <apk>
 # Rule: the app requests only INTERNET (talking to the server) plus three normal,
 # no-prompt permissions WorkManager needs to send queued messages when the
@@ -6,11 +6,11 @@
 # the CPU awake while a send runs) and RECEIVE_BOOT_COMPLETED (reschedules pending
 # sends after a reboot). ACCESS_LOCAL_NETWORK (runtime, API 37+) is allowed because Android 17 blocks apps that
 # target it from LAN and private addresses without it, and a self-hosted server is often on one; the app asks for it
-# only when the server's address is on the local network. The only other allowed entry is AndroidX's app-private
+# before connecting to a literal private address, and offers it after a failed connection attempt. The only other allowed entry is AndroidX's app-private
 # signature permission that guards non-exported dynamic receivers. Every requesting tag counts (uses-permission,
 # uses-permission-sdk-23, ...). Fails closed: any line it cannot parse fails, and
 # it passes only after INTERNET was positively recognised.
-set -eu
+set -euo pipefail
 dump="$("$1" dump permissions "$2")"
 internet=0
 bad=""

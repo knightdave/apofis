@@ -61,7 +61,7 @@ private fun Reason.text() = when (this) {
     Reason.KEY_INVALID -> R.string.connect_error_key_invalid
     Reason.KEY_REJECTED -> R.string.connect_error_key_rejected
     Reason.SAVE_FAILED -> R.string.connect_error_save_failed
-    Reason.LOCAL_NETWORK_DENIED -> R.string.connect_error_local_network_denied
+    Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK -> R.string.connect_error_unreachable_local_network
 }
 
 /** First-run connect screen, and the Connection row of Settings when [onBack] is set. */
@@ -76,7 +76,7 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
     val urlError = failed?.takeIf { it.field == Field.URL }?.reason?.text()?.let { stringResource(it) }
     val keyError = failed?.takeIf { it.field == Field.KEY }?.reason?.text()?.let { stringResource(it) }
     var keyVisible by rememberSaveable { mutableStateOf(false) }
-    val localNetwork = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.onLocalNetworkResult(it) }
+    val localNetwork = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.onLocalNetworkResult() }
     LaunchedEffect(asking) { if (asking) localNetwork.launch(LOCAL_NETWORK_PERMISSION) }
 
     // The key can be shown here, so the window is secure while this screen is up: it never appears in Recents,
@@ -126,6 +126,12 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                 enabled = !testing,
                 isError = urlError != null,
                 supportingText = when {
+                    failed?.reason == Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK -> ({
+                        Column {
+                            Text(urlError.orEmpty())
+                            TextButton(onClick = vm::retryWithLocalNetwork) { Text(stringResource(R.string.connect_local_network_retry)) }
+                        }
+                    })
                     urlError != null -> ({ Text(urlError) })
                     asking -> ({ Text(stringResource(R.string.connect_local_network_rationale)) })
                     else -> null

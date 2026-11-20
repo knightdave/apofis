@@ -13,7 +13,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import java.net.SocketTimeoutException
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
@@ -31,14 +30,14 @@ enum class Reason {
     KEY_INVALID, // a character an HTTP header cannot carry
     KEY_REJECTED,
     SAVE_FAILED,
-    LOCAL_NETWORK_DENIED, // the server is on the local network and the user refused local network access
+    UNREACHABLE_WITHOUT_LOCAL_NETWORK, // a network error while local network access is not granted: offers it
 }
 
 sealed interface ConnectState {
     data object Idle : ConnectState
     data object Testing : ConnectState // cancellable: Back cancels it first
 
-    /** The server is on the local network: the screen asks the system for local network access, then calls back. */
+    /** The screen asks the system for local network access, then calls back; the connection is tried either way. */
     data object NeedsLocalNetwork : ConnectState
 
     /** Writing the switch; runs to the end, and Back is ignored meanwhile. */
@@ -63,7 +62,6 @@ class ConnectViewModel(
     failedBefore: Boolean = false,
     private val back: ConnectBack? = null,
     private val localNetworkGranted: () -> Boolean = { true },
-    private val resolvesLocal: suspend (host: String) -> Boolean = { false },
 ) : ViewModel() {
     var url by mutableStateOf(current?.baseUrl.orEmpty())
         private set
@@ -104,7 +102,9 @@ class ConnectViewModel(
     }
 
     /** Returns the test's job, or null when the input was rejected without a request. */
-    fun connect(): Job? {
+    fun connect(): Job? = start(askFirst = true)
+
+    private fun start(askFirst: Boolean): Job? {
         if (state == ConnectState.Testing || state == ConnectState.Saving) return null
         val baseUrl = url.trim()
         if (!baseUrl.startsWith("http://", true) && !baseUrl.startsWith("https://", true)) return fail(Field.URL, Reason.MISSING_SCHEME)
@@ -119,7 +119,7 @@ class ConnectViewModel(
         } catch (_: IllegalArgumentException) {
             return fail(Field.URL, Reason.MALFORMED_URL)
         }
-        if (!localNetworkGranted() && hostNeedsLocalNetwork(parsed.host)) {
+        if (askFirst && asksForLocalNetworkFirst(parsed.host, localNetworkGranted())) {
             state = ConnectState.NeedsLocalNetwork
             return null
         }
@@ -140,14 +140,11 @@ class ConnectViewModel(
         } catch (e: ApiError) {
             return when (e) {
                 ApiError.Unauthorized -> ConnectState.Failed(Field.KEY, Reason.KEY_REJECTED)
-                // A blocked local network connection times out; a host name is asked about only after that happens.
-                is ApiError.Network -> if (e.cause is SocketTimeoutException && !localNetworkGranted() &&
-                    resolvesLocal(c.baseUrl.toHttpUrlOrNull()?.host.orEmpty())
-                ) {
-                    ConnectState.NeedsLocalNetwork
-                } else {
-                    ConnectState.Failed(Field.URL, Reason.UNREACHABLE)
-                }
+                // The platform's block usually looks like a plain timeout, so without the grant the error offers it.
+                is ApiError.Network -> ConnectState.Failed(
+                    Field.URL,
+                    if (localNetworkGranted()) Reason.UNREACHABLE else Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK,
+                )
                 else -> ConnectState.Failed(Field.URL, Reason.NOT_HERMES)
             }
         } catch (_: Exception) {
@@ -167,11 +164,18 @@ class ConnectViewModel(
         return saveOrFail(c, mine)
     }
 
-    /** The system's answer to the local network request: granted tries again, refused is a field error. */
-    fun onLocalNetworkResult(granted: Boolean): Job? {
+    /**
+     * The system's answer to the local network request. The connection is tried either way: a refusal does not mean
+     * the server is unreachable (a VPN route needs no permission), and a failure offers the permission again.
+     */
+    fun onLocalNetworkResult(): Job? {
         if (state != ConnectState.NeedsLocalNetwork) return null
-        if (granted) return connect().also { if (it == null && state == ConnectState.NeedsLocalNetwork) fail(Field.URL, Reason.LOCAL_NETWORK_DENIED) }
-        return fail(Field.URL, Reason.LOCAL_NETWORK_DENIED)
+        return start(askFirst = false)
+    }
+
+    /** "Allow local network access and retry" under a failed attempt: the screen asks, then [onLocalNetworkResult]. */
+    fun retryWithLocalNetwork() {
+        if (state == ConnectState.Failed(Field.URL, Reason.UNREACHABLE_WITHOUT_LOCAL_NETWORK)) state = ConnectState.NeedsLocalNetwork
     }
 
     fun confirmServerChange(): Job? {

@@ -31,9 +31,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
@@ -50,7 +48,6 @@ import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_MIN_SDK
 import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_PERMISSION
-import xyz.rycerz.apofis.ui.connect.resolvesToLocalNetwork
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
 
 enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT, LICENSES }
@@ -93,7 +90,6 @@ fun AppNav(container: AppContainer) {
                         Build.VERSION.SDK_INT < LOCAL_NETWORK_MIN_SDK ||
                             context.checkSelfPermission(LOCAL_NETWORK_PERMISSION) == PackageManager.PERMISSION_GRANTED
                     },
-                    resolvesLocal = { withContext(Dispatchers.IO) { resolvesToLocalNetwork(it) } },
                 )
             }
             LaunchedEffect(vm.state) { if (vm.state == ConnectState.Connected) chosen = Screen.CHAT }
