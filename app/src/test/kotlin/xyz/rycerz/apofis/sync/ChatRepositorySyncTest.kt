@@ -281,6 +281,17 @@ class ChatRepositorySyncTest {
     }
 
     @Test
+    fun admittedRunSendShowsAsSentAndKeepsItsTurnAnchor() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        db.pendingSendDao().upsert(pending("apofis-s", "a").copy(state = "sending", runId = "run_1", attempted = true))
+
+        val item = repo.transcript("apofis-s").first().single() as UserMessage
+        assertEquals(SendState.SENT, item.state) // the server admitted its run: no longer "Sending"
+        assertEquals("run_1", item.runId)
+        assertEquals("a", item.idempotencyKey)
+    }
+
+    @Test
     fun deliveredPendingRowIsHiddenOnceTheServerShowsIt() = runTest {
         db.sessionDao().upsert(session("apofis-s"))
         // The repository clock is 1 s; rows are confirmed by the follower's rule: text, kind and the last minute.

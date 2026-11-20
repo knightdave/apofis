@@ -23,7 +23,7 @@ const val SEND_EXPIRY_MS = 24L * 60 * 60 * 1000
 private const val TITLE_TRIES = 9 // titles tried when the first line is already another chat's title
 
 /**
- * [PendingSendEntity.state] values. In the transcript: [QUEUED] is QUEUED, [SENDING] is SENDING, [FAILED] is FAILED,
+ * [PendingSendEntity.state] values. In the transcript: [QUEUED] is QUEUED, [SENDING] is SENT, [FAILED] is FAILED,
  * and the steer states are a `UserMessage` with `steered = true`: [STEERING] is SENDING, [STEERED] is SENT.
  */
 object PendingState {

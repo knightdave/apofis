@@ -409,8 +409,8 @@ private fun PendingSendEntity.toItem() = UserMessage(
     key = "p$idempotencyKey", text = text, steered = state == PendingState.STEERING || state == PendingState.STEERED,
     timestamp = createdAt / 1000.0,
     state = when (state) {
-        PendingState.SENDING, PendingState.STEERING -> SendState.SENDING
-        PendingState.STEERED -> SendState.SENT
+        PendingState.STEERING -> SendState.SENDING // the steer request is still in flight
+        PendingState.SENDING, PendingState.STEERED -> SendState.SENT // its run was admitted, or it reached the run
         PendingState.FAILED -> SendState.FAILED
         else -> SendState.QUEUED
     },
