@@ -73,6 +73,9 @@ class RunFollowerTest {
     private val finished = CopyOnWriteArrayList<String>()
     private val roomStatusAtDelay = CopyOnWriteArrayList<String?>()
 
+    /** Runs on the database thread just before each statement, so a test can act in the middle of a write. */
+    @Volatile private var beforeQuery: (sql: String, args: List<Any?>) -> Unit = { _, _ -> }
+
     @Before
     fun setUp() {
         server = MockWebServer()
@@ -86,6 +89,7 @@ class RunFollowerTest {
         server.start()
         db = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
             .allowMainThreadQueries()
+            .setQueryCallback(Dispatchers.Unconfined) { sql, args -> beforeQuery(sql, args) }
             .build()
         api = HermesApi(server.url("/").toString(), "secret-key")
         repo = ChatRepository(api, db)
@@ -465,7 +469,8 @@ class RunFollowerTest {
 
         val pending = f.live(KEY).first { it?.pending != null }!!.pending!!
         assertEquals("ctl_prompt", pending.requestId)
-        assertEquals("waiting_for_approval", db.activeRunDao().forSession(KEY)!!.status)
+        // Stored right after it is shown, on the database thread: awaited, not assumed.
+        awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "waiting_for_approval" }
         assertEquals(AnswerResult.SENT, f.answerApproval(KEY, pending.requestId, pending.executionGeneration, ApprovalChoice.ONCE))
 
         val body = requestsTo("/v1/runs/$RUN/approval").single().body!!.utf8()
@@ -1065,9 +1070,9 @@ class RunFollowerTest {
         messages()
         on(STATUS, status("running"))
         on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
+        beforeQuery = { sql, _ -> if ("SET polling = 1" in sql) f.pauseAll() } // lands while the truncation is stored
         started(f)
-        f.live(KEY).first { it?.text == "a" }
-        f.pauseAll() // lands while the follower handles the truncation
+        db.activeRunDao().observeAll().first { it.singleOrNull()?.polling == true } // the old process's write commits
 
         val done = CompletableDeferred<Unit>()
         val g = follower(done) // a later resume, here in a new process
@@ -1244,9 +1249,15 @@ class RunFollowerTest {
         messages()
         on(STATUS, status("running"), status("completed"))
         on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
+        val paused = CountDownLatch(1)
+        beforeQuery = { sql, _ ->
+            if ("SET polling = 1" in sql) {
+                f.pauseAll() // the old job is still writing polling = true
+                paused.countDown()
+            }
+        }
         started(f)
-        f.live(KEY).first { it?.text == "a" }
-        f.pauseAll() // the old job is still writing polling = true
+        awaitUntil { paused.count == 0L }
         f.resumeAll()
         done.await()
 
@@ -1259,9 +1270,8 @@ class RunFollowerTest {
         messages()
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         routes[MESSAGES] = { MockResponse.Builder().code(503).build() } // Finish never completes here
+        beforeQuery = { sql, args -> if ("SET status" in sql && "completed" in args) f.pauseAll() } // lands while it is stored
         started(f)
-        f.live(KEY).first { it?.text == "a" }
-        f.pauseAll() // lands while the terminal status is being stored
 
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
     }
