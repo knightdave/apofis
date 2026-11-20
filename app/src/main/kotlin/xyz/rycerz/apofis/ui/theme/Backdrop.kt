@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.inset
+import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
@@ -81,6 +82,8 @@ fun Modifier.frostedGlass(state: BackdropState?, shape: Shape, fill: Color, bord
 /** [this] with alpha 0, for gradients that fade a token out (interpolating toward transparent black would grey it). */
 internal fun Color.transparent(): Color = copy(alpha = 0f)
 
+private const val SAMPLE_SCALE = 0.5f
+
 private data class GlassElement(val state: BackdropState?, val shape: Shape, val fill: Color, val border: Color, val blur: Dp) :
     ModifierNodeElement<GlassNode>() {
     override fun create() = GlassNode(state, shape, fill, border, blur)
@@ -126,12 +129,18 @@ private class GlassNode(var state: BackdropState?, var shape: Shape, var fill: C
             val margin = blur.toPx()
             val layer = sample ?: requireGraphicsContext().createGraphicsLayer().also { sample = it }
             layer.clip = true // the blur works on this sub-rectangle only, never on the whole viewport
-            layer.renderEffect = if (margin > 0f) BlurEffect(margin, margin, TileMode.Clamp) else null
+            // Recorded and blurred at half resolution, drawn scaled up (a blur hides the lost detail): at full resolution
+            // the emulator measured 13 ms more at p95, at half 6 ms (Task 7 report).
+            layer.renderEffect = if (margin > 0f) BlurEffect(margin * SAMPLE_SCALE, margin * SAMPLE_SCALE, TileMode.Clamp) else null
             val at = position - origin
-            layer.record(IntSize(ceil(size.width + 2 * margin).toInt(), ceil(size.height + 2 * margin).toInt())) {
-                translate(margin - at.x, margin - at.y) { drawLayer(source) }
+            val w = ceil((size.width + 2 * margin) * SAMPLE_SCALE).toInt()
+            val h = ceil((size.height + 2 * margin) * SAMPLE_SCALE).toInt()
+            layer.record(IntSize(w, h)) {
+                scale(SAMPLE_SCALE, SAMPLE_SCALE, pivot = Offset.Zero) { translate(margin - at.x, margin - at.y) { drawLayer(source) } }
             }
-            clipPath(Path().apply { addOutline(outline) }) { translate(-margin, -margin) { drawLayer(layer) } }
+            clipPath(Path().apply { addOutline(outline) }) {
+                translate(-margin, -margin) { scale(1 / SAMPLE_SCALE, 1 / SAMPLE_SCALE, pivot = Offset.Zero) { drawLayer(layer) } }
+            }
         }
         drawOutline(outline, fill)
         val stroke = 1.dp.toPx()

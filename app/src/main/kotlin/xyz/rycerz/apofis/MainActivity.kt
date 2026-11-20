@@ -61,7 +61,9 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }) {
+            // Glass draws its fill only: the blur missed its cost gate on the emulator (BlurCostTest: p95 6 ms worse at half
+            // resolution, limit 4). Turn it on again only after a measurement on a real GPU passes.
+            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }, blur = false) {
                 // Test tags become resource ids, so the end-to-end tests find chat items by their opaque keys.
                 Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
             }

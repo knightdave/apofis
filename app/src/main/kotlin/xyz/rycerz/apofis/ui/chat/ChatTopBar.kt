@@ -49,9 +49,13 @@ import xyz.rycerz.apofis.ui.theme.transparent
 /** The bar's row height below the status bar. */
 internal val TopBarHeight = 56.dp
 
+/** The gradient's fade below the bar's row. */
+private val TopFade = 24.dp
+
 /**
- * The transparent top bar over the list: a page-colored gradient (opaque to 60 %, clear at the bottom, 12 dp past the
- * row) keeps the title readable over scrolled text; no elevation, no scroll tint. Only the title area and the buttons
+ * The transparent top bar over the list: a page-colored gradient, opaque behind the status bar and the bar's row and
+ * fading to clear over [TopFade] below it, keeps the title and the status line readable over scrolled text; no
+ * elevation, no scroll tint. Only the title area and the buttons
  * take touches: the rest lets them through to the list.
  */
 @Composable
@@ -65,11 +69,12 @@ internal fun ChatTopBar(
 ) {
     val surface = MaterialTheme.colorScheme.surface
     val top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val solid = (top + TopBarHeight) / (top + TopBarHeight + TopFade)
     Box(
         modifier
             .fillMaxWidth()
-            .height(top + TopBarHeight + 12.dp)
-            .background(Brush.verticalGradient(0f to surface, 0.6f to surface, 1f to surface.transparent()))
+            .height(top + TopBarHeight + TopFade)
+            .background(Brush.verticalGradient(0f to surface, solid to surface, 1f to surface.transparent()))
             .testTag("chat.topbar"),
     ) {
         Row(Modifier.padding(top = top, end = 4.dp).height(TopBarHeight).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

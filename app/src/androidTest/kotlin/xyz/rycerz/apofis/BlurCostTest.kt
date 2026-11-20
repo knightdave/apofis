@@ -12,8 +12,6 @@ import android.view.Window
 import android.view.WindowInsets
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
@@ -25,6 +23,15 @@ import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import android.os.Looper
+import android.view.Choreographer
+import android.view.ViewTreeObserver
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.key
+import kotlin.math.PI
+import kotlin.math.cos
+import androidx.lifecycle.Lifecycle
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -68,11 +75,12 @@ class BlurCostTest {
     @Test
     fun measure() {
         ActivityScenario.launch(ComponentActivity::class.java).use { scenario ->
-            lateinit var activity: ComponentActivity
-            scenario.onActivity { activity = it }
-            val hardware = activity.window.decorView.isHardwareAccelerated
-            val on = phase(activity, blur = true)
-            val off = phase(activity, blur = false)
+            SystemClock.sleep(3000) // a configuration change right after boot recreates the activity: let it settle
+            lateinit var first: ComponentActivity
+            scenario.onActivity { first = it }
+            val hardware = first.window.decorView.isHardwareAccelerated
+            val on = phase(scenario, blur = true)
+            val off = phase(scenario, blur = false)
             val p95Delta = on.p95 - off.p95
             val allocDelta = on.allocsPerFrame - off.allocsPerFrame
             val accepted = p95Delta <= 4.0 && allocDelta <= 10.0
@@ -90,16 +98,33 @@ class BlurCostTest {
         }
     }
 
-    private fun phase(activity: ComponentActivity, blur: Boolean): Result {
+    private fun phase(scenario: ActivityScenario<ComponentActivity>, blur: Boolean): Result {
         val name = if (blur) "blur-on" else "blur-off"
         val text = mutableStateOf("")
-        val scrolling = mutableStateOf(false)
-        instrumentation.runOnMainSync { activity.setContent { Bench(blur, text, scrolling) } }
-        SystemClock.sleep(3000) // first composition and layout of the transcript
+        lateinit var activity: ComponentActivity
+        for (attempt in 1..3) { // the current instance; set again if it was recreated meanwhile
+            scenario.onActivity {
+                activity = it
+                it.setContent { key(blur) { Bench(blur, text) } } // a new composition per mode
+            }
+            SystemClock.sleep(3000) // first composition and layout of the transcript
+            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) break
+            Log.i(TAG, "$name: the activity was recreated (attempt $attempt)")
+        }
+        diagnose(activity, name)
 
-        swipeAway(activity) // a real drag releases following, so the reply grows below the reader
+        val view = activity.window.decorView
+        val x = view.width / 2f
+        val top = view.height * 0.3f
+        val amplitude = view.height * 0.3f
+        // A real slow drag away from the bottom releases following (no fling: the finger rests before lifting).
+        Finger(x, top).apply {
+            for (i in 1..30) move(top + amplitude * i / 30)
+            SystemClock.sleep(150)
+            move(top + amplitude)
+            up()
+        }
         SystemClock.sleep(1500)
-        instrumentation.runOnMainSync { scrolling.value = true }
 
         val durations = ArrayList<Long>()
         val half = CountDownLatch(FRAMES / 2)
@@ -114,49 +139,91 @@ class BlurCostTest {
         Debug.startAllocCounting()
         val allocsBefore = Debug.getGlobalAllocCount()
         instrumentation.runOnMainSync { activity.window.addOnFrameMetricsAvailableListener(listener, Handler(thread.looper)) }
-        half.await(180, TimeUnit.SECONDS)
-        screenshot("$name.png") // text behind the composer and under the glass button while it scrolls
-        done.await(180, TimeUnit.SECONDS)
+        // The scripted scroll: one held drag, down and up again over about a second, until 600 frames were drawn.
+        val finger = Finger(x, top)
+        val until = SystemClock.uptimeMillis() + 120_000
+        var step = 0
+        var shot = false
+        while (done.count > 0 && SystemClock.uptimeMillis() < until) {
+            step++
+            finger.move(top + amplitude * (1 - cos(step * 2 * PI / 60)).toFloat() / 2)
+            if (!shot && half.count == 0L) {
+                screenshot("$name.png") // text behind the composer and the glass button while it scrolls
+                shot = true
+            }
+            SystemClock.sleep(16)
+        }
+        finger.up()
         val allocs = Debug.getGlobalAllocCount() - allocsBefore
         instrumentation.runOnMainSync { activity.window.removeOnFrameMetricsAvailableListener(listener) }
         @Suppress("DEPRECATION")
         Debug.stopAllocCounting()
         thread.quitSafely()
+        if (!shot) diagnose(activity, "$name-stalled")
 
         // The keyboard shown and hidden again (a resize of the bottom area), then the glass button once more.
-        instrumentation.runOnMainSync { scrolling.value = false }
         SystemClock.sleep(1000)
-        val view = activity.window.decorView
         tap(view.width / 2f, view.height - 60 * view.resources.displayMetrics.density) // the composer's text field
         SystemClock.sleep(2500)
         instrumentation.runOnMainSync { activity.window.insetsController?.hide(WindowInsets.Type.ime()) }
         SystemClock.sleep(2000)
-        instrumentation.runOnMainSync { scrolling.value = true }
-        SystemClock.sleep(700)
-        screenshot("$name-keyboard.png")
-        instrumentation.runOnMainSync { scrolling.value = false }
+        Finger(x, top).apply {
+            for (i in 1..20) {
+                move(top + amplitude * i / 20)
+                SystemClock.sleep(16)
+            }
+            SystemClock.sleep(300)
+            screenshot("$name-keyboard.png")
+            up()
+        }
 
         val sorted = synchronized(durations) { durations.sorted() }
         fun percentile(p: Double) = if (sorted.isEmpty()) 0.0 else sorted[((sorted.size - 1) * p).toInt()] / 1e6
         return Result(sorted.size, percentile(0.5), percentile(0.95), allocs.toDouble() / sorted.size.coerceAtLeast(1))
     }
 
+    private val compositions = AtomicInteger()
+
+    /** What the device is doing, in logcat (kept by the harness): drawing, frames, compositions, the main thread. */
+    private fun diagnose(activity: ComponentActivity, label: String) {
+        val draws = AtomicInteger()
+        val frames = AtomicInteger()
+        val view = activity.window.decorView
+        val onDraw = ViewTreeObserver.OnDrawListener { draws.incrementAndGet() }
+        val callback = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                frames.incrementAndGet()
+                Choreographer.getInstance().postFrameCallback(this)
+            }
+        }
+        val before = compositions.get()
+        instrumentation.runOnMainSync {
+            view.viewTreeObserver.addOnDrawListener(onDraw)
+            Choreographer.getInstance().postFrameCallback(callback)
+        }
+        SystemClock.sleep(2000)
+        val stack = Looper.getMainLooper().thread.stackTrace.take(30).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" }
+        instrumentation.runOnMainSync {
+            view.viewTreeObserver.removeOnDrawListener(onDraw)
+            Choreographer.getInstance().removeFrameCallback(callback)
+        }
+        Log.i(TAG, "diag $label: draws=${draws.get()} choreographer=${frames.get()} compositions=${compositions.get() - before} " +
+            "state=${activity.lifecycle.currentState} focus=${activity.hasWindowFocus()} shown=${view.isShown} size=${view.width}x${view.height} " +
+            "children=${(view as? android.view.ViewGroup)?.childCount}")
+        Log.i(TAG, "diag $label main: $stack")
+    }
+
     @androidx.compose.runtime.Composable
-    private fun Bench(blur: Boolean, text: MutableState<String>, scrolling: MutableState<Boolean>) {
+    private fun Bench(blur: Boolean, text: MutableState<String>) {
         ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = false, blur = blur) {
             val list = rememberLazyListState()
+            SideEffect { compositions.incrementAndGet() }
             LaunchedEffect(Unit) {
                 var n = 0
                 while (true) {
                     withFrameNanos {}
                     // 40 characters a frame, a paragraph break about every 400.
                     text.value += if (++n % 10 == 0) "words go here\n\n" + "x".repeat(25) else "growing reply text, forty characters ok "
-                }
-            }
-            LaunchedEffect(scrolling.value) {
-                while (scrolling.value) { // positive is away from the bottom of the reversed list
-                    list.animateScrollBy(3000f, tween(900))
-                    list.animateScrollBy(-3000f, tween(900))
                 }
             }
             val live = LiveReply("run_bench", "running", text.value, emptyList(), null, Connection.LIVE)
@@ -170,20 +237,27 @@ class BlurCostTest {
         }
     }
 
-    private fun swipeAway(activity: ComponentActivity) {
-        val v = activity.window.decorView
-        val x = v.width / 2f
-        val from = v.height * 0.3f
-        val to = v.height * 0.7f
-        val start = SystemClock.uptimeMillis()
-        fun send(action: Int, y: Float, t: Long) {
-            val e = MotionEvent.obtain(start, t, action, x, y, 0)
+    /** A finger on the screen: injected events, each delivered before the next. */
+    private inner class Finger(private val x: Float, y: Float) {
+        private val downTime = SystemClock.uptimeMillis()
+        private var y = y
+
+        init {
+            send(MotionEvent.ACTION_DOWN)
+        }
+
+        fun move(to: Float) {
+            y = to
+            send(MotionEvent.ACTION_MOVE)
+        }
+
+        fun up() = send(MotionEvent.ACTION_UP)
+
+        private fun send(action: Int) {
+            val e = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, x, y, 0)
             instrumentation.sendPointerSync(e)
             e.recycle()
         }
-        send(MotionEvent.ACTION_DOWN, from, start)
-        for (i in 1..20) send(MotionEvent.ACTION_MOVE, from + (to - from) * i / 20, start + i * 16L)
-        send(MotionEvent.ACTION_UP, to, start + 21 * 16L)
     }
 
     private fun tap(x: Float, y: Float) {
