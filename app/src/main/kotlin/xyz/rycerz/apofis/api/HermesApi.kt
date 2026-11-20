@@ -129,11 +129,14 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         exchange(post(url, jsonBody(body))) { }
     }
 
-    // The server accepted the request, so a body it cannot be read from still counts as resolved.
+    /** Only the documented bodies count: any other 2xx body is [ApiError.Protocol], never an accepted answer. */
     private suspend fun answer(url: HttpUrl, body: JsonObjectBuilder.() -> Unit): ControlResult =
         exchange(post(url, jsonBody(body))) { response ->
-            val status = runCatching { json.decodeFromString<ControlReply>(response.body.string()).status }.getOrNull()
-            if (status == "already_resolved") ControlResult.ALREADY_RESOLVED else ControlResult.RESOLVED
+            when (decode<ControlReply>(response).status) {
+                "resolved" -> ControlResult.RESOLVED
+                "already_resolved" -> ControlResult.ALREADY_RESOLVED
+                else -> throw ApiError.Protocol
+            }
         }
 
     private fun url(vararg segments: String, query: HttpUrl.Builder.() -> Unit = {}): HttpUrl =

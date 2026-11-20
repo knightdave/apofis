@@ -414,7 +414,8 @@ class HermesApiTest {
     @Test
     fun controlRequests() = runTest {
         serve("session_patch.json")
-        repeat(4) { respond(200, "{}") }
+        repeat(2) { respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p"}""") }
+        repeat(2) { respond(200, "{}") }
         serve("messages_tool_run.json")
         api.patchSession("a b", pinned = true)
         api.approve("r1", "p1", 3, ApprovalChoice.SESSION)
@@ -437,11 +438,16 @@ class HermesApiTest {
         respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p1"}""")
         respond(200, """{"run_id":"r1","status":"already_resolved","prompt_id":"p1"}""")
         respond(200, """{"run_id":"r1","status":"already_resolved","prompt_id":"p2"}""")
-        respond(200, "not json")
         assertEquals(ControlResult.RESOLVED, api.approve("r1", "p1", 3, ApprovalChoice.ONCE))
         assertEquals(ControlResult.ALREADY_RESOLVED, api.approve("r1", "p1", 3, ApprovalChoice.ONCE))
         assertEquals(ControlResult.ALREADY_RESOLVED, api.clarify("r1", "p2", 3, "blue"))
-        // The server accepted the request; an unreadable 2xx body is not a reason to report failure.
-        assertEquals(ControlResult.RESOLVED, api.clarify("r1", "p2", 3, "blue"))
+    }
+
+    @Test
+    fun controlAnswersRejectUndocumentedBodies() = runTest {
+        for (body in listOf("not json", "{}", """{"run_id":"r1"}""", """{"run_id":"r1","status":"weird"}""", """{"status":"reso""")) {
+            respond(200, body)
+            assertEquals(body, ApiError.Protocol, runCatching { api.approve("r1", "p1", 3, ApprovalChoice.ONCE) }.exceptionOrNull())
+        }
     }
 }

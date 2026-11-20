@@ -124,33 +124,68 @@ class ChatRepository(
         }
     }
 
-    suspend fun syncMessages(sessionKey: String) {
-        syncMessages(sessionKey) { }
+    /** True when the transcript was fetched: a request was made and the server accepted it. */
+    suspend fun syncMessages(sessionKey: String): Boolean {
+        requireAppKey(sessionKey)
+        return lock.withLock {
+            val (tip, rows) = fetchRows(sessionKey) ?: return@withLock false
+            db.withTransaction { replaceRows(sessionKey, tip, rows) }
+            true
+        }
     }
 
     /**
      * Like [syncMessages], and runs [afterReplace] with the fetched rows inside the transaction that writes them, so
-     * no observer sees a state between the two. Only the fetch is cancellable. False (block not run) when the chat
-     * has no server copy to read.
+     * no observer sees a state between the two. Only the fetch is cancellable: from the write on, through
+     * [afterCommit] (run after the lock is released, only when the transaction committed with the block run), the
+     * call completes even if the caller is cancelled. True when the transcript was fetched.
      */
-    suspend fun syncMessages(sessionKey: String, afterReplace: suspend (List<MessageDto>) -> Unit): Boolean {
+    suspend fun syncMessages(
+        sessionKey: String,
+        afterCommit: suspend () -> Unit = {},
+        afterReplace: suspend (List<MessageDto>) -> Unit,
+    ): Boolean {
         requireAppKey(sessionKey)
-        return lock.withLock {
-            val session = sessionDao.get(sessionKey) ?: return@withLock false
-            if (!session.existsOnServer || session.hidden) return@withLock false
-            val (tip, messages) = fetchMessages(session.currentId)
-            val rows = messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
-            withContext(NonCancellable) {
-                db.withTransaction {
-                    val current = sessionDao.get(sessionKey) ?: return@withTransaction false
-                    if (current.hidden) return@withTransaction false
-                    db.messageDao().replaceSession(sessionKey, rows)
-                    sessionDao.upsert(current.movedTo(tip).copy(stale = false))
-                    afterReplace(messages)
-                    true
-                }
-            }
+        lock.lock()
+        val fetched = try {
+            fetchRows(sessionKey)
+        } catch (e: Throwable) {
+            lock.unlock()
+            throw e
         }
+        if (fetched == null) {
+            lock.unlock()
+            return false
+        }
+        val (tip, rows) = fetched
+        withContext(NonCancellable) {
+            val written = try {
+                db.withTransaction {
+                    replaceRows(sessionKey, tip, rows).also { if (it) afterReplace(rows.map { r -> r.toDto() }) }
+                }
+            } finally {
+                lock.unlock()
+            }
+            if (written) afterCommit()
+        }
+        return true
+    }
+
+    /** Under the lock: the server transcript as rows, or null when the chat has no server copy (no request made). */
+    private suspend fun fetchRows(sessionKey: String): Pair<String, List<MessageEntity>>? {
+        val session = sessionDao.get(sessionKey) ?: return null
+        if (!session.existsOnServer || session.hidden) return null
+        val (tip, messages) = fetchMessages(session.currentId)
+        return tip to messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
+    }
+
+    /** In a transaction: false when the chat went away or got hidden since the fetch. */
+    private suspend fun replaceRows(sessionKey: String, tip: String, rows: List<MessageEntity>): Boolean {
+        val current = sessionDao.get(sessionKey) ?: return false
+        if (current.hidden) return false
+        db.messageDao().replaceSession(sessionKey, rows)
+        sessionDao.upsert(current.movedTo(tip).copy(stale = false))
+        return true
     }
 
     suspend fun createLocalSession(): String = lock.withLock {

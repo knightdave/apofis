@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.run
 
 import android.content.Context
+import android.database.sqlite.SQLiteException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.ConcurrentHashMap
@@ -1182,5 +1183,128 @@ class RunFollowerTest {
         awaitUntil { rejectedAtDelay.isNotEmpty() }
 
         assertEquals(listOf(true), rejectedAtDelay)
+    }
+
+    // ---- fix round 3 ----
+
+    @Test
+    fun failedReadAfterPostKeepsApprovalAndRetries() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("waiting_for_approval", otherControl))
+        on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}"""))
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        assertEquals("ctl_prompt", f.live(KEY).value!!.pending!!.requestId) // never cleared on a failed read
+        assertEquals("ctl_other", f.live(KEY).first { it?.pending?.requestId == "ctl_other" }!!.pending!!.requestId)
+        assertEquals(listOf(1000L), delays)
+        release.countDown()
+    }
+
+    @Test
+    fun malformedAnswerWithRequestStillPendingIsAnError() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        on("/v1/runs/$RUN/approval", json("not json"))
+        heldOpen(f, release)
+
+        try {
+            f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE)
+            fail("expected Protocol")
+        } catch (_: ApiError.Protocol) {
+        }
+        assertEquals("ctl_prompt", f.live(KEY).value!!.pending!!.requestId)
+        release.countDown()
+    }
+
+    @Test
+    fun malformedAnswerWithRequestGoneIsGone() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        routes["/v1/runs/$RUN/approval"] = {
+            on(STATUS, status("running"))
+            json("""{"run_id":"$RUN"}""")()
+        }
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.GONE, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        release.countDown()
+    }
+
+    @Test
+    fun resumeRightAfterPauseWaitsForTheOldJob() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        messages()
+        on(STATUS, status("running"), status("completed"))
+        on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
+        started(f)
+        f.live(KEY).first { it?.text == "a" }
+        f.pauseAll() // the old job is still writing polling = true
+        f.resumeAll()
+        done.await()
+
+        assertEquals(1, requestsTo(EVENTS).size)
+    }
+
+    @Test
+    fun pauseDuringTerminalStatusWriteStillStoresIt() = runTest {
+        val f = follower()
+        messages()
+        on(EVENTS, sse(delta(0, "a"), terminal(1)))
+        routes[MESSAGES] = { MockResponse.Builder().code(503).build() } // Finish never completes here
+        started(f)
+        f.live(KEY).first { it?.text == "a" }
+        f.pauseAll() // lands while the terminal status is being stored
+
+        awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
+    }
+
+    @Test
+    fun failedFinishTransactionLeavesLiveAndQueue() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val atRetry = CopyOnWriteArrayList<String>()
+        val f = follower(done, onDelay = {
+            atRetry += "live=${live(KEY).value != null} finished=${finished.size} row=${db.activeRunDao().forSession(KEY) != null} " +
+                "p1=${db.pendingSendDao().get("p1")?.state}"
+        })
+        val failures = AtomicInteger()
+        f.beforeFinishWrite = { if (failures.getAndIncrement() == 0) throw SQLiteException("disk I/O error") }
+        messages()
+        on(EVENTS, sse(delta(0, "a"), terminal(1)))
+        started(f)
+        done.await()
+
+        assertEquals(listOf("live=true finished=0 row=true p1=sending"), atRetry)
+        assertEquals(listOf(KEY), finished)
+        assertNull(db.pendingSendDao().get("p1"))
+    }
+
+    @Test
+    fun successfulTranscriptFetchClearsCredentialsRejected() = runTest {
+        val rejectedAtDelay = CopyOnWriteArrayList<Boolean>()
+        val f = follower(onDelay = {
+            rejectedAtDelay += credentialsRejected.value
+            pauseAll()
+        })
+        messages()
+        on("/v1/runs/$RUN/stop", json("""{"error":{"code":"invalid_api_key"}}""", 401))
+        on(STATUS, json("{}", 500))
+        f.resumeAll()
+        addSession()
+        addRun(lastSeq = 3) // the resume syncs the transcript first, with a request that succeeds
+        try {
+            f.stop(KEY)
+            fail("expected Unauthorized")
+        } catch (_: ApiError.Unauthorized) {
+        }
+        assertTrue(f.credentialsRejected.value)
+        f.resumeAll()
+        awaitUntil { rejectedAtDelay.isNotEmpty() }
+
+        assertEquals(listOf(false), rejectedAtDelay)
     }
 }

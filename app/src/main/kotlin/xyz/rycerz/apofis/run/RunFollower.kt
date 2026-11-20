@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.run
 
+import android.database.SQLException
 import androidx.room.withTransaction
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
@@ -8,6 +9,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,6 +22,7 @@ import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.ControlResult
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.api.PendingControl
 import xyz.rycerz.apofis.api.RunEvent
 import xyz.rycerz.apofis.api.RunStatus
 import xyz.rycerz.apofis.chat.ChatItem
@@ -60,6 +63,8 @@ enum class AnswerResult {
     GONE, // no request is pending any more; nothing was sent, or the server no longer wanted the answer
 }
 
+private enum class Posted { ACCEPTED, REFUSED, UNCLEAR }
+
 /** The follower's state machine; one step per loop turn. */
 private sealed interface Next {
     data object Attach : Next
@@ -84,7 +89,8 @@ class RunFollower(
     private val onRunFinished: suspend (sessionKey: String) -> Unit = {},
 ) : RunStarter {
     private val lives = ConcurrentHashMap<String, MutableStateFlow<LiveReply?>>()
-    private val jobs = HashMap<String, Job>() // by run id; it also guards [foreground]
+    private val jobs = HashMap<String, Job>() // by run id; it also guards [foreground] and [stopping]
+    private val stopping = HashMap<String, Job>() // cancelled jobs still completing, by run id; waited for before a restart
     private var foreground = false // opened by resumeAll, closed by pauseAll; no follower starts while closed
     private val seqs = ConcurrentHashMap<String, Long>() // last applied seq by run id; matches the live text across pauseAll
     private val rejected = MutableStateFlow(false)
@@ -92,7 +98,7 @@ class RunFollower(
     /** True once the server refused the API key; the runs stay stored. Cleared by the next request that succeeds. */
     val credentialsRejected: StateFlow<Boolean> = rejected.asStateFlow()
 
-    /** Test seam: runs at the start of Finish's database phase. */
+    /** Test-only: runs at the start of Finish's database phase, to cancel or fail it there. */
     internal var beforeFinishWrite: suspend RunFollower.() -> Unit = {}
 
     /** Run ids with a follower job; for tests. */
@@ -107,7 +113,12 @@ class RunFollower(
 
     /** Call on app start and every return to the foreground. */
     suspend fun resumeAll() {
-        synchronized(jobs) { foreground = true }
+        val completing = synchronized(jobs) {
+            foreground = true
+            stopping.values.toList()
+        }
+        // A paused job may still be writing (lastSeq, polling): read the rows only once it has finished.
+        completing.joinAll()
         db.activeRunDao().all().forEach { start(it, Next.Check) } // start checks the gate again
     }
 
@@ -115,6 +126,7 @@ class RunFollower(
     fun pauseAll() {
         val running = synchronized(jobs) {
             foreground = false
+            stopping.putAll(jobs)
             jobs.values.toList().also { jobs.clear() }
         }
         // Outside the lock and over a copy: a job may complete inside cancel() and run its completion handler.
@@ -155,21 +167,45 @@ class RunFollower(
     private suspend fun answer(sessionKey: String, requestId: String, generation: Long, post: suspend (runId: String) -> ControlResult): AnswerResult {
         val run = db.activeRunDao().forSession(sessionKey) ?: return AnswerResult.GONE
         val before = refresh(run).pendingControls
-        if (before.none { it.requestId == requestId && it.executionGeneration == generation }) return changedOrGone(before)
-        val accepted = try {
-            call(run) { post(run.runId) } == ControlResult.RESOLVED
+        fun same(c: PendingControl) = c.requestId == requestId && c.executionGeneration == generation
+        if (before.none(::same)) return changedOrGone(before)
+        val posted = try {
+            if (call(run) { post(run.runId) } == ControlResult.RESOLVED) Posted.ACCEPTED else Posted.REFUSED
         } catch (_: ApiError.Conflict) {
-            false // answered elsewhere, expired, or a newer generation
+            Posted.REFUSED // answered elsewhere, expired, or a newer generation
+        } catch (_: ApiError.Protocol) {
+            Posted.UNCLEAR // a 2xx body that is neither documented answer
         }
-        // What shows next comes from a read made after the POST: a new request may have been published meanwhile.
+        // What shows next comes only from a read made after the POST: a new request may have been published meanwhile.
         val after = try {
-            refresh(run).pendingControls
+            call(run) { api.runStatus(run.runId) }
         } catch (e: ApiError) {
-            if (!accepted || e == ApiError.Unauthorized) throw e
-            edit(run) { it.copy(pending = null) } // the stream's next control event reads the status again
+            if (posted != Posted.ACCEPTED || e == ApiError.Unauthorized) throw e
+            refreshLater(run) // the request stays on screen until a read succeeds
             return AnswerResult.SENT
         }
-        return if (accepted) AnswerResult.SENT else changedOrGone(after)
+        applyStatus(run, after)
+        return when {
+            posted == Posted.ACCEPTED -> AnswerResult.SENT
+            posted == Posted.UNCLEAR && after.pendingControls.any(::same) -> throw ApiError.Protocol
+            else -> changedOrGone(after.pendingControls)
+        }
+    }
+
+    private fun refreshLater(run: ActiveRunEntity) {
+        scope.launch {
+            var wait = FIRST_RETRY_MS
+            repeat(FINISH_ATTEMPTS) {
+                delayMs(wait)
+                try {
+                    refresh(run)
+                    return@launch
+                } catch (e: ApiError) {
+                    if (e == ApiError.Unauthorized) return@launch
+                }
+                wait = (wait * 2).coerceAtMost(MAX_RETRY_MS)
+            }
+        }
     }
 
     private fun changedOrGone(pending: List<*>) = if (pending.isEmpty()) AnswerResult.GONE else AnswerResult.CHANGED
@@ -182,7 +218,8 @@ class RunFollower(
     /** Shows [s] and stores its status (terminal ones too), so the send queue's steer decision reads the truth. */
     private suspend fun applyStatus(run: ActiveRunEntity, s: RunStatus) {
         edit(run) { it.copy(status = s.status, pending = s.pendingControls.firstOrNull()) }
-        db.activeRunDao().setStatus(run.runId, stored(s.status))
+        // Not cancellable: a terminal status must be stored once seen, or the send queue could steer into the run.
+        withContext(NonCancellable) { db.activeRunDao().setStatus(run.runId, stored(s.status)) }
     }
 
     private suspend fun refresh(run: ActiveRunEntity): RunStatus = call(run) { api.runStatus(run.runId) }.also { applyStatus(run, it) }
@@ -191,7 +228,7 @@ class RunFollower(
     private suspend fun <T> call(run: ActiveRunEntity, block: suspend () -> T): T = try {
         io(block)
     } catch (e: ApiError.Unauthorized) {
-        synchronized(jobs) { jobs.remove(run.runId) }?.cancel()
+        synchronized(jobs) { jobs.remove(run.runId)?.also { stopping[run.runId] = it } }?.cancel()
         throw e
     }
 
@@ -216,9 +253,18 @@ class RunFollower(
         state(run.sessionKey).update {
             if (it?.runId == run.runId) it else LiveReply(run.runId, run.status, "", emptyList(), null, Connection.LIVE)
         }
-        val job = scope.launch(start = CoroutineStart.LAZY) { Follow(run, first).run() }
+        val previous = old ?: stopping[run.runId]
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            previous?.join() // never follow a run while an earlier job for it is still writing
+            Follow(run, first).run()
+        }
         jobs[run.runId] = job
-        job.invokeOnCompletion { synchronized(jobs) { if (jobs[run.runId] === job) jobs.remove(run.runId) } }
+        job.invokeOnCompletion {
+            synchronized(jobs) {
+                if (jobs[run.runId] === job) jobs.remove(run.runId)
+                if (stopping[run.runId] === job) stopping.remove(run.runId)
+            }
+        }
         job.start()
     }
 
@@ -237,7 +283,7 @@ class RunFollower(
             try {
                 // shortcut: after a restart the stream resumes at lastSeq, so earlier text of this reply shows only
                 // as far as the server already stored it, until the run ends and the transcript is synced.
-                if (next == Next.Check && run.lastSeq != null && state(key).value?.text.isNullOrEmpty()) quietly { repo.syncMessages(key) }
+                if (next == Next.Check && run.lastSeq != null && state(key).value?.text.isNullOrEmpty()) syncQuietly()
                 if (next == Next.Check && polling) next = Next.Poll // a run that lost its stream never reattaches
                 while (true) {
                     next = when (val step = next) {
@@ -254,7 +300,7 @@ class RunFollower(
                         Next.Poll -> {
                             edit(run) { it.copy(connection = Connection.POLLING) }
                             delayMs(POLL_MS)
-                            quietly { repo.syncMessages(key) }
+                            syncQuietly()
                             when (val n = status()) {
                                 is Next.Finish, Next.Unknown -> n
                                 else -> Next.Poll
@@ -334,7 +380,8 @@ class RunFollower(
                 is RunEvent.Other -> if (event.name in CONTROL_EVENTS) return readControls()
                 is RunEvent.Truncated -> return fallBackToPolling()
                 is RunEvent.Terminal -> {
-                    db.activeRunDao().setStatus(id, stored(event.status)) // before Finish: the queue must not steer into it
+                    // Stored at once and not cancellable: the send queue must never steer into a finished run.
+                    withContext(NonCancellable) { db.activeRunDao().setStatus(id, stored(event.status)) }
                     return Next.Finish(event.status)
                 }
                 is RunEvent.Reasoning, is RunEvent.Steered -> Unit
@@ -394,33 +441,38 @@ class RunFollower(
          * cancellable: once the write has committed, the hand-off always completes.
          */
         suspend fun finish(status: String?, sync: Boolean = true): Boolean {
-            var committed = false
             try {
-                val replaced = sync && try {
-                    repo.syncMessages(key) { rows ->
-                        write(status, buildTranscript(rows))
-                        committed = true
+                if (sync) {
+                    var wrote = false
+                    val fetched = try {
+                        // The hand-off runs inside the repository call, only after its transaction has committed.
+                        repo.syncMessages(key, afterCommit = { handOff() }) { rows ->
+                            write(status, buildTranscript(rows))
+                            wrote = true
+                        }
+                    } catch (e: ApiError) {
+                        when (e) {
+                            ApiError.Unauthorized -> throw e
+                            is ApiError.Network, is ApiError.Unavailable -> return false
+                            else -> false // permanent: finish without a transcript to check against
+                        }
+                    } catch (_: IllegalArgumentException) {
+                        false
                     }
-                } catch (e: ApiError) {
-                    when (e) {
-                        ApiError.Unauthorized -> throw e
-                        is ApiError.Network, is ApiError.Unavailable -> return false
-                        else -> false
-                    }
-                } catch (_: IllegalArgumentException) {
-                    false
+                    if (fetched) accepted()
+                    if (wrote) return true
                 }
-                if (!replaced) {
-                    withContext(NonCancellable) {
-                        withRepositoryLock { db.withTransaction { write(status, items = null) } }
-                        committed = true
-                    }
+                withContext(NonCancellable) {
+                    withRepositoryLock { db.withTransaction { write(status, items = null) } }
+                    handOff() // reached only when the transaction returned normally
                 }
-            } finally {
-                if (committed) withContext(NonCancellable) { handOff() }
+                return true
+            } catch (_: SQLException) {
+                return false // rolled back: nothing was cleared or handed off; retried like a transient failure
             }
-            return true
         }
+
+        private suspend fun syncQuietly() = quietly { if (repo.syncMessages(key)) accepted() }
 
         /**
          * Inside the repository lock and a transaction. A pending send is removed only when the transcript the user
