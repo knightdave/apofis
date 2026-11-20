@@ -140,4 +140,66 @@ class HighlightTest {
             for (b in parseBlocks(text.substring(0, end))) assertTrue(b.lang.length <= LANG_MAX)
         }
     }
+
+    // ---- fix round 1 ----
+
+    /** Every token of [code] in [lang]: its text and tone, in order. */
+    private fun marks(code: String, lang: Lang) = tokens(code, lang)!!.let { a ->
+        a.getStringAnnotations(0, a.length).sortedBy { it.start }.map { code.substring(it.start, it.end) to Tone.valueOf(it.item) }
+    }
+
+    private val S = Tone.STRING
+    private val K = Tone.KEYWORD
+    private val C = Tone.COMMENT
+    private val N = Tone.LITERAL
+
+    @Test
+    fun rawStringsEndWhereTheLanguageEndsThem() {
+        // Go backtick strings have no escapes; the code after the closer is code.
+        assertEquals(
+            listOf("const" to K, "`\\`" to S, "func" to K, "// work" to C),
+            marks("const sep = `\\`\nfunc load() {\n  // work\n}", Lang.GO),
+        )
+        // Shell single quotes have no escapes; double quotes do.
+        assertEquals(
+            listOf("'C:\\Tools\\'" to S, "echo" to K, "\"\$dir\"" to S, "# show" to C),
+            marks("dir='C:\\Tools\\'; echo \"\$dir\" # show", Lang.SHELL),
+        )
+        assertEquals(listOf("echo" to K, "\"a\\\"b\"" to S, "# c" to C), marks("echo \"a\\\"b\" # c", Lang.SHELL))
+        // Rust raw strings, with and without hashes; ordinary strings keep their escapes.
+        assertEquals(listOf("let" to K, "r\"C:\\Windows\\\"" to S, "// path" to C), marks("let path = r\"C:\\Windows\\\"; // path", Lang.RUST))
+        assertEquals(listOf("let" to K, "r#\"a \"quoted\" \\\"#" to S, "// c" to C), marks("let s = r#\"a \"quoted\" \\\"#; // c", Lang.RUST))
+        assertEquals(listOf("let" to K, "br\"\\\"" to S, "1" to N), marks("let b = br\"\\\"; 1", Lang.RUST))
+        assertEquals(listOf("let" to K, "\"a\\\"b\"" to S, "// c" to C), marks("let s = \"a\\\"b\"; // c", Lang.RUST))
+        // Kotlin, Swift and Dart triple-quoted raw strings: a backslash before the closer does not escape it.
+        assertEquals(listOf("val" to K, "\"\"\"C:\\\"\"\"" to S, "// c" to C), marks("val p = \"\"\"C:\\\"\"\" // c", Lang.KOTLIN))
+        // Dart r'...' raw strings; C# @"..." verbatim strings, where "" is the only escape.
+        assertEquals(listOf("var" to K, "r'C:\\'" to S, "// c" to C), marks("var p = r'C:\\'; // c", Lang.DART))
+        assertEquals(listOf("var" to K, "@\"C:\\ \"\"x\"\" \\\"" to S, "// c" to C), marks("var p = @\"C:\\ \"\"x\"\" \\\"; // c", Lang.CSHARP))
+        // JS template literals keep their escapes and may span lines.
+        assertEquals(listOf("`a\\`\nb`" to S, "return" to K), marks("`a\\`\nb` ; return", Lang.JAVASCRIPT))
+        // Python raw strings: a backslash still keeps the quote from ending the string (r"a\"b" is one valid string).
+        assertEquals(listOf("\"a\\\"b\"" to S, "# c" to C), marks("r\"a\\\"b\" # c", Lang.PYTHON))
+    }
+
+    @Test
+    fun anUnterminatedStringEndsAtItsLine() {
+        for (lang in Lang.entries) {
+            for (q in listOf("\"", "'")) {
+                val m = marks("x = ${q}open\nreturn 1", lang)
+                assertTrue("$lang $q: $m", m.none { (text, tone) -> tone == S && '\n' in text })
+                assertTrue("$lang $q: $m", ("1" to N) in m)
+            }
+        }
+    }
+
+    @Test
+    fun regexLiteralsAndDigitSeparatorsDoNotStartComments() {
+        for (lang in listOf(Lang.JAVASCRIPT, Lang.TYPESCRIPT)) {
+            assertEquals(listOf("if" to K, "return" to K, "true" to K), marks("if (/^https?:\\/\\//.test(url)) return true;", lang))
+            assertEquals(listOf("let" to K, "1" to N, "2" to N, "// half" to C), marks("let x = 1 / 2 // half", lang))
+            assertEquals(listOf("let" to K, "// c" to C), marks("let r = (/[/]x/); // c", lang).filter { it.second != N })
+        }
+        assertEquals(listOf("int" to K, "1'000" to N, "// count" to C), marks("int n = 1'000; // count", Lang.CPP))
+    }
 }

@@ -26,6 +26,13 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.delay
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.platform.Clipboard
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -397,14 +404,67 @@ internal fun Modifier.blockFrame(first: Boolean, last: Boolean, color: Color, ra
     }
 }
 
-/** A header action: copies [source] (the raw source of the whole block) to the clipboard as plain text, no toast. */
+/**
+ * The most text put on the clipboard. ClipData carries text inline through one Binder transaction, whose buffer is
+ * 1 MiB shared by the whole process, as UTF-16 (2 bytes per character): 100,000 characters is about 200 KB, a fifth of
+ * it. Longer text is refused, never cut.
+ */
+internal const val MAX_CLIP_CHARS = 100_000
+
+/** How long the Copy result stays beside the button. */
+internal const val COPY_NOTE_MS = 2000L
+
+internal enum class CopyResult(@StringRes val note: Int) {
+    COPIED(R.string.copy_done),
+    TOO_LARGE(R.string.copy_too_large),
+    FAILED(R.string.copy_failed),
+}
+
+/** Puts [text] on [clipboard] as plain text, whole or not at all; a rejected write (for example by Binder) is caught. */
+internal suspend fun copyText(clipboard: Clipboard, text: String): CopyResult {
+    if (text.length > MAX_CLIP_CHARS) return CopyResult.TOO_LARGE
+    return try {
+        clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(null, text)))
+        CopyResult.COPIED
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        CopyResult.FAILED
+    }
+}
+
+/**
+ * A header action: copies [source] (the raw source of the whole block) to the clipboard, no toast. What happened
+ * (copied, too large, failed) shows beside the button for [COPY_NOTE_MS] and is announced.
+ */
 @Composable
 internal fun CopyButton(@StringRes description: Int, source: () -> String?) {
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val current by rememberUpdatedState(source)
+    var note by remember { mutableStateOf<CopyResult?>(null) }
+    var taps by remember { mutableIntStateOf(0) }
+    LaunchedEffect(taps) {
+        delay(COPY_NOTE_MS)
+        note = null
+    }
+    note?.let {
+        Text(
+            stringResource(it.note),
+            Modifier.padding(start = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },
+            style = TextStyle(fontSize = 12.sp),
+            color = ApofisTheme.colors.codeLabel,
+            maxLines = 1,
+        )
+    }
     ApofisIconButton(
-        onClick = { current()?.let { text -> scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(null, text))) } } },
+        onClick = {
+            val text = current() ?: return@ApofisIconButton
+            scope.launch {
+                note = copyText(clipboard, text)
+                taps++
+            }
+        },
         contentDescription = stringResource(description),
         visualSize = 24.dp,
     ) {

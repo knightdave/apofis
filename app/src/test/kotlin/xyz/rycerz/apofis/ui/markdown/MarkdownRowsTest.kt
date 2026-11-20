@@ -684,7 +684,7 @@ class MarkdownRowsTest {
         // A stored reply whose fence never closed is shown closed: highlighted, with its bottom edge.
         val stored = ChatRows(ZoneId.of("UTC")).rows(listOf(AssistantReply("r1", emptyList(), text.substring(0, close - 3), 0.0)))
             .filterIsInstance<TextRow>().filter { it.kind == BlockKind.CODE }
-        assertTrue(stored.all { it.fenceClosed && (it.chunk as DisplayChunk.Code).highlighted != null })
+        assertTrue(stored.last().fenceClosed && stored.all { (it.chunk as DisplayChunk.Code).highlighted != null })
     }
 
     @Test
@@ -810,5 +810,48 @@ class MarkdownRowsTest {
         }
         assertEquals(200L, Work.highlights - highlights)
         assertEquals(failures, Work.highlightFailures)
+    }
+
+    // ---- fix round 1 ----
+
+    @Test
+    fun copyUsesTheCanonicalLfText() {
+        // Ruled: Copy gives the block in the app's canonical text, line endings LF (Task 2 normalizes at the boundary),
+        // which is what a terminal or editor expects. Offsets are found in that text, so a CRLF before the block is fine.
+        val text = "intro\r\n\r\n```sh\r\na\r\nb\rc\r\n```\r\n\r\n| x | y |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\nend"
+        assertEquals("a\nb\nc", blockSource(text, 1))
+        assertEquals("| x | y |\n|---|---|\n| 1 | 2 |", blockSource(text, 2))
+        val items = listOf(AssistantReply("r1", emptyList(), text, 0.0))
+        val rows = ChatRows(ZoneId.of("UTC")).rows(items).filterIsInstance<TextRow>()
+        assertEquals("a\nb\nc", copySource(items, rows.first { it.kind == BlockKind.CODE }.key))
+        assertEquals("| x | y |\n|---|---|\n| 1 | 2 |", copySource(items, rows.first { it.kind == BlockKind.TABLE }.key))
+    }
+
+    /** Row work of the reviewer's four fence transitions after [lines] lines of a fence; checks every result against fresh. */
+    private fun transitionWork(lines: Int): List<Triple<Long, Long, Long>> {
+        val live = ReplyText()
+        var text = "```kotlin\n" + "0\n".repeat(lines)
+        live.update("r1", text)
+        val snapshots = ArrayList<Pair<String, List<TextRow>>>()
+        val work = ArrayList<Triple<Long, Long, Long>>()
+        for (append in listOf("```", "x", "\n```", "\n")) {
+            text += append
+            val copies = Work.rowCopies
+            val built = Work.rowsBuilt
+            val chunk = Work.chunkSteps
+            val rows = live.update("r1", text)
+            work += Triple(Work.rowCopies - copies, Work.rowsBuilt - built, Work.chunkSteps - chunk)
+            snapshots += text to rows
+        }
+        for ((t, rows) in snapshots) assertEquals("snapshot of ${t.length}", replyRows("r1", t), rows.toList())
+        return work
+    }
+
+    @Test
+    fun fenceTransitionsCostTheSameAtAnyBlockLength() {
+        val small = transitionWork(50_000)
+        val large = transitionWork(500_000)
+        assertEquals(small, large)
+        assertTrue("$small", small.all { it.first <= 2 })
     }
 }

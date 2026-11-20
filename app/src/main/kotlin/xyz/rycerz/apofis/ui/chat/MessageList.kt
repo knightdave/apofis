@@ -502,7 +502,7 @@ private fun firstNonSpace(text: CharSequence, from: Int, end: Int): Int {
 /** The row for chunk number [c] of [chunks] of block [b] of reply [key]. */
 private fun textRow(key: String, b: LogicalBlock, c: Int, chunk: DisplayChunk, last: Boolean): TextRow {
     Work.rowsBuilt++
-    return TextRow("$key/b${b.index}/c$c", chunk, b.kind, b.lang, first = c == 0, joinBelow = !last, fenceClosed = b.fenceClosed)
+    return TextRow("$key/b${b.index}/c$c", chunk, b.kind, b.lang, first = c == 0, joinBelow = !last, fenceClosed = b.fenceClosed && last)
 }
 
 private fun blockRows(key: String, b: LogicalBlock, text: CharSequence): List<TextRow> {
@@ -522,6 +522,8 @@ internal fun replyRows(key: String, text: String, closeFences: Boolean = false):
 }
 
 /** The raw source (line endings LF) of logical block [blockIndex] of [replyText], from a fresh parse; null if none. */
+// Ruled: Copy gives the app's canonical text, line endings LF (normalized once at the boundary, as for display), which
+// is what a terminal or editor expects; the original CR characters are not restored.
 internal fun blockSource(replyText: String, blockIndex: Int): String? {
     val t = lf(replyText)
     return parseBlocks(t).getOrNull(blockIndex)?.let { t.substring(it.start, it.end) }
@@ -545,6 +547,22 @@ private class Prefix<T>(private val backing: List<T>, override val size: Int) : 
     override fun get(index: Int): T {
         if (index >= size) throw IndexOutOfBoundsException("$index of $size")
         return backing[index]
+    }
+}
+
+/** The first [count] of [parts] read as one list; [ends] holds each part's end. Both are only ever appended to: a view. */
+private class Segments<T>(private val parts: List<List<T>>, private val ends: List<Int>, private val count: Int) : AbstractList<T>() {
+    override val size: Int = if (count == 0) 0 else ends[count - 1]
+
+    override fun get(index: Int): T {
+        if (index !in 0 until size) throw IndexOutOfBoundsException("$index of $size")
+        var lo = 0
+        var hi = count - 1
+        while (lo < hi) { // the first part ending after index
+            val mid = (lo + hi) ushr 1
+            if (ends[mid] > index) hi = mid else lo = mid + 1
+        }
+        return parts[lo][index - (if (lo == 0) 0 else ends[lo - 1])]
     }
 }
 
@@ -586,7 +604,9 @@ internal class ReplyText {
     private var text = "" // as given
     private var norm: CharSequence = "" // [text] through [lf]: [text] itself while it holds no CR, else a builder only appended to
     private var blankTo = 0 // the last line holds only spaces from its start up to here (read once, not per token)
-    private var closed = ArrayList<TextRow>() // rows of stable blocks; only appended to, so earlier views stay valid
+    // Rows of stable blocks, one segment per block, never copied; both lists are only appended to, so earlier views stay valid.
+    private var closedParts = ArrayList<List<TextRow>>()
+    private var closedEnds = ArrayList<Int>()
     private var closedBlocks = 0
     private var checkpoint = ScanState() // the scanner at the start of the text's last line
     private var tail: List<Open> = emptyList()
@@ -601,7 +621,8 @@ internal class ReplyText {
         if (key == this.key && (raw === text || raw == text)) return rows
         val appended = key == this.key && raw.startsWith(text)
         if (!appended) {
-            closed = ArrayList()
+            closedParts = ArrayList()
+            closedEnds = ArrayList()
             closedBlocks = 0
             checkpoint = ScanState()
             tail = emptyList()
@@ -644,22 +665,28 @@ internal class ReplyText {
             checkpoint = next
             parsed = out.size
         }
+        // The last line may still become a closing fence (blank so far or starting with a backtick, and short enough for
+        // the scanner to judge whole): no code piece whose cut depends on it is settled, so the closing drops none.
+        val mayClose = (blankTo >= new.length || new[blankTo] == '`') && new.length - checkpoint.pos <= LINE_LOOK + 1
+        val settleBefore = if (mayClose) checkpoint.pos - 1 else Int.MAX_VALUE
         val firstIndex = closedBlocks
         val nextTail = ArrayList<Open>()
         blocks.forEachIndexed { n, scanned ->
             val b = scanned.copy(index = firstIndex + n)
-            val open = open(key, tail.firstOrNull { it.block.start == b.start }, b, new)
+            val open = open(key, tail.firstOrNull { it.block.start == b.start }, b, new, settleBefore)
             if (n < finished) {
                 val r = open.rows
-                closed.addAll(r)
-                Work.rowCopies += r.size
+                if (r.isNotEmpty()) {
+                    closedEnds += (closedEnds.lastOrNull() ?: 0) + r.size
+                    closedParts += r
+                }
                 closedBlocks++
             } else {
                 nextTail += open
             }
         }
         tail = nextTail
-        var view: List<TextRow> = Prefix(closed, closed.size)
+        var view: List<TextRow> = Segments(closedParts, closedEnds, closedParts.size)
         for (o in nextTail) view = Joined(view, o.rows)
         rows = view
         this.key = key
@@ -669,7 +696,13 @@ internal class ReplyText {
     }
 
     /** The rows of [b], reusing what [prev] (the block at the same start in the last update) still has right. */
-    private fun open(key: String, prev: Open?, b: LogicalBlock, text: CharSequence): Open {
+    /**
+     * The rows of [b], reusing what [prev] (the block at the same start in the last update) still has right. A code
+     * piece is settled only when its cut was decided before [settleBefore] (just before a last line that may still close
+     * the fence): so a fence closing or reopening never drops a settled piece, and only the last row, which alone carries
+     * the closed state, is rebuilt.
+     */
+    private fun open(key: String, prev: Open?, b: LogicalBlock, text: CharSequence, settleBefore: Int): Open {
         val p = prev?.block
         val same = p != null && p.start == b.start && p.kind == b.kind && p.mode == b.mode && p.lang == b.lang
         if (same && p!!.end == b.end && p.fenceClosed == b.fenceClosed) {
@@ -685,13 +718,13 @@ internal class ReplyText {
             // A settled piece stays while its cut was decided before the new end too; usually all of them do.
             var k = prev!!.size
             while (k > 0 && prev.decided[k - 1] >= b.end) k--
-            if (k == prev.size && p!!.fenceClosed == b.fenceClosed) {
+            if (k == prev.size) {
                 settled = prev.settled
                 starts = prev.starts
                 decided = prev.decided
                 from = prev.looseStart
-            } else { // the block got shorter or its fence opened or closed: copy what stays (rare)
-                for (r in 0 until k) settled += prev.settled[r].let { if (it.fenceClosed == b.fenceClosed) it else it.copy(fenceClosed = b.fenceClosed) }
+            } else { // the block got shorter than a settled cut: copy what stays (not expected, see above)
+                for (r in 0 until k) settled += prev.settled[r]
                 starts.addAll(prev.starts.subList(0, k))
                 decided.addAll(prev.decided.subList(0, k))
                 Work.rowCopies += k
@@ -703,7 +736,7 @@ internal class ReplyText {
         var looseStart = -1
         rawPieces(text, b, from) { s, e, d, last ->
             val row = textRow(key, b, size + loose.size, rawChunk(text, b, s, e, last), last)
-            if (d < b.end && loose.isEmpty()) {
+            if (d < b.end && (b.kind != BlockKind.CODE || d < settleBefore) && loose.isEmpty()) {
                 settled += row
                 starts += s
                 decided += d

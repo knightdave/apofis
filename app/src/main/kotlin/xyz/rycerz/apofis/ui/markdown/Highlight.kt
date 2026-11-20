@@ -72,7 +72,7 @@ internal fun tokens(code: CharSequence, lang: Lang): AnnotatedString? {
     Work.highlights++
     Work.largestHighlight = maxOf(Work.largestHighlight, code.length)
     return try {
-        scan(code.toString(), SYNTAX.getValue(lang)).takeIf { it.text.length == code.length } ?: run {
+        scan(code.toString(), SYNTAX.getValue(lang), lang).takeIf { it.text.length == code.length } ?: run {
             Work.highlightFailures++
             null
         }
@@ -195,34 +195,70 @@ internal fun keywords(lang: Lang): Set<String> = SYNTAX.getValue(lang).keywords
 
 private fun Char.isAsciiWord() = this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9' || this == '_'
 
-private fun scan(code: String, syn: Syntax): AnnotatedString {
+/**
+ * Ordinary `'` and `"` strings honour backslash escapes and end at their line (an unterminated one colors no more than
+ * that line). Raw forms end only at their own closer: Go backtick strings, shell single quotes, Rust `r"..."` and
+ * `r#"..."#`, Dart `r'...'`, C# `@"..."` (where `""` is a quote), and triple-quoted strings. Python's `r"..."` keeps
+ * the backslash rule, as Python does (`r"a\"b"` is one string).
+ */
+private fun scan(code: String, syn: Syntax, lang: Lang): AnnotatedString {
     val out = AnnotatedString.Builder(code.length)
     out.append(code)
     val n = code.length
     var steps = 0L
     fun mark(tone: Tone, start: Int, end: Int) = out.addStringAnnotation(TAG, tone.name, start, end)
     fun lineEnd(from: Int) = code.indexOf('\n', from).let { if (it < 0) n else it }
-    // The end of the quoted string at [start], escapes skipped; a quote other than a backtick stops at the line end.
-    fun quoteEnd(start: Int, limit: Int): Int {
+    fun closer(delimiter: String, from: Int) = code.indexOf(delimiter, from).let { if (it < 0) n else it + delimiter.length }
+    // The end of the string quoted at [start] whose content starts at [from]; [multiline]: it may span lines.
+    fun quoteEnd(start: Int, from: Int, limit: Int, escapes: Boolean, multiline: Boolean): Int {
         val q = code[start]
-        var k = start + 1
+        var k = from
         while (k < limit) {
             val c = code[k]
             if (c == q) return k + 1
-            if (c == '\n' && q != '`') return k
-            k += if (c == '\\') 2 else 1
+            if (c == '\n' && !multiline) return k
+            k += if (c == '\\' && escapes) 2 else 1
         }
         return minOf(k, n)
+    }
+    // Rust `r"..."`, `r#"..."#` or `br"..."` at [i]: its end, or -1 when it is not one.
+    fun rustRawEnd(i: Int): Int {
+        var k = i + (if (code[i] == 'b') 2 else 1)
+        val hashes = k
+        while (k < n && code[k] == '#') k++
+        steps += k - i
+        if (k >= n || code[k] != '"') return -1
+        return closer("\"" + "#".repeat(k - hashes), k + 1)
+    }
+    // A JS regex literal at [i] (after an operator or an opening bracket): its end, or -1. Reads at most 256 characters.
+    fun regexEnd(i: Int): Int {
+        var p = i - 1
+        while (p >= 0 && i - p <= 64 && (code[p] == ' ' || code[p] == '\t')) p--
+        if (p >= 0 && code[p] != '\n' && code[p] !in "(,=:[!&|?{};") return -1
+        var k = i + 1
+        var inClass = false
+        val limit = minOf(n, i + 256)
+        while (k < limit && code[k] != '\n') {
+            when (code[k]) {
+                '\\' -> k++
+                '[' -> inClass = true
+                ']' -> inClass = false
+                '/' -> if (!inClass) return k + 1
+            }
+            k++
+        }
+        steps += k - i + i - p
+        return -1
     }
     var i = 0
     while (i < n) {
         val c = code[i]
         val next = if (i + 1 < n) code[i + 1] else '\u0000'
         val start = i
+        var regex = -1
         when {
             syn.slashes && c == '/' && next == '*' -> {
-                val close = code.indexOf("*/", i + 2)
-                i = if (close < 0) n else close + 2
+                i = closer("*/", i + 2)
                 mark(Tone.COMMENT, start, i)
             }
             (syn.slashes && c == '/' && next == '/') ||
@@ -230,18 +266,34 @@ private fun scan(code: String, syn: Syntax): AnnotatedString {
                 i = lineEnd(i)
                 mark(Tone.COMMENT, start, i)
             }
+            (lang == Lang.JAVASCRIPT || lang == Lang.TYPESCRIPT) && c == '/' && regexEnd(i).also { regex = it } > 0 -> i = regex
             syn.triple && (c == '"' || c == '\'') && next == c && i + 2 < n && code[i + 2] == c -> {
-                val close = code.indexOf(code.substring(i, i + 3), i + 3)
-                i = if (close < 0) n else close + 3
+                i = closer(code.substring(i, i + 3), i + 3)
+                mark(Tone.STRING, start, i)
+            }
+            lang == Lang.RUST && (c == 'r' || (c == 'b' && next == 'r')) && rustRawEnd(i).also { regex = it } > 0 -> {
+                i = regex
+                mark(Tone.STRING, start, i)
+            }
+            lang == Lang.DART && c == 'r' && (next == '"' || next == '\'') -> {
+                val q = next.toString()
+                i = if (code.startsWith(q.repeat(3), i + 1)) closer(q.repeat(3), i + 4) else quoteEnd(i + 1, i + 2, n, escapes = false, multiline = false)
+                mark(Tone.STRING, start, i)
+            }
+            lang == Lang.CSHARP && c == '@' && next == '"' -> { // verbatim: "" is a quote, no escapes, may span lines
+                i += 2
+                while (i < n && !(code[i] == '"' && (i + 1 >= n || code[i + 1] != '"'))) i += if (code[i] == '"') 2 else 1
+                i = minOf(n, i + 1)
                 mark(Tone.STRING, start, i)
             }
             c == '"' || (c == '\'' && !syn.charQuote) || (c == '`' && syn.backtick) -> {
-                i = quoteEnd(i, n)
+                val raw = (c == '`' && lang == Lang.GO) || (c == '\'' && lang == Lang.SHELL)
+                i = quoteEnd(i, i + 1, n, escapes = !raw, multiline = c == '`')
                 mark(Tone.STRING, start, i)
             }
             c == '\'' -> { // a character literal: 'a', a surrogate pair, or an escape like '\n'; else a lifetime ('a)
                 val e = when {
-                    next == '\\' -> quoteEnd(i, minOf(n, i + 12)).takeIf { it > i + 2 && code[it - 1] == '\'' }
+                    next == '\\' -> quoteEnd(i, i + 1, minOf(n, i + 12), escapes = true, multiline = false).takeIf { it > i + 2 && code[it - 1] == '\'' }
                     next != '\n' && i + 2 < n && code[i + 2] == '\'' -> i + 3
                     Character.isHighSurrogate(next) && i + 3 < n && code[i + 3] == '\'' -> i + 4
                     else -> null
@@ -256,7 +308,13 @@ private fun scan(code: String, syn: Syntax): AnnotatedString {
             }
             c in '0'..'9' -> {
                 i++
-                while (i < n && (code[i].isAsciiWord() || (code[i] == '.' && i + 1 < n && code[i + 1] in '0'..'9'))) i++
+                while (i < n) {
+                    val d = code[i]
+                    val more = d.isAsciiWord() || (d == '.' && i + 1 < n && code[i + 1] in '0'..'9') ||
+                        (d == '\'' && lang == Lang.CPP && i + 1 < n && code[i + 1].isAsciiWord()) // C++ 1'000
+                    if (!more) break
+                    i++
+                }
                 mark(Tone.LITERAL, start, i)
             }
             c.isLetter() || c == '_' -> {
