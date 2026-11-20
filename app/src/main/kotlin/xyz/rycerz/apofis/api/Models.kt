@@ -78,6 +78,12 @@ data class PendingControl(
 
 enum class ApprovalChoice { ONCE, SESSION, ALWAYS, DENY }
 
+/** The answer to an approval or clarify POST: [ALREADY_RESOLVED] when the prompt was answered or expired in between. */
+enum class ControlResult { RESOLVED, ALREADY_RESOLVED }
+
+@Serializable
+internal data class ControlReply(val status: String? = null)
+
 @Serializable
 internal data class SessionEnvelope(val session: SessionDto)
 

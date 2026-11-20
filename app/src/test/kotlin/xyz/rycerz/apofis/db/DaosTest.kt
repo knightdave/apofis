@@ -227,7 +227,7 @@ class DaosTest {
         val dao = db.activeRunDao()
         dao.updateLastSeq("gone", 5)
         dao.setStatus("gone", "stopping")
-        dao.updateStatus("gone", "queued")
+        dao.setStopRequested("gone")
         dao.setPolling("gone")
         assertTrue(dao.all().isEmpty())
 
@@ -235,16 +235,20 @@ class DaosTest {
         dao.updateLastSeq("run_1", 7)
         dao.updateLastSeq("run_1", 3)
         dao.setStatus("run_1", "stopping")
-        dao.updateStatus("run_1", "running") // a requested stop is never overwritten by a status read
+        dao.setStatus("run_1", "running") // the status mirrors the server, also back from stopping
+        dao.setStopRequested("run_1")
         dao.setPolling("run_1")
         val row = dao.all().single()
         assertEquals(7L, row.lastSeq)
-        assertEquals("stopping", row.status)
+        assertEquals("running", row.status)
         assertTrue(row.polling)
+        assertTrue(row.stopRequested)
+        assertEquals(row, dao.get("run_1"))
 
         dao.upsert(ActiveRunEntity("run_2", "t", null, "running", 1L))
-        dao.updateStatus("run_2", "queued")
+        dao.setStatus("run_2", "queued")
         assertEquals("queued", dao.forSession("t")!!.status)
         assertEquals(false, dao.forSession("t")!!.polling)
+        assertEquals(false, dao.forSession("t")!!.stopRequested)
     }
 }

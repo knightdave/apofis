@@ -9,7 +9,12 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.first
@@ -34,7 +39,9 @@ import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ToolStep
+import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
@@ -89,6 +96,7 @@ class RunFollowerTest {
     private fun TestScope.follower(
         done: CompletableDeferred<Unit>? = null,
         beforeFinished: suspend RunFollower.() -> Unit = {},
+        onDelay: suspend RunFollower.() -> Unit = {},
     ): RunFollower {
         lateinit var f: RunFollower
         f = RunFollower(
@@ -97,6 +105,7 @@ class RunFollowerTest {
                 delays += it
                 seenAtDelay += f.live(KEY).value
                 roomStatusAtDelay += db.activeRunDao().forSession(KEY)?.status
+                f.onDelay()
             },
             onRunFinished = {
                 f.beforeFinished()
@@ -105,6 +114,15 @@ class RunFollowerTest {
             },
         )
         return f
+    }
+
+    /** Waits (in real time, since requests run on real threads) for [condition]; fails the test after 10 s. */
+    private suspend fun awaitUntil(condition: () -> Boolean) = withContext(Dispatchers.IO) {
+        repeat(2000) {
+            if (condition()) return@withContext
+            Thread.sleep(5)
+        }
+        fail("condition not met within 10 s")
     }
 
     // ---- server helpers ----
@@ -435,7 +453,10 @@ class RunFollowerTest {
                 sseResponse(terminal(2))
             }
         }
-        on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}"""))
+        routes["/v1/runs/$RUN/approval"] = {
+            on(STATUS, status("running"))
+            json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}""")()
+        }
         started(f)
 
         val pending = f.live(KEY).first { it?.pending != null }!!.pending!!
@@ -747,7 +768,7 @@ class RunFollowerTest {
         started(f)
 
         assertEquals("ctl_prompt", f.live(KEY).first { it?.pending != null }!!.pending!!.requestId)
-        withContext(Dispatchers.IO) { while (requestsTo(EVENTS).size < 2) Thread.sleep(5) }
+        awaitUntil { requestsTo(EVENTS).size >= 2 }
         assertEquals("0", requestsTo(EVENTS)[1].headers["Last-Event-ID"]) // the approval event was not checkpointed
         assertEquals(listOf(1000L), delays)
         assertEquals("a", f.live(KEY).value!!.text)
@@ -760,7 +781,7 @@ class RunFollowerTest {
         val release = CountDownLatch(1)
         on("/v1/runs/$RUN/stop", json("""{"error":{"code":"invalid_api_key"}}""", 401))
         heldOpen(f, release)
-        withContext(Dispatchers.IO) { while (requestsTo(EVENTS).isEmpty()) Thread.sleep(5) }
+        awaitUntil { requestsTo(EVENTS).isNotEmpty() }
 
         try {
             f.stop(KEY)
@@ -768,7 +789,7 @@ class RunFollowerTest {
         } catch (_: ApiError.Unauthorized) {
         }
         assertTrue(f.credentialsRejected.value)
-        withContext(Dispatchers.IO) { while (f.following.isNotEmpty()) Thread.sleep(5) }
+        awaitUntil { f.following.isEmpty() }
         assertNotNull(db.activeRunDao().forSession(KEY))
         release.countDown()
         assertTrue(finished.isEmpty())
@@ -834,7 +855,7 @@ class RunFollowerTest {
         f.pauseAll()
         val before = statusCalls.get()
         f.resumeAll()
-        withContext(Dispatchers.IO) { while (statusCalls.get() <= before) Thread.sleep(5) }
+        awaitUntil { statusCalls.get() > before }
         f.pauseAll()
 
         val done = CompletableDeferred<Unit>()
@@ -874,7 +895,7 @@ class RunFollowerTest {
         on(EVENTS, sse(terminal(0)))
         started(f)
         testScheduler.advanceUntilIdle()
-        withContext(Dispatchers.IO) { while (f.following.isNotEmpty()) Thread.sleep(5) }
+        awaitUntil { f.following.isEmpty() }
 
         assertEquals(5, requestsTo(MESSAGES).size)
         assertTrue(finished.isEmpty())
@@ -897,5 +918,269 @@ class RunFollowerTest {
         assertTrue(db.activeRunDao().all().isEmpty())
         assertEquals("unconfirmed", db.pendingSendDao().get("p1")!!.error)
         assertTrue(requests.isEmpty())
+    }
+
+    // ---- fix round 2 ----
+
+    private fun steerContent(vararg texts: String) =
+        "[OUT-OF-BAND USER MESSAGE - sent while you were working]\\n" + texts.joinToString("\\n\\n") + "\\n[/OUT-OF-BAND USER MESSAGE]"
+
+    private fun messagesWith(vararg rows: String) =
+        json("""{"session_id":"$KEY","data":[${rows.joinToString(",")}]}""")
+
+    @Test
+    fun hiddenUserRowDoesNotConfirm() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        on(MESSAGES, messagesWith("""{"id":10,"role":"user","display_kind":"hidden","content":"text p1","timestamp":1.0}"""))
+        on(EVENTS, sse(terminal(0)))
+        started(f)
+        done.await()
+
+        assertEquals("unconfirmed", db.pendingSendDao().get("p1")!!.error)
+    }
+
+    @Test
+    fun mergedSteersAreAllConfirmed() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        on(
+            MESSAGES,
+            messagesWith(
+                """{"id":10,"role":"user","content":"text p1","timestamp":1.0}""",
+                """{"id":11,"role":"user","display_kind":"steer","content":"${steerContent("text p2", "text p3")}","timestamp":1.5}""",
+            ),
+        )
+        on(EVENTS, sse(terminal(0)))
+        f.resumeAll()
+        addSession()
+        addRun()
+        addSend("p1", "sending", RUN)
+        addSend("p2", "steered", RUN)
+        addSend("p3", "steered", RUN)
+        f.onRunStarted(KEY, RUN)
+        done.await()
+
+        assertTrue(db.pendingSendDao().observe(KEY).first().isEmpty())
+    }
+
+    @Test
+    fun transcriptNeverLosesUserTextDuringFinish() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val gate = CountDownLatch(1)
+        gatedMessages(gate)
+        on(EVENTS, sse(delta(0, "a"), terminal(1)))
+        started(f)
+        val emissions = CopyOnWriteArrayList<List<ChatItem>>()
+        val first = CompletableDeferred<Unit>()
+        backgroundScope.launch {
+            repo.transcript(KEY).collect {
+                emissions += it
+                first.complete(Unit)
+            }
+        }
+        first.await()
+        gate.countDown()
+        done.await()
+        awaitUntil { emissions.last().any { it is UserMessage && it.key.startsWith("u") } }
+
+        for (e in emissions) assertTrue(e.toString(), e.any { it is UserMessage && it.text == "text p1" })
+    }
+
+    @Test
+    fun cancellationDuringFinishWriteStillCompletes() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        f.beforeFinishWrite = {
+            pauseAll()
+            yield()
+        }
+        messages()
+        on(EVENTS, sse(terminal(0, "failed")))
+        started(f)
+        done.await()
+
+        assertTrue(db.activeRunDao().all().isEmpty())
+        assertNull(db.pendingSendDao().get("p1"))
+        assertEquals(listOf("FAILED"), outcomes().map { it.outcome })
+        assertNull(f.live(KEY).value)
+    }
+
+    @Test
+    fun newerApprovalDuringPostIsShown() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        routes["/v1/runs/$RUN/approval"] = {
+            on(STATUS, status("waiting_for_approval", otherControl)) // published while the POST was in flight
+            json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}""")()
+        }
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        assertEquals("ctl_other", f.live(KEY).value!!.pending!!.requestId)
+        release.countDown()
+    }
+
+    @Test
+    fun alreadyResolvedReportsGone() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        routes["/v1/runs/$RUN/approval"] = {
+            on(STATUS, status("running"))
+            json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}""")()
+        }
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.GONE, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        assertNull(f.live(KEY).value!!.pending)
+        release.countDown()
+    }
+
+    @Test
+    fun conflictWithReplacementReportsChanged() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        routes["/v1/runs/$RUN/approval"] = {
+            on(STATUS, status("waiting_for_approval", otherControl))
+            json("""{"error":{"code":"stale_generation"}}""", 409)()
+        }
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.CHANGED, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        assertEquals("ctl_other", f.live(KEY).value!!.pending!!.requestId)
+        release.countDown()
+    }
+
+    @Test
+    fun pauseAfterTruncationNeverReattaches() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("running"))
+        on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
+        started(f)
+        f.live(KEY).first { it?.text == "a" }
+        f.pauseAll() // lands while the follower handles the truncation
+
+        val done = CompletableDeferred<Unit>()
+        val g = follower(done) // a later resume, here in a new process
+        on(STATUS, status("completed"))
+        g.resumeAll()
+        done.await()
+        assertEquals(1, requestsTo(EVENTS).size)
+    }
+
+    @Test
+    fun serverStoppingWithoutLocalIntentIsInterrupted() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        messages()
+        on(STATUS, status("stopping"))
+        on(EVENTS, sse(), sse(terminal(0, "cancelled")))
+        started(f)
+        done.await()
+
+        assertEquals(listOf("INTERRUPTED"), outcomes().map { it.outcome })
+    }
+
+    @Test
+    fun stopIntentIsStoredApartFromStatus() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("running"))
+        on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
+        heldOpen(f, release)
+
+        f.stop(KEY)
+        val row = db.activeRunDao().forSession(KEY)!!
+        assertTrue(row.stopRequested)
+        assertEquals("running", row.status) // no status read has said otherwise yet
+        release.countDown()
+    }
+
+    @Test
+    fun recoveryFromStoppingIsStoredAsRunning() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("running"))
+        on(EVENTS, heldStream(delta(0, "a")))
+        f.resumeAll()
+        addSession()
+        addRun(status = "stopping")
+        f.resumeAll()
+
+        f.live(KEY).first { it?.text == "a" }
+        assertEquals("running", db.activeRunDao().forSession(KEY)!!.status)
+    }
+
+    @Test
+    fun unrecognizedStatusIsStoredAsRunning() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("brand_new_state"))
+        on(EVENTS, heldStream(delta(0, "a")))
+        f.resumeAll()
+        addSession()
+        addRun()
+        f.resumeAll()
+
+        f.live(KEY).first { it?.text == "a" }
+        assertEquals("brand_new_state", f.live(KEY).value!!.status)
+        assertEquals("running", db.activeRunDao().forSession(KEY)!!.status)
+    }
+
+    @Test
+    fun terminalStatusIsStoredBeforeFinish() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val gate = CountDownLatch(1)
+        gatedMessages(gate)
+        on(EVENTS, sse(terminal(0)))
+        started(f)
+
+        db.activeRunDao().observeAll().first { it.singleOrNull()?.status == "completed" }
+        gate.countDown()
+        done.await()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun pauseAllSurvivesInlineCompletion() = runTest {
+        // Unconfined: a cancelled job completes inside cancel(), so its completion handler runs during pauseAll.
+        val f = RunFollower(api, db, repo, CoroutineScope(UnconfinedTestDispatcher(testScheduler)), delayMs = { awaitCancellation() })
+        addSession("apofis-a")
+        addSession("apofis-b")
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", "apofis-a", null, "running", 1L, polling = true))
+        db.activeRunDao().upsert(ActiveRunEntity("run_b", "apofis-b", null, "running", 1L, polling = true))
+        f.resumeAll()
+        assertEquals(setOf("run_a", "run_b"), f.following)
+
+        f.pauseAll()
+        assertTrue(f.following.isEmpty())
+    }
+
+    @Test
+    fun syncWithoutRequestKeepsCredentialsRejected() = runTest {
+        val rejectedAtDelay = CopyOnWriteArrayList<Boolean>()
+        val f = follower(onDelay = {
+            rejectedAtDelay += credentialsRejected.value
+            pauseAll()
+        })
+        on("/v1/runs/$RUN/stop", json("""{"error":{"code":"invalid_api_key"}}""", 401))
+        on(STATUS, json("{}", 500))
+        f.resumeAll()
+        addRun(lastSeq = 3) // its chat is not stored, so the resume sync makes no request
+        try {
+            f.stop(KEY)
+            fail("expected Unauthorized")
+        } catch (_: ApiError.Unauthorized) {
+        }
+        f.resumeAll()
+        awaitUntil { rejectedAtDelay.isNotEmpty() }
+
+        assertEquals(listOf(true), rejectedAtDelay)
     }
 }

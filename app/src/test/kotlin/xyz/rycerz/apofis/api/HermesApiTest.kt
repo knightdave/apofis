@@ -431,4 +431,17 @@ class HermesApiTest {
         assertEquals("POST /v1/runs/r1/steer" to """{"text":"more"}""", next())
         assertEquals("GET /api/sessions/s1/messages?limit=500&offset=0&order=oldest&include_compacted=true" to "", next())
     }
+
+    @Test
+    fun controlAnswersReportAlreadyResolved() = runTest {
+        respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p1"}""")
+        respond(200, """{"run_id":"r1","status":"already_resolved","prompt_id":"p1"}""")
+        respond(200, """{"run_id":"r1","status":"already_resolved","prompt_id":"p2"}""")
+        respond(200, "not json")
+        assertEquals(ControlResult.RESOLVED, api.approve("r1", "p1", 3, ApprovalChoice.ONCE))
+        assertEquals(ControlResult.ALREADY_RESOLVED, api.approve("r1", "p1", 3, ApprovalChoice.ONCE))
+        assertEquals(ControlResult.ALREADY_RESOLVED, api.clarify("r1", "p2", 3, "blue"))
+        // The server accepted the request; an unreadable 2xx body is not a reason to report failure.
+        assertEquals(ControlResult.RESOLVED, api.clarify("r1", "p2", 3, "blue"))
+    }
 }

@@ -105,15 +105,15 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
 
     suspend fun stop(runId: String) = control(url("v1/runs", runId, "stop")) { }
 
-    suspend fun approve(runId: String, requestId: String, executionGeneration: Long, choice: ApprovalChoice) =
-        control(url("v1/runs", runId, "approval")) {
+    suspend fun approve(runId: String, requestId: String, executionGeneration: Long, choice: ApprovalChoice): ControlResult =
+        answer(url("v1/runs", runId, "approval")) {
             put("request_id", requestId)
             put("execution_generation", executionGeneration)
             put("choice", choice.name.lowercase())
         }
 
-    suspend fun clarify(runId: String, requestId: String, executionGeneration: Long, answer: String) =
-        control(url("v1/runs", runId, "clarify")) {
+    suspend fun clarify(runId: String, requestId: String, executionGeneration: Long, answer: String): ControlResult =
+        answer(url("v1/runs", runId, "clarify")) {
             put("request_id", requestId)
             put("execution_generation", executionGeneration)
             put("answer", answer)
@@ -128,6 +128,13 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
     private suspend fun control(url: HttpUrl, body: JsonObjectBuilder.() -> Unit) {
         exchange(post(url, jsonBody(body))) { }
     }
+
+    // The server accepted the request, so a body it cannot be read from still counts as resolved.
+    private suspend fun answer(url: HttpUrl, body: JsonObjectBuilder.() -> Unit): ControlResult =
+        exchange(post(url, jsonBody(body))) { response ->
+            val status = runCatching { json.decodeFromString<ControlReply>(response.body.string()).status }.getOrNull()
+            if (status == "already_resolved") ControlResult.ALREADY_RESOLVED else ControlResult.RESOLVED
+        }
 
     private fun url(vararg segments: String, query: HttpUrl.Builder.() -> Unit = {}): HttpUrl =
         base.newBuilder().apply {

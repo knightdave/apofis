@@ -511,4 +511,31 @@ class ChatRepositorySyncTest {
         assertEquals("a".repeat(60), titleFrom("a".repeat(200)))
         assertEquals("", titleFrom(""))
     }
+
+    @Test
+    fun syncWithBlockRunsInsideTheReplace() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        db.pendingSendDao().upsert(pending("apofis-s", "k"))
+        respond(messagesJson("apofis-s", listOf(1, 2)))
+
+        val seen = mutableListOf<Long>()
+        assertTrue(
+            repo.syncMessages("apofis-s") { rows ->
+                seen += rows.map { it.id }
+                assertEquals(2L, db.messageDao().maxId("apofis-s")) // the new rows are already written
+                db.pendingSendDao().delete("k")
+            },
+        )
+        assertEquals(listOf(1L, 2L), seen)
+        assertNull(db.pendingSendDao().get("k"))
+
+        // A failing block rolls the replace back too.
+        respond(messagesJson("apofis-s", listOf(1, 2, 3)))
+        assertTrue(expectError { repo.syncMessages("apofis-s") { error("boom") } } is IllegalStateException)
+        assertEquals(2L, db.messageDao().maxId("apofis-s"))
+
+        // No server copy to read: the block does not run.
+        db.sessionDao().upsert(session("apofis-l", existsOnServer = false))
+        assertFalse(repo.syncMessages("apofis-l") { fail("must not run") })
+    }
 }

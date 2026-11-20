@@ -18,16 +18,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
+import xyz.rycerz.apofis.api.ControlResult
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.RunEvent
 import xyz.rycerz.apofis.api.RunStatus
+import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.ToolStep
-import xyz.rycerz.apofis.chat.unwrapSteer
+import xyz.rycerz.apofis.chat.UserMessage
+import xyz.rycerz.apofis.chat.buildTranscript
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
-import xyz.rycerz.apofis.db.MessageEntity
-import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.ReplyOutcomeEntity
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.PendingState
@@ -36,6 +37,11 @@ import xyz.rycerz.apofis.sync.SendError
 import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private val TERMINAL = setOf("completed", "failed", "cancelled", "interrupted")
+
+// The only statuses ever stored: server text outside this list is stored as running (and followed like it).
+private val KNOWN = TERMINAL + setOf("queued", "running", "waiting_for_approval", "stopping", "unknown")
+
+private fun stored(status: String) = if (status in KNOWN) status else "running"
 
 // Events after which the pending controls may have changed; each one is checked against a fresh status read.
 private val CONTROL_EVENTS = setOf("approval.responded", "approval.settled", "clarify.request", "clarify.settled")
@@ -81,11 +87,13 @@ class RunFollower(
     private val jobs = HashMap<String, Job>() // by run id; it also guards [foreground]
     private var foreground = false // opened by resumeAll, closed by pauseAll; no follower starts while closed
     private val seqs = ConcurrentHashMap<String, Long>() // last applied seq by run id; matches the live text across pauseAll
-    private val stopRequested: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val rejected = MutableStateFlow(false)
 
-    /** True once the server refused the API key; the runs stay stored. Cleared by the next call that succeeds. */
+    /** True once the server refused the API key; the runs stay stored. Cleared by the next request that succeeds. */
     val credentialsRejected: StateFlow<Boolean> = rejected.asStateFlow()
+
+    /** Test seam: runs at the start of Finish's database phase. */
+    internal var beforeFinishWrite: suspend RunFollower.() -> Unit = {}
 
     /** Run ids with a follower job; for tests. */
     internal val following: Set<String> get() = synchronized(jobs) { jobs.keys.toSet() }
@@ -104,17 +112,20 @@ class RunFollower(
     }
 
     /** Call when the app leaves the foreground: cancels the streams and keeps every stored run. */
-    fun pauseAll() = synchronized(jobs) {
-        foreground = false
-        jobs.values.forEach { it.cancel() }
-        jobs.clear()
+    fun pauseAll() {
+        val running = synchronized(jobs) {
+            foreground = false
+            jobs.values.toList().also { jobs.clear() }
+        }
+        // Outside the lock and over a copy: a job may complete inside cancel() and run its completion handler.
+        running.forEach { it.cancel() }
     }
 
     suspend fun stop(sessionKey: String) {
         val run = db.activeRunDao().forSession(sessionKey) ?: return
-        // Stored too, so a cancel seen after a restart still counts as this user's stop.
-        stopRequested += run.runId
-        db.activeRunDao().setStatus(run.runId, "stopping")
+        // The intent is stored apart from the server's status, so a cancel seen after a restart still counts as this
+        // user's stop, and a stop by another client never does.
+        db.activeRunDao().setStopRequested(run.runId)
         edit(run) { it.copy(status = "stopping") }
         call(run) { api.stop(run.runId) }
     }
@@ -141,32 +152,37 @@ class RunFollower(
         start(run, Next.Finish("interrupted"), replace = true)
     }
 
-    private suspend fun answer(sessionKey: String, requestId: String, generation: Long, post: suspend (runId: String) -> Unit): AnswerResult {
+    private suspend fun answer(sessionKey: String, requestId: String, generation: Long, post: suspend (runId: String) -> ControlResult): AnswerResult {
         val run = db.activeRunDao().forSession(sessionKey) ?: return AnswerResult.GONE
-        val pending = refresh(run).pendingControls
-        if (pending.none { it.requestId == requestId && it.executionGeneration == generation }) {
-            return if (pending.isEmpty()) AnswerResult.GONE else AnswerResult.CHANGED
-        }
-        try {
-            call(run) { post(run.runId) }
+        val before = refresh(run).pendingControls
+        if (before.none { it.requestId == requestId && it.executionGeneration == generation }) return changedOrGone(before)
+        val accepted = try {
+            call(run) { post(run.runId) } == ControlResult.RESOLVED
         } catch (_: ApiError.Conflict) {
-            // Answered elsewhere, expired, or a newer generation: show what the server waits for now.
-            refresh(run)
-            return AnswerResult.GONE
+            false // answered elsewhere, expired, or a newer generation
         }
-        edit(run) { it.copy(pending = pending.firstOrNull { c -> c.requestId != requestId }) }
-        return AnswerResult.SENT
+        // What shows next comes from a read made after the POST: a new request may have been published meanwhile.
+        val after = try {
+            refresh(run).pendingControls
+        } catch (e: ApiError) {
+            if (!accepted || e == ApiError.Unauthorized) throw e
+            edit(run) { it.copy(pending = null) } // the stream's next control event reads the status again
+            return AnswerResult.SENT
+        }
+        return if (accepted) AnswerResult.SENT else changedOrGone(after)
     }
+
+    private fun changedOrGone(pending: List<*>) = if (pending.isEmpty()) AnswerResult.GONE else AnswerResult.CHANGED
 
     private fun state(sessionKey: String) = lives.getOrPut(sessionKey) { MutableStateFlow(null) }
 
     private fun edit(run: ActiveRunEntity, change: (LiveReply) -> LiveReply) =
         state(run.sessionKey).update { if (it?.runId == run.runId) change(it) else it }
 
-    /** Shows [s] and stores its status, so the send queue's steer decision reads the truth. */
+    /** Shows [s] and stores its status (terminal ones too), so the send queue's steer decision reads the truth. */
     private suspend fun applyStatus(run: ActiveRunEntity, s: RunStatus) {
         edit(run) { it.copy(status = s.status, pending = s.pendingControls.firstOrNull()) }
-        if (s.status !in TERMINAL) db.activeRunDao().updateStatus(run.runId, s.status)
+        db.activeRunDao().setStatus(run.runId, stored(s.status))
     }
 
     private suspend fun refresh(run: ActiveRunEntity): RunStatus = call(run) { api.runStatus(run.runId) }.also { applyStatus(run, it) }
@@ -175,16 +191,21 @@ class RunFollower(
     private suspend fun <T> call(run: ActiveRunEntity, block: suspend () -> T): T = try {
         io(block)
     } catch (e: ApiError.Unauthorized) {
-        synchronized(jobs) { jobs.remove(run.runId)?.cancel() }
+        synchronized(jobs) { jobs.remove(run.runId) }?.cancel()
         throw e
     }
 
-    /** Every API call goes through here, so [credentialsRejected] tracks the latest answer. */
+    /** Every direct HermesApi request goes through here (never repository calls, which may make no request). */
     private suspend fun <T> io(block: suspend () -> T): T = try {
-        block().also { rejected.value = false }
+        block().also { accepted() }
     } catch (e: ApiError.Unauthorized) {
         rejected.value = true
         throw e
+    }
+
+    /** The one place that records a request the server accepted with this key. */
+    private fun accepted() {
+        rejected.value = false
     }
 
     private fun start(run: ActiveRunEntity, first: Next, replace: Boolean = false): Unit = synchronized(jobs) {
@@ -216,7 +237,7 @@ class RunFollower(
             try {
                 // shortcut: after a restart the stream resumes at lastSeq, so earlier text of this reply shows only
                 // as far as the server already stored it, until the run ends and the transcript is synced.
-                if (next == Next.Check && run.lastSeq != null && state(key).value?.text.isNullOrEmpty()) quietly { io { repo.syncMessages(key) } }
+                if (next == Next.Check && run.lastSeq != null && state(key).value?.text.isNullOrEmpty()) quietly { repo.syncMessages(key) }
                 if (next == Next.Check && polling) next = Next.Poll // a run that lost its stream never reattaches
                 while (true) {
                     next = when (val step = next) {
@@ -231,13 +252,9 @@ class RunFollower(
                             status()
                         }
                         Next.Poll -> {
-                            if (!polling) {
-                                polling = true
-                                db.activeRunDao().setPolling(id)
-                            }
                             edit(run) { it.copy(connection = Connection.POLLING) }
                             delayMs(POLL_MS)
-                            quietly { io { repo.syncMessages(key) } }
+                            quietly { repo.syncMessages(key) }
                             when (val n = status()) {
                                 is Next.Finish, Next.Unknown -> n
                                 else -> Next.Poll
@@ -253,10 +270,10 @@ class RunFollower(
                     }
                 }
             } catch (_: ApiError.Unauthorized) {
-                // io() raised the flag; the row stays for a later resumeAll.
+                rejected.value = true // the row stays for a later resumeAll
             } catch (_: IllegalArgumentException) {
                 // HermesApi refuses a malformed run id before any request: the run can never be followed.
-                cleanup("failed", verified = false)
+                finish("failed", sync = false)
             }
         }
 
@@ -271,7 +288,7 @@ class RunFollower(
                 io { api.runEvents(id, lastSeq).takeWhile { event -> handle(event)?.also { next = it } == null }.collect() }
             } catch (e: ApiError) {
                 if (e == ApiError.Unauthorized) throw e
-                if (e == ApiError.NotFound) next = Next.Poll
+                if (e == ApiError.NotFound) next = fallBackToPolling()
             } finally {
                 withContext(NonCancellable) { save() }
             }
@@ -282,7 +299,7 @@ class RunFollower(
         private suspend fun handle(event: RunEvent): Next? {
             val seq = event.seq.takeIf { it >= 0 } // frames without a sequence number are applied but never stored
             if (seq != null && lastSeq.let { it != null && seq <= it }) return null // already applied
-            rejected.value = false
+            accepted()
             if (state(key).value?.connection != Connection.LIVE) edit(run) { it.copy(connection = Connection.LIVE) }
             val next = apply(event)
             // Check means a control change could not be read: leave without storing this seq, so the event replays.
@@ -315,8 +332,11 @@ class RunFollower(
                 // The event's ids are never used: pending controls come only from a status read.
                 is RunEvent.ApprovalRequested -> return readControls()
                 is RunEvent.Other -> if (event.name in CONTROL_EVENTS) return readControls()
-                is RunEvent.Truncated -> return Next.Poll
-                is RunEvent.Terminal -> return Next.Finish(event.status)
+                is RunEvent.Truncated -> return fallBackToPolling()
+                is RunEvent.Terminal -> {
+                    db.activeRunDao().setStatus(id, stored(event.status)) // before Finish: the queue must not steer into it
+                    return Next.Finish(event.status)
+                }
                 is RunEvent.Reasoning, is RunEvent.Steered -> Unit
             }
             return null
@@ -329,6 +349,15 @@ class RunFollower(
         } catch (e: ApiError) {
             if (e == ApiError.Unauthorized) throw e
             Next.Check
+        }
+
+        /** Stored before anything else can suspend or be cancelled: once the stream is gone, it is never requested again. */
+        private suspend fun fallBackToPolling(): Next {
+            if (!polling) {
+                polling = true
+                withContext(NonCancellable) { db.activeRunDao().setPolling(id) }
+            }
+            return Next.Poll
         }
 
         private suspend fun save() {
@@ -359,84 +388,88 @@ class RunFollower(
         }
 
         /**
-         * Syncs the transcript, then cleans up. False (rows kept, retried) only for a transient failure; any other
-         * failure still ends the run, so the session's queue is never blocked, but nothing can be confirmed delivered.
+         * Syncs the transcript and, in the same transaction, settles the run's pending sends, records the outcome and
+         * deletes the run. False (rows kept, retried) only for a transient failure; any other failure still ends the
+         * run, so the session's queue is never blocked, but then nothing counts as delivered. Only the fetch is
+         * cancellable: once the write has committed, the hand-off always completes.
          */
-        private suspend fun finish(status: String?): Boolean {
-            val verified = try {
-                io { repo.syncMessages(key) }
-                true
-            } catch (e: ApiError) {
-                when (e) {
-                    ApiError.Unauthorized -> throw e
-                    is ApiError.Network, is ApiError.Unavailable -> return false
-                    else -> false
+        suspend fun finish(status: String?, sync: Boolean = true): Boolean {
+            var committed = false
+            try {
+                val replaced = sync && try {
+                    repo.syncMessages(key) { rows ->
+                        write(status, buildTranscript(rows))
+                        committed = true
+                    }
+                } catch (e: ApiError) {
+                    when (e) {
+                        ApiError.Unauthorized -> throw e
+                        is ApiError.Network, is ApiError.Unavailable -> return false
+                        else -> false
+                    }
+                } catch (_: IllegalArgumentException) {
+                    false
                 }
-            } catch (_: IllegalArgumentException) {
-                false
+                if (!replaced) {
+                    withContext(NonCancellable) {
+                        withRepositoryLock { db.withTransaction { write(status, items = null) } }
+                        committed = true
+                    }
+                }
+            } finally {
+                if (committed) withContext(NonCancellable) { handOff() }
             }
-            cleanup(status, verified)
             return true
         }
 
         /**
-         * Removes the run's pending sends that the synced transcript shows ([verified]); the others become failed
-         * `unconfirmed` so the user's text stays on screen. Holds the repository lock, so it never interleaves with a
-         * steer into this run.
+         * Inside the repository lock and a transaction. A pending send is removed only when the transcript the user
+         * would see ([items]; null: unknown) shows it; otherwise it becomes failed `unconfirmed` and stays on screen.
          */
-        suspend fun cleanup(status: String?, verified: Boolean) {
-            withRepositoryLock {
-                val stopped = id in stopRequested || db.activeRunDao().forSession(key)?.takeIf { it.runId == id }?.status == "stopping"
-                val outcome = when (status) {
-                    "failed" -> ReplyOutcome.FAILED
-                    "interrupted" -> ReplyOutcome.INTERRUPTED
-                    "cancelled" -> if (stopped) ReplyOutcome.STOPPED else ReplyOutcome.INTERRUPTED
-                    else -> null
+        private suspend fun write(status: String?, items: List<ChatItem>?) {
+            beforeFinishWrite()
+            val stopped = db.activeRunDao().get(id)?.stopRequested == true
+            val outcome = when (status) {
+                "failed" -> ReplyOutcome.FAILED
+                "interrupted" -> ReplyOutcome.INTERRUPTED
+                "cancelled" -> if (stopped) ReplyOutcome.STOPPED else ReplyOutcome.INTERRUPTED
+                else -> null
+            }
+            val shown = items.orEmpty().filterIsInstance<UserMessage>()
+            val used = HashSet<String>() // one bubble confirms one send; a merged steer bubble confirms every steer in it
+            val pendingDao = db.pendingSendDao()
+            for (p in pendingDao.forRun(id)) {
+                val text = p.text.trim()
+                val since = p.createdAt / 1000.0 - DELIVERY_WINDOW_S
+                val confirmed = when (p.state) {
+                    PendingState.SENDING -> shown.firstOrNull { !it.steered && it.key !in used && it.timestamp >= since && it.text.trim() == text }
+                        ?.also { used += it.key } != null
+                    PendingState.STEERED -> shown.any { it.steered && it.timestamp >= since && it.text.contains(text) }
+                    else -> false
                 }
-                val stored = if (verified) db.messageDao().userRows(key) else emptyList()
-                val used = HashSet<Int>() // one stored row confirms one pending send
-                db.withTransaction {
-                    val pendingDao = db.pendingSendDao()
-                    for (p in pendingDao.forRun(id)) {
-                        val row = stored.firstOrNull { it.position !in used && delivered(p, it) }
-                        if (row != null) {
-                            used += row.position
-                            pendingDao.delete(p.idempotencyKey)
-                        } else {
-                            pendingDao.update(p.copy(state = PendingState.FAILED, error = SendError.UNCONFIRMED, runId = null))
-                        }
-                    }
-                    if (outcome != null) {
-                        db.replyOutcomeDao().upsert(ReplyOutcomeEntity(key, db.messageDao().maxId(key) ?: 0, outcome.name, detail = null))
-                    }
-                    db.activeRunDao().delete(id)
+                if (confirmed) {
+                    pendingDao.delete(p.idempotencyKey)
+                } else {
+                    pendingDao.update(p.copy(state = PendingState.FAILED, error = SendError.UNCONFIRMED, runId = null))
                 }
             }
-            // Committed: the hand-off must complete even if the app leaves the foreground now.
-            withContext(NonCancellable) {
-                stopRequested -= id
-                seqs -= id
-                state(key).update { if (it?.runId == id) null else it }
-                try {
-                    onRunFinished(key)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    // The run is finished and cleaned up; a failing drain must not undo that.
-                }
+            if (outcome != null) {
+                db.replyOutcomeDao().upsert(ReplyOutcomeEntity(key, db.messageDao().maxId(key) ?: 0, outcome.name, detail = null))
+            }
+            db.activeRunDao().delete(id)
+        }
+
+        private suspend fun handOff() {
+            seqs -= id
+            state(key).update { if (it?.runId == id) null else it }
+            try {
+                onRunFinished(key)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // The run is finished and cleaned up; a failing drain must not undo that.
             }
         }
-    }
-}
-
-/** True when stored user row [m] is pending send [p]: same text, stored no earlier than a minute before it was made. */
-private fun delivered(p: PendingSendEntity, m: MessageEntity): Boolean {
-    if (m.timestamp < p.createdAt / 1000.0 - DELIVERY_WINDOW_S) return false
-    val text = p.text.trim()
-    return when (p.state) {
-        PendingState.SENDING -> m.displayKind != "steer" && m.content.trim() == text
-        PendingState.STEERED -> m.displayKind == "steer" && unwrapSteer(m.content).contains(text)
-        else -> false
     }
 }
 

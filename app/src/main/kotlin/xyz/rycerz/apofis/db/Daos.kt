@@ -98,6 +98,9 @@ interface MessageDao {
         insertAll(rows)
     }
 
+    @Query("SELECT * FROM MessageEntity WHERE sessionKey = :sessionKey ORDER BY position")
+    suspend fun rows(sessionKey: String): List<MessageEntity>
+
     @Query("SELECT * FROM MessageEntity WHERE sessionKey = :sessionKey AND role = 'user' ORDER BY position")
     suspend fun userRows(sessionKey: String): List<MessageEntity>
 
@@ -115,6 +118,9 @@ interface MessageDao {
 interface PendingSendDao {
     @Query("SELECT * FROM PendingSendEntity WHERE sessionKey = :sessionKey ORDER BY createdAt")
     fun observe(sessionKey: String): Flow<List<PendingSendEntity>>
+
+    @Query("SELECT * FROM PendingSendEntity WHERE sessionKey = :sessionKey ORDER BY createdAt")
+    suspend fun rows(sessionKey: String): List<PendingSendEntity>
 
     @Query("SELECT * FROM PendingSendEntity WHERE state = 'queued' ORDER BY createdAt")
     suspend fun allQueued(): List<PendingSendEntity>
@@ -155,6 +161,9 @@ interface ActiveRunDao {
     @Query("SELECT * FROM ActiveRunEntity ORDER BY startedAt")
     suspend fun all(): List<ActiveRunEntity>
 
+    @Query("SELECT * FROM ActiveRunEntity WHERE runId = :runId")
+    suspend fun get(runId: String): ActiveRunEntity?
+
     @Query("SELECT * FROM ActiveRunEntity WHERE sessionKey = :sessionKey ORDER BY startedAt DESC LIMIT 1")
     suspend fun forSession(sessionKey: String): ActiveRunEntity?
 
@@ -171,9 +180,8 @@ interface ActiveRunDao {
     @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId")
     suspend fun setStatus(runId: String, status: String)
 
-    /** A status read from the server; a stop this app requested stays recorded as `stopping`. */
-    @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId AND status != 'stopping'")
-    suspend fun updateStatus(runId: String, status: String)
+    @Query("UPDATE ActiveRunEntity SET stopRequested = 1 WHERE runId = :runId")
+    suspend fun setStopRequested(runId: String)
 
     @Query("UPDATE ActiveRunEntity SET polling = 1 WHERE runId = :runId")
     suspend fun setPolling(runId: String)
@@ -183,6 +191,9 @@ interface ActiveRunDao {
 interface ReplyOutcomeDao {
     @Query("SELECT * FROM ReplyOutcomeEntity WHERE sessionKey = :sessionKey ORDER BY afterMessageId")
     fun observe(sessionKey: String): Flow<List<ReplyOutcomeEntity>>
+
+    @Query("SELECT * FROM ReplyOutcomeEntity WHERE sessionKey = :sessionKey ORDER BY afterMessageId")
+    suspend fun rows(sessionKey: String): List<ReplyOutcomeEntity>
 
     @Upsert
     suspend fun upsert(o: ReplyOutcomeEntity)
