@@ -12,6 +12,10 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -44,7 +48,6 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.HermesApi
-import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
@@ -101,10 +104,23 @@ class DrawerViewModelTest {
         Dispatchers.resetMain()
     }
 
-    private fun vm(): DrawerViewModel = ViewModelProvider.create(
+    private val saved = CopyOnWriteArrayList<String>()
+
+    private fun vm(lastChat: String? = null): DrawerViewModel = ViewModelProvider.create(
         store,
-        viewModelFactory { initializer { DrawerViewModel(connected, now = clock::get, zone = { ZoneOffset.UTC }) } },
+        viewModelFactory {
+            initializer { DrawerViewModel(connected, lastChat = lastChat, onSelected = { saved += it }, now = clock::get, zone = { ZoneOffset.UTC }) }
+        },
     ).get(DrawerViewModel::class)
+
+    private fun ok(body: String = "{}") = { _: RecordedRequest -> MockResponse.Builder().code(200).body(body).addHeader("Content-Type", "application/json").build() }
+
+    private fun listing(vararg keys: String) = ok(
+        """{"object":"list","data":[""" + keys.joinToString(",") {
+            """{"id":"$it","source":"api_server","title":"Kept","pinned":false,"archived":false,"hidden":false,""" +
+                """"started_at":1.0,"last_active":1.0,"message_count":2,"preview":null,"_lineage_root_id":null}"""
+        } + """],"has_more":false}""",
+    )
 
     private suspend fun <T> StateFlow<T>.await(condition: (T) -> Boolean): T =
         withContext(Dispatchers.Default) { withTimeout(10_000) { first(condition) } }
@@ -119,6 +135,8 @@ class DrawerViewModelTest {
 
     private fun List<DrawerRow>.chats() = filterIsInstance<DrawerRow.Chat>()
 
+    private fun sessionsListed() = requests.count { it.target.startsWith("/api/sessions?") }
+
     @Test
     fun refreshFailureKeepsCache() = runTest {
         addSession("apofis-a", "Garden plans")
@@ -128,17 +146,16 @@ class DrawerViewModelTest {
         vm.onOpen() // the list request answers 500
         vm.refreshFailed.await { it }
         assertEquals(listOf("Garden plans"), vm.rows.value.chats().map { it.title })
-        val listed = requests.count { it.target.startsWith("/api/sessions?") }
-        assertEquals(1, listed)
+        assertEquals(1, sessionsListed())
 
-        clock.addAndGet(29_000)
-        vm.onOpen() // within 30 s of the last attempt: no request
-        clock.addAndGet(1_000)
-        vm.onOpen()
-        withContext(Dispatchers.Default) {
-            withTimeout(10_000) { while (requests.count { it.target.startsWith("/api/sessions?") } < 2) delay(5) }
-        }
-        assertEquals(2, requests.count { it.target.startsWith("/api/sessions?") })
+        clock.addAndGet(29_999)
+        vm.onOpen() // just under 30 s since the last attempt: throttled, decided without any coroutine
+        assertEquals(1, sessionsListed())
+
+        clock.addAndGet(1)
+        vm.onOpen() // exactly 30 s: refreshes again
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (sessionsListed() < 2) delay(5) } }
+        assertEquals(2, sessionsListed())
     }
 
     @Test
@@ -156,20 +173,104 @@ class DrawerViewModelTest {
     }
 
     @Test
+    fun rapidNewChatCreatesOneChat() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        val vm = vm()
+        vm.selected.await { it == "apofis-a" }
+        val keys = withContext(Dispatchers.Default) {
+            List(5) { async { vm.onNewChat() } }.awaitAll()
+        }
+        assertEquals(1, keys.toSet().size)
+        assertEquals(2, db.sessionDao().all().size)
+    }
+
+    @Test
     fun deleteOpenChatSwitchesToNew() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
-        routes["DELETE /api/sessions/apofis-a"] = { MockResponse.Builder().code(200).body(fixture("session_delete.json")).build() }
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
         val vm = vm()
-        vm.selected.await { it != null }
-        vm.onSelect("apofis-a")
+        vm.selected.await { it == "apofis-a" }
+        vm.saveDraft("apofis-a", "half a thought")
         vm.onDeleteRequest("apofis-a")
-        assertEquals(PromptKind.DELETE, vm.prompt.value?.kind)
+        val prompt = vm.prompt.value!!
+        assertEquals(PromptKind.DELETE, prompt.kind)
 
-        vm.onDelete("apofis-a")
+        vm.confirmDelete(prompt.token)
         val next = vm.selected.await { it != "apofis-a" }!!
         vm.prompt.await { it == null }
         assertNull(db.sessionDao().get("apofis-a"))
         assertFalse(db.sessionDao().get(next)!!.existsOnServer)
+        assertEquals("", vm.draft("apofis-a"))
+    }
+
+    @Test
+    fun deleteNeedsTheOpenPromptsToken() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        addSession("apofis-b", "Bike repair")
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
+        routes["DELETE /api/sessions/apofis-b"] = ok("""{"deleted":true}""")
+        val vm = vm()
+        vm.rows.await { it.chats().size == 2 }
+
+        vm.confirmDelete(1) // nothing open
+        vm.onDeleteRequest("apofis-a")
+        val forA = vm.prompt.value!!.token
+        vm.dismiss(forA)
+        assertNull(vm.prompt.value)
+        vm.confirmDelete(forA) // dismissed
+        vm.onDeleteRequest("apofis-b")
+        val forB = vm.prompt.value!!
+        vm.confirmDelete(forA) // a confirmation for A while B is open
+        vm.dismiss(forA) // does not close B's dialog either
+        assertEquals(forB, vm.prompt.value)
+        assertTrue(requests.none { it.method == "DELETE" })
+
+        vm.confirmDelete(forB.token)
+        vm.prompt.await { it == null }
+        assertEquals(listOf("DELETE /api/sessions/apofis-b"), requests.map { "${it.method} ${it.target}" })
+        assertTrue(db.sessionDao().get("apofis-a") != null)
+    }
+
+    @Test
+    fun runStartedAfterTheDialogOpenedNeedsAnotherConfirm() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
+        routes["POST /v1/runs/run_a/stop"] = ok("""{"run_id":"run_a","status":"stopping"}""")
+        routes["POST /v1/runs/run_b/stop"] = ok("""{"run_id":"run_b","status":"stopping"}""")
+        val vm = vm()
+        vm.rows.await { it.chats().isNotEmpty() }
+        vm.onDeleteRequest("apofis-a")
+        val prompt = vm.prompt.value!!
+        assertFalse(prompt.running)
+
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", "apofis-a", null, "running", 1L))
+        db.activeRunDao().upsert(ActiveRunEntity("run_b", "apofis-a", null, "queued", 2L))
+        vm.confirmDelete(prompt.token)
+        val shown = vm.prompt.await { it?.running == true && !it.busy }!!
+        assertTrue(requests.isEmpty()) // nothing stopped or deleted before the user saw the warning
+
+        vm.confirmDelete(shown.token)
+        vm.prompt.await { it == null }
+        assertEquals(
+            listOf("POST /v1/runs/run_a/stop", "POST /v1/runs/run_b/stop", "DELETE /api/sessions/apofis-a"),
+            requests.map { "${it.method} ${it.target}" },
+        )
+    }
+
+    @Test
+    fun failedStopKeepsTheChat() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", "apofis-a", null, "running", 1L))
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""") // the stop answers 500
+        val vm = vm()
+        vm.rows.await { it.chats().any { c -> c.running } }
+        vm.onDeleteRequest("apofis-a")
+        val prompt = vm.prompt.value!!
+        assertTrue(prompt.running)
+        vm.confirmDelete(prompt.token)
+        assertEquals(ActionError.FAILED, vm.prompt.await { it?.error != null }!!.error)
+        assertTrue(requests.none { it.method == "DELETE" })
+        assertTrue(db.sessionDao().get("apofis-a") != null)
     }
 
     @Test
@@ -178,9 +279,49 @@ class DrawerViewModelTest {
         val vm = vm()
         vm.rows.await { it.chats().isNotEmpty() }
         vm.onDeleteRequest("apofis-a")
-        vm.onDelete("apofis-a")
+        vm.confirmDelete(vm.prompt.value!!.token)
         assertEquals(ActionError.FAILED, vm.prompt.await { it?.error != null }!!.error)
         assertEquals(listOf("apofis-a"), vm.rows.value.chats().map { it.key })
+    }
+
+    @Test
+    fun lateCompletionLeavesANewerPromptAlone() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        addSession("apofis-b", "Bike repair")
+        val gate = CountDownLatch(1)
+        routes["PATCH /api/sessions/apofis-a"] = { gate.await(10, TimeUnit.SECONDS); MockResponse.Builder().code(500).build() }
+        val vm = vm()
+        vm.rows.await { it.chats().size == 2 }
+        vm.onPin("apofis-a", true) // an accessibility action: runs at once in its own prompt
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
+        vm.onDeleteRequest("apofis-b")
+        val forB = vm.prompt.value!!
+        gate.countDown()
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.busyActions() > 0) delay(5) } }
+        assertEquals(forB, vm.prompt.value)
+    }
+
+    @Test
+    fun selectionFollowsAChatRemovedByRefresh() = runTest {
+        addSession("apofis-a", "Gone on the server")
+        addSession("apofis-b", "Still there", active = clock.get() / 1000.0 - 60)
+        routes["GET /api/sessions"] = listing("apofis-b")
+        val vm = vm()
+        vm.selected.await { it == "apofis-a" }
+        vm.onOpen()
+        val next = vm.selected.await { it != "apofis-a" }!!
+        assertNotEquals("apofis-b", next)
+        assertFalse(db.sessionDao().get(next)!!.existsOnServer)
+    }
+
+    @Test
+    fun restoresTheLastChatWhenItExists() = runTest {
+        addSession("apofis-a", "Newest")
+        addSession("apofis-b", "Older", active = clock.get() / 1000.0 - 600)
+        assertEquals("apofis-b", vm(lastChat = "apofis-b").selected.await { it != null })
+        store.clear()
+        assertEquals("apofis-a", vm(lastChat = "apofis-gone").selected.await { it != null })
+        assertTrue("apofis-a" in saved)
     }
 
     @Test

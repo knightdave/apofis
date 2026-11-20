@@ -4,7 +4,9 @@ import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.focusable
+import androidx.compose.foundation.focusGroup
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -79,10 +81,14 @@ fun DrawerContent(
     modifier: Modifier = Modifier,
 ) {
     val empty = rows.isEmpty() && query.isEmpty() && !hasArchived
-    Column(modifier.fillMaxHeight()) {
-        // The drawer moves focus into its sheet when it opens; in touch mode the search field would be the first
-        // focusable element and raise the keyboard every time. This empty target takes that focus instead.
-        Box(Modifier.focusable())
+    // The drawer moves focus into its sheet when it opens, which would focus the search field and raise the keyboard.
+    // That programmatic entry is refused; moving focus in with a keyboard (Tab, arrows) still works.
+    Column(
+        modifier
+            .fillMaxHeight()
+            .focusProperties { onEnter = { if (requestedFocusDirection == FocusDirection.Enter) cancelFocusChange() } }
+            .focusGroup(),
+    ) {
         Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp)) {
             if (refreshFailed) {
                 Text(

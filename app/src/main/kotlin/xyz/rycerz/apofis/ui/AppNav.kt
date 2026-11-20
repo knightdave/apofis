@@ -46,7 +46,13 @@ import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.chat.ChatScreen
 import xyz.rycerz.apofis.ui.chat.ChatViewModel
-import xyz.rycerz.apofis.ui.chat.onlineFlow
+import xyz.rycerz.apofis.ui.chat.ChatActions
+import xyz.rycerz.apofis.ui.chat.ChatUiState
+import xyz.rycerz.apofis.ui.chat.ComposerMode
+import xyz.rycerz.apofis.ui.chat.StatusLine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import androidx.compose.foundation.layout.RowScope
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
@@ -75,7 +81,7 @@ fun AppNav(container: AppContainer) {
         else -> chosen ?: Screen.CHAT
     }
 
-    // Outlives the chat screen (Settings, Connection) but not the connection: a server switch clears every chat.
+    // Holds the drawer (open chat, drafts): outlives the chat screen (Settings, Connection), not the connection.
     val chatOwner = key(conn) { rememberViewModelStoreOwner() }
 
     when (screen) {
@@ -100,7 +106,7 @@ fun AppNav(container: AppContainer) {
             BackHandler(enabled = canGoBack, onBack = leave)
             ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
-        Screen.CHAT -> if (conn != null) ChatRoute(conn, chatOwner, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })
+        Screen.CHAT -> if (conn != null) ChatRoute(container, conn, chatOwner, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })
         Screen.SETTINGS -> {
             BackHandler { chosen = Screen.CHAT }
             val scope = rememberCoroutineScope()
@@ -129,14 +135,17 @@ fun AppNav(container: AppContainer) {
 }
 
 /**
- * The chat with the drawer. [owner] lives as long as the connection, so the drawer and each chat's view model (keyed by
- * session, with its draft) survive a visit to Settings and switching between chats.
+ * The chat with the drawer. [owner] lives as long as the connection and holds the drawer, which owns the open chat and
+ * the drafts of chats not on screen. Only the chat on screen has a view model: switching chats clears the old one.
+ * Choosing never leaves a blank screen: while loading, or after a failure (with Retry), the chat screen itself shows.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChatRoute(conn: Connected, owner: ViewModelStoreOwner, onSettings: () -> Unit, onConnection: () -> Unit) {
-    val drawer = viewModel(viewModelStoreOwner = owner) { DrawerViewModel(conn) }
+private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner, onSettings: () -> Unit, onConnection: () -> Unit) {
+    val prefs = container.preferences
+    val drawer = viewModel(viewModelStoreOwner = owner) { DrawerViewModel(conn, lastChat = prefs.lastChat, onSelected = { prefs.lastChat = it }) }
     val selected by drawer.selected.collectAsState()
+    val loadFailed by drawer.loadFailed.collectAsState()
     val rows by drawer.rows.collectAsState()
     val archived by drawer.archived.collectAsState()
     val query by drawer.query.collectAsState()
@@ -167,6 +176,19 @@ private fun ChatRoute(conn: Connected, owner: ViewModelStoreOwner, onSettings: (
             scope.launch { drawerState.close() }
         }
     }
+    val drawerButton: @Composable () -> Unit = {
+        IconButton(onClick = {
+            keyboard?.hide()
+            scope.launch { drawerState.open() }
+        }) {
+            Icon(painterResource(R.drawable.lucide_menu), contentDescription = stringResource(R.string.drawer_open), Modifier.size(20.dp))
+        }
+    }
+    val newChatButton: @Composable RowScope.() -> Unit = {
+        IconButton(onClick = drawer::newChat) {
+            Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = stringResource(R.string.drawer_new_chat), Modifier.size(20.dp))
+        }
+    }
     if (showArchived) {
         BackHandler { showArchived = false }
         ArchivedScreen(archived, open, onBack = { showArchived = false })
@@ -194,30 +216,25 @@ private fun ChatRoute(conn: Connected, owner: ViewModelStoreOwner, onSettings: (
         ) {
             val sessionKey = selected
             if (sessionKey == null) {
-                Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface))
+                ChatScreen(
+                    ChatUiState("", "", if (loadFailed) StatusLine.LOAD_FAILED else StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, ""),
+                    object : ChatActions {},
+                    onOpenConnection = onConnection,
+                    onRetryLoad = drawer::retryLoad,
+                    navigationIcon = drawerButton,
+                    appBarActions = newChatButton,
+                )
             } else {
                 key(sessionKey) {
-                    val context = LocalContext.current.applicationContext
-                    val vm = viewModel(viewModelStoreOwner = owner, key = sessionKey) { ChatViewModel(sessionKey, conn, context.onlineFlow()) }
+                    // Scoped to this chat being on screen: leaving clears the view model, its collectors and its
+                    // connectivity subscription; its draft is handed back to the drawer as it changes.
+                    val chatOwner = rememberViewModelStoreOwner()
+                    val vm = viewModel(viewModelStoreOwner = chatOwner) {
+                        ChatViewModel(sessionKey, conn, container.online).also { it.onDraftChange(drawer.draft(sessionKey)) }
+                    }
+                    LaunchedEffect(vm) { vm.state.map { it.draft }.distinctUntilChanged().collect { drawer.saveDraft(sessionKey, it) } }
                     val state by vm.state.collectAsState()
-                    ChatScreen(
-                        state,
-                        vm,
-                        onOpenConnection = onConnection,
-                        navigationIcon = {
-                            IconButton(onClick = {
-                                keyboard?.hide()
-                                scope.launch { drawerState.open() }
-                            }) {
-                                Icon(painterResource(R.drawable.lucide_menu), contentDescription = stringResource(R.string.drawer_open), Modifier.size(20.dp))
-                            }
-                        },
-                        appBarActions = {
-                            IconButton(onClick = drawer::newChat) {
-                                Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = stringResource(R.string.drawer_new_chat), Modifier.size(20.dp))
-                            }
-                        },
-                    )
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton)
                 }
             }
         }

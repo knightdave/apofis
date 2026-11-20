@@ -33,15 +33,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 
-/** What the prompts can ask for; [DrawerViewModel] implements it. */
+/** What the prompts can ask for, each bound to the prompt's token; [DrawerViewModel] implements it. */
 interface PromptActions {
-    fun onRenameRequest(key: String) {}
-    fun onDeleteRequest(key: String) {}
-    fun onRename(key: String, title: String) {}
-    fun onPin(key: String, pinned: Boolean) {}
-    fun onArchive(key: String, archived: Boolean) {}
-    fun onDelete(key: String) {}
-    fun onDismiss() {}
+    fun openRename(token: Long) {}
+    fun openDelete(token: Long) {}
+    fun confirmRename(token: Long, title: String) {}
+    fun pin(token: Long, pinned: Boolean) {}
+    fun archive(token: Long, archived: Boolean) {}
+    fun confirmDelete(token: Long) {}
+    fun dismiss(token: Long) {}
 }
 
 /** Shows the open [prompt]: the long-press sheet, the rename dialog or the delete confirmation. */
@@ -59,8 +59,8 @@ fun PromptHost(prompt: Prompt, actions: PromptActions) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SessionActionsSheet(prompt: Prompt, actions: PromptActions) {
-    val key = prompt.key
-    ModalBottomSheet(onDismissRequest = actions::onDismiss, containerColor = MaterialTheme.colorScheme.surface) {
+    val token = prompt.token
+    ModalBottomSheet(onDismissRequest = { actions.dismiss(token) }, containerColor = MaterialTheme.colorScheme.surface) {
         Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp).navigationBarsPadding()) {
             Text(
                 prompt.title.ifEmpty { stringResource(R.string.chat_new_title) },
@@ -72,17 +72,17 @@ fun SessionActionsSheet(prompt: Prompt, actions: PromptActions) {
             )
             val enabled = !prompt.busy
             if (prompt.archived) {
-                SheetRow(R.drawable.lucide_archive_arrow_up, R.string.drawer_unarchive, enabled) { actions.onArchive(key, false) }
+                SheetRow(R.drawable.lucide_archive_arrow_up, R.string.drawer_unarchive, enabled) { actions.archive(token, false) }
             } else {
-                SheetRow(R.drawable.lucide_pencil, R.string.drawer_rename, enabled) { actions.onRenameRequest(key) }
+                SheetRow(R.drawable.lucide_pencil, R.string.drawer_rename, enabled) { actions.openRename(token) }
                 if (prompt.pinned) {
-                    SheetRow(R.drawable.lucide_pin_off, R.string.drawer_unpin, enabled) { actions.onPin(key, false) }
+                    SheetRow(R.drawable.lucide_pin_off, R.string.drawer_unpin, enabled) { actions.pin(token, false) }
                 } else {
-                    SheetRow(R.drawable.lucide_pin, R.string.drawer_pin, enabled) { actions.onPin(key, true) }
+                    SheetRow(R.drawable.lucide_pin, R.string.drawer_pin, enabled) { actions.pin(token, true) }
                 }
-                SheetRow(R.drawable.lucide_archive, R.string.drawer_archive, enabled) { actions.onArchive(key, true) }
+                SheetRow(R.drawable.lucide_archive, R.string.drawer_archive, enabled) { actions.archive(token, true) }
             }
-            SheetRow(R.drawable.lucide_trash, R.string.drawer_delete, enabled, MaterialTheme.colorScheme.error) { actions.onDeleteRequest(key) }
+            SheetRow(R.drawable.lucide_trash, R.string.drawer_delete, enabled, MaterialTheme.colorScheme.error) { actions.openDelete(token) }
             ErrorLine(prompt.error, Modifier.padding(start = 14.dp, top = 8.dp))
         }
     }
@@ -106,9 +106,9 @@ private fun SheetRow(@DrawableRes icon: Int, label: Int, enabled: Boolean, color
 
 @Composable
 private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
-    var title by rememberSaveable(prompt.key) { mutableStateOf(prompt.title) }
+    var title by rememberSaveable(prompt.token) { mutableStateOf(prompt.title) }
     AlertDialog(
-        onDismissRequest = actions::onDismiss,
+        onDismissRequest = { actions.dismiss(prompt.token) },
         title = { Text(stringResource(R.string.drawer_rename_title)) },
         text = {
             Column {
@@ -123,11 +123,11 @@ private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            TextButton(onClick = { actions.onRename(prompt.key, title) }, enabled = title.isNotBlank() && !prompt.busy) {
+            TextButton(onClick = { actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy) {
                 Text(stringResource(R.string.drawer_save))
             }
         },
-        dismissButton = { TextButton(onClick = actions::onDismiss) { Text(stringResource(R.string.cancel)) } },
+        dismissButton = { TextButton(onClick = { actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
     )
 }
 
@@ -135,7 +135,7 @@ private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
 private fun DeleteDialog(prompt: Prompt, actions: PromptActions) {
     val scheme = MaterialTheme.colorScheme
     AlertDialog(
-        onDismissRequest = actions::onDismiss,
+        onDismissRequest = { actions.dismiss(prompt.token) },
         title = { Text(stringResource(R.string.drawer_delete_title)) },
         text = {
             Column {
@@ -145,11 +145,11 @@ private fun DeleteDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            TextButton(onClick = { actions.onDelete(prompt.key) }, enabled = !prompt.busy) {
+            TextButton(onClick = { actions.confirmDelete(prompt.token) }, enabled = !prompt.busy) {
                 Text(stringResource(R.string.drawer_delete), color = if (prompt.busy) Color.Unspecified else scheme.error)
             }
         },
-        dismissButton = { TextButton(onClick = actions::onDismiss) { Text(stringResource(R.string.cancel)) } },
+        dismissButton = { TextButton(onClick = { actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
     )
 }
 

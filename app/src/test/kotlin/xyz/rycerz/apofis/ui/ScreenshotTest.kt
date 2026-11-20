@@ -288,7 +288,7 @@ class ScreenshotTest {
     }
 
     private fun prompt(kind: PromptKind, running: Boolean = false, error: ActionError? = null) =
-        Prompt(kind, "apofis-3", "Trip to Lisbon: three days, mostly on foot, with a list of bakeries", pinned = false, archived = false, running, error)
+        Prompt(kind, "apofis-3", "Trip to Lisbon: three days, mostly on foot, with a list of bakeries", pinned = false, archived = false, running = running, token = 1, error = error)
 
     @Test
     fun drawer_groups_light() = shot("drawer_groups_light", ThemeMode.LIGHT) { DrawerOpen(rows()) }

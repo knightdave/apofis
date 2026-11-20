@@ -16,9 +16,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -34,6 +37,7 @@ import xyz.rycerz.apofis.sync.RunStarter
 import xyz.rycerz.apofis.sync.SendQueue
 import xyz.rycerz.apofis.sync.SendWorker
 import xyz.rycerz.apofis.sync.withRepositoryLock
+import xyz.rycerz.apofis.ui.chat.onlineFlow
 import xyz.rycerz.apofis.ui.connect.ConnectBack
 
 /**
@@ -98,6 +102,9 @@ class AppContainer(
 ) {
     val preferences = Preferences(app)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + logOnly)
+
+    /** Device connectivity, one network callback for the whole app, registered only while someone listens. */
+    val online: Flow<Boolean> by lazy { app.onlineFlow().shareIn(scope, SharingStarted.WhileSubscribed(5_000), replay = 1) }
 
     /** Back during a connect check; here so it outlives rotation. */
     val connectBack = ConnectBack()
