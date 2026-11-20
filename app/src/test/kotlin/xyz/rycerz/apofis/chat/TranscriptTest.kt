@@ -110,7 +110,7 @@ class TranscriptTest {
 
     @Test
     fun toolErrorDetected() {
-        for (result in listOf("""{"exit_code": 2}""", """{"error": "boom"}""")) {
+        for (result in listOf("""{"exit_code": 2}""", """{"error": "boom"}""", """{"error": "false"}""", """{"error": true}""")) {
             val step = stepFor(result)
             assertTrue(result, step.error)
             assertFalse(step.running)
@@ -135,6 +135,9 @@ class TranscriptTest {
         assertTrue(stepFor(huge).error)
         assertTrue(stepFor("""{"output": "${"x".repeat(3_000_000)}", "error": "boom"}""").error)
         assertFalse(stepFor("""{"output": "${"x".repeat(3_000_000)}", "exit_code": 0, "error": null}""").error)
+        assertTrue(stepFor("""{"output": "${"x".repeat(3_000_000)}", "exit_code": 0, "error": true}""").error)
+        assertFalse(stepFor("""{"meta": {"exit_code": 2}, "output": "${"x".repeat(3_000_000)}", "exit_code": 0}""").error)
+        assertFalse(stepFor("""{"output": "${"x".repeat(3_000_000)}", "meta": {"exit_code": 2}}""").error)
     }
 
     @Test
@@ -148,11 +151,36 @@ class TranscriptTest {
                 row(5, "assistant", "done"),
             ),
         )
-        assertEquals(listOf("u1", "r2", "n3"), items.map { it.key })
-        val step = toolSteps(items).single()
+        assertEquals(listOf("u1", "r2", "n3", "r5"), items.map { it.key })
+        val step = (items[1] as AssistantReply).steps.single() as ToolStep
         assertFalse(step.running)
         assertEquals("ok", step.result)
-        assertEquals("done", (items[1] as AssistantReply).text)
+        assertEquals("", (items[1] as AssistantReply).text)
+        assertEquals(AssistantReply("r5", emptyList(), "done", 5.0), items[3])
+    }
+
+    @Test
+    fun orphanAfterNoticeStaysWhereStored() {
+        val items = buildTranscript(
+            listOf(
+                row(1, "assistant", toolCallsJson = call("c1")),
+                row(2, "system", "Switched model", displayKind = "model_switch"),
+                row(3, "tool", "lost", toolCallId = "c9"),
+            ),
+        )
+        assertEquals(listOf("r1", "n2", "r3"), items.map { it.key })
+        assertTrue(((items[0] as AssistantReply).steps.single() as ToolStep).running)
+        assertEquals("lost", ((items[2] as AssistantReply).steps.single() as ToolStep).result)
+    }
+
+    @Test
+    fun unwrapSteerExactBody() {
+        val open = "[OUT-OF-BAND USER MESSAGE - x]"
+        val close = "[/OUT-OF-BAND USER MESSAGE]"
+        assertEquals("  a\r\n b ", unwrapSteer("$open\r\n  a\r\n b \r\n$close"))
+        assertEquals(" body\n", unwrapSteer("\n  \n$open\n body\n\n$close  \n"))
+        assertEquals("", unwrapSteer("$open\n$close"))
+        assertEquals("", unwrapSteer("$open\r\n$close"))
     }
 
     @Test
