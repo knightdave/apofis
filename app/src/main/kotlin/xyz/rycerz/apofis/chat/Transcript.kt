@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.chat
 
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -8,14 +10,11 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.doubleOrNull
 import xyz.rycerz.apofis.api.MessageDto
 
 private const val STEER_OPEN = "[OUT-OF-BAND USER MESSAGE"
 private const val STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 private const val ARG_VALUE_LIMIT = 40
-private const val PARSE_LIMIT = 262144
-private const val SCAN_WINDOW = 4096
 
 /** Turns stored session rows (oldest first) into chat items. Linear in the number of rows. */
 fun buildTranscript(rows: List<MessageDto>): List<ChatItem> {
@@ -101,14 +100,12 @@ private class ReplyBuilder(first: MessageDto) {
     }
 
     private fun withResult(step: ToolStep, row: MessageDto): ToolStep {
-        val content = row.content
-        // Results above PARSE_LIMIT are never parsed: shown raw, judged by their tail.
-        val obj = if (content.length <= PARSE_LIMIT) parse(content) as? JsonObject else null
-        val shown = obj?.str("output") ?: content
+        val fields = decodeResult(row.content)
+        val shown = (fields?.output as? JsonPrimitive)?.takeIf { it.isString }?.content ?: row.content
         return step.copy(
             result = shown.take(TOOL_RESULT_DISPLAY_LIMIT),
             resultTruncated = shown.length > TOOL_RESULT_DISPLAY_LIMIT,
-            error = if (content.length <= PARSE_LIMIT) obj != null && isError(obj) else tailIsError(content),
+            error = fields != null && isError(fields),
             running = false,
         )
     }
@@ -133,96 +130,36 @@ private fun parse(text: String?): JsonElement? =
 
 private fun parseArray(text: String?) = parse(text) as? JsonArray ?: JsonArray(emptyList())
 
+/** The only members of a tool result that are read; the decoder skips all others without building them. */
+@Serializable
+private class ResultFields(
+    val output: JsonElement? = null,
+    val error: JsonElement? = null,
+    @SerialName("exit_code") val exitCode: JsonElement? = null,
+)
+
+private val resultJson = Json { ignoreUnknownKeys = true }
+
+/** Null when the text is not a JSON object. */
+private fun decodeResult(text: String): ResultFields? =
+    try {
+        resultJson.decodeFromString<ResultFields>(text)
+    } catch (e: SerializationException) {
+        null
+    } catch (e: IllegalArgumentException) {
+        null
+    }
+
 /**
  * A result failed when `error` is present and is not null, not boolean false and not the empty string
- * (the string "false" is a failure), or when `exit_code` is a non-zero number (a quoted one is ignored). A result that is not a JSON object never failed.
+ * (the string "false" is a failure), or when `exit_code` is a non-zero integer number (a quoted one is ignored). A result that is not a JSON object never failed.
  */
-private fun isError(obj: JsonObject): Boolean {
-    val error = obj["error"]
+private fun isError(fields: ResultFields): Boolean {
+    val error = fields.error
     val errorSet = error != null && error != JsonNull &&
         !(error is JsonPrimitive && ((!error.isString && error.booleanOrNull == false) || (error.isString && error.content.isEmpty())))
-    val exit = (obj["exit_code"] as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull
-    return errorSet || (exit != null && exit != 0.0)
-}
-
-/**
- * [isError] for a huge result: reads backwards, without recursion or backtracking, at most two top-level
- * `"error"` / `"exit_code"` members that end the document within the last SCAN_WINDOW characters.
- * shortcut: recognises only the terminal tool's result shape (those fields last), use a streaming parse if other large tools need it.
- */
-private fun tailIsError(content: String): Boolean {
-    val w = content.takeLast(SCAN_WINDOW)
-    var i = w.length - 1
-    fun skipSpace() {
-        while (i >= 0 && w[i].isWhitespace()) i--
-    }
-    skipSpace()
-    if (i < 0 || w[i] != '}') return false
-    i--
-    val fields = HashMap<String, JsonElement>()
-    for (member in 0 until 2) {
-        skipSpace()
-        if (i < 0) break
-        val value: JsonElement
-        var integer = false
-        if (w[i] == '"') {
-            val close = i
-            i--
-            while (i >= 0 && !(w[i] == '"' && evenBackslashesBefore(w, i))) i--
-            if (i < 0) {
-                // Opening quote is outside the window, key unknown. Only the last member is taken as the long
-                // error text (the terminal shape ends with "error"); earlier, it is the output and ends the scan.
-                if (member == 0) fields["error"] = JsonPrimitive(if (close > 0) "x" else "")
-                break
-            }
-            value = JsonPrimitive(if (close - i > 1) "x" else "")
-            i--
-        } else {
-            val end = i
-            while (i >= 0 && (w[i].isLetterOrDigit() || w[i] == '-')) i--
-            val literal = w.substring(i + 1, end + 1)
-            value = when {
-                literal == "null" -> JsonNull
-                literal == "true" -> JsonPrimitive(true)
-                literal == "false" -> JsonPrimitive(false)
-                literal.matches(INTEGER) -> JsonPrimitive(if (literal.any { it in '1'..'9' }) 1 else 0).also { integer = true }
-                else -> break
-            }
-        }
-        skipSpace()
-        if (i < 0 || w[i] != ':') break
-        i--
-        skipSpace()
-        if (i < 0 || w[i] != '"') break
-        val keyEnd = i
-        i--
-        while (i >= 0 && w[i] != '"') i--
-        if (i < 0) break
-        val key = w.substring(i + 1, keyEnd)
-        i--
-        when {
-            key == "error" && !integer -> fields.putIfAbsent(key, value)
-            key == "exit_code" && integer -> fields.putIfAbsent(key, value)
-            key == "exit_code" -> Unit // a quoted exit_code is not the terminal shape: not a failure
-            else -> break
-        }
-        skipSpace()
-        if (i < 0 || w[i] != ',') break
-        i--
-    }
-    return isError(JsonObject(fields))
-}
-
-private val INTEGER = Regex("-?[0-9]+") // applied to a short token only
-
-private fun evenBackslashesBefore(text: String, at: Int): Boolean {
-    var n = 0
-    var j = at - 1
-    while (j >= 0 && text[j] == '\\') {
-        n++
-        j--
-    }
-    return n % 2 == 0
+    val exit = (fields.exitCode as? JsonPrimitive)?.takeIf { !it.isString }?.content?.toBigIntegerOrNull()
+    return errorSet || (exit != null && exit.signum() != 0)
 }
 
 private fun argsPreview(arguments: JsonElement?): String {

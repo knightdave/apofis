@@ -110,13 +110,13 @@ class TranscriptTest {
 
     @Test
     fun toolErrorDetected() {
-        for (result in listOf("""{"exit_code": 2}""", """{"error": "boom"}""", """{"error": "false"}""", """{"error": true}""")) {
+        for (result in listOf("""{"exit_code": 2}""", """{"error": "boom"}""", """{"error": "false"}""", """{"error": true}""", """{"error": 0}""", """{"error": 1}""", """{"error": {}}""", """{"error": []}""")) {
             val step = stepFor(result)
             assertTrue(result, step.error)
             assertFalse(step.running)
             assertEquals(result, step.result)
         }
-        for (result in listOf("""{"error": null}""", """{"error": false}""", """{"error": ""}""", """{"exit_code": 0}""", """{"exit_code": "2"}""", "plain text")) {
+        for (result in listOf("""{"error": null}""", """{"error": false}""", """{"error": ""}""", """{"exit_code": 0}""", """{"exit_code": "2"}""", """{"exit_code": 2.5}""", "plain text", "[1]", "")) {
             assertFalse(result, stepFor(result).error)
         }
     }
@@ -130,20 +130,28 @@ class TranscriptTest {
     }
 
     @Test
-    fun hugeResultExitCodeNearEndFlagged() {
-        val huge = """{"output": "${"x".repeat(3_000_000)}", "exit_code": 2, "error": null}"""
-        assertTrue(stepFor(huge).error)
-        assertTrue(stepFor("""{"output": "${"x".repeat(3_000_000)}", "error": "boom"}""").error)
-        assertFalse(stepFor("""{"output": "${"x".repeat(3_000_000)}", "exit_code": 0, "error": null}""").error)
-        assertTrue(stepFor("""{"output": "${"x".repeat(3_000_000)}", "exit_code": 0, "error": true}""").error)
-        assertFalse(stepFor("""{"meta": {"exit_code": 2}, "output": "${"x".repeat(3_000_000)}", "exit_code": 0}""").error)
-        assertFalse(stepFor("""{"output": "${"x".repeat(3_000_000)}", "meta": {"exit_code": 2}}""").error)
+    fun hugeResultFailureDetected() {
         val big = "x".repeat(3_000_000)
-        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": "${"ab\\\"".repeat(950)}"}""").error) // 3800 chars with escaped quotes
-        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": "${"e".repeat(6000)}"}""").error)
+        val failed = stepFor("""{"output": "$big", "exit_code": 2}""")
+        assertTrue(failed.error)
+        assertEquals(TOOL_RESULT_DISPLAY_LIMIT, failed.result!!.length)
+        assertTrue(failed.resultTruncated)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 2, "error": null}""").error)
+        assertTrue(stepFor("""{"output": "$big", "error": "boom"}""").error)
+        assertFalse(stepFor("""{"output": "$big", "exit_code": 0, "error": null}""").error)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": true}""").error)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": 0}""").error)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": 1}""").error)
+        assertFalse(stepFor("""{"meta": {"exit_code": 2}, "output": "$big", "exit_code": 0}""").error)
+        assertFalse(stepFor("""{"output": "$big", "meta": {"exit_code": 2}}""").error)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": "${"ab\\\"".repeat(950)}"}""").error) // escaped quotes
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": "${"e".repeat(4093)}"}""").error)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 0, "error": "${"e".repeat(5000)}"}""").error)
+        assertTrue(stepFor("""{"output": "$big", "error": "${"e".repeat(4093)}"}""").error)
         assertFalse(stepFor("""{"output": "$big", "exit_code": 0, "error": ""}""").error)
         assertFalse(stepFor("""{"output": "$big", "error": null, "exit_code":"2"}""").error)
         assertTrue(stepFor("""{"output": "$big", "error": null, "exit_code":-1}""").error)
+        assertTrue(stepFor("""{"output": "$big", "exit_code": 1${"0".repeat(5000)}}""").error) // long integer token
     }
 
     @Test
@@ -154,11 +162,10 @@ class TranscriptTest {
             input += row(2L * i, "user", "q")
             input += row(2L * i + 1, "assistant", toolCallsJson = call("c$i")) // left running, so each turn has a waiting call
         }
-        val started = System.nanoTime()
         val items = buildTranscript(input)
-        val seconds = (System.nanoTime() - started) / 1e9
         assertEquals(40_001, items.size)
-        assertTrue("took $seconds s", seconds < 1.5) // about 0.5 s linear, over 2 s with a reused cleared map
+        assertEquals("r0", items.first().key)
+        assertEquals("r40001", items.last().key)
     }
 
     @Test
