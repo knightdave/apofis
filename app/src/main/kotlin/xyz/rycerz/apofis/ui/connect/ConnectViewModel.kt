@@ -56,18 +56,28 @@ class ConnectViewModel(
     private val willClearCache: suspend (baseUrl: String) -> Boolean,
     private val save: suspend (Credentials) -> Unit,
     failedBefore: Boolean = false,
+    private val back: ConnectBack? = null,
 ) : ViewModel() {
     var url by mutableStateOf(current?.baseUrl.orEmpty())
         private set
     /** A secure field's state: the key is not held in a plain String state or offered for copying. */
     val apiKey = TextFieldState()
-    var state by mutableStateOf<ConnectState>(
+    private var shown by mutableStateOf<ConnectState>(
         if (failedBefore) ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED) else ConnectState.Idle,
     )
-        private set
+    var state: ConnectState
+        get() = shown
+        private set(value) {
+            shown = value
+            back?.isEnabled = value == ConnectState.Testing || value == ConnectState.Saving
+        }
     private var pending: Credentials? = null
     private var job: Job? = null
     private var attempt = 0 // bumped by every start and by cancel(); a result of an older attempt is dropped
+
+    init {
+        back?.target = this
+    }
 
     val keepsCurrentKey: Boolean get() = current != null
     val httpWarning: Boolean get() = url.trim().startsWith("http://", ignoreCase = true)
@@ -181,6 +191,10 @@ class ConnectViewModel(
     }
 
     override fun onCleared() {
+        if (back?.target === this) {
+            back.target = null
+            back.isEnabled = false
+        }
         pending = null
         apiKey.clearText()
     }

@@ -110,14 +110,21 @@ class AppContainer(
     private val published = MutableStateFlow<Connected?>(null)
     private val switchLock = Mutex()
 
-    /** Test hooks: [beforeResume] runs on the lifecycle path before a resume; [beforeSwitch] at the start of a switch. */
+    /**
+     * Test hooks: [beforeResume] runs on the lifecycle path after the started check, before the follower opens its gate;
+     * [afterResume] once it has opened it; [beforeSwitch] at the start of a switch.
+     */
     internal var beforeResume: suspend () -> Unit = {}
+    internal var afterResume: suspend () -> Unit = {}
     internal var beforeSwitch: () -> Unit = {}
 
     private val foreground = Foreground(scope, resume = { stillStarted ->
         val c = connected()
-        beforeResume()
-        if (c != null && stillStarted()) c.resume()
+        if (c != null && stillStarted()) {
+            beforeResume()
+            c.resume()
+            afterResume()
+        }
     }, pause = { current?.pause() }, onError = ::logFailure)
 
     /** The current graph for the UI; null when not connected. Changes only when a switch has finished. */
@@ -161,9 +168,11 @@ class AppContainer(
      */
     suspend fun connect(c: Credentials): Unit = withContext(NonCancellable + Dispatchers.IO) {
         switchLock.withLock {
+            var old: Connected? = null
             var next: Connected? = null
+            var done = false
             try {
-                val old = synchronized(this@AppContainer) {
+                old = synchronized(this@AppContainer) {
                     loadLocked()
                     switching = true
                     current
@@ -181,13 +190,17 @@ class AppContainer(
                 commitOrThrow(cachePrefs.edit().putString(CACHE_URL, c.baseUrl))
                 commitOrThrow(cachePrefs.edit().remove(SWITCH_MARKER))
                 publish(next)
-            } catch (e: Exception) {
-                // Whatever step failed, the end state is disconnected with the credentials erased, never stuck switching.
-                runCatching { next?.close() }
-                disconnect()
-                publish(null)
-                throw e
+                done = true
             } finally {
+                if (!done) {
+                    // Whatever failed (cancellation included, rethrown after this), the end state is disconnected with
+                    // the credentials erased: published first, so no cleanup step can leave the container switching.
+                    publish(null)
+                    runCatching { old?.close() }.onFailure(::logFailure)
+                    runCatching { next?.close() }.onFailure(::logFailure)
+                    runCatching { WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME) }.onFailure(::logFailure)
+                    disconnect()
+                }
                 afterSwitch()
             }
         }
@@ -218,7 +231,7 @@ class AppContainer(
     private fun disconnect() {
         val erased = runCatching { credentials.clear() }.getOrDefault(false)
         // A mark that cannot be removed is harmless: it only forces this same disconnected state again.
-        if (erased && !cachePrefs.edit().remove(SWITCH_MARKER).commit()) Log.w(TAG, "Switch mark not removed")
+        if (erased && !runCatching { cachePrefs.edit().remove(SWITCH_MARKER).commit() }.getOrDefault(false)) Log.w(TAG, "Switch mark not removed")
     }
 
     private fun publish(next: Connected?) {

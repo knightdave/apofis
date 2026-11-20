@@ -1,7 +1,6 @@
 package xyz.rycerz.apofis.ui
 
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -36,6 +35,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.ui.connect.ConnectBack
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
@@ -45,7 +45,7 @@ enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT, LICENSES }
 
 /** State-based navigation: Connect when not connected, otherwise the chat; Settings and Connection from there. */
 @Composable
-fun AppNav(container: AppContainer) {
+fun AppNav(container: AppContainer, connectBack: ConnectBack) {
     var loaded by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         container.load() // decrypts the stored key off the main thread
@@ -75,20 +75,15 @@ fun AppNav(container: AppContainer) {
                     willClearCache = container::willClearCache,
                     save = container::connect,
                     failedBefore = !reconnect && container.consumeSwitchFailure(),
+                    back = connectBack,
                 )
             }
             LaunchedEffect(vm.state) { if (vm.state == ConnectState.Connected) chosen = Screen.CHAT }
-            // Back cancels a running check synchronously before leaving; while saving, cancel() refuses and Back is
-            // swallowed. On first run, leaving means sending the app to the background, as the system would.
-            val activity = LocalActivity.current
+            // Back cancels a running check synchronously before returning to Settings; while saving, cancel() refuses
+            // and Back is swallowed. Without a screen to return to, the activity's ConnectBack handles a busy Back.
             val canGoBack = reconnect && conn != null
-            val busy = vm.state == ConnectState.Testing || vm.state == ConnectState.Saving
-            val leave = {
-                if (vm.cancel()) {
-                    if (canGoBack) chosen = Screen.SETTINGS else activity?.moveTaskToBack(true)
-                }
-            }
-            BackHandler(enabled = canGoBack || busy, onBack = leave)
+            val leave = { if (vm.cancel()) chosen = Screen.SETTINGS }
+            BackHandler(enabled = canGoBack, onBack = leave)
             ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
         Screen.CHAT -> ChatPlaceholder(conn, onSettings = { chosen = Screen.SETTINGS })

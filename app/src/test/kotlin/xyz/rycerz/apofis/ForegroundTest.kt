@@ -23,12 +23,11 @@ class ForegroundTest {
         fg.start()
         runCurrent()
         fg.stop() // arrives while resumeAll is still running
-        runCurrent()
-        assertEquals(listOf("resume"), calls)
+        assertEquals(listOf("resume", "pause"), calls) // paused before stop() returned
         slow.complete(Unit)
         runCurrent()
 
-        assertEquals(listOf("resume", "resumed", "pause"), calls)
+        assertEquals(listOf("resume", "pause", "resumed", "pause"), calls) // the late resume is closed again
     }
 
     @Test

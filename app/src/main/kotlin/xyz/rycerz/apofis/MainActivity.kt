@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import xyz.rycerz.apofis.ui.AppNav
+import xyz.rycerz.apofis.ui.connect.ConnectBack
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.isDarkTheme
 
@@ -29,6 +30,9 @@ class MainActivity : ComponentActivity() {
                 }
             },
         )
+        // Added here, not from Compose, so Back cancels a connect check even before the frame that shows it.
+        val connectBack = ConnectBack { moveTaskToBack(true) }
+        onBackPressedDispatcher.addCallback(this, connectBack)
         setContent {
             val prefs = container.preferences
             val mode by prefs.themeMode.collectAsState()
@@ -41,7 +45,7 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            ApofisTheme(mode, dynamicColor, pureBlack) { AppNav(container) }
+            ApofisTheme(mode, dynamicColor, pureBlack) { AppNav(container, connectBack) }
         }
     }
 }
