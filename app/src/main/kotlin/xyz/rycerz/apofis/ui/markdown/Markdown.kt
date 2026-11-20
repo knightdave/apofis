@@ -15,6 +15,7 @@ import org.commonmark.node.Code
 import org.commonmark.node.Emphasis
 import org.commonmark.node.HardLineBreak
 import org.commonmark.node.Heading
+import org.commonmark.node.HtmlBlock
 import org.commonmark.node.HtmlInline
 import org.commonmark.node.Image
 import org.commonmark.node.Link
@@ -27,6 +28,8 @@ import org.commonmark.node.SoftLineBreak
 import org.commonmark.node.StrongEmphasis
 import org.commonmark.node.Text
 import org.commonmark.node.ThematicBreak
+import java.net.URI
+import java.net.URISyntaxException
 import org.commonmark.parser.Parser
 
 enum class SpanKind { STRONG, EMPHASIS, STRIKE, CODE, LINK }
@@ -52,39 +55,53 @@ sealed interface MdBlock {
 /** Quotes and lists nest at most this deep; anything deeper is flattened into the deepest container. */
 const val MAX_NESTING = 8
 
-private val parser: Parser = Parser.builder()
+// Code is cut out before parsing (fences) or is not markdown at all (indentation). HTML blocks are recognised only
+// so that their source shows as it is, never interpreted.
+private val blockTypes = setOf(org.commonmark.node.Heading::class.java, BlockQuote::class.java, ListBlock::class.java, ThematicBreak::class.java, HtmlBlock::class.java)
+
+// One tilde is common in prose ("~5 min"), so only ~~text~~ strikes through.
+private fun parser(tables: Boolean): Parser = Parser.builder()
     .extensions(
-        listOf(
-            TablesExtension.builder().maxCells(TABLE_MAX_CELLS).build(),
-            // One tilde is common in prose ("~5 min"), so only ~~text~~ strikes through.
+        listOfNotNull(
+            if (tables) TablesExtension.builder().maxCells(TABLE_MAX_CELLS).build() else null,
             StrikethroughExtension.builder().requireTwoTildes(true).build(),
             TaskListItemsExtension.create(),
         ),
     )
-    // Code is cut out before parsing (fences) or not markdown at all (indentation); HTML is never interpreted.
-    .enabledBlockTypes(setOf(org.commonmark.node.Heading::class.java, BlockQuote::class.java, ListBlock::class.java, ThematicBreak::class.java))
+    .enabledBlockTypes(blockTypes)
     .build()
 
-/** The markdown blocks of [text]. Never throws for any input; raw HTML stays literal text and nothing is fetched. */
-fun parseMarkdown(text: String): List<MdBlock> {
+private val withTables = parser(tables = true)
+private val withoutTables = parser(tables = false)
+
+/**
+ * The markdown blocks of [text]. Tables are parsed only when [tables] is set: the row builder sets it only for a block
+ * its scanner accepted as a table, within the table budgets. Raw HTML stays literal text and nothing is fetched.
+ */
+fun parseMarkdown(text: String, tables: Boolean = true): List<MdBlock> {
     val document = try {
-        parser.parse(text)
-    } catch (_: IllegalArgumentException) { // a table over the cell limit, nested where the row builder cannot see it
+        (if (tables) withTables else withoutTables).parse(text)
+    } catch (_: IllegalArgumentException) { // over the cell limit: unreachable from the row builder, which checks first
         return listOf(MdBlock.Paragraph(MdText(text, emptyList())))
     }
     return blocks(document, 0)
 }
 
-/** http or https (any case), absolute, with a host; the url itself, else null. */
+/**
+ * [url] when it is an absolute http or https URL (scheme in any case) with a well-formed, non-empty host, with the
+ * scheme in lower case (Android matches intent schemes case-sensitively); else null.
+ */
 fun safeUrl(url: String): String? {
-    val m = SAFE_URL.find(url) ?: return null
-    if (url.any { it.isWhitespace() || it.isISOControl() }) return null
-    val authority = m.groupValues[1].substringAfterLast('@')
-    val host = if (authority.startsWith('[')) authority.substringBefore(']').drop(1) else authority.substringBefore(':')
-    return url.takeIf { host.isNotEmpty() }
+    val uri = try {
+        URI(url)
+    } catch (_: URISyntaxException) {
+        return null
+    }
+    val scheme = uri.scheme ?: return null
+    if (!scheme.equals("http", ignoreCase = true) && !scheme.equals("https", ignoreCase = true)) return null
+    if (uri.isOpaque || uri.host.isNullOrEmpty() || uri.rawAuthority == null) return null
+    return scheme.lowercase() + url.substring(scheme.length)
 }
-
-private val SAFE_URL = Regex("^[hH][tT][tT][pP][sS]?://([^/?#]*)")
 
 /** The blocks under [parent], which sits [depth] containers deep. */
 private fun blocks(parent: Node, depth: Int): List<MdBlock> {
@@ -102,6 +119,7 @@ private fun addBlock(node: Node, depth: Int, out: MutableList<MdBlock>) {
         is Paragraph -> out += paragraph(node)
         is Heading -> out += MdBlock.Heading(node.level, inline(node))
         is ThematicBreak -> out += MdBlock.Rule
+        is HtmlBlock -> out += MdBlock.Paragraph(MdText(node.literal.trimEnd('\n', '\r'), emptyList()))
         is TableBlock -> out += table(node)
         is BlockQuote ->
             if (depth >= MAX_NESTING) out += blocks(node, depth) else out += MdBlock.Quote(blocks(node, depth + 1))

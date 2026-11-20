@@ -7,6 +7,7 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
@@ -248,5 +249,41 @@ class BlocksTest {
         val streamed = "```\n" + "y".repeat(1600) + "\n```\nafter"
         val live = ReplyText()
         for (end in 1..streamed.length) assertEquals("at $end", fresh(streamed.substring(0, end)), live.update("r1", streamed.substring(0, end)).map { it.chunk to it.kind })
+    }
+
+    /** Scanner steps, chunking steps and row references copied by one more update of a live reply, through ChatRows. */
+    private fun workFor(before: String, after: String): Pair<Long, Long> {
+        val rows = ChatRows(ZoneId.of("UTC"))
+        fun items(text: String) = Joined(emptyList<ChatItem>(), listOf<ChatItem>(AssistantReply("r1", emptyList(), text, 0.0, live = true)))
+        rows.rows(items(before))
+        val scan = Work.scanSteps + Work.chunkSteps
+        val copies = Work.rowCopies
+        rows.rows(items(after))
+        return (Work.scanSteps + Work.chunkSteps - scan) to (Work.rowCopies - copies)
+    }
+
+    @Test
+    fun workPerAppendDoesNotGrowWithLength() {
+        val para = "word ".repeat(19) + "end.\n\n"
+        for (append in listOf("y", "\nmore", "\n\nnext", "\n- item")) {
+            val small = workFor(para.repeat(100) + "tail", para.repeat(100) + "tail" + append)
+            val large = workFor(para.repeat(5000) + "tail", para.repeat(5000) + "tail" + append)
+            assertEquals("appending ${append.replace("\n", "\\n")}", small, large)
+        }
+        // A long open fence streamed line by line: scanning a line costs the same however long the fence already is.
+        val line = "val x = compute(1, 2, 3)\n"
+        val small = workFor("```kotlin\n" + line.repeat(100), "```kotlin\n" + line.repeat(101)).first
+        val large = workFor("```kotlin\n" + line.repeat(20_000), "```kotlin\n" + line.repeat(20_001)).first
+        assertEquals(small, large)
+        assertTrue("scanned $large for one line", large <= 4L * line.length)
+    }
+
+    @Test
+    fun codeCutsConsumeWholeLineTerminators() {
+        val code = { text: String -> ReplyText().update("r1", text).filter { it.kind == BlockKind.CODE }.map { (it.chunk as DisplayChunk.Code).text } }
+        assertEquals(listOf("y".repeat(20_000), "short"), code("```\n" + "y".repeat(20_000) + "\nshort\n```\n"))
+        assertEquals(listOf("x"), code("```\r\nx\r\n```\r\n"))
+        val crlf = "```\r\n" + "line of code\r\n".repeat(300) + "```\r\n"
+        assertTrue(code(crlf).size > 1 && code(crlf).none { it.endsWith('\r') })
     }
 }

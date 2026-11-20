@@ -47,6 +47,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
@@ -108,7 +109,7 @@ fun ChatScreen(
         bottomBar = {
             Column(Modifier.navigationBarsPadding().imePadding()) {
                 state.composerNote?.let { ComposerNoteLine(it) }
-                if (linkFailed) NoteLine(R.string.settings_link_no_app)
+                if (linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
                 state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                 Composer(
                     state.draft,
@@ -233,14 +234,17 @@ private fun ComposerNoteLine(note: ComposerNote) = NoteLine(
     },
 )
 
-/** A one-line note above the composer. */
+/** A note above the composer; [oneLine] keeps it to one line (the full text stays readable to accessibility). */
 @Composable
-private fun NoteLine(text: Int) {
+private fun NoteLine(text: Int, oneLine: Boolean = false) {
+    val full = stringResource(text)
     Text(
-        stringResource(text),
-        Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(top = 6.dp).semantics { liveRegion = LiveRegionMode.Polite },
+        full,
+        Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(top = 6.dp).semantics { liveRegion = LiveRegionMode.Polite; contentDescription = full },
         style = MaterialTheme.typography.labelMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = if (oneLine) 1 else Int.MAX_VALUE,
+        overflow = TextOverflow.Ellipsis,
     )
 }
 

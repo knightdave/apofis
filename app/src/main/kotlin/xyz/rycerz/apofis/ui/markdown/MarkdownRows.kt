@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import java.text.BreakIterator
 import xyz.rycerz.apofis.ui.chat.CHUNK
 import xyz.rycerz.apofis.ui.chat.Work
 import xyz.rycerz.apofis.ui.chat.chunkRanges
@@ -31,6 +32,15 @@ const val TABLE_MAX_ROWS = 500
 const val TABLE_MAX_CELLS = 4000
 const val TABLE_ROWS_PER_CHUNK = 40
 
+/** A table wider than this is LITERAL: even one row of it would be too many cells for one display row. */
+const val TABLE_MAX_COLUMNS = 100
+
+/** Cells one table slice lays out at most (fewer rows per slice for wide tables). */
+private const val SLICE_CELLS = 400
+
+/** What a block or list item costs in a display row besides its characters: a whole row holds at most about 50. */
+private const val NODE_COST = 30
+
 /** What one display row shows. */
 sealed interface DisplayChunk {
     /** Whole [MdBlock]s, or one slice of a long paragraph or list (spans clipped, numbering kept). */
@@ -57,7 +67,12 @@ fun displayChunks(source: String, block: LogicalBlock): List<DisplayChunk> {
         return out
     }
     Work.markdownParses++
-    return sliceBlocks(parseMarkdown(source.substring(block.start, block.end)))
+    val chunks = sliceBlocks(parseMarkdown(source.substring(block.start, block.end), tables = block.kind == BlockKind.TABLE))
+    // A block that cannot be cut small enough (one huge list item, say) shows as literal text instead.
+    if (chunks.any { it is DisplayChunk.Blocks && it.blocks.sumOf(::cost) > 2 * CHUNK }) {
+        return displayChunks(source, block.copy(mode = BlockMode.LITERAL))
+    }
+    return chunks
 }
 
 /** The chunk for piece [s, e) of a LITERAL or CODE block. */
@@ -90,17 +105,17 @@ internal fun codeRanges(text: String, start: Int, end: Int, emit: (start: Int, e
             Work.chunkSteps++
         }
         if (lastBreak > s) {
-            emit(s, lastBreak, limit, false)
+            emit(s, withoutCr(text, s, lastBreak), limit, false)
             s = lastBreak + 1
             continue
         }
-        val far = minOf(end, s + TABLE_MAX_CHARS)
+        val far = minOf(end, s + TABLE_MAX_CHARS + 1) // a break right at the limit still ends the line
         while (i < far && text[i] != '\n') {
             i++
             Work.chunkSteps++
         }
         if (i < far) { // the long line ends here
-            emit(s, i, i, false)
+            emit(s, withoutCr(text, s, i), i, false)
             s = i + 1
             i = s
         } else if (end - s > TABLE_MAX_CHARS) {
@@ -115,36 +130,46 @@ internal fun codeRanges(text: String, start: Int, end: Int, emit: (start: Int, e
     emit(s, end, end, true)
 }
 
-/** Packs whole blocks into chunks of about [CHUNK] characters; a long paragraph, list or any table is sliced. */
+/** [end], or one less when a CR stands before the line break there. */
+private fun withoutCr(text: String, start: Int, end: Int) = if (end > start && text[end - 1] == '\r') end - 1 else end
+
+/**
+ * Packs whole blocks into chunks costing about [CHUNK] (characters plus [NODE_COST] per block and list item); a long
+ * paragraph, list or quote is sliced, and every table.
+ */
 internal fun sliceBlocks(blocks: List<MdBlock>): List<DisplayChunk> {
     val out = ArrayList<DisplayChunk>()
     val pending = ArrayList<MdBlock>()
-    var pendingSize = 0
+    var pendingCost = 0
     fun flush() {
         if (pending.isEmpty()) return
         out += DisplayChunk.Blocks(pending.toList())
         pending.clear()
-        pendingSize = 0
+        pendingCost = 0
     }
     for (b in blocks) {
-        val size = size(b)
+        val cost = cost(b)
         when {
             b is MdBlock.Table -> {
                 flush()
                 out += tableSlices(b)
             }
-            b is MdBlock.Paragraph && size > CHUNK -> {
+            b is MdBlock.Paragraph && cost > CHUNK -> {
                 flush()
                 sliceText(b.text).mapTo(out) { DisplayChunk.Blocks(listOf(MdBlock.Paragraph(it))) }
             }
-            b is MdBlock.ListBlock && size > CHUNK && b.items.size > 1 -> {
+            b is MdBlock.ListBlock && cost > CHUNK && b.items.size > 1 -> {
                 flush()
                 sliceList(b).mapTo(out) { DisplayChunk.Blocks(listOf(it)) }
             }
+            b is MdBlock.Quote && cost > CHUNK -> {
+                flush()
+                sliceBlocks(b.blocks).mapTo(out) { DisplayChunk.Blocks(listOf(MdBlock.Quote((it as DisplayChunk.Blocks).blocks))) }
+            }
             else -> {
-                if (pendingSize + size > CHUNK) flush()
+                if (pendingCost + cost > CHUNK) flush()
                 pending += b
-                pendingSize += size
+                pendingCost += cost
             }
         }
     }
@@ -152,18 +177,18 @@ internal fun sliceBlocks(blocks: List<MdBlock>): List<DisplayChunk> {
     return out
 }
 
-/** Characters a block shows, roughly its source size. */
-private fun size(b: MdBlock): Int = when (b) {
+/** What a block costs in one display row: its characters and [NODE_COST] for it and each block and item inside. */
+internal fun cost(b: MdBlock): Int = NODE_COST + when (b) {
     is MdBlock.Paragraph -> b.text.text.length
     is MdBlock.Heading -> b.text.text.length
-    is MdBlock.Quote -> b.blocks.sumOf(::size)
-    is MdBlock.ListBlock -> b.items.sumOf(::size)
+    is MdBlock.Quote -> b.blocks.sumOf(::cost)
+    is MdBlock.ListBlock -> b.items.sumOf(::cost)
     is MdBlock.Table -> b.header.sumOf { it.text.length } + b.rows.sumOf { r -> r.sumOf { it.text.length } }
     is MdBlock.Image -> b.alt.length
-    MdBlock.Rule -> 1
+    MdBlock.Rule -> 0
 }
 
-private fun size(item: MdListItem) = item.blocks.sumOf(::size)
+private fun cost(item: MdListItem) = NODE_COST + item.blocks.sumOf(::cost)
 
 /** [text] in slices of at most [CHUNK] characters, cut after the last space or line break before the bound. */
 internal fun sliceText(text: MdText): List<MdText> {
@@ -174,12 +199,21 @@ internal fun sliceText(text: MdText): List<MdText> {
         val bound = a + CHUNK
         var cut = bound
         while (cut > a && s[cut - 1] != ' ' && s[cut - 1] != '\n') cut--
-        if (cut == a) cut = if (Character.isHighSurrogate(s[bound - 1])) bound - 1 else bound
+        if (cut == a) cut = graphemeCut(s, a, bound)
         out += clip(text, a, cut)
         a = cut
     }
     out += clip(text, a, s.length)
     return out
+}
+
+/** [bound], moved back to the start of the character (with its marks or joined parts) it would split, when within 32. */
+private fun graphemeCut(s: String, a: Int, bound: Int): Int {
+    val breaks = BreakIterator.getCharacterInstance()
+    breaks.setText(s)
+    if (breaks.isBoundary(bound)) return bound
+    val back = breaks.preceding(bound)
+    return if (back > a && bound - back <= 32) back else if (Character.isHighSurrogate(s[bound - 1])) bound - 1 else bound
 }
 
 private fun clip(text: MdText, a: Int, b: Int) = MdText(
@@ -193,7 +227,7 @@ private fun sliceList(list: MdBlock.ListBlock): List<MdBlock.ListBlock> {
     var first = 0
     var size = 0
     list.items.forEachIndexed { i, item ->
-        val s = size(item)
+        val s = cost(item)
         if (i > first && size + s > CHUNK) {
             out += MdBlock.ListBlock(list.ordered, list.start + first, list.items.subList(first, i).toList())
             first = i
@@ -214,8 +248,9 @@ private fun tableSlices(table: MdBlock.Table): List<DisplayChunk> {
     val widths = tableWidths(table)
     val n = table.rows.size
     if (n == 0) return listOf(DisplayChunk.TableSlice(table, 0, 0, widths, first = true, last = true))
-    return (0 until n step TABLE_ROWS_PER_CHUNK).map { from ->
-        val to = minOf(n, from + TABLE_ROWS_PER_CHUNK)
+    val step = (SLICE_CELLS / maxOf(1, widths.size)).coerceIn(1, TABLE_ROWS_PER_CHUNK)
+    return (0 until n step step).map { from ->
+        val to = minOf(n, from + step)
         DisplayChunk.TableSlice(table, from, to, widths, first = from == 0, last = to == n)
     }
 }

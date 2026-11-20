@@ -40,10 +40,16 @@ class MarkdownTest {
             assertTrue(src, text.spans.none { it.kind == SpanKind.LINK })
         }
         assertEquals(listOf(para("x")), parseMarkdown("[x](javascript:alert(1))"))
-        assertEquals(listOf(para("x", MdSpan(0, 1, SpanKind.LINK, "HTTPS://a.b/c"))), parseMarkdown("[x](HTTPS://a.b/c)"))
+        // The scheme is normalized to lower case: Android matches intent schemes case-sensitively.
+        assertEquals(listOf(para("x", MdSpan(0, 1, SpanKind.LINK, "https://a.b/c"))), parseMarkdown("[x](HTTPS://a.b/c)"))
+        assertEquals("https://Example.com/Path?q=1#f", safeUrl("HtTpS://Example.com/Path?q=1#f"))
         assertEquals("http://u@h:8080/p", safeUrl("http://u@h:8080/p"))
         assertEquals("https://[200::1]/", safeUrl("https://[200::1]/"))
-        for (bad in listOf("http://", "https://:80/", "ftp://a.b", "https://a b", "https://a\u0000b", "//a.b/c", " https://a.b")) assertNull(bad, safeUrl(bad))
+        val bad = listOf(
+            "http://", "https://:80/", "ftp://a.b", "https://a b", "https://a\u0000b", "//a.b/c", " https://a.b",
+            "https://[broken", "https://[broken/x", "https://a..b/", "https://a.b:port/", "https://@/", "https:a.b", "https:/a.b", "javascript://a.b/%0Aalert(1)",
+        )
+        for (url in bad) assertNull(url, safeUrl(url))
     }
 
     @Test
@@ -141,5 +147,12 @@ class MarkdownTest {
         assertEquals(listOf(para("a"), MdBlock.Rule, para("b")), parseMarkdown("a\n\n---\n\nb"))
         assertEquals(listOf(MdBlock.Rule), parseMarkdown("***"))
         assertEquals(listOf(para("~one~")), parseMarkdown("~one~")) // one tilde is text
+    }
+
+    @Test
+    fun rawHtmlBlocksAreLiteral() {
+        val html = "<div>\n**hi** [site](https://x.y)\n</div>"
+        assertEquals(listOf(para(html)), parseMarkdown(html))
+        assertEquals(listOf(para("<details>\n<summary>*s*</summary>"), para("text")), parseMarkdown("<details>\n<summary>*s*</summary>\n\ntext"))
     }
 }

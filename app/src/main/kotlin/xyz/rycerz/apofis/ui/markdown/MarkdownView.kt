@@ -50,6 +50,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -149,7 +151,9 @@ private fun Block(b: MdBlock, body: TextStyle, color: Color, strike: Boolean, on
 @Composable
 private fun MdTextView(text: MdText, style: TextStyle, color: Color, strike: Boolean, onLink: (String) -> Unit, modifier: Modifier = Modifier, align: TextAlign = TextAlign.Unspecified) {
     val primary = MaterialTheme.colorScheme.primary
-    val annotated = remember(text, primary, strike) { annotate(text, primary, strike, onLink) }
+    val pressed = ApofisTheme.colors.pressWash
+    val focused = ApofisTheme.colors.selectedRow
+    val annotated = remember(text, primary, pressed, focused, strike) { annotate(text, LinkTones(primary, pressed, focused), strike, onLink) }
     val codes = remember(text) { text.spans.filter { it.kind == SpanKind.CODE } }
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val fill = ApofisTheme.colors.inlineCodeFill
@@ -191,7 +195,10 @@ private fun MdTextView(text: MdText, style: TextStyle, color: Color, strike: Boo
     )
 }
 
-private fun annotate(text: MdText, primary: Color, strike: Boolean, onLink: (String) -> Unit): AnnotatedString = buildAnnotatedString {
+/** Link text, and the backgrounds that show a held press and keyboard focus (the link handler draws no indication). */
+private data class LinkTones(val text: Color, val pressed: Color, val focused: Color)
+
+private fun annotate(text: MdText, tones: LinkTones, strike: Boolean, onLink: (String) -> Unit): AnnotatedString = buildAnnotatedString {
     append(text.text)
     for (span in text.spans) {
         when (span.kind) {
@@ -201,7 +208,12 @@ private fun annotate(text: MdText, primary: Color, strike: Boolean, onLink: (Str
             SpanKind.CODE -> addStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 0.86.em), span.start, span.end)
             SpanKind.LINK -> {
                 val url = span.url ?: continue
-                val styles = TextLinkStyles(SpanStyle(color = primary, textDecoration = TextDecoration.Underline))
+                val link = SpanStyle(color = tones.text, textDecoration = TextDecoration.Underline)
+                val styles = TextLinkStyles(
+                    style = link,
+                    focusedStyle = link.copy(background = tones.focused),
+                    pressedStyle = link.copy(background = tones.pressed),
+                )
                 addLink(LinkAnnotation.Clickable(url, styles) { onLink(url) }, span.start, span.end)
             }
         }
@@ -220,7 +232,13 @@ private fun ListView(list: MdBlock.ListBlock, body: TextStyle, color: Color, str
     val muted = ApofisTheme.colors.muted
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(ItemGap)) {
         list.items.forEachIndexed { i, item ->
-            Row(Modifier.fillMaxWidth()) {
+            // A task item reads as checked or not, but is not a control: no click action, no press state.
+            val task = if (item.task) {
+                Modifier.semantics(mergeDescendants = true) { toggleableState = if (item.checked) ToggleableState.On else ToggleableState.Off }
+            } else {
+                Modifier
+            }
+            Row(Modifier.fillMaxWidth().then(task)) {
                 Box(Modifier.width(marker), contentAlignment = Alignment.TopEnd) {
                     if (item.task) {
                         TaskBox(item.checked, Modifier.padding(top = (line - 16.dp) / 2))
@@ -299,22 +317,23 @@ private fun Table(
     val measurer = rememberTextMeasurer()
     val density = LocalDensity.current
     val charWidth = with(density) { remember(bodyStyle) { measurer.measure("0", bodyStyle).size.width }.toDp() }
-    Column(modifier.fillMaxWidth().tableFrame(first, last, colors.tableBorder)) {
-        if (first) {
-            Row(
-                Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(painterResource(R.drawable.lucide_table), null, Modifier.size(16.dp), tint = colors.codeLabel)
-                Box(Modifier.width(6.dp))
-                Text(stringResource(R.string.md_table), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel)
+    BoxWithConstraints(modifier.fillMaxWidth()) {
+        val columns = widths.map { (charWidth * it + CellPadX * 2).coerceIn(48.dp, MaxColumn) }
+        fun width(cols: List<Dp>) = cols.fold(0.dp) { a, w -> a + w } + 1.dp * (cols.size - 1).coerceAtLeast(0)
+        val total = width(columns)
+        // A narrow table shares the spare width, each column up to the cap; what is left stays outside the frame.
+        val fitted = if (total < maxWidth && columns.isNotEmpty()) columns.map { minOf(MaxColumn, it + (maxWidth - total) / columns.size) } else columns
+        Column(Modifier.width(minOf(maxWidth, width(fitted))).tableFrame(first, last, colors.tableBorder)) {
+            if (first) {
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = 40.dp).background(colors.codeHeaderFill).padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(painterResource(R.drawable.lucide_table), null, Modifier.size(16.dp), tint = colors.codeLabel)
+                    Box(Modifier.width(6.dp))
+                    Text(stringResource(R.string.md_table), style = TextStyle(fontSize = 12.sp), color = colors.codeLabel)
+                }
             }
-        }
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
-            val columns = widths.map { (charWidth * it + CellPadX * 2).coerceIn(48.dp, MaxColumn) }
-            val total = columns.fold(0.dp) { a, w -> a + w } + 1.dp * (columns.size - 1).coerceAtLeast(0)
-            // A narrow table still fills the frame: the last column takes the rest.
-            val fitted = if (total < maxWidth && columns.isNotEmpty()) columns.dropLast(1) + (columns.last() + (maxWidth - total)) else columns
             Column(Modifier.horizontalScroll(scroll)) {
                 if (first) TableRow(table.header, table.align, fitted, headerStyle, MaterialTheme.colorScheme.onSurface, colors.tableHeaderFill, colors.tableDivider, onLink)
                 for (r in from until to) TableRow(table.rows[r], table.align, fitted, bodyStyle, colors.tableBody, Color.Unspecified, colors.tableDivider, onLink)

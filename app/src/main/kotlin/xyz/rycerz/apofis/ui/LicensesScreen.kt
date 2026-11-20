@@ -31,9 +31,14 @@ import xyz.rycerz.apofis.R
 /** Packaged from the repository's licenses/ directory (see app/build.gradle.kts). */
 const val LUCIDE_LICENSE_ASSET = "LUCIDE-LICENSE"
 const val COMMONMARK_LICENSE_ASSET = "COMMONMARK-LICENSE"
+const val COMMONMARK_NOTICE_ASSET = "COMMONMARK-NOTICE"
 
 /** Every shipped license: its heading and its asset. */
-private val LICENSES = listOf(R.string.licenses_lucide to LUCIDE_LICENSE_ASSET, R.string.licenses_commonmark to COMMONMARK_LICENSE_ASSET)
+private val LICENSES = listOf(
+    R.string.licenses_lucide to listOf(LUCIDE_LICENSE_ASSET),
+    // The repository's license at the pinned tag, then the notice the four jars carry (another copyright line).
+    R.string.licenses_commonmark to listOf(COMMONMARK_LICENSE_ASSET, COMMONMARK_NOTICE_ASSET),
+)
 
 /** The third-party license texts shipped in the app, verbatim. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -41,7 +46,7 @@ private val LICENSES = listOf(R.string.licenses_lucide to LUCIDE_LICENSE_ASSET, 
 fun LicensesScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val texts by produceState(emptyList<String>()) {
-        value = withContext(Dispatchers.IO) { LICENSES.map { (_, asset) -> context.assets.open(asset).bufferedReader().use { it.readText() } } }
+        value = withContext(Dispatchers.IO) { LICENSES.map { (_, assets) -> assets.joinToString("\n\n") { a -> context.assets.open(a).bufferedReader().use { it.readText() } } } }
     }
     Scaffold(
         topBar = {
