@@ -7,10 +7,10 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
 /**
- * The one serialized path for lifecycle work, and the only caller of [resume]. Events run one at a time in the order
- * they arrive, so a slow [resume] always finishes before the [pause] of a stop that follows it, and a resume that runs
- * after a stop does nothing. [resume] gets a check to repeat before it opens anything. Whether a stream may run is the
- * follower's own gate; this class only orders the calls that open and close it.
+ * The one serialized path for resumes, and the only caller of [resume]. [stop] calls [pause] itself before it returns,
+ * so the follower's gate is closed by then even while a slow resume is in flight. A resume checks [started] before it
+ * opens anything ([resume] gets that check to repeat) and again once it returns, and pauses again if a stop came in
+ * meanwhile. Whether a stream may run is the follower's own gate; this class only orders the calls that open and close it.
  */
 internal class Foreground(
     scope: CoroutineScope,
@@ -22,7 +22,7 @@ internal class Foreground(
     var started = false
         private set
 
-    // true: resume if started; false: pause; a Barrier: completed once everything before it has run
+    // true: resume if started; a Barrier: completed once everything before it has run
     private val events = Channel<Any>(Channel.UNLIMITED)
 
     init {
@@ -31,8 +31,11 @@ internal class Foreground(
                 try {
                     when {
                         event is Barrier -> event.done.complete(Unit)
-                        event == false -> pause()
-                        started -> resume { started }
+                        started -> try {
+                            resume { started }
+                        } finally {
+                            if (!started) pause() // a stop during the resume may have run before the gate opened
+                        }
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -48,9 +51,14 @@ internal class Foreground(
         events.trySend(true)
     }
 
+    /** Called on the main thread; returns with the gate closed. */
     fun stop() {
         started = false
-        events.trySend(false)
+        try {
+            pause()
+        } catch (e: Exception) {
+            onError(e)
+        }
     }
 
     /** Resume again if started, for example after the graph was replaced. */
