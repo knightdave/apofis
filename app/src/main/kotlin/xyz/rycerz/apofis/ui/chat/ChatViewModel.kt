@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -13,8 +14,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -185,11 +184,14 @@ class ChatViewModel(
         },
     )
 
+    private var opening: Job? = null
+
     init {
-        onOpened()
-        // A session refresh (foreground, drawer, a finished run) marked the shown chat changed elsewhere: fetch it once.
+        // One check now, again whenever the chat turns stale, and again after every completed session refresh (on return
+        // to the foreground, from the drawer, after a run): a chat still stale after a failed fetch is fetched then.
         viewModelScope.launch {
-            repo.session(sessionKey).map { it?.stale == true }.distinctUntilChanged().drop(1).filter { it }.collect { onOpened() }
+            combine(repo.refreshed, repo.session(sessionKey).map { it?.stale == true }.distinctUntilChanged()) { _, _ -> }
+                .collect { onOpened() }
         }
     }
 
@@ -198,10 +200,13 @@ class ChatViewModel(
      * Decided by the session row alone; unsent bubbles say nothing about the cache. A local-only chat makes no request.
      * A failure shows on the status line.
      */
-    fun onOpened() = request {
-        val session = repo.session(sessionKey).first()
-        if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
-            repo.syncMessages(sessionKey)
+    fun onOpened() {
+        if (opening?.isActive == true) return // one load at a time: the one running reads the newest state anyway
+        opening = launchRequest {
+            val session = repo.session(sessionKey).first()
+            if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
+                repo.syncMessages(sessionKey)
+            }
         }
     }
 
@@ -308,6 +313,10 @@ class ChatViewModel(
 
     /** Runs [block]; every API failure shows on the status line, a success clears it. */
     private fun request(block: suspend () -> Unit) {
+        launchRequest(block)
+    }
+
+    private fun launchRequest(block: suspend () -> Unit): Job =
         viewModelScope.launch {
             val failure = try {
                 block()
@@ -324,7 +333,6 @@ class ChatViewModel(
             }
             local.update { it.copy(failure = failure) }
         }
-    }
 }
 
 /**

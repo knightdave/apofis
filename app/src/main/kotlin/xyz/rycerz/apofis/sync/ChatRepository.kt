@@ -3,6 +3,10 @@ package xyz.rycerz.apofis.sync
 import androidx.room.withTransaction
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.sync.Mutex
@@ -59,6 +63,11 @@ class ChatRepository(
     private val active: () -> Boolean = { true },
 ) {
     private val sessionDao = db.sessionDao()
+
+    private val refreshes = MutableStateFlow(0L)
+
+    /** Counts the session list refreshes that completed and were stored; a shown chat checks itself again on each. */
+    val refreshed: StateFlow<Long> = refreshes.asStateFlow()
 
     /** Test-only: runs in the plain [syncMessages] after its fetch has returned, right before its write. */
     internal var beforeSyncWrite: suspend () -> Unit = {}
@@ -160,7 +169,10 @@ class ChatRepository(
                 sessionDao.deleteReplyOutcomes(row.key)
             }
         }
-        if (active()) onCached(sessionDao.all().mapTo(HashSet()) { it.key })
+        if (active()) {
+            onCached(sessionDao.all().mapTo(HashSet()) { it.key })
+            refreshes.update { it + 1 }
+        }
     }
 
     /** True when server rows of this chat are cached on the phone. */

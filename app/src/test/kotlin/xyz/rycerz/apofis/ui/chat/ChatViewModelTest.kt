@@ -628,6 +628,25 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun staleChatWhoseFetchFailedIsFetchedAfterTheNextSuccessfulRefresh() = runTest {
+        addSession(onServer = true, stale = true)
+        routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
+        val vm = vm()
+        vm.await { it.status == StatusLine.SERVER_ERROR } // the phone went to sleep with the chat still stale
+        assertEquals(1, requests.count { it.target.startsWith(MESSAGES) })
+        routes[MESSAGES] = json(serverRows)
+        routes["/api/sessions"] = json(
+            """{"object":"list","data":[{"id":"$KEY","source":"api_server","title":"Plans","pinned":false,"archived":false,""" +
+                """"hidden":false,"started_at":1.0,"last_active":2.0,"message_count":2,"preview":"p","_lineage_ids":[]}],"has_more":false}""",
+        )
+
+        connected.repo.refreshSessions() // the refresh on waking up succeeds; the stale bit was true all along
+
+        vm.await { it.items.any { i -> i.key == "r11" } } // fetched with no tap on the drawer
+        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
+    }
+
+    @Test
     fun shownChatMarkedStaleIsFetchedWithoutReopening() = runTest {
         addSession(onServer = true)
         routes[MESSAGES] = json("""{"session_id":"$KEY","data":[{"id":10,"role":"user","content":"hello","timestamp":$now}]}""")
