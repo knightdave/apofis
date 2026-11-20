@@ -70,6 +70,16 @@ private val handoff = Mutex()
 
 private enum class Attempt { STARTED, FAILED, STOP }
 
+private val UNCERTAIN_ERRORS = setOf(SendError.STEER_UNCERTAIN, SendError.UNCONFIRMED, SendError.EXPIRED_UNCERTAIN)
+
+/**
+ * For a switch to another API key at the same server, after the old graph is closed: quarantines attempted sends
+ * (see [xyz.rycerz.apofis.db.PendingSendDao.quarantineAttempted]) under drainLock and the repository lock, so no
+ * drain, retry or cancel of the old graph can be between its read and its write.
+ */
+internal suspend fun quarantineAttemptedSends(db: AppDatabase) =
+    drainLock.withLock { withRepositoryLock { db.pendingSendDao().quarantineAttempted() } }
+
 /** Thrown inside the locks once the owning connection is closed. Writes pass it on; [SendQueue.drain] returns false. */
 private class QueueClosed : IllegalStateException("closed")
 
@@ -91,6 +101,9 @@ class SendQueue(
     private val settle: suspend (runId: String) -> Unit = {},
 ) {
     private val pendingDao = db.pendingSendDao()
+
+    /** Test-only: runs in [retry] after its read and decision, before its write. */
+    internal var beforeRetryWrite: suspend () -> Unit = {}
 
     /** Stores [text] as a queued send for [sessionKey]; returns its idempotency key. */
     suspend fun enqueue(sessionKey: String, text: String): String = store(sessionKey, text).idempotencyKey
@@ -201,12 +214,16 @@ class SendQueue(
         drainLock.withLock {
             ensureOpen()
             val send = pendingDao.get(idempotencyKey)?.takeIf { it.state == PendingState.FAILED } ?: return RetryResult.NOT_FOUND
-            // A failed steer keeps attempted only with STEER_UNCERTAIN; an unconfirmed send may already be on the server.
-            val uncertain = send.error == SendError.STEER_UNCERTAIN || send.error == SendError.UNCONFIRMED
+            // A failed steer keeps attempted only with STEER_UNCERTAIN; an unconfirmed send may already be on the server;
+            // an expired uncertain one needs consent whatever the clock says now.
+            val uncertain = send.error in UNCERTAIN_ERRORS
             val old = expired(send)
             val unsafe = send.attempted && (uncertain || old)
             if (unsafe && !confirmedDuplicateRisk) return RetryResult.NEEDS_CONFIRMATION
             val queued = send.copy(state = PendingState.QUEUED, error = null, runId = null)
+            beforeRetryWrite()
+            // Armed before the write, under drainLock: a worker it starts waits for this lock and then sees the row.
+            schedule()
             // The chat may have been deleted since the read: a write that changes no row means nothing was queued.
             val written = if (unsafe || old) {
                 db.withTransaction {
@@ -219,7 +236,6 @@ class SendQueue(
             }
             if (!written) return RetryResult.NOT_FOUND
         }
-        schedule()
         return RetryResult.STARTED
     }
 

@@ -38,6 +38,7 @@ import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.RunStarter
 import xyz.rycerz.apofis.sync.SendQueue
 import xyz.rycerz.apofis.sync.SendWorker
+import xyz.rycerz.apofis.sync.quarantineAttemptedSends
 import xyz.rycerz.apofis.sync.withRepositoryLock
 import xyz.rycerz.apofis.ui.chat.onlineFlow
 import xyz.rycerz.apofis.ui.connect.ConnectBack
@@ -234,7 +235,7 @@ class AppContainer(
                 } else if (old?.credentials?.apiKey != c.apiKey) {
                     // An unknown old key (an interrupted switch erased it) counts as changed. Under the marker, so a
                     // death before this commit forces another switch, which quarantines again.
-                    withRepositoryLock { db.pendingSendDao().quarantineAttempted() }
+                    quarantineAttemptedSends(db)
                 }
                 if (!credentials.save(c)) throw IOException("credentials not written")
                 next = build(c)

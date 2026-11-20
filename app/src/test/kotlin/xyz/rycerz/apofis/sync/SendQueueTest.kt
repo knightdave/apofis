@@ -538,6 +538,18 @@ class SendQueueTest {
     }
 
     @Test
+    fun expiredUncertainNeedsConfirmationEvenIfTheClockMovedBack() = runTest {
+        addSession("apofis-a")
+        db.pendingSendDao().upsert(
+            PendingSendEntity(
+                idempotencyKey = "k", sessionKey = "apofis-a", text = "t", requestBody = buildRunBody("apofis-a", "t"),
+                createdAt = clock, state = "failed", runId = null, error = SendError.EXPIRED_UNCERTAIN, attempted = true,
+            ),
+        )
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, queue.retry("k"))
+    }
+
+    @Test
     fun steerIsStoredBeforeTheRequest() = runTest {
         addSession("apofis-a")
         running("apofis-a")

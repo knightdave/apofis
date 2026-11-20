@@ -186,6 +186,35 @@ class AppContainerTest {
     }
 
     @Test
+    fun retryInFlightAcrossAKeyChangeEndsQuarantined() = runTest {
+        container.connect(A)
+        val old = container.connected()!!
+        addSession("apofis-a")
+        val tried = old.sendQueue.enqueue("apofis-a", "accepted under key A, then refused")
+        db.pendingSendDao().update(db.pendingSendDao().get(tried)!!.copy(state = "failed", error = "unauthorized", attempted = true))
+        val reading = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        old.sendQueue.beforeRetryWrite = {
+            reading.complete(Unit)
+            release.await()
+        }
+        val retry = async(Dispatchers.IO) { old.sendQueue.retry(tried) } // no confirmation needed under key A
+        reading.await() // read and decided, not yet written
+        val switch = async(Dispatchers.IO) { container.connect(A.copy(apiKey = "key-a2")) }
+        val prefs = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
+        eventually("switch marked") { prefs.contains(SWITCH_MARKER) } // the quarantine step is next
+        release.complete(Unit)
+        retry.await()
+        switch.await()
+
+        // The old retry's write can never land after the quarantine: the new key never resends it unasked.
+        val row = db.pendingSendDao().get(tried)!!
+        assertEquals("failed", row.state)
+        assertEquals("unconfirmed", row.error)
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, container.connected()!!.sendQueue.retry(tried))
+    }
+
+    @Test
     fun sameKeyAgainKeepsAttemptedSendsQueued() = runTest {
         container.connect(A)
         val old = container.connected()!!
