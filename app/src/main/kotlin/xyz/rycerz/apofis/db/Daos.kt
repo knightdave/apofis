@@ -183,15 +183,15 @@ interface ActiveRunDao {
     @Query("UPDATE ActiveRunEntity SET lastSeq = :seq WHERE runId = :runId AND (lastSeq IS NULL OR lastSeq < :seq)")
     suspend fun updateLastSeq(runId: String, seq: Long)
 
-    @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId")
+    /** Never moves a run back from a terminal status: the first terminal status stored is final. */
+    @Query("UPDATE ActiveRunEntity SET status = :status WHERE runId = :runId AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')")
     suspend fun setStatus(runId: String, status: String)
 
     @Query("UPDATE ActiveRunEntity SET stopRequested = 1 WHERE runId = :runId")
     suspend fun setStopRequested(runId: String)
 
-    /** Never replaces a terminal status, which once stored is final. */
-    @Query("UPDATE ActiveRunEntity SET status = 'stopping' WHERE runId = :runId AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')")
-    suspend fun setStopping(runId: String)
+    @Query("UPDATE ActiveRunEntity SET stopRequested = 0 WHERE runId = :runId")
+    suspend fun clearStopRequested(runId: String)
 
     @Query("UPDATE ActiveRunEntity SET polling = 1 WHERE runId = :runId")
     suspend fun setPolling(runId: String)

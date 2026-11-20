@@ -1129,7 +1129,7 @@ class RunFollowerTest {
         f.stop(KEY)
         val row = db.activeRunDao().forSession(KEY)!!
         assertTrue(row.stopRequested)
-        assertEquals("stopping", row.status) // stored before it is shown, so a send now is not steered
+        assertEquals("running", row.status) // no status read has said otherwise yet
         release.countDown()
     }
 
@@ -1294,10 +1294,10 @@ class RunFollowerTest {
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         routes[MESSAGES] = { MockResponse.Builder().code(503).build() } // Finish never completes here
         val paused = AtomicBoolean(false)
-        beforeQuery = { sql, args ->
-            if ("SET status" in sql && "completed" in args) {
-                f.pauseAll() // lands while the terminal status is being stored
-                paused.set(true)
+        f.beforeStatusStore = { status ->
+            if (status == "completed" && paused.compareAndSet(false, true)) {
+                pauseAll() // lands as the terminal status starts being stored, before anything is written
+                yield()
             }
         }
         started(f)
@@ -1702,7 +1702,10 @@ class RunFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("running"))
-        on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
+        routes["/v1/runs/$RUN/stop"] = {
+            on(STATUS, status("stopping")) // the server reports it from now on
+            json("""{"run_id":"$RUN","status":"stopping"}""")()
+        }
         on(steerPath, json(fixture("steer_response.json")))
         heldOpen(f, release)
         val sent = sendWhenShown(f, "stopping")
@@ -1711,5 +1714,84 @@ class RunFollowerTest {
         sent.await()
         assertTrue(requestsTo(steerPath).isEmpty())
         release.countDown()
+    }
+
+    @Test
+    fun failedStopKeepsTheStatusAndTheNextSendSteers() = runTest {
+        val f = follower()
+        val release = gate()
+        on(STATUS, status("running"))
+        on("/v1/runs/$RUN/stop", json("{}", 500))
+        on(steerPath, json(fixture("steer_response.json")))
+        heldOpen(f, release)
+
+        try {
+            f.stop(KEY)
+            fail("expected the stop's error")
+        } catch (e: ApiError.Http) {
+            assertEquals(500, e.status)
+        }
+        val row = db.activeRunDao().forSession(KEY)!!
+        assertEquals("running", row.status)
+        assertFalse(row.stopRequested) // a later cancel by someone else is not this user's stop
+        SendQueue(api, db, { _, _ -> }, System::currentTimeMillis).submit(KEY, "after the failed stop")
+        assertEquals(1, requestsTo(steerPath).size)
+        release.countDown()
+    }
+
+    @Test
+    fun statusReadReturningAfterTheTerminalEventNeverUndoesIt() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val finish = gate()
+        gatedMessages(finish) // keeps the run (and its live state) until the end
+        val emit = gate()
+        val read = gate()
+        routes[EVENTS] = {
+            emit.pass()
+            sseResponse(terminal(0))
+        }
+        routes[STATUS] = {
+            read.pass() // started before the terminal event, returns after it
+            status("running")()
+        }
+        started(f)
+
+        val answer = backgroundScope.async { f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE) }
+        awaitUntil { requestsTo(STATUS).size == 1 }
+        emit.countDown()
+        awaitUntil { f.live(KEY).value?.status == "completed" }
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status) // stored before it was shown
+        read.countDown()
+        assertEquals(AnswerResult.GONE, answer.await())
+
+        assertEquals("completed", f.live(KEY).value!!.status)
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        finish.countDown()
+        done.await() // the run ends before the database closes
+    }
+
+    @Test
+    fun statusReadBeforeTheTerminalEventEndsTerminal() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val finish = gate()
+        gatedMessages(finish)
+        val emit = gate()
+        routes[EVENTS] = {
+            emit.pass()
+            sseResponse(terminal(0))
+        }
+        on(STATUS, status("running"))
+        started(f)
+
+        assertEquals(AnswerResult.GONE, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        assertEquals("running", f.live(KEY).value!!.status)
+        emit.countDown()
+        awaitUntil { f.live(KEY).value?.status == "completed" }
+
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        finish.countDown()
+        done.await() // the run ends before the database closes
     }
 }
