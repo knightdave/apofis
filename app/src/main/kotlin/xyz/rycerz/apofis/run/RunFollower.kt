@@ -147,6 +147,8 @@ class RunFollower(
         // The intent is stored apart from the server's status, so a cancel seen after a restart still counts as this
         // user's stop, and a stop by another client never does.
         db.activeRunDao().setStopRequested(run.runId)
+        // Stored before it is shown, like every status: a send the user makes on seeing it must not steer.
+        db.activeRunDao().setStopping(run.runId)
         edit(run) { it.copy(status = "stopping") }
         io(run.runId) { api.stop(run.runId) }
     }
@@ -299,10 +301,13 @@ class RunFollower(
         }
     }
 
-    /** Called only by [Refresher.read]: shows [s] and, when [store], stores its status for the send queue. */
+    /**
+     * Called only by [Refresher.read]: when [store], stores [s]'s status for the send queue, and only then shows it,
+     * so whatever the user sees is already what a send decides by.
+     */
     private suspend fun applyStatus(run: ActiveRunEntity, s: RunStatus, store: Boolean) {
-        edit(run) { it.copy(status = s.status, pending = s.pendingControls.firstOrNull()) }
         if (store) withContext(NonCancellable) { db.activeRunDao().setStatus(run.runId, stored(s.status)) }
+        edit(run) { it.copy(status = s.status, pending = s.pendingControls.firstOrNull()) }
     }
 
     /**

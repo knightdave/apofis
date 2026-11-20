@@ -250,5 +250,13 @@ class DaosTest {
         assertEquals("queued", dao.forSession("t")!!.status)
         assertEquals(false, dao.forSession("t")!!.polling)
         assertEquals(false, dao.forSession("t")!!.stopRequested)
+
+        dao.setStopping("run_2")
+        assertEquals("stopping", dao.forSession("t")!!.status)
+        dao.setStatus("run_2", "completed")
+        dao.setStopping("run_2") // a terminal status is final
+        assertEquals("completed", dao.forSession("t")!!.status)
+        dao.setStopping("gone")
+        assertNull(dao.get("gone"))
     }
 }

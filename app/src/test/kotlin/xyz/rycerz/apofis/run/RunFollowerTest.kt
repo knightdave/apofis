@@ -43,6 +43,7 @@ import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
@@ -51,6 +52,7 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.sync.ChatRepository
+import xyz.rycerz.apofis.sync.SendQueue
 
 private const val KEY = "apofis-a"
 private const val RUN = "run_1"
@@ -469,8 +471,7 @@ class RunFollowerTest {
 
         val pending = f.live(KEY).first { it?.pending != null }!!.pending!!
         assertEquals("ctl_prompt", pending.requestId)
-        // Stored right after it is shown, on the database thread: awaited, not assumed.
-        awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "waiting_for_approval" }
+        assertEquals("waiting_for_approval", db.activeRunDao().forSession(KEY)!!.status) // stored before it is shown
         assertEquals(AnswerResult.SENT, f.answerApproval(KEY, pending.requestId, pending.executionGeneration, ApprovalChoice.ONCE))
 
         val body = requestsTo("/v1/runs/$RUN/approval").single().body!!.utf8()
@@ -1106,7 +1107,7 @@ class RunFollowerTest {
         f.stop(KEY)
         val row = db.activeRunDao().forSession(KEY)!!
         assertTrue(row.stopRequested)
-        assertEquals("running", row.status) // no status read has said otherwise yet
+        assertEquals("stopping", row.status) // stored before it is shown, so a send now is not steered
         release.countDown()
     }
 
@@ -1584,6 +1585,100 @@ class RunFollowerTest {
         assertTrue(f.refreshOwed(RUN))
         f.resumeAll()
         f.live(KEY).first { it?.pending?.requestId == "ctl_other" }
+        release.countDown()
+    }
+
+    // ---- the stored status is what the user sees ----
+
+    private val steerPath = "/v1/runs/$RUN/steer"
+
+    /**
+     * Sends "now" from inside the live update that first shows [status], before the follower takes another step, the
+     * way a user tapping send on what the screen shows would. Completes the returned deferred once it has sent.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun TestScope.sendWhenShown(f: RunFollower, status: String): CompletableDeferred<Unit> {
+        val sent = CompletableDeferred<Unit>()
+        val queue = SendQueue(api, db, { _, _ -> }, System::currentTimeMillis)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            f.live(KEY).collect {
+                if (it?.status == status && !sent.isCompleted) {
+                    runBlocking { queue.submit(KEY, "now") } // inline: the follower is still inside its update
+                    sent.complete(Unit)
+                }
+            }
+        }
+        return sent
+    }
+
+    @Test
+    fun sendRightAfterRunningIsShownIsSteered() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("queued"), status("running"))
+        on(EVENTS, sse(), heldStream())
+        on(steerPath, json(fixture("steer_response.json")))
+        f.resumeAll()
+        addSession()
+        addRun(status = "queued")
+        val sent = sendWhenShown(f, "running")
+        f.onRunStarted(KEY, RUN)
+
+        sent.await()
+        assertEquals(1, requestsTo(steerPath).size)
+        assertEquals(listOf("steered"), db.pendingSendDao().observe(KEY).first().map { it.state })
+    }
+
+    @Test
+    fun sendRightAfterApprovalIsShownIsNotSteered() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        on(EVENTS, heldStream(frame(1, approvalEvent)))
+        on(steerPath, json(fixture("steer_response.json")))
+        f.resumeAll()
+        addSession()
+        addRun()
+        val sent = sendWhenShown(f, "waiting_for_approval")
+        f.onRunStarted(KEY, RUN)
+
+        sent.await()
+        assertTrue(requestsTo(steerPath).isEmpty())
+        assertTrue(db.pendingSendDao().observe(KEY).first().none { it.runId == RUN })
+    }
+
+    @Test
+    fun sendRightAfterTerminalStatusIsShownIsNotSteered() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        messages()
+        on(STATUS, status("completed"))
+        on(EVENTS, sse())
+        on(steerPath, json(fixture("steer_response.json")))
+        f.resumeAll()
+        addSession()
+        addRun()
+        val sent = sendWhenShown(f, "completed")
+        f.onRunStarted(KEY, RUN)
+
+        sent.await()
+        done.await()
+        assertTrue(requestsTo(steerPath).isEmpty())
+    }
+
+    @Test
+    fun sendRightAfterStopIsShownIsNotSteered() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("running"))
+        on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
+        on(steerPath, json(fixture("steer_response.json")))
+        heldOpen(f, release)
+        val sent = sendWhenShown(f, "stopping")
+
+        f.stop(KEY)
+        sent.await()
+        assertTrue(requestsTo(steerPath).isEmpty())
         release.countDown()
     }
 }
