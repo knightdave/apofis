@@ -55,6 +55,7 @@ enum class CancelResult {
     REMOVED_MAY_HAVE_SENT, // removed from this phone, but a request for it may already have reached the server
     STARTED, // already being sent or delivered: nothing was removed
     NOT_FOUND,
+    NOW_ATTEMPTED, // a request for it may have gone out since the user was told it had not: nothing was removed
 }
 
 // Process-wide like the repository lock: the app foreground and SendWorker must never start the same send twice.
@@ -149,11 +150,15 @@ class SendQueue(
         }
     }
 
-    /** Removes a queued or failed send; one started or steered cannot be taken back. */
-    suspend fun cancel(idempotencyKey: String): CancelResult = drainLock.withLock {
+    /**
+     * Removes a queued or failed send; one started or steered cannot be taken back. [mayHaveSentShown] is what the
+     * user was told; a row attempted since a "not sent yet" warning is kept ([CancelResult.NOW_ATTEMPTED]).
+     */
+    suspend fun cancel(idempotencyKey: String, mayHaveSentShown: Boolean = true): CancelResult = drainLock.withLock {
         ensureOpen()
         val send = pendingDao.get(idempotencyKey) ?: return@withLock CancelResult.NOT_FOUND
         if (send.state != PendingState.QUEUED && send.state != PendingState.FAILED) return@withLock CancelResult.STARTED
+        if (send.attempted && !mayHaveSentShown) return@withLock CancelResult.NOW_ATTEMPTED
         if (pendingDao.delete(idempotencyKey) == 0) return@withLock CancelResult.NOT_FOUND
         if (send.attempted) CancelResult.REMOVED_MAY_HAVE_SENT else CancelResult.REMOVED
     }

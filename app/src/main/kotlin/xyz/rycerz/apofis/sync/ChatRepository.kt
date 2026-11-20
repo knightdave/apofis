@@ -74,10 +74,18 @@ class ChatRepository(
                     mapped = rows.withIndex().associate { (i, row) -> row.id to i } to buildTranscript(rows.map { it.toDto() })
                     shown = mapped.second.filterIsInstance<UserMessage>()
                 }
-                // A started send the stored rows already show (synced while its run goes on) is not shown twice.
+                // A started send the stored rows already show (synced while its run goes on) is not shown twice;
+                // the row showing it carries its run id instead, so the screen knows where that run's turn starts.
                 val used = HashSet<String>()
-                val unsent = pending.filterNot { deliveredIn(it, shown, used) }
-                emit(withOutcomes(mapped.first, mapped.second, outcomes) + unsent.map { it.toItem() })
+                val started = HashMap<String, String>() // bubble key to run id
+                val unsent = pending.filter { p ->
+                    val bubble = matchIn(p, shown, used)
+                    if (bubble != null && p.state == PendingState.SENDING && p.runId != null) started[bubble.key] = p.runId
+                    bubble == null
+                }
+                var items = withOutcomes(mapped.first, mapped.second, outcomes)
+                if (started.isNotEmpty()) items = items.map { if (it is UserMessage && it.key in started) it.copy(runId = started[it.key]) else it }
+                emit(items + unsent.map { it.toItem() })
             }
         }.distinctUntilChanged()
     }
@@ -252,7 +260,9 @@ class ChatRepository(
         queue().submit(sessionKey, text)
     }
 
-    suspend fun cancelSend(idempotencyKey: String): CancelResult = queue().cancel(idempotencyKey)
+    /** See [SendQueue.cancel]. */
+    suspend fun cancelSend(idempotencyKey: String, mayHaveSentShown: Boolean = true): CancelResult =
+        queue().cancel(idempotencyKey, mayHaveSentShown)
 
     /** See [SendQueue.retry]; a send queued again is started at once when possible. */
     suspend fun retrySend(idempotencyKey: String, confirmedDuplicateRisk: Boolean = false): RetryResult =
@@ -316,14 +326,17 @@ private const val DELIVERY_WINDOW_S = 60.0
  * within a minute can therefore confirm each other. [used] keeps one bubble from confirming two run sends.
  * Rows in any other state are never confirmed.
  */
-internal fun deliveredIn(p: PendingSendEntity, shown: List<UserMessage>, used: MutableSet<String>): Boolean {
+internal fun deliveredIn(p: PendingSendEntity, shown: List<UserMessage>, used: MutableSet<String>): Boolean = matchIn(p, shown, used) != null
+
+/** [deliveredIn], giving the bubble that shows [p]. */
+internal fun matchIn(p: PendingSendEntity, shown: List<UserMessage>, used: MutableSet<String>): UserMessage? {
     val text = p.text.trim()
     val since = p.createdAt / 1000.0 - DELIVERY_WINDOW_S
     return when (p.state) {
         PendingState.SENDING -> shown.firstOrNull { !it.steered && it.key !in used && it.timestamp >= since && it.text.trim() == text }
-            ?.also { used += it.key } != null
-        PendingState.STEERED -> shown.any { it.steered && it.timestamp >= since && it.text.contains(text) }
-        else -> false
+            ?.also { used += it.key }
+        PendingState.STEERED -> shown.firstOrNull { it.steered && it.timestamp >= since && it.text.contains(text) }
+        else -> null
     }
 }
 
@@ -372,6 +385,7 @@ private fun PendingSendEntity.toItem() = UserMessage(
     idempotencyKey = idempotencyKey,
     error = error,
     attempted = attempted,
+    runId = runId.takeIf { state == PendingState.SENDING }, // a steer's run id is the run it joined, not one it started
 )
 
 /**

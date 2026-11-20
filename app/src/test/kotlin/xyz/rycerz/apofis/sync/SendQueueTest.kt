@@ -790,4 +790,15 @@ class SendQueueTest {
         assertEquals(CancelResult.NOT_FOUND, queue.cancel("missing"))
         assertEquals(listOf("sending"), rows("apofis-a").map { it.text })
     }
+
+    @Test
+    fun cancelKeepsARowAttemptedSinceTheWeakerWarning() = runTest {
+        addSession("apofis-a")
+        val key = queue.enqueue("apofis-a", "later")
+        db.pendingSendDao().update(pending(key).copy(attempted = true)) // a drain tried it while the dialog was open
+
+        assertEquals(CancelResult.NOW_ATTEMPTED, queue.cancel(key, mayHaveSentShown = false))
+        assertEquals(listOf("later"), rows("apofis-a").map { it.text })
+        assertEquals(CancelResult.REMOVED_MAY_HAVE_SENT, queue.cancel(key, mayHaveSentShown = true))
+    }
 }
