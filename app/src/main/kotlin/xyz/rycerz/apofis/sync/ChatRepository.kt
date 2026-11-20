@@ -31,6 +31,13 @@ private const val MAX_PAGES = 100
 // Process-wide: the app has a single database, so every repository instance must share one lock.
 private val lock = Mutex()
 
+// Chats a delete is in progress for: the send queue starts no run for them until the delete ends. In memory only, and
+// process-wide like the lock: a delete never outlives the process, and a killed one leaves nothing to clear.
+private val deleting: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+/** For the send pipeline, under the repository lock: true while a delete of [sessionKey] is in progress. */
+internal fun isBeingDeleted(sessionKey: String): Boolean = sessionKey in deleting
+
 /** For the send pipeline: runs [block] under the repository lock (taken after SendQueue's own lock, never before). */
 internal suspend fun <T> withRepositoryLock(block: suspend () -> T): T = lock.withLock { block() }
 
@@ -238,6 +245,20 @@ class ChatRepository(
 
     suspend fun setArchived(sessionKey: String, archived: Boolean) =
         update(sessionKey, { api.patchSession(it, archived = archived) }) { it.copy(archived = archived) }
+
+    /**
+     * Marks [sessionKey] as being deleted: from now until [endDelete] the send queue starts no run for it (queued sends
+     * stay queued). Taken under the lock, so a run start in progress finishes first and its run is visible afterwards.
+     */
+    suspend fun beginDelete(sessionKey: String) = lock.withLock {
+        ensureOpen()
+        deleting += sessionKey
+    }
+
+    /** Ends [beginDelete]; after a failed delete the chat can send again (drain the queue to send what waited). */
+    suspend fun endDelete(sessionKey: String) = lock.withLock {
+        deleting -= sessionKey
+    }
 
     /** Server first: local rows, unsent messages included, go only once the server confirmed. */
     suspend fun delete(sessionKey: String) {

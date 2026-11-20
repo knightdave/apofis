@@ -94,6 +94,24 @@ class SendQueueTest {
         db.activeRunDao().upsert(ActiveRunEntity(runId, sessionKey, null, "running", 1L))
 
     @Test
+    fun noRunStartsWhileTheChatIsBeingDeleted() = runTest {
+        addSession("apofis-a")
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val key = queue.enqueue("apofis-a", "Hello there")
+        repo.beginDelete("apofis-a")
+        try {
+            queue.drain()
+            assertEquals(0, server.requestCount)
+            assertEquals("queued", pending(key).state) // left as it was, not failed
+        } finally {
+            repo.endDelete("apofis-a")
+        }
+        respond(fixture("run_start.json"))
+        assertTrue(queue.drain())
+        assertEquals("sending", pending(key).state)
+    }
+
+    @Test
     fun happyPathCreatesSessionThenRun() = runTest {
         addSession("apofis-a", existsOnServer = false)
         respond(fixture("session_create.json"))
