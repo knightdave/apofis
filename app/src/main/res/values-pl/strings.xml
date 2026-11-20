@@ -15,7 +15,8 @@
     <string name="connect_key_hide_description">Ukryj klucz API</string>
     <string name="connect_button">Połącz</string>
     <string name="connect_testing">Sprawdzanie połączenia</string>
-    <string name="connect_http_warning">Ten adres używa zwykłego HTTP: klucz API i wiadomości zostaną wysłane bez szyfrowania. Używaj http tylko przez VPN lub szyfrowaną sieć nakładkową.</string>
+    <string name="connect_saving">Zapisywanie połączenia</string>
+    <string name="connect_http_warning">Ten adres używa zwykłego HTTP: klucz API i wiadomości są wysyłane bez szyfrowania. Używaj http tylko wtedy, gdy VPN lub szyfrowana sieć nakładkowa chroni całą drogę między tym telefonem a serwerem.</string>
     <string name="connect_error_missing_scheme">Zacznij adres od https:// lub http://</string>
     <string name="connect_error_malformed_url">To nie jest prawidłowy adres</string>
     <string name="connect_error_url_extra_parts">Usuń część użytkownik:hasło@ oraz wszystko po znaku ? lub #</string>
@@ -46,5 +47,7 @@
     <string name="settings_version">Wersja</string>
     <string name="settings_license">Licencja</string>
     <string name="settings_source">Kod źródłowy</string>
+    <string name="settings_licenses">Licencje open source</string>
+    <string name="licenses_lucide">Ikony Lucide</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
 </resources>

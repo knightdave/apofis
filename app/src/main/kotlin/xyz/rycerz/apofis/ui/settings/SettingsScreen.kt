@@ -67,6 +67,7 @@ fun SettingsScreen(
     onThemeMode: (ThemeMode) -> Unit,
     onDynamicColor: (Boolean) -> Unit,
     onPureBlack: (Boolean) -> Unit,
+    onLicenses: () -> Unit,
     onBack: () -> Unit,
 ) {
     val uriHandler = LocalUriHandler.current
@@ -118,6 +119,7 @@ fun SettingsScreen(
                 InfoRow(R.drawable.lucide_code, stringResource(R.string.settings_source), sourceUrl, chevron = true, onClick = {
                     linkFailed = runCatching { uriHandler.openUri(sourceUrl) }.isFailure
                 })
+                InfoRow(R.drawable.lucide_file_text, stringResource(R.string.settings_licenses), chevron = true, onClick = onLicenses)
                 if (linkFailed) {
                     Text(
                         stringResource(R.string.settings_link_no_app),

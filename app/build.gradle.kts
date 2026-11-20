@@ -59,6 +59,9 @@ android {
         compose = true
     }
 
+    // Third-party license texts ship verbatim from the repository's licenses/ directory.
+    sourceSets.getByName("main").assets.directories.add(rootProject.file("licenses").path)
+
     testOptions {
         unitTests.isIncludeAndroidResources = true
     }

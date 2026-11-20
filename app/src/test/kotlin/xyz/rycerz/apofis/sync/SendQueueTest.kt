@@ -687,7 +687,7 @@ class SendQueueTest {
         val before = pending(key)
 
         assertFalse(closing.drain())
-        closing.submit("apofis-b", "steer after the switch")
+        assertClosed { closing.submit("apofis-b", "steer after the switch") }
 
         assertEquals(0, server.requestCount)
         assertEquals(before, pending(key))
@@ -716,5 +716,32 @@ class SendQueueTest {
         assertEquals(1, server.requestCount)
         assertEquals(written, pending(after))
         assertTrue(started.isEmpty()) // no stream is attached for the old server either
+    }
+
+    private suspend fun assertClosed(block: suspend () -> Unit) {
+        try {
+            block()
+            fail("a closed queue must refuse writes")
+        } catch (e: IllegalStateException) {
+            assertEquals("closed", e.message)
+        }
+    }
+
+    @Test
+    fun closedQueueRefusesEveryWrite() = runTest {
+        var open = true
+        val old = SendQueue(api, db, { _, _ -> }, { clock }, active = { open })
+        addSession("apofis-a")
+        val failed = old.enqueue("apofis-a", "failed before the switch")
+        db.pendingSendDao().update(pending(failed).copy(state = "failed", error = "protocol"))
+        val before = rows("apofis-a")
+        open = false
+
+        assertClosed { old.enqueue("apofis-a", "the same session key on the new server") }
+        assertClosed { old.cancel(failed) }
+        assertClosed { old.retry(failed) }
+
+        assertEquals(before, rows("apofis-a"))
+        assertEquals(0, server.requestCount)
     }
 }

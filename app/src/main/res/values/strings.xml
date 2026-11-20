@@ -16,7 +16,8 @@
     <string name="connect_key_hide_description">Hide API key</string>
     <string name="connect_button">Connect</string>
     <string name="connect_testing">Testing connection</string>
-    <string name="connect_http_warning">This address uses plain HTTP: your API key and messages will be sent without encryption. Use http only through a VPN or an encrypted overlay network.</string>
+    <string name="connect_saving">Saving connection</string>
+    <string name="connect_http_warning">This address uses plain HTTP: your API key and messages are sent without encryption. Use http only when a VPN or an encrypted overlay network protects the whole path between this phone and the server.</string>
     <string name="connect_error_missing_scheme">Start the address with https:// or http://</string>
     <string name="connect_error_malformed_url">This is not a valid address</string>
     <string name="connect_error_url_extra_parts">Remove the user:password@ part and anything after ? or #</string>
@@ -49,5 +50,7 @@
     <string name="settings_license_value" translatable="false">MIT</string>
     <string name="settings_source">Source code</string>
     <string name="settings_source_url" translatable="false">https://github.com/knightdave/apofis</string>
+    <string name="settings_licenses">Open-source licenses</string>
+    <string name="licenses_lucide">Lucide icons</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
 </resources>

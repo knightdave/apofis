@@ -40,7 +40,7 @@ import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
 
-enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT }
+enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT, LICENSES }
 
 /** State-based navigation: Connect when not connected, otherwise the chat; Settings and Connection from there. */
 @Composable
@@ -73,12 +73,16 @@ fun AppNav(container: AppContainer) {
                     current = if (reconnect) conn?.credentials else null,
                     willClearCache = container::willClearCache,
                     save = container::connect,
+                    failedBefore = !reconnect && container.consumeSwitchFailure(),
                 )
             }
             LaunchedEffect(vm.state) { if (vm.state == ConnectState.Connected) chosen = Screen.CHAT }
-            val back = if (reconnect && conn != null) ({ chosen = Screen.SETTINGS }) else null
-            if (back != null) BackHandler(onBack = back)
-            ConnectScreen(vm, onBack = back)
+            val scope = rememberCoroutineScope()
+            // Leaving first cancels and waits for a running check; while saving, leave() refuses and Back is swallowed.
+            val canGoBack = reconnect && conn != null
+            val leave = { scope.launch { if (vm.leave()) chosen = Screen.SETTINGS }; Unit }
+            BackHandler(enabled = canGoBack || vm.state == ConnectState.Saving) { if (canGoBack) leave() }
+            ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
         Screen.CHAT -> ChatPlaceholder(conn, onSettings = { chosen = Screen.SETTINGS })
         Screen.SETTINGS -> {
@@ -97,8 +101,13 @@ fun AppNav(container: AppContainer) {
                 onThemeMode = { scope.launch { prefs.setThemeMode(it) } },
                 onDynamicColor = { scope.launch { prefs.setDynamicColor(it) } },
                 onPureBlack = { scope.launch { prefs.setPureBlack(it) } },
+                onLicenses = { chosen = Screen.LICENSES },
                 onBack = { chosen = Screen.CHAT },
             )
+        }
+        Screen.LICENSES -> {
+            BackHandler { chosen = Screen.SETTINGS }
+            LicensesScreen(onBack = { chosen = Screen.SETTINGS })
         }
     }
 }

@@ -54,15 +54,16 @@ private val drainLock = Mutex()
 
 private enum class Attempt { STARTED, FAILED, STOP }
 
-/** Thrown inside the locks once the owning connection is closed; the public entry points catch it. */
-private class QueueClosed : Exception()
+/** Thrown inside the locks once the owning connection is closed. Writes pass it on; [SendQueue.drain] returns false. */
+private class QueueClosed : IllegalStateException("closed")
 
 /**
  * The durable path from "send" to "run started". Each message is stored with its exact request body and
  * idempotency key before any request, so a retry is byte-identical and the server never runs it twice.
  * [schedule] is called whenever a send is left queued; the app passes `{ SendWorker.schedule(context) }`.
- * [active] turns false when the app switches servers: drain, submit and steering then stop before their next request
- * or row write, so a queue bound to the old server never sends or changes rows that belong to the new one.
+ * [active] turns false when the app switches servers. From then on every write ([enqueue], [submit], [cancel], [retry])
+ * throws IllegalStateException("closed") and [drain] returns false, each checked inside the lock of the write and again
+ * before every request, so a queue bound to the old server never sends or changes rows that belong to the new one.
  */
 class SendQueue(
     private val api: HermesApi,
@@ -76,7 +77,10 @@ class SendQueue(
 
     /** Stores [text] as a queued send for [sessionKey]; returns its idempotency key. */
     suspend fun enqueue(sessionKey: String, text: String): String =
-        withRepositoryLock { insert(sessionKey, text, steer = false) }.idempotencyKey.also { schedule() }
+        withRepositoryLock {
+            ensureOpen()
+            insert(sessionKey, text, steer = false)
+        }.idempotencyKey.also { schedule() }
 
     /**
      * For ChatRepository.send: steers the session's running run, else queues [text] and drains. The row is stored
@@ -85,16 +89,12 @@ class SendQueue(
      * the session and a delete cannot remove the row in between.
      */
     internal suspend fun submit(sessionKey: String, text: String) {
-        val queued = try {
-            drainLock.withLock {
-                withRepositoryLock {
-                    ensureOpen()
-                    val row = insert(sessionKey, text, steer = true)
-                    if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
-                }
+        val queued = drainLock.withLock {
+            withRepositoryLock {
+                ensureOpen()
+                val row = insert(sessionKey, text, steer = true)
+                if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
             }
-        } catch (_: QueueClosed) {
-            return
         }
         if (queued) {
             schedule()
@@ -132,6 +132,7 @@ class SendQueue(
 
     /** Removes a queued or failed send; one started or steered cannot be taken back. */
     suspend fun cancel(idempotencyKey: String) = drainLock.withLock {
+        ensureOpen()
         val send = pendingDao.get(idempotencyKey) ?: return@withLock
         if (send.state == PendingState.QUEUED || send.state == PendingState.FAILED) pendingDao.delete(idempotencyKey)
     }
@@ -144,6 +145,7 @@ class SendQueue(
      */
     suspend fun retry(idempotencyKey: String, confirmedDuplicateRisk: Boolean = false): RetryResult {
         drainLock.withLock {
+            ensureOpen()
             val send = pendingDao.get(idempotencyKey)?.takeIf { it.state == PendingState.FAILED } ?: return RetryResult.NOT_FOUND
             val steer = send.error == SendError.STEER_UNCERTAIN // a failed steer keeps attempted only with this error
             val old = expired(send)

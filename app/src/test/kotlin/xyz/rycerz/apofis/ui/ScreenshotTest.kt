@@ -62,6 +62,7 @@ class ScreenshotTest {
         onThemeMode = {},
         onDynamicColor = {},
         onPureBlack = {},
+        onLicenses = {},
         onBack = {},
     )
 

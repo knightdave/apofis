@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -206,6 +207,49 @@ class ConnectViewModelTest {
 
         assertTrue(saved.isEmpty())
         assertEquals("", vm.apiKey.text.toString())
+    }
+
+    @Test
+    fun backCancelsTheProbeBeforeLeaving() = runTest {
+        server.enqueue(
+            MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        val vm = vm()
+        vm.onUrlChange(server.url("/").toString())
+        vm.onKeyChange("sk-1")
+        vm.connect()
+        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }
+
+        assertTrue(vm.leave())
+        assertEquals(ConnectState.Idle, vm.state)
+        withContext(Dispatchers.IO) { Thread.sleep(800) } // past the moment the response arrives
+        assertTrue(saved.isEmpty())
+    }
+
+    @Test
+    fun backIsIgnoredWhileSaving() = runTest {
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        val release = CompletableDeferred<Unit>()
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = {
+            release.await()
+            saved += it
+        })
+        vm.onUrlChange(server.url("/").toString())
+        vm.onKeyChange("sk-1")
+        val job = vm.connect()!!
+        withContext(Dispatchers.IO) { while (vm.state != ConnectState.Saving) Thread.sleep(10) }
+
+        assertFalse(vm.leave())
+        release.complete(Unit)
+        job.join()
+        assertEquals(ConnectState.Connected, vm.state)
+        assertEquals(1, saved.size)
+    }
+
+    @Test
+    fun interruptedEarlierSwitchShowsTheSaveError() {
+        val vm = ConnectViewModel(null, willClearCache = { false }, save = {}, failedBefore = true)
+        assertEquals(ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED), vm.state)
     }
 
     @Test

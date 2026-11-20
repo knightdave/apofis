@@ -65,7 +65,8 @@ private fun Reason.text() = when (this) {
 @Composable
 fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
     val state = vm.state
-    val testing = state == ConnectState.Testing
+    val saving = state == ConnectState.Saving
+    val testing = state == ConnectState.Testing || saving
     val failed = state as? ConnectState.Failed
     val urlError = failed?.takeIf { it.field == Field.URL }?.reason?.text()?.let { stringResource(it) }
     val keyError = failed?.takeIf { it.field == Field.KEY }?.reason?.text()?.let { stringResource(it) }
@@ -165,7 +166,7 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                 if (testing) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                     Spacer(Modifier.size(12.dp))
-                    Text(stringResource(R.string.connect_testing))
+                    Text(stringResource(if (saving) R.string.connect_saving else R.string.connect_testing))
                 } else {
                     Text(stringResource(R.string.connect_button))
                 }

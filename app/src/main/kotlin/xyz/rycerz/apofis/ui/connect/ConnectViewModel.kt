@@ -34,7 +34,10 @@ enum class Reason {
 
 sealed interface ConnectState {
     data object Idle : ConnectState
-    data object Testing : ConnectState
+    data object Testing : ConnectState // cancellable: Back cancels it first
+
+    /** Writing the switch; runs to the end, and Back is ignored meanwhile. */
+    data object Saving : ConnectState
     data class Failed(val field: Field, val reason: Reason) : ConnectState
 
     /** The server works, but it is not the one the cached chats came from: saving clears the cache. */
@@ -52,14 +55,18 @@ class ConnectViewModel(
     private val current: Credentials?,
     private val willClearCache: suspend (baseUrl: String) -> Boolean,
     private val save: suspend (Credentials) -> Unit,
+    failedBefore: Boolean = false,
 ) : ViewModel() {
     var url by mutableStateOf(current?.baseUrl.orEmpty())
         private set
     /** A secure field's state: the key is not held in a plain String state or offered for copying. */
     val apiKey = TextFieldState()
-    var state by mutableStateOf<ConnectState>(ConnectState.Idle)
+    var state by mutableStateOf<ConnectState>(
+        if (failedBefore) ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED) else ConnectState.Idle,
+    )
         private set
     private var pending: Credentials? = null
+    private var job: Job? = null
 
     val keepsCurrentKey: Boolean get() = current != null
     val httpWarning: Boolean get() = url.trim().startsWith("http://", ignoreCase = true)
@@ -80,7 +87,7 @@ class ConnectViewModel(
 
     /** Returns the test's job, or null when the input was rejected without a request. */
     fun connect(): Job? {
-        if (state == ConnectState.Testing) return null
+        if (state == ConnectState.Testing || state == ConnectState.Saving) return null
         val baseUrl = url.trim()
         if (!baseUrl.startsWith("http://", true) && !baseUrl.startsWith("https://", true)) return fail(Field.URL, Reason.MISSING_SCHEME)
         val parsed = baseUrl.toHttpUrlOrNull() ?: return fail(Field.URL, Reason.MALFORMED_URL)
@@ -95,7 +102,7 @@ class ConnectViewModel(
             return fail(Field.URL, Reason.MALFORMED_URL)
         }
         state = ConnectState.Testing
-        return viewModelScope.launch { state = probe(api, Credentials(baseUrl, key)) }
+        return viewModelScope.launch { state = probe(api, Credentials(baseUrl, key)) }.also { job = it }
     }
 
     // Every failure other than cancellation ends as a field error.
@@ -130,8 +137,7 @@ class ConnectViewModel(
     fun confirmServerChange(): Job? {
         val c = pending ?: return null
         pending = null
-        state = ConnectState.Testing
-        return viewModelScope.launch { state = saveOrFail(c) }
+        return viewModelScope.launch { state = saveOrFail(c) }.also { job = it }
     }
 
     fun cancelServerChange() {
@@ -141,13 +147,29 @@ class ConnectViewModel(
 
     // Storage or cache clearing can fail (disk full, keystore error); show it instead of crashing.
     private suspend fun saveOrFail(c: Credentials): ConnectState = try {
-        currentCoroutineContext().ensureActive() // the screen may have gone while the cache was checked
+        currentCoroutineContext().ensureActive() // Back may have cancelled while the server was checked
+        state = ConnectState.Saving
         save(c)
         ConnectState.Connected
     } catch (e: CancellationException) {
         throw e
     } catch (_: Exception) {
         ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED)
+    }
+
+    /**
+     * For Back and any other way of leaving: cancels and waits for a running check, then returns true. Returns false
+     * while saving, which always runs to the end; the caller stays on the screen.
+     */
+    suspend fun leave(): Boolean {
+        if (state == ConnectState.Saving) return false
+        job?.let {
+            it.cancel()
+            it.join()
+        }
+        pending = null
+        state = ConnectState.Idle
+        return true
     }
 
     override fun onCleared() {
