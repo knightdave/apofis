@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.ui.markdown
 
 import java.text.BreakIterator
+import java.text.StringCharacterIterator
 import xyz.rycerz.apofis.ui.chat.CHUNK
 import xyz.rycerz.apofis.ui.chat.Work
 import xyz.rycerz.apofis.ui.chat.chunkRanges
@@ -27,6 +28,15 @@ data class LogicalBlock(
 
 /** An open TEXT or TABLE block longer than this is LITERAL until it is stable. */
 const val OPEN_PARSE_LIMIT = 8000
+
+/** The most source handed to the markdown parser at once; a longer block, even a stable one, shows as literal text. */
+const val PARSE_MAX_CHARS = 20000
+
+/**
+ * The most `[` in a block handed to the parser: completing a link walks every pending bracket, so many unmatched
+ * brackets before many links would cost their product. A block with more shows as literal text.
+ */
+const val PARSE_MAX_BRACKETS = 1000
 const val TABLE_MAX_CHARS = 20000
 const val TABLE_MAX_ROWS = 500
 const val TABLE_MAX_CELLS = 4000
@@ -57,22 +67,40 @@ sealed interface DisplayChunk {
 }
 
 /**
- * The display chunks of [block] in [source]. A PARSED block is parsed whole once and then sliced, so styles, list
- * numbering and table widths survive the cuts; LITERAL and CODE blocks are cut as raw text by [rawPieces].
+ * The display chunks of [block] in [source] (line breaks LF only). A PARSED block is parsed whole once and then
+ * sliced, so styles, list numbering and table widths survive the cuts; LITERAL and CODE blocks are cut as raw text by
+ * [rawPieces]. Whatever the parser should not get, or returns in a shape the slicer does not expect, shows as literal
+ * text: a stored reply always opens.
  */
 fun displayChunks(source: String, block: LogicalBlock): List<DisplayChunk> {
-    if (block.kind == BlockKind.CODE || block.mode == BlockMode.LITERAL) {
+    if (block.kind == BlockKind.CODE || block.mode == BlockMode.LITERAL || !parseable(source, block)) {
         val out = ArrayList<DisplayChunk>()
         rawPieces(source, block, block.start) { s, e, _, last -> out += rawChunk(source, block, s, e, last) }
         return out
     }
     Work.markdownParses++
-    val chunks = sliceBlocks(parseMarkdown(source.substring(block.start, block.end), tables = block.kind == BlockKind.TABLE))
+    Work.largestParse = maxOf(Work.largestParse, block.end - block.start)
+    val chunks = try {
+        val blocks = parseMarkdown(source.substring(block.start, block.end), tables = block.kind == BlockKind.TABLE)
+        // A scanned table parses to exactly one table; anything else (the scanner and the parser disagree) is literal.
+        if (block.kind == BlockKind.TABLE && blocks.singleOrNull() !is MdBlock.Table) null else sliceBlocks(blocks)
+    } catch (_: RuntimeException) {
+        Work.parseFailures++
+        null
+    }
     // A block that cannot be cut small enough (one huge list item, say) shows as literal text instead.
-    if (chunks.any { it is DisplayChunk.Blocks && it.blocks.sumOf(::cost) > 2 * CHUNK }) {
+    if (chunks == null || chunks.any { it is DisplayChunk.Blocks && it.blocks.sumOf(::cost) > 2 * CHUNK }) {
         return displayChunks(source, block.copy(mode = BlockMode.LITERAL))
     }
     return chunks
+}
+
+/** Whether [block] is within what the parser is given: [PARSE_MAX_CHARS] characters and [PARSE_MAX_BRACKETS] brackets. */
+private fun parseable(source: String, block: LogicalBlock): Boolean {
+    if (block.end - block.start > PARSE_MAX_CHARS) return false
+    var brackets = 0
+    for (k in block.start until block.end) if (source[k] == '[' && ++brackets > PARSE_MAX_BRACKETS) return false
+    return true
 }
 
 /** The chunk for piece [s, e) of a LITERAL or CODE block. */
@@ -105,7 +133,7 @@ internal fun codeRanges(text: String, start: Int, end: Int, emit: (start: Int, e
             Work.chunkSteps++
         }
         if (lastBreak > s) {
-            emit(s, withoutCr(text, s, lastBreak), limit, false)
+            emit(s, lastBreak, limit, false)
             s = lastBreak + 1
             continue
         }
@@ -115,7 +143,7 @@ internal fun codeRanges(text: String, start: Int, end: Int, emit: (start: Int, e
             Work.chunkSteps++
         }
         if (i < far) { // the long line ends here
-            emit(s, withoutCr(text, s, i), i, false)
+            emit(s, i, i, false)
             s = i + 1
             i = s
         } else if (end - s > TABLE_MAX_CHARS) {
@@ -129,9 +157,6 @@ internal fun codeRanges(text: String, start: Int, end: Int, emit: (start: Int, e
     }
     emit(s, end, end, true)
 }
-
-/** [end], or one less when a CR stands before the line break there. */
-private fun withoutCr(text: String, start: Int, end: Int) = if (end > start && text[end - 1] == '\r') end - 1 else end
 
 /**
  * Packs whole blocks into chunks costing about [CHUNK] (characters plus [NODE_COST] per block and list item); a long
@@ -158,13 +183,18 @@ internal fun sliceBlocks(blocks: List<MdBlock>): List<DisplayChunk> {
                 flush()
                 sliceText(b.text).mapTo(out) { DisplayChunk.Blocks(listOf(MdBlock.Paragraph(it))) }
             }
+            b is MdBlock.Heading && cost > CHUNK -> {
+                flush()
+                sliceText(b.text).mapTo(out) { DisplayChunk.Blocks(listOf(MdBlock.Heading(b.level, it))) }
+            }
             b is MdBlock.ListBlock && cost > CHUNK && b.items.size > 1 -> {
                 flush()
                 sliceList(b).mapTo(out) { DisplayChunk.Blocks(listOf(it)) }
             }
             b is MdBlock.Quote && cost > CHUNK -> {
                 flush()
-                sliceBlocks(b.blocks).mapTo(out) { DisplayChunk.Blocks(listOf(MdBlock.Quote((it as DisplayChunk.Blocks).blocks))) }
+                // Only blocks go in a quote; anything else (no table reaches here) is shown as it is.
+                sliceBlocks(b.blocks).mapTo(out) { if (it is DisplayChunk.Blocks) DisplayChunk.Blocks(listOf(MdBlock.Quote(it.blocks))) else it }
             }
             else -> {
                 if (pendingCost + cost > CHUNK) flush()
@@ -199,7 +229,7 @@ internal fun sliceText(text: MdText): List<MdText> {
         val bound = a + CHUNK
         var cut = bound
         while (cut > a && s[cut - 1] != ' ' && s[cut - 1] != '\n') cut--
-        if (cut == a) cut = graphemeCut(s, a, bound)
+        cut = graphemeCut(s, a, if (cut == a) bound else cut)
         out += clip(text, a, cut)
         a = cut
     }
@@ -207,10 +237,13 @@ internal fun sliceText(text: MdText): List<MdText> {
     return out
 }
 
-/** [bound], moved back to the start of the character (with its marks or joined parts) it would split, when within 32. */
+/**
+ * [bound], moved back to the start of the character (with its marks or joined parts) it would split, when within 32;
+ * the break search looks at no more than 64 characters around [bound].
+ */
 private fun graphemeCut(s: String, a: Int, bound: Int): Int {
     val breaks = BreakIterator.getCharacterInstance()
-    breaks.setText(s)
+    breaks.setText(StringCharacterIterator(s, maxOf(a, bound - 32), minOf(s.length, bound + 32), bound))
     if (breaks.isBoundary(bound)) return bound
     val back = breaks.preceding(bound)
     return if (back > a && bound - back <= 32) back else if (Character.isHighSurrogate(s[bound - 1])) bound - 1 else bound
@@ -229,13 +262,13 @@ private fun sliceList(list: MdBlock.ListBlock): List<MdBlock.ListBlock> {
     list.items.forEachIndexed { i, item ->
         val s = cost(item)
         if (i > first && size + s > CHUNK) {
-            out += MdBlock.ListBlock(list.ordered, list.start + first, list.items.subList(first, i).toList())
+            out += list.copy(start = list.start + first, items = list.items.subList(first, i).toList())
             first = i
             size = 0
         }
         size += s
     }
-    out += MdBlock.ListBlock(list.ordered, list.start + first, list.items.subList(first, list.items.size).toList())
+    out += list.copy(start = list.start + first, items = list.items.subList(first, list.items.size).toList())
     return out
 }
 

@@ -45,7 +45,8 @@ class MarkdownScreenshotTest {
         "md_lists_tasks",
         "- First bullet\n- Second bullet\n  - Nested bullet\n    - Deeper bullet\n\n" +
             "9. Ninth\n10. Tenth\n11. Eleventh\n\n" +
-            "- [ ] Open task\n- [x] Finished task\n- [ ] Another open one",
+            "- [ ] Open task\n- [x] Finished task\n- [ ] Another open one\n\n" +
+            "1. A loose item\n\n   with a second paragraph.\n\n2. The next loose item",
     )
 
     @Test

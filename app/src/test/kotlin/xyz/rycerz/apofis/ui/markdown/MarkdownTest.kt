@@ -155,4 +155,10 @@ class MarkdownTest {
         assertEquals(listOf(para(html)), parseMarkdown(html))
         assertEquals(listOf(para("<details>\n<summary>*s*</summary>"), para("text")), parseMarkdown("<details>\n<summary>*s*</summary>\n\ntext"))
     }
+
+    @Test
+    fun looseAndTightLists() {
+        assertEquals(false, (parseMarkdown("1. one\n\n   two\n2. three").single() as MdBlock.ListBlock).tight)
+        assertEquals(true, (parseMarkdown("- a\n  - b\n- c").single() as MdBlock.ListBlock).tight)
+    }
 }

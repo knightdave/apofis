@@ -230,7 +230,9 @@ private fun ListView(list: MdBlock.ListBlock, body: TextStyle, color: Color, str
     val marker = if (list.items.any { it.task }) maxOf(textWidth, 16.dp) else textWidth
     val line = with(density) { (body.fontSize * 1.5f).toDp() }
     val muted = ApofisTheme.colors.muted
-    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(ItemGap)) {
+    // A loose list's items and their blocks are as far apart as any blocks; a tight list's sit close.
+    val gap = if (list.tight) ItemGap else with(density) { (body.fontSize * 0.9f).toDp() }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(gap)) {
         list.items.forEachIndexed { i, item ->
             // A task item reads as checked or not, but is not a control: no click action, no press state.
             val task = if (item.task) {
@@ -248,7 +250,7 @@ private fun ListView(list: MdBlock.ListBlock, body: TextStyle, color: Color, str
                 }
                 Box(Modifier.width(6.dp))
                 val done = item.task && item.checked
-                Blocks(item.blocks, body, if (done) muted else color, strike || done, onLink, Modifier.weight(1f), ItemGap)
+                Blocks(item.blocks, body, if (done) muted else color, strike || done, onLink, Modifier.weight(1f), gap)
             }
         }
     }

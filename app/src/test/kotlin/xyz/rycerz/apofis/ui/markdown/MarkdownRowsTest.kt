@@ -338,9 +338,7 @@ class MarkdownRowsTest {
             listOf(DisplayChunk.Blocks(listOf(MdBlock.Heading(2, plain("Title")))), DisplayChunk.Blocks(listOf(para("next")))),
             allRows("Title\n-\n\nnext").map { it.chunk },
         )
-        val long = parseBlocks("x".repeat(9000) + "\n-\n\n").single()
-        assertTrue(long.stable)
-        assertEquals(BlockMode.PARSED, long.mode)
+        // The long underlined heading: see aLongSetextHeadingShowsAsAHeading, which checks what is shown.
     }
 
     @Test
@@ -353,6 +351,142 @@ class MarkdownRowsTest {
     @Test
     fun aCutNeverSplitsACharacterFromItsCombiningMark() {
         val text = MdText("x".repeat(CHUNK - 1) + "á" + "y".repeat(800), emptyList())
+        val slices = sliceText(text)
+        assertEquals(text.text, slices.joinToString("") { it.text })
+        for (slice in slices.drop(1)) assertTrue(Character.getType(slice.text[0]) != Character.NON_SPACING_MARK.toInt())
+    }
+
+    // ---- fix round 2 ----
+
+    /** The text a run of Literal rows shows (cuts fall on dropped line breaks in these inputs). */
+    private fun literalText(rows: List<TextRow>) = rows.joinToString("\n") { (it.chunk as DisplayChunk.Literal).text }
+
+    /** Rows of [text] on the live path, fed in steps of [step] characters; checks each step against the stored path. */
+    private fun streamed(text: String, step: Int): List<TextRow> {
+        val live = ReplyText()
+        var rows = emptyList<TextRow>()
+        for (end in (step until text.length step step) + text.length) {
+            rows = live.update("r1", text.substring(0, end))
+            assertEquals("at $end", replyRows("r1", text.substring(0, end)), rows)
+        }
+        return rows
+    }
+
+    @Test
+    fun parserInputIsBounded() {
+        // One stable loose list of about 60,000 characters: no parser call gets more than 20,000 characters of it.
+        val long = ("- item " + "word ".repeat(30) + "\n\n").repeat(400) + "end\n\n"
+        Work.largestParse = 0
+        val rows = allRows(long)
+        assertEquals(streamed(long, 997), rows)
+        assertTrue("parsed ${Work.largestParse} characters at once", Work.largestParse <= 20_000)
+        assertEquals(long.removeSuffix("\n\nend\n\n"), literalText(rows.dropLast(1)))
+        assertEquals(DisplayChunk.Blocks(listOf(para("end"))), rows.last().chunk)
+
+        // Unmatched brackets before many links: the parser would walk every pending bracket per link, so it never runs.
+        val brackets = "[".repeat(3000) + "[a](https://x.y) ".repeat(300) + "\n\n"
+        val parses = Work.markdownParses
+        val bracketRows = allRows(brackets)
+        assertEquals(parses, Work.markdownParses)
+        assertEquals(brackets.removeSuffix("\n\n"), bracketRows.joinToString("") { (it.chunk as DisplayChunk.Literal).text })
+        assertEquals(streamed(brackets, 501), bracketRows)
+    }
+
+    /** Inputs that once broke a path, or look like they could. */
+    private val adversarial = listOf(
+        // Mixed line endings: one scanned table line that a parser splitting on CR reads as a table and a quoted table.
+        "| a | b |\n|---|---|\n| 1 | 2 |\r\r> | c | d |\r> |---|---|\r" + "> | 3333333333 | 4444444444 |\r".repeat(200) + "\n\n",
+        "| a | b |\r\n|---|---|\r\n| 1 | 2 |\r| 3 | 4 |\n",
+        "| a | b |\n|---|---|\n" + "| 1 | 2 |\r".repeat(600) + "\n\n",
+        "| a |\n|---|\n" + "|" + "c|".repeat(4100) + "\n\n",
+        "a\rb\r\rc\r\n\r\n- x\r\r- y\r",
+        "\r\r\r\n\n\r",
+        "# Items\n3. first\n\n1. next",
+        "<!--\n\n**b** [l](https://x.y)\n-->\nafter",
+        "<!-- unterminated\n\n# not a heading\n\n| a |\n|---|\n",
+        "<div>\n| a | b |\n|---|---|\n| 1 | 2 |\n</div>",
+        "<script>\n\nx **y**\n```\n</script>\n\nafter *e*",
+        "`name` | Value\n---|---\n`a` | 1\n",
+        "> " + "> ".repeat(300) + "| a |\n|---|\n| 1 |\n",
+        "- | a |\n  |---|\n" + "  | 1 |\n".repeat(300),
+        "x".repeat(9000) + "\n-\n\n",
+        "```\r\n" + "y".repeat(20_000) + "\r\nshort\r\n```\r\n",
+        "😀".repeat(800) + " ́" + "é".repeat(800),
+        "\uD800 \uDC00 [x](https://\uD800.a/) \u0000 \t|\t|\n|-|-|\n",
+        "[".repeat(2000) + "](https://x.y)".repeat(2000),
+        "![".repeat(500) + "x" + "](https://u.v)".repeat(500),
+        "1. a\n\n   > q\n   > | t |\n   > |---|\n\n2. b",
+        "|" + "h|".repeat(150) + "\n|" + "-|".repeat(150) + "\n|c|\n",
+    )
+
+    @Test
+    fun adversarialInputsNeverThrow() {
+        val failures = Work.parseFailures
+        for (text in adversarial) {
+            val stored = allRows(text)
+            val step = maxOf(1, text.length / 300)
+            assertEquals(text.take(40), stored, streamed(text, step))
+        }
+        assertEquals("the literal fallback for a throwing parse was never needed", failures, Work.parseFailures)
+        // The mixed line endings case: a table, then a quote whose table is plain text (tables in quotes are text).
+        val mixed = allRows(adversarial[0])
+        assertEquals(BlockKind.TABLE, mixed[0].kind)
+        val quotes = mixed.drop(1).flatMap { (it.chunk as DisplayChunk.Blocks).blocks }
+        assertTrue(quotes.size > 1 && quotes.all { q -> q is MdBlock.Quote && q.blocks.all { it is MdBlock.Paragraph } })
+    }
+
+    @Test
+    fun tableBudgetCountsRowsAsTheParserSplitsThem() {
+        // Bare CR ends a line for the parser too: 600 rows are over the 500-row budget, shown literally.
+        assertTrue(allRows("| a | b |\n|---|---|\n" + "| 1 | 2 |\r".repeat(600) + "\n\n").all { it.chunk is DisplayChunk.Literal })
+        // A body row wider than its header is split whole by the parser before it is cut: its cells count.
+        assertTrue(allRows("| a |\n|---|\n" + "|" + "c|".repeat(4100) + "\n\n").all { it.chunk is DisplayChunk.Literal })
+        // Within the budgets a wide row is cut to the header, as before.
+        val cut = (allRows("| a |\n|---|\n| 1 | 2 | 3 |\n\n").single().chunk as DisplayChunk.TableSlice).table
+        assertEquals(listOf(cells("1")), cut.rows)
+    }
+
+    @Test
+    fun anOrderedListAfterAHeadingContinues() {
+        val blocks = shownBlocks(allRows("# Items\n3. first\n\n1. next"))
+        assertEquals(MdBlock.Heading(1, plain("Items")), blocks[0])
+        val list = blocks[1] as MdBlock.ListBlock
+        assertEquals(3 to listOf(listOf(para("first")), listOf(para("next"))), list.start to list.items.map { it.blocks })
+        assertEquals(2, blocks.size)
+    }
+
+    @Test
+    fun aLongSetextHeadingShowsAsAHeading() {
+        val rows = allRows("x".repeat(9000) + "\n-\n\n")
+        val headings = shownBlocks(rows).map { it as MdBlock.Heading }
+        assertTrue(headings.size > 1 && headings.all { it.level == 2 })
+        assertEquals("x".repeat(9000), headings.joinToString("") { it.text.text })
+    }
+
+    @Test
+    fun htmlStaysLiteralAcrossBlankLines() {
+        val comment = "<!--\n\n**b** [l](https://x.y)\n-->"
+        assertEquals(listOf(DisplayChunk.Blocks(listOf(para(comment)))), allRows(comment).map { it.chunk })
+        assertEquals(allRows(comment), streamed(comment, 1))
+        val script = "<script>\n\nx **y**\n```\n</script>\n\nafter *e*"
+        assertEquals(
+            listOf(para("<script>\n\nx **y**\n```\n</script>"), MdBlock.Paragraph(MdText("after e", listOf(MdSpan(6, 7, SpanKind.EMPHASIS))))),
+            shownBlocks(allRows(script)),
+        )
+        val div = "<div>\n| a | b |\n|---|---|\n| 1 | 2 |\n</div>"
+        assertEquals(listOf(DisplayChunk.Blocks(listOf(para(div)))), allRows(div).map { it.chunk })
+    }
+
+    @Test
+    fun aHeaderStartingWithInlineCodeIsATable() {
+        val table = (allRows("`name` | Value\n---|---\n`a` | 1\n").single().chunk as DisplayChunk.TableSlice).table
+        assertEquals(listOf(MdText("name", listOf(MdSpan(0, 4, SpanKind.CODE))), plain("Value")), table.header)
+        assertEquals(listOf(listOf(MdText("a", listOf(MdSpan(0, 1, SpanKind.CODE))), plain("1"))), table.rows)
+    }
+
+    @Test
+    fun aCutAfterASpaceNeverStrandsACombiningMark() {
+        val text = MdText("x".repeat(CHUNK - 2) + " ́" + "y".repeat(800), emptyList())
         val slices = sliceText(text)
         assertEquals(text.text, slices.joinToString("") { it.text })
         for (slice in slices.drop(1)) assertTrue(Character.getType(slice.text[0]) != Character.NON_SPACING_MARK.toInt())

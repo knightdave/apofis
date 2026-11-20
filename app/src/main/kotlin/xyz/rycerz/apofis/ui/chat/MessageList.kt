@@ -64,7 +64,9 @@ internal data class ScanState(
     var paraStart: Int = -1, // the open paragraph group
     var paraEnd: Int = -1,
     var list: Boolean = false, // the group holds a list item, so it may go on across blank lines
-    var quote: Boolean = false, // the group holds a quote line, so no table starts in it
+    var paraOpen: Boolean = false, // the group's last line left a paragraph open (a list item numbered 3 cannot start a list then)
+    var noTable: Boolean = false, // the group holds a quote or HTML line, so no table starts in it
+    var htmlEnd: String? = null, // inside an HTML block that runs, across blank lines, to the line holding this
     var pendingBlank: Boolean = false, // blank lines after a list group, which the next line may still continue
     var headStart: Int = -1, // the previous line, when it can be a table's header row
     var headCells: Int = 0,
@@ -72,9 +74,13 @@ internal data class ScanState(
     var tableEnd: Int = -1,
     var tableRows: Int = 0, // body rows
     var tableCols: Int = 0,
+    var tableCells: Long = 0, // body cells, each row counted at least as wide as the header, as the parser splits it
 )
 
-/** The logical blocks of [text] from [from], which must be a line start between blocks; indices count from 0 there. */
+/**
+ * The logical blocks of [text] (line breaks LF only, see [lf]) from [from], which must be a line start between blocks;
+ * indices count from 0 there.
+ */
 internal fun parseBlocks(text: String, from: Int = 0): List<LogicalBlock> {
     val out = ArrayList<LogicalBlock>()
     val s = ScanState(pos = from)
@@ -93,7 +99,7 @@ internal fun parseBlocks(text: String, from: Int = 0): List<LogicalBlock> {
 internal fun scanLine(s: ScanState, text: String, out: MutableList<LogicalBlock>) {
     val i = s.pos
     val nl = lineEnd(text, i)
-    val end = if (nl > i && text[nl - 1] == '\r') nl - 1 else nl // the content, without a CR before the LF
+    val end = nl // the line's content
     val finished = nl < text.length
     Work.scanSteps += nl - i + 1
     s.pos = nl + 1
@@ -101,11 +107,15 @@ internal fun scanLine(s: ScanState, text: String, out: MutableList<LogicalBlock>
     val fence = text.startsWith(FENCE, first)
     if (s.fenceBody >= 0) {
         if (fence && firstNonSpace(text, first + FENCE.length, end) == end) {
-            var bodyEnd = maxOf(s.fenceBody, i - 1)
-            if (bodyEnd > s.fenceBody && text[bodyEnd - 1] == '\r') bodyEnd--
-            out += LogicalBlock(0, s.fenceBody, bodyEnd, BlockKind.CODE, s.fenceLang, stable = finished, fenceClosed = true, BlockMode.PARSED, next = nl + 1)
+            out += LogicalBlock(0, s.fenceBody, maxOf(s.fenceBody, i - 1), BlockKind.CODE, s.fenceLang, stable = finished, fenceClosed = true, BlockMode.PARSED, next = nl + 1)
             s.fenceBody = -1
         }
+        return
+    }
+    val html = s.htmlEnd
+    if (html != null) { // HTML source: no cut, list or table until its end marker
+        if (text.substring(i, end).contains(html, ignoreCase = true)) s.htmlEnd = null
+        s.paraEnd = nl
         return
     }
     val blank = first == end
@@ -118,6 +128,7 @@ internal fun scanLine(s: ScanState, text: String, out: MutableList<LogicalBlock>
             fence -> endTable(s, out, true, i)
             hasPipe(text, i, end) && !onlyPipe(text, first, end) -> {
                 s.tableRows++
+                s.tableCells += maxOf(rowCells(text, first, end), s.tableCols)
                 s.tableEnd = nl
                 return
             }
@@ -147,13 +158,49 @@ internal fun scanLine(s: ScanState, text: String, out: MutableList<LogicalBlock>
     }
     if (s.paraStart < 0) s.paraStart = i
     // An empty item, or one numbered other than 1, cannot interrupt a paragraph: "text\n-" underlines a heading.
-    if (item && (s.paraStart == i || canInterrupt(text, i, end))) s.list = true
-    if (text[first] == '>') s.quote = true
+    if (item && (s.paraStart == i || !s.paraOpen || canInterrupt(text, i, end))) s.list = true
+    val heading = isAtxHeading(text, first, end)
+    s.paraOpen = !heading && !isRuleOrUnderline(text, first, end)
+    if (text[first] == '>' || text[first] == '<') s.noTable = true
+    if (text[first] == '<' && first - i < 4) s.htmlEnd = htmlEnd(text, first, end)
     s.paraEnd = nl
-    // A header row must start a paragraph: not in a list or quote, not a list item, heading, HTML, fence or underline.
-    val cells = if (s.list || s.quote || item || text[first] in "<>#=`~") 0 else headerCells(text, first, end)
+    // A header row must start a paragraph: not in a list, quote or HTML, not a list item or heading.
+    val cells = if (s.list || s.noTable || item || heading) 0 else rowCells(text, first, end)
     s.headStart = if (cells > 0) i else -1
     s.headCells = cells
+}
+
+/** `#` to `######` then a space, a tab or the line end. */
+private fun isAtxHeading(text: String, first: Int, end: Int): Boolean {
+    var k = first
+    while (k < end && k - first < 7 && text[k] == '#') k++
+    return k > first && k - first <= 6 && (k == end || text[k] == ' ' || text[k] == '\t')
+}
+
+/** Only `-`, `=`, `*` or `_` and spaces: a rule or a setext underline, which closes a paragraph. */
+private fun isRuleOrUnderline(text: String, first: Int, end: Int): Boolean {
+    for (k in first until end) if (text[k] !in "-=*_ \t") return false
+    return true
+}
+
+private val rawHtmlTags = listOf("script", "pre", "style", "textarea")
+
+/**
+ * The end marker of an HTML block starting at [first] that may run across blank lines (comment, processing
+ * instruction, declaration, CDATA, or script, pre, style and textarea), when it does not end on this line; else null.
+ */
+private fun htmlEnd(text: String, first: Int, end: Int): String? {
+    val marker = when {
+        text.startsWith("<!--", first) -> "-->"
+        text.startsWith("<?", first) -> "?>"
+        text.startsWith("<![CDATA[", first) -> "]]>"
+        text.startsWith("<!", first) && first + 2 < end && text[first + 2].isLetter() -> ">"
+        else -> rawHtmlTags.firstOrNull { tag ->
+            val after = first + 1 + tag.length
+            text.regionMatches(first + 1, tag, 0, tag.length, ignoreCase = true) && (after == end || text[after] in " \t>")
+        }?.let { "</$it>" }
+    } ?: return null
+    return if (text.substring(first + 2, end).contains(marker, ignoreCase = true)) null else marker
 }
 
 /** Adds the open blocks at the end of the text (none of them stable) to [out], leaving [s] as it was. */
@@ -172,7 +219,9 @@ private fun endPara(s: ScanState, out: MutableList<LogicalBlock>, stable: Boolea
     }
     s.paraStart = -1
     s.list = false
-    s.quote = false
+    s.paraOpen = false
+    s.noTable = false
+    s.htmlEnd = null
     s.pendingBlank = false
     s.headStart = -1
 }
@@ -187,12 +236,13 @@ private fun startTable(s: ScanState, out: MutableList<LogicalBlock>, nl: Int) {
     s.tableEnd = nl
     s.tableRows = 0
     s.tableCols = cols
+    s.tableCells = 0L
 }
 
-/** Ends the open table; over any budget (counted from the rows and the header's width, as padded) it is LITERAL. */
+/** Ends the open table; over any budget (rows and cells as the parser splits and pads them) it is LITERAL. */
 private fun endTable(s: ScanState, out: MutableList<LogicalBlock>, stable: Boolean, next: Int) {
     val chars = s.tableEnd - s.tableStart
-    val cells = (s.tableRows + 1).toLong() * s.tableCols
+    val cells = s.tableCols + s.tableCells // Long: rows times a wide header can pass Int
     val literal = (!stable && chars > OPEN_PARSE_LIMIT) || chars > TABLE_MAX_CHARS || s.tableRows > TABLE_MAX_ROWS ||
         cells > TABLE_MAX_CELLS || s.tableCols > TABLE_MAX_COLUMNS
     out += LogicalBlock(0, s.tableStart, s.tableEnd, BlockKind.TABLE, "", stable, false, if (literal) BlockMode.LITERAL else BlockMode.PARSED, next)
@@ -236,8 +286,8 @@ private fun delimiterColumns(text: String, start: Int, end: Int): Int {
     return if (valid) columns else -1
 }
 
-/** Cells of a header row, split as the table parser splits it (`\|` does not split); 0 without a pipe. */
-private fun headerCells(text: String, first: Int, end: Int): Int {
+/** Cells of a table row, split as the table parser splits it (`\|` does not split); 0 without a pipe. */
+private fun rowCells(text: String, first: Int, end: Int): Int {
     if (!hasPipe(text, first, end)) return 0
     var start = first
     var cellEnd = end
@@ -311,6 +361,8 @@ internal object Work {
     var markdownParses = 0L
     var scanSteps = 0L // characters looked at by the block scanner
     var rowCopies = 0L // row references copied while assembling rows
+    var largestParse = 0 // the longest source handed to the markdown parser
+    var parseFailures = 0L // blocks shown literally because parsing or slicing threw: a bug, never expected
 }
 
 /**
@@ -365,8 +417,11 @@ private fun blockRows(key: String, b: LogicalBlock, text: String): List<TextRow>
     return chunks.mapIndexed { c, chunk -> textRow(key, b, c, chunk, c == chunks.size - 1) }
 }
 
+/** [text] with CRLF and bare CR as LF: done once where text comes in, so every later stage sees one line ending. */
+internal fun lf(text: String): String = if (text.indexOf('\r') < 0) text else text.replace("\r\n", "\n").replace('\r', '\n')
+
 /** Every text row of a reply, parsed from scratch. */
-internal fun replyRows(key: String, text: String): List<TextRow> = parseBlocks(text).flatMap { blockRows(key, it, text) }
+internal fun replyRows(key: String, text: String): List<TextRow> = lf(text).let { t -> parseBlocks(t).flatMap { blockRows(key, it, t) } }
 
 /** The first [size] elements of [backing], which is only ever appended to: a view, never a copy. */
 private class Prefix<T>(private val backing: List<T>, override val size: Int) : AbstractList<T>() {
@@ -381,21 +436,38 @@ private class Prefix<T>(private val backing: List<T>, override val size: Int) : 
  * checkpoint at the start of the last line, so finished lines are never scanned again; stable blocks keep their rows
  * and are never parsed again; an open block whose source is unchanged keeps its rows; a changed PARSED block is parsed
  * again whole (it is at most [OPEN_PARSE_LIMIT] long); a changed LITERAL or CODE block keeps the rows of every piece
- * whose cut is unchanged. A block whose kind or mode changes is rebuilt from scratch. An append without a line break
- * to an open LITERAL paragraph or table or a fence is not even scanned. The result is a view of the stable rows plus
- * the open rows, so an update copies only the open rows. Any other change (another key, or the text replaced) starts
- * from scratch and shares nothing with the previous parse.
+ * whose cut is settled, without copying them. A block whose kind or mode changes is rebuilt from scratch. An append
+ * without a line break to an open LITERAL paragraph or table or a fence is not even scanned. The result is a view of
+ * the stable rows, the settled rows and the few rows built for this update. Any other change (another key, or the text
+ * replaced) starts from scratch and shares nothing with the previous parse.
  *
  * Telling an append from a replacement compares the old text with the new one's start: one vectorised comparison per
  * update. The producer already copies the whole text for every token (`text + delta`); a cheaper test needs a revision
- * from the run follower, which this milestone does not change.
+ * from the run follower, which this milestone does not change. Line endings are made LF here, for the appended part
+ * only; a reply that holds a CR costs one more copy of the text per update.
  */
 internal class ReplyText {
-    /** An open block, its rows, and where each row's piece starts and up to where its cut was decided (raw pieces only). */
-    private class Open(val block: LogicalBlock, val rows: List<TextRow>, val starts: List<Int>, val decided: List<Int>)
+    /**
+     * An open block. Its rows are the first [size] of [settled] (pieces whose cut no appended text can move; the lists
+     * are only appended to, so the next update of the same block shares them) and then [loose], which start at
+     * [looseStart]. [starts] and [decided] go with [settled]: where each piece starts and up to where its cut was
+     * decided (see [rawPieces]). A PARSED block has only [loose] rows.
+     */
+    private class Open(
+        val block: LogicalBlock,
+        val settled: ArrayList<TextRow>,
+        val starts: ArrayList<Int>,
+        val decided: ArrayList<Int>,
+        val size: Int,
+        val loose: List<TextRow>,
+        val looseStart: Int,
+    ) {
+        val rows: List<TextRow> get() = if (size == 0) loose else Joined(Prefix(settled, size), loose)
+    }
 
     private var key: String? = null
-    private var text = ""
+    private var text = "" // as given
+    private var norm = "" // [text] through [lf]; the same instance while it holds no CR
     private var closed = ArrayList<TextRow>() // rows of stable blocks; only appended to, so earlier views stay valid
     private var closedBlocks = 0
     private var checkpoint = ScanState() // the scanner at the start of the text's last line
@@ -406,17 +478,26 @@ internal class ReplyText {
     var parsed = 0
         private set
 
-    fun update(key: String, new: String): List<TextRow> {
+    fun update(key: String, raw: String): List<TextRow> {
         parsed = 0
-        if (key == this.key && (new === text || new == text)) return rows
-        val appended = key == this.key && new.startsWith(text)
+        if (key == this.key && (raw === text || raw == text)) return rows
+        val appended = key == this.key && raw.startsWith(text)
         if (!appended) {
             closed = ArrayList()
             closedBlocks = 0
             checkpoint = ScanState()
             tail = emptyList()
         }
-        val old = if (appended) text else ""
+        val new = when {
+            !appended -> lf(raw)
+            norm === text && raw.indexOf('\r', text.length) < 0 -> raw
+            else -> {
+                // A CR that ended the old text already stands for the line break; an LF right after it adds nothing.
+                val from = if (text.endsWith('\r') && raw.getOrNull(text.length) == '\n') text.length + 1 else text.length
+                norm + lf(raw.substring(from))
+            }
+        }
+        val old = if (appended) norm else ""
         val grown = if (appended && new.indexOf('\n', old.length) < 0) grown(old, new.length) else null
         var finished = 0 // blocks ended on finished lines: stable, and before the checkpoint
         val blocks = grown ?: ArrayList<LogicalBlock>().also { out ->
@@ -443,20 +524,21 @@ internal class ReplyText {
             val b = scanned.copy(index = firstIndex + n)
             val open = open(key, tail.firstOrNull { it.block.start == b.start }, b, new)
             if (n < finished) {
-                closed.addAll(open.rows)
-                Work.rowCopies += open.rows.size
+                val r = open.rows
+                closed.addAll(r)
+                Work.rowCopies += r.size
                 closedBlocks++
             } else {
                 nextTail += open
             }
         }
         tail = nextTail
-        val tailRows = ArrayList<TextRow>()
-        nextTail.forEach { tailRows.addAll(it.rows) }
-        Work.rowCopies += tailRows.size
-        rows = Joined(Prefix(closed, closed.size), tailRows)
+        var view: List<TextRow> = Prefix(closed, closed.size)
+        for (o in nextTail) view = Joined(view, o.rows)
+        rows = view
         this.key = key
-        text = new
+        text = raw
+        norm = new
         return rows
     }
 
@@ -464,39 +546,54 @@ internal class ReplyText {
     private fun open(key: String, prev: Open?, b: LogicalBlock, text: String): Open {
         val p = prev?.block
         val same = p != null && p.start == b.start && p.kind == b.kind && p.mode == b.mode && p.lang == b.lang
-        if (same && p!!.end == b.end && p.fenceClosed == b.fenceClosed) return Open(b, prev!!.rows, prev.starts, prev.decided)
-        if (b.kind != BlockKind.CODE && b.mode == BlockMode.PARSED) return Open(b, blockRows(key, b, text), emptyList(), emptyList())
-        val rows = ArrayList<TextRow>()
-        val starts = ArrayList<Int>()
-        val decided = ArrayList<Int>()
+        if (same && p!!.end == b.end && p.fenceClosed == b.fenceClosed) {
+            return Open(b, prev!!.settled, prev.starts, prev.decided, prev.size, prev.loose, prev.looseStart)
+        }
+        if (b.kind != BlockKind.CODE && b.mode == BlockMode.PARSED) return Open(b, ArrayList(), ArrayList(), ArrayList(), 0, blockRows(key, b, text), b.start)
+        var settled = ArrayList<TextRow>()
+        var starts = ArrayList<Int>()
+        var decided = ArrayList<Int>()
         var from = b.start
         if (same) {
-            // A piece is unchanged when its cut was decided before both the old and the new end (see rawPieces); the
-            // last piece never is, as it was decided by the old end.
-            val end = minOf(p!!.end, b.end)
-            var k = 0
-            while (k < prev!!.rows.size && prev.decided[k] < end) k++
-            for (r in 0 until k) {
-                rows += prev.rows[r].let { if (it.fenceClosed == b.fenceClosed) it else it.copy(fenceClosed = b.fenceClosed) }
-                starts += prev.starts[r]
-                decided += prev.decided[r]
+            // A settled piece stays while its cut was decided before the new end too; usually all of them do.
+            var k = prev!!.size
+            while (k > 0 && prev.decided[k - 1] >= b.end) k--
+            if (k == prev.size && p!!.fenceClosed == b.fenceClosed) {
+                settled = prev.settled
+                starts = prev.starts
+                decided = prev.decided
+                from = prev.looseStart
+            } else { // the block got shorter or its fence opened or closed: copy what stays (rare)
+                for (r in 0 until k) settled += prev.settled[r].let { if (it.fenceClosed == b.fenceClosed) it else it.copy(fenceClosed = b.fenceClosed) }
+                starts.addAll(prev.starts.subList(0, k))
+                decided.addAll(prev.decided.subList(0, k))
+                Work.rowCopies += k
+                from = if (k == prev.size) prev.looseStart else prev.starts[k]
             }
-            from = prev.starts[k]
         }
-        var c = rows.size
+        var size = settled.size
+        val loose = ArrayList<TextRow>()
+        var looseStart = -1
         rawPieces(text, b, from) { s, e, d, last ->
-            rows += textRow(key, b, c++, rawChunk(text, b, s, e, last), last)
-            starts += s
-            decided += d
+            val row = textRow(key, b, size + loose.size, rawChunk(text, b, s, e, last), last)
+            if (d < b.end && loose.isEmpty()) {
+                settled += row
+                starts += s
+                decided += d
+                size++
+            } else {
+                if (loose.isEmpty()) looseStart = s
+                loose += row
+            }
         }
-        return Open(b, rows, starts, decided)
+        return Open(b, settled, starts, decided, size, loose, looseStart)
     }
 
     /**
      * The tail after characters without a line break were appended to [old], when that provably only lengthens one
      * open LITERAL paragraph or table or a fence to [length]: its last line is that block's, no appended character
      * could turn the line into a fence opening (paragraph) or closing (fence), and the line does not follow a blank
-     * line (where it could still end or continue a list). Else null.
+     * line in a list (where it could still end or continue the list). Else null.
      */
     private fun grown(old: String, length: Int): List<LogicalBlock>? {
         val b = tail.singleOrNull()?.block ?: return null
@@ -506,10 +603,7 @@ internal class ReplyText {
         val f = firstNonSpace(old, lineStart, old.length)
         val ticks = old.length - f <= FENCE.length && (f until old.length).all { old[it] == '`' }
         if (if (code) ticks else (f == old.length || ticks)) return null
-        if (!code && lineStart > b.start) {
-            val prevStart = old.lastIndexOf('\n', lineStart - 2) + 1
-            if (firstNonSpace(old, prevStart, lineStart - 1) == lineStart - 1) return null
-        }
+        if (!code && checkpoint.pendingBlank) return null
         return listOf(b.copy(end = length))
     }
 }

@@ -110,8 +110,9 @@ class BlocksTest {
 
     @Test
     fun aLongOpenParagraphEndingAtAFenceIsParsedOnce() {
-        // Literal while open (over the limit); a fence on its last line makes it stable, so it is parsed once, whole.
-        val para = "a line of prose\n".repeat(20_000) + "``"
+        // Literal while open (over the limit); a fence on its last line makes it stable, so it is parsed once, whole
+        // (it is within the parser's 20,000 characters; a longer one stays literal, see parserInputIsBounded).
+        val para = "a line of prose\n".repeat(1_000) + "``"
         val live = ReplyText()
         val open = live.update("r1", para)
         assertTrue(open.all { it.chunk is DisplayChunk.Literal })
@@ -272,10 +273,14 @@ class BlocksTest {
         }
         // A long open fence streamed line by line: scanning a line costs the same however long the fence already is.
         val line = "val x = compute(1, 2, 3)\n"
-        val small = workFor("```kotlin\n" + line.repeat(100), "```kotlin\n" + line.repeat(101)).first
-        val large = workFor("```kotlin\n" + line.repeat(20_000), "```kotlin\n" + line.repeat(20_001)).first
-        assertEquals(small, large)
-        assertTrue("scanned $large for one line", large <= 4L * line.length)
+        val small = workFor("```kotlin\n" + line.repeat(100), "```kotlin\n" + line.repeat(101))
+        val large = workFor("```kotlin\n" + line.repeat(20_000), "```kotlin\n" + line.repeat(20_001))
+        assertEquals(small, large) // scanning and chunking, and row references copied
+        assertTrue("scanned ${large.first} for one line", large.first <= 4L * line.length)
+        assertTrue("copied ${large.second} rows for one line", large.second <= 2)
+        // The same for a long open literal paragraph streamed line by line.
+        val prose = "a line of prose that goes on\n"
+        assertEquals(workFor(prose.repeat(400), prose.repeat(401)), workFor(prose.repeat(20_000), prose.repeat(20_001)))
     }
 
     @Test
@@ -283,6 +288,7 @@ class BlocksTest {
         val code = { text: String -> ReplyText().update("r1", text).filter { it.kind == BlockKind.CODE }.map { (it.chunk as DisplayChunk.Code).text } }
         assertEquals(listOf("y".repeat(20_000), "short"), code("```\n" + "y".repeat(20_000) + "\nshort\n```\n"))
         assertEquals(listOf("x"), code("```\r\nx\r\n```\r\n"))
+        assertEquals(listOf("y".repeat(20_000), "short"), code("```\r\n" + "y".repeat(20_000) + "\r\nshort\r\n```\r\n"))
         val crlf = "```\r\n" + "line of code\r\n".repeat(300) + "```\r\n"
         assertTrue(code(crlf).size > 1 && code(crlf).none { it.endsWith('\r') })
     }

@@ -44,7 +44,8 @@ sealed interface MdBlock {
     data class Paragraph(val text: MdText) : MdBlock
     data class Heading(val level: Int, val text: MdText) : MdBlock
     data class Quote(val blocks: List<MdBlock>) : MdBlock
-    data class ListBlock(val ordered: Boolean, val start: Int, val items: List<MdListItem>) : MdBlock
+    /** [tight]: no blank line between its items or their blocks, so blocks inside an item sit close. */
+    data class ListBlock(val ordered: Boolean, val start: Int, val items: List<MdListItem>, val tight: Boolean = true) : MdBlock
     data class Table(val header: List<MdText>, val align: List<Align>, val rows: List<List<MdText>>) : MdBlock
 
     /** A paragraph that is only an image; [url] is empty unless [safeUrl] accepts it. Nothing is ever fetched. */
@@ -69,6 +70,9 @@ private fun parser(tables: Boolean): Parser = Parser.builder()
         ),
     )
     .enabledBlockTypes(blockTypes)
+    // Deeper structure becomes plain text in the parser; the tree is flattened further to MAX_NESTING below.
+    .maxOpenBlockParsers(4 * MAX_NESTING)
+    .maxInlineNesting(4 * MAX_NESTING)
     .build()
 
 private val withTables = parser(tables = true)
@@ -138,7 +142,7 @@ private fun addBlock(node: Node, depth: Int, out: MutableList<MdBlock>) {
                     item = item.next
                 }
                 val start = (node as? OrderedList)?.markerStartNumber ?: 1
-                out += MdBlock.ListBlock(node is OrderedList, start, items)
+                out += MdBlock.ListBlock(node is OrderedList, start, items, node.isTight)
             }
         }
         else -> Unit // link reference definitions and anything unknown add nothing visible
