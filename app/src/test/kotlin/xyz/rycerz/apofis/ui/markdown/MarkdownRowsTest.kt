@@ -426,6 +426,10 @@ class MarkdownRowsTest {
         // Lines of spaces growing token by token in every kind of block.
         "| a |\n|---|\n| 1 |\n      \n     x", "- a\n\n      \n  b\n      ", "<!--\n      \n-->\n    ", "<div>\n     \n<p>\n   ",
         "```\n     \n   ```\n    ", "para\n      \t  \r\n   \r   x",
+        "<!--\n" + " ".repeat(2000), "\t<div>\n```sh\necho ok\n```", "\t# a | b\n|---|---|\n| 1 | 2 |\n", "\t> a | b\n|---|---|\n",
+        "text\n\t---\n3. a\n\n4. b", "\u00A0<!--\n\n**b**\n-->",
+        // Lines longer than the scanner looks at.
+        "para\n" + " ".repeat(20_005) + "x\n\nnext", "<!--\n" + "x".repeat(25_000) + "-->\n```\ncode\n```", "| a |\n|---|\n|" + " ".repeat(20_010) + "x\n",
     )
 
     @Test
@@ -527,5 +531,24 @@ class MarkdownRowsTest {
         // An autolink is no HTML block: its line can be a header.
         val link = (allRows("<https://example.org> | Status\n---|---\nx | y\n").single().chunk as DisplayChunk.TableSlice).table
         assertEquals(MdText("https://example.org", listOf(MdSpan(0, 19, SpanKind.LINK, "https://example.org"))), link.header[0])
+    }
+
+    @Test
+    fun indentedOrTabbedLinesStartNoBlock() {
+        // A tab (four columns) before <div> makes it paragraph text, so the fence after it is code.
+        for (indent in listOf("\t", "    ", "\u00A0")) {
+            val text = "$indent<div>\n```sh\necho ok\n```"
+            val rows = allRows(text)
+            assertEquals(listOf(BlockKind.TEXT, BlockKind.CODE), rows.map { it.kind })
+            assertEquals("sh" to "echo ok", rows[1].lang to (rows[1].chunk as DisplayChunk.Code).text)
+            assertEquals(rows, streamed(text, 1))
+        }
+        // Nor is a tabbed "#" or ">" a heading or quote: the line is a paragraph, and here a table's header.
+        for (marker in listOf("#", ">")) {
+            val table = (allRows("\t$marker a | b\n|---|---|\n| 1 | 2 |\n").single().chunk as DisplayChunk.TableSlice).table
+            assertEquals(cells("$marker a", "b"), table.header)
+        }
+        // Fences are the app's own cut at any indentation (milestone 1), with a tab as with spaces.
+        assertEquals(listOf(BlockKind.CODE), allRows("\t```sh\nls\n\t```\n").map { it.kind })
     }
 }

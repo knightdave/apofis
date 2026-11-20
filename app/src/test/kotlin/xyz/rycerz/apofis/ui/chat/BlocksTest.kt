@@ -309,4 +309,34 @@ class BlocksTest {
         val crlf = "```\r\n" + "line of code\r\n".repeat(300) + "```\r\n"
         assertTrue(code(crlf).size > 1 && code(crlf).none { it.endsWith('\r') })
     }
+
+    @Test
+    fun spacesInsideAnHtmlCommentCostTheSameAtAnyLength() {
+        val comment = "<!--\n"
+        assertEquals(workFor(comment + " ".repeat(20_000), comment + " ".repeat(20_001)), workFor(comment + " ".repeat(80_000), comment + " ".repeat(80_001)))
+        // The line break that finishes a long line: the scanner reads at most 20,000 characters of it, however long.
+        for (prefix in listOf("", comment, "```\n")) {
+            assertEquals(prefix, workFor(prefix + "x".repeat(20_000), prefix + "x".repeat(20_000) + "\n"), workFor(prefix + "x".repeat(80_000), prefix + "x".repeat(80_000) + "\n"))
+        }
+    }
+
+    @Test
+    fun aLineGrowingToEightyThousandCostsNoMorePerAppendAtTheEnd() {
+        val kinds = listOf("" to "paragraph", "- " to "list", "> " to "quote", "```\n" to "fence", "| a |\n|---|\n| 1 " to "table row", "<div>\n" to "HTML block", "<!--\n" to "HTML comment")
+        for ((prefix, kind) in kinds) for (c in listOf("x", " ")) {
+            val full = prefix + c.repeat(80_010)
+            val live = ReplyText()
+            var atStart = 0L
+            for (length in prefix.length + 1..full.length) {
+                val scan = Work.scanSteps + Work.lfChars
+                val chunk = Work.chunkSteps
+                live.update("r1", full.substring(0, length))
+                val steps = Work.scanSteps + Work.lfChars - scan
+                assertTrue("$kind '$c' at $length: cut ${Work.chunkSteps - chunk}", Work.chunkSteps - chunk <= 20_001)
+                if (length == prefix.length + 20) atStart = steps
+                if (length > full.length - 10) assertTrue("$kind '$c' at $length: $steps steps, $atStart near the start", steps <= atStart)
+            }
+            assertEquals("$kind '$c'", replyRows("r1", full), live.update("r1", full))
+        }
+    }
 }

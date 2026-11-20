@@ -51,6 +51,12 @@ import xyz.rycerz.apofis.ui.markdown.rawPieces
 /** Longest chunk of text laid out as one row, so one streamed token never re-lays out a whole long block. */
 internal const val CHUNK = 1500
 
+/**
+ * The block scanner decides what a line is from its first this many characters (the most a table may hold, so table
+ * budgets stay exact) and treats the rest as more of the same line, so no line costs more than this to classify.
+ */
+private const val LINE_LOOK = TABLE_MAX_CHARS
+
 private const val FENCE = "```"
 
 /**
@@ -96,15 +102,16 @@ internal fun parseBlocks(text: CharSequence, from: Int = 0): List<LogicalBlock> 
  * every line with a pipe) is a block of its own; only this scanner decides what is a table. Work and stack depth are
  * linear in the line and constant respectively, whatever the line holds.
  */
-internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<LogicalBlock>) {
+internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<LogicalBlock>, noBreakBefore: Int = 0) {
     val i = s.pos
-    val nl = lineEnd(text, i)
-    val end = nl // the line's content
+    val nl = lineEnd(text, maxOf(i, noBreakBefore))
+    val end = minOf(nl, i + LINE_LOOK) // the part of the line that decides what it is
     val finished = nl < text.length
-    Work.scanSteps += nl - i + 1
+    Work.scanSteps += nl - maxOf(i, noBreakBefore) + end - i + 1
     s.pos = nl + 1
     val first = firstNonSpace(text, i, end)
-    val fence = text.startsWith(FENCE, first)
+    val shallow = first - i < 4 && (i until first).all { text[it] == ' ' } // indented under four columns, by spaces only
+    val fence = first + FENCE.length <= end && text.startsWith(FENCE, first)
     if (s.fenceBody >= 0) {
         if (fence && firstNonSpace(text, first + FENCE.length, end) == end) {
             out += LogicalBlock(0, s.fenceBody, maxOf(s.fenceBody, i - 1), BlockKind.CODE, s.fenceLang, stable = finished, fenceClosed = true, BlockMode.PARSED, next = nl + 1)
@@ -112,7 +119,7 @@ internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<Logical
         }
         return
     }
-    val blank = first == end
+    val blank = first == nl // a line with more than LINE_LOOK leading spaces is text, not blank
     val inHtml = s.htmlEnd
     // HTML source: no fence, cut, list or table until its end, the line holding its marker or else a blank line
     if (inHtml != null && !(inHtml.isEmpty() && blank)) {
@@ -162,14 +169,14 @@ internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<Logical
     val inParagraph = s.paraStart < i && s.paraOpen
     // An empty item, or one numbered other than 1, cannot interrupt a paragraph: "text\n-" underlines a heading.
     if (item && (!inParagraph || canInterrupt(text, i, end))) s.list = true
-    val heading = isAtxHeading(text, first, end)
-    val html = if (text[first] == '<' && first - i < 4) htmlMarker(text, first, end, inParagraph) else null
+    val heading = shallow && isAtxHeading(text, first, end)
+    val html = if (shallow && first < end && text[first] == '<') htmlMarker(text, first, end, inParagraph) else null
     if (html != null) {
         val closed = html.isNotEmpty() && text.substring(first + 2, end).contains(html, ignoreCase = true)
         s.htmlEnd = if (closed) null else html
     }
-    s.paraOpen = !heading && html == null && !isRuleOrUnderline(text, first, end)
-    if (text[first] == '>') s.noTable = true
+    s.paraOpen = !heading && html == null && !(shallow && isRuleOrUnderline(text, first, end))
+    if (shallow && first < end && text[first] == '>') s.noTable = true
     s.paraEnd = nl
     // A header row must start a paragraph: not in a list or quote, not a list item, heading or HTML block.
     val cells = if (s.list || s.noTable || item || heading || html != null) 0 else rowCells(text, first, end)
@@ -186,6 +193,7 @@ private fun isAtxHeading(text: CharSequence, first: Int, end: Int): Boolean {
 
 /** Only `-`, `=`, `*` or `_` and spaces: a rule or a setext underline, which closes a paragraph. */
 private fun isRuleOrUnderline(text: CharSequence, first: Int, end: Int): Boolean {
+    if (first == end) return false
     for (k in first until end) if (text[k] !in "-=*_ \t") return false
     return true
 }
@@ -582,20 +590,22 @@ internal class ReplyText {
             val s = checkpoint.copy()
             var next: ScanState? = null
             while (s.pos < new.length) {
-                if (lineEnd(new, s.pos) == new.length) {
+                if (lineEnd(new, maxOf(s.pos, oldLength)) == new.length) { // the old last line has no break before oldLength
                     next = s.copy()
                     finished = out.size
                 }
-                scanLine(s, new, out)
+                scanLine(s, new, out, oldLength)
             }
             if (next == null) {
                 next = s.copy()
                 finished = out.size
             }
             openBlocks(s, new, out)
+            // How far the last line is only spaces; read on from what is known when the line is the same one.
+            val known = if (next.pos == checkpoint.pos) maxOf(blankTo, next.pos) else next.pos
+            blankTo = firstNonSpace(new, known, minOf(new.length, next.pos + LINE_LOOK + 1))
+            Work.scanSteps += blankTo - known
             checkpoint = next
-            blankTo = firstNonSpace(new, next.pos, new.length) // the scanner just read this line; keep what it found
-            Work.scanSteps += blankTo - next.pos
             parsed = out.size
         }
         val firstIndex = closedBlocks
@@ -679,25 +689,30 @@ internal class ReplyText {
      */
     private fun grown(text: CharSequence, old: Int): List<LogicalBlock>? {
         val lineStart = checkpoint.pos
+        // Leading spaces matter only as far as the scanner looks (LINE_LOOK), so they are never read further.
         val from = maxOf(blankTo, lineStart)
-        val f = firstNonSpace(text, from, old)
+        val f = firstNonSpace(text, from, maxOf(from, minOf(old, lineStart + LINE_LOOK + 1)))
         blankTo = f
-        Work.scanSteps += f - from
+        val g = firstNonSpace(text, old, text.length)
+        Work.scanSteps += f - from + g - old
+        val spaces = g == text.length // only spaces were appended
         val b = tail.singleOrNull()?.block
-        if (f == old) {
-            val g = firstNonSpace(text, old, text.length)
-            Work.scanSteps += g - old
-            if (g == text.length && checkpoint.htmlEnd.isNullOrEmpty()) { // still only spaces
-                if (checkpoint.fenceBody < 0) return tail.map { it.block }
-                return if (b != null && b.kind == BlockKind.CODE && !b.stable && b.end == old) listOf(b.copy(end = text.length)) else null
-            }
+        val longer = if (b != null && !b.stable && b.end == old && b.mode == BlockMode.LITERAL) listOf(b.copy(end = text.length)) else null
+        // Inside a comment-like HTML block only its end marker matters, and spaces cannot complete it.
+        if (!checkpoint.htmlEnd.isNullOrEmpty() && spaces) return longer
+        val blank = f == old && old - lineStart <= LINE_LOOK // the line so far is blank (see scanLine)
+        if (blank && spaces && text.length - lineStart <= LINE_LOOK) { // and stays blank
+            if (checkpoint.fenceBody < 0) return tail.map { it.block }
+            return if (b != null && b.kind == BlockKind.CODE && !b.stable && b.end == old) listOf(b.copy(end = text.length)) else null
         }
         if (b == null) return null
         val code = b.kind == BlockKind.CODE
         if (b.stable || b.end != old || lineStart < b.start || (!code && b.mode != BlockMode.LITERAL)) return null
-        val ticks = old - f <= FENCE.length && (f until old).all { text[it] == '`' }
-        if (if (code) ticks else (f == old || ticks)) return null
-        if (!code && checkpoint.pendingBlank) return null
+        // Backticks could still make the line a fence line (only within what the scanner looks at).
+        val ticks = old - f <= FENCE.length && f + FENCE.length <= lineStart + LINE_LOOK && (f until old).all { text[it] == '`' }
+        if (if (code) ticks else (blank || ticks)) return null
+        // After a blank line in a list, the first characters decide whether the line goes on with the list.
+        if (!code && checkpoint.pendingBlank && old - lineStart < 16) return null
         return listOf(b.copy(end = text.length))
     }
 }
