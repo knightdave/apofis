@@ -21,10 +21,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+
+// Test tags (end-to-end tests find the buttons by these ids).
+internal const val SEND_TAG = "composer.send"
+internal const val STOP_TAG = "composer.stop"
 
 /** Whether the main button works: a send in flight ([busy]) blocks another send or steer, never Stop. */
 internal fun primaryEnabled(mode: ComposerMode, busy: Boolean) = when (mode) {
@@ -74,19 +79,19 @@ internal fun Composer(
                 focusedPlaceholderColor = scheme.onSurfaceVariant,
             ),
         )
-        if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, onClick = onStop)
+        if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
         when (mode) {
-            ComposerMode.SEND_DISABLED -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_send, enabled = false, onClick = onSend)
-            ComposerMode.SEND -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_send, enabled = primaryEnabled(mode, busy), onClick = onSend)
-            ComposerMode.STEER -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_steer, enabled = primaryEnabled(mode, busy), onClick = onSend)
-            ComposerMode.STOP -> RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = primaryEnabled(mode, busy), onClick = onStop)
+            ComposerMode.SEND_DISABLED -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_send, enabled = false, tag = SEND_TAG, onClick = onSend)
+            ComposerMode.SEND -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_send, enabled = primaryEnabled(mode, busy), tag = SEND_TAG, onClick = onSend)
+            ComposerMode.STEER -> RoundButton(R.drawable.lucide_arrow_up, R.string.chat_steer, enabled = primaryEnabled(mode, busy), tag = SEND_TAG, onClick = onSend)
+            ComposerMode.STOP -> RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = primaryEnabled(mode, busy), tag = STOP_TAG, onClick = onStop)
         }
     }
 }
 
 /** A 32 dp circle with an 18 dp glyph inside a 48 dp touch target. */
 @Composable
-private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, filled: Boolean = true, onClick: () -> Unit) {
+private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, tag: String, filled: Boolean = true, onClick: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     val fill = when {
         !enabled -> scheme.onSurface.copy(alpha = 0.12f)
@@ -98,7 +103,7 @@ private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, fi
         filled -> scheme.onPrimary
         else -> scheme.primary
     }
-    IconButton(onClick = onClick, enabled = enabled) {
+    IconButton(onClick = onClick, Modifier.testTag(tag), enabled = enabled) {
         Box(
             Modifier
                 .size(32.dp)

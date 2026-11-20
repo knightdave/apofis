@@ -7,9 +7,13 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
@@ -57,7 +61,10 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            ApofisTheme(mode, dynamicColor, pureBlack) { AppNav(container) }
+            ApofisTheme(mode, dynamicColor, pureBlack) {
+                // Test tags become resource ids, so the end-to-end tests find chat items by their opaque keys.
+                Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
+            }
         }
     }
 }

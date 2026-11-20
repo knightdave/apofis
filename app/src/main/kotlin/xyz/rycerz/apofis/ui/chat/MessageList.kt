@@ -14,6 +14,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -405,12 +406,13 @@ internal fun MessageList(
             key = { rows[rows.size - 1 - it].key },
             contentType = { rows[rows.size - 1 - it]::class },
         ) { index ->
+            val row = rows[rows.size - 1 - index]
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
-                Box(Modifier.widthIn(max = 860.dp).fillMaxWidth()) {
-                    when (val row = rows[rows.size - 1 - index]) {
+                Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
+                    when (row) {
                         is DateRow -> DateSeparator(row.day, zone)
                         is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
-                        is StepsRow -> StepList(row.reply.steps) { i ->
+                        is StepsRow -> StepList(row.reply.steps, tag = "step:${row.reply.key}") { i ->
                             val step = row.reply.steps[i] as ToolStep
                             onStep(StepSubject(row.reply.key, i, step.callId.ifEmpty { null }, step.name))
                         }
@@ -423,6 +425,14 @@ internal fun MessageList(
             }
         }
     }
+}
+
+/** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [StepList]). */
+private fun rowTag(row: Row): Modifier = when (row) {
+    is UserRow -> Modifier.testTag("user:${row.key}")
+    is TextRow -> Modifier.testTag("reply:${row.key}")
+    is NoticeRow -> Modifier.testTag("notice:${row.key}")
+    else -> Modifier
 }
 
 @Composable

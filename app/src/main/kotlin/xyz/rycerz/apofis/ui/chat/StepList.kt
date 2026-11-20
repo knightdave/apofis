@@ -18,6 +18,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
@@ -32,9 +33,9 @@ import xyz.rycerz.apofis.chat.ToolStep
 private const val MIN_SHOWN_DURATION_S = 0.1
 
 /** The reply's steps as a simple list in a pale card: tool name, one-line preview, running or error state. */
-/** [onStep] gets the tapped step's index in [steps]. */
+/** [onStep] gets the tapped step's index in [steps]; step i is tagged "[tag]:i" for the end-to-end tests. */
 @Composable
-internal fun StepList(steps: List<Step>, onStep: (Int) -> Unit) {
+internal fun StepList(steps: List<Step>, tag: String = "step", onStep: (Int) -> Unit) {
     val scheme = MaterialTheme.colorScheme
     val fill = scheme.primaryContainer.copy(alpha = if (isDarkSurface()) 0.25f else 0.30f).compositeOver(scheme.surface)
     Column(
@@ -46,22 +47,22 @@ internal fun StepList(steps: List<Step>, onStep: (Int) -> Unit) {
     ) {
         steps.forEachIndexed { i, step ->
             when (step) {
-                is ToolStep -> ToolRow(step) { onStep(i) }
-                is ReasoningStep -> StepRow(null, stringResource(R.string.chat_reasoning), step.text.trim().lineSequence().firstOrNull().orEmpty(), null, null)
+                is ToolStep -> ToolRow(step, Modifier.testTag("$tag:$i")) { onStep(i) }
+                is ReasoningStep -> StepRow(null, stringResource(R.string.chat_reasoning), step.text.trim().lineSequence().firstOrNull().orEmpty(), null, null, Modifier.testTag("$tag:$i"))
             }
         }
     }
 }
 
 @Composable
-private fun ToolRow(step: ToolStep, onClick: () -> Unit) {
+private fun ToolRow(step: ToolStep, modifier: Modifier, onClick: () -> Unit) {
     val state = when {
         step.running -> stringResource(R.string.chat_tool_running)
         step.error -> stringResource(R.string.chat_tool_failed)
         else -> null
     }
     val duration = step.durationSeconds?.takeIf { it >= MIN_SHOWN_DURATION_S }?.let { stringResource(R.string.chat_tool_duration, it) }
-    StepRow(step, step.name, step.argsPreview, duration, state, Modifier.clickable(onClick = onClick))
+    StepRow(step, step.name, step.argsPreview, duration, state, modifier.clickable(onClick = onClick))
 }
 
 @Composable

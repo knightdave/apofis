@@ -41,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -249,7 +250,7 @@ private fun Title(state: ChatUiState, onOpenConnection: () -> Unit, onRetryLoad:
 
 @Composable
 private fun StatusText(@DrawableRes icon: Int?, text: String, color: Color, tappable: Boolean) {
-    Row(Modifier.semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }, verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.testTag("status.line").semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }, verticalAlignment = Alignment.CenterVertically) {
         if (icon != null) {
             Icon(painterResource(icon), null, Modifier.size(12.dp), tint = color)
             Box(Modifier.width(4.dp))
