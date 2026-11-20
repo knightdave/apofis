@@ -106,6 +106,9 @@ class RunFollower(
     /** Test-only: runs after a status read has returned and been recorded, before its result is applied. */
     internal var beforeStatusApply: suspend RunFollower.() -> Unit = {}
 
+    /** True while a status read for [runId] is requested and not yet applied; for tests. */
+    internal fun refreshOwed(runId: String): Boolean = refreshers[runId]?.owed == true
+
     /** Run ids with a follower job; for tests. */
     internal val following: Set<String> get() = synchronized(jobs) { jobs.keys.toSet() }
 
@@ -221,7 +224,6 @@ class RunFollower(
         suspend fun read(): RunStatus {
             val ticket = tickets.incrementAndGet()
             val s = io(run.runId) { api.runStatus(run.runId) }
-            synchronized(this) { if (ticket > owedAfter) owedAfter = -1L }
             // Stored before taking the lock, which a pause could interrupt: the send queue must never steer into it.
             if (s.status in TERMINAL) storeTerminal(s.status)
             beforeStatusApply()
@@ -231,6 +233,8 @@ class RunFollower(
                     applyStatus(run, s, store = !terminal)
                 }
             }
+            // Only now: a read cancelled before its result was applied leaves the request standing.
+            synchronized(this) { if (ticket > owedAfter) owedAfter = -1L }
             return s
         }
 
@@ -251,6 +255,8 @@ class RunFollower(
         /** Notes that a read starting from now is wanted, without asking for one yet. */
         fun owe(): Unit = synchronized(this) { owedAfter = tickets.get() }
 
+        val owed: Boolean get() = synchronized(this) { owedAfter >= 0 }
+
         /**
          * Asks for a read (after the backoff when [retry]: one just failed); requests are coalesced, and any read
          * started after a request serves it. Failures retry with backoff until one succeeds, the app leaves the
@@ -264,7 +270,7 @@ class RunFollower(
         /** On return to the foreground: an unserved request, or a displayed control, is read again. */
         fun resume() {
             val shown = state(run.sessionKey).value?.let { it.runId == run.runId && it.pending != null } == true
-            if (shown || synchronized(this) { owedAfter >= 0 }) request()
+            if (shown || owed) request()
         }
 
         fun stopWorker() {
