@@ -414,7 +414,8 @@ class HermesApiTest {
     @Test
     fun controlRequests() = runTest {
         serve("session_patch.json")
-        repeat(2) { respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p"}""") }
+        respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p1"}""")
+        respond(200, """{"run_id":"r1","status":"resolved","prompt_id":"p2"}""")
         repeat(2) { respond(200, "{}") }
         serve("messages_tool_run.json")
         api.patchSession("a b", pinned = true)
@@ -448,6 +449,23 @@ class HermesApiTest {
         for (body in listOf("not json", "{}", """{"run_id":"r1"}""", """{"run_id":"r1","status":"weird"}""", """{"status":"reso""")) {
             respond(200, body)
             assertEquals(body, ApiError.Protocol, runCatching { api.approve("r1", "p1", 3, ApprovalChoice.ONCE) }.exceptionOrNull())
+        }
+    }
+
+    @Test
+    fun controlAnswersRequireMatchingIds() = runTest {
+        for (
+            body in listOf(
+                """{"status":"resolved"}""",
+                """{"run_id":"r1","status":"resolved"}""",
+                """{"status":"resolved","prompt_id":"p1"}""",
+                """{"run_id":"r1","status":"resolved","prompt_id":"p2"}""",
+                """{"run_id":"r2","status":"resolved","prompt_id":"p1"}""",
+                """{"run_id":"r1","status":"already_resolved","prompt_id":"p2"}""",
+            )
+        ) {
+            respond(200, body)
+            assertEquals(body, ApiError.Protocol, runCatching { api.clarify("r1", "p1", 3, "x") }.exceptionOrNull())
         }
     }
 }

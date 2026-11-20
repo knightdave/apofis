@@ -82,7 +82,11 @@ enum class ApprovalChoice { ONCE, SESSION, ALWAYS, DENY }
 enum class ControlResult { RESOLVED, ALREADY_RESOLVED }
 
 @Serializable
-internal data class ControlReply(val status: String? = null)
+internal data class ControlReply(
+    @SerialName("run_id") val runId: String? = null,
+    val status: String? = null,
+    @SerialName("prompt_id") val promptId: String? = null,
+)
 
 @Serializable
 internal data class SessionEnvelope(val session: SessionDto)

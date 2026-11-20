@@ -106,14 +106,14 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
     suspend fun stop(runId: String) = control(url("v1/runs", runId, "stop")) { }
 
     suspend fun approve(runId: String, requestId: String, executionGeneration: Long, choice: ApprovalChoice): ControlResult =
-        answer(url("v1/runs", runId, "approval")) {
+        answer(runId, requestId, url("v1/runs", runId, "approval")) {
             put("request_id", requestId)
             put("execution_generation", executionGeneration)
             put("choice", choice.name.lowercase())
         }
 
     suspend fun clarify(runId: String, requestId: String, executionGeneration: Long, answer: String): ControlResult =
-        answer(url("v1/runs", runId, "clarify")) {
+        answer(runId, requestId, url("v1/runs", runId, "clarify")) {
             put("request_id", requestId)
             put("execution_generation", executionGeneration)
             put("answer", answer)
@@ -129,10 +129,16 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         exchange(post(url, jsonBody(body))) { }
     }
 
-    /** Only the documented bodies count: any other 2xx body is [ApiError.Protocol], never an accepted answer. */
-    private suspend fun answer(url: HttpUrl, body: JsonObjectBuilder.() -> Unit): ControlResult =
+    /**
+     * Only the documented bodies `{run_id, status, prompt_id}` naming this run and this request count; any other 2xx
+     * body is [ApiError.Protocol], never an accepted answer. The server does not echo the generation (it refuses a
+     * stale one with 409 instead), so it cannot be checked here.
+     */
+    private suspend fun answer(runId: String, requestId: String, url: HttpUrl, body: JsonObjectBuilder.() -> Unit): ControlResult =
         exchange(post(url, jsonBody(body))) { response ->
-            when (decode<ControlReply>(response).status) {
+            val reply = decode<ControlReply>(response)
+            if (reply.runId != runId || reply.promptId != requestId) throw ApiError.Protocol
+            when (reply.status) {
                 "resolved" -> ControlResult.RESOLVED
                 "already_resolved" -> ControlResult.ALREADY_RESOLVED
                 else -> throw ApiError.Protocol

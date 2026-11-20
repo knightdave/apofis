@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -26,6 +27,7 @@ import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
+import mockwebserver3.SocketEffect
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -469,7 +471,7 @@ class RunFollowerTest {
         assertTrue(body, body.contains("\"request_id\":\"ctl_prompt\""))
         assertTrue(body, body.contains("\"execution_generation\":2"))
         assertTrue(body, body.contains("\"choice\":\"once\""))
-        assertNull(f.live(KEY).value!!.pending)
+        awaitUntil { f.live(KEY).value!!.pending == null } // the follow-up read runs after SENT is returned
         release.countDown()
         done.await()
     }
@@ -1020,7 +1022,7 @@ class RunFollowerTest {
         heldOpen(f, release)
 
         assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
-        assertEquals("ctl_other", f.live(KEY).value!!.pending!!.requestId)
+        awaitUntil { f.live(KEY).value!!.pending?.requestId == "ctl_other" } // the follow-up read runs after SENT
         release.countDown()
     }
 
@@ -1306,5 +1308,137 @@ class RunFollowerTest {
         awaitUntil { rejectedAtDelay.isNotEmpty() }
 
         assertEquals(listOf(false), rejectedAtDelay)
+    }
+
+    // ---- fix round 4 ----
+
+    private val unauthorized = json("""{"error":{"code":"invalid_api_key"}}""", 401)
+
+    @Test
+    fun acceptedAnswerStaysSentWhenTheReadIsRejected() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
+        on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}"""))
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.SENT, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        awaitUntil { f.credentialsRejected.value }
+        assertEquals("ctl_prompt", f.live(KEY).value!!.pending!!.requestId)
+        release.countDown()
+    }
+
+    @Test
+    fun alreadyResolvedWithFailedReadRethrowsAndRetries() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("running"))
+        on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}"""))
+        heldOpen(f, release)
+
+        try {
+            f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE)
+            fail("expected the read's error")
+        } catch (e: ApiError.Http) {
+            assertEquals(500, e.status)
+        }
+        assertEquals("ctl_prompt", f.live(KEY).value!!.pending!!.requestId)
+        awaitUntil { f.live(KEY).value?.pending == null }
+        assertEquals(listOf(1000L), delays)
+        release.countDown()
+    }
+
+    @Test
+    fun olderReadNeverOverwritesANewerApproval() = runTest {
+        val f = follower()
+        messages()
+        val slow = CountDownLatch(1)
+        val emit = CountDownLatch(1)
+        val reads = AtomicInteger()
+        routes[STATUS] = {
+            when (reads.incrementAndGet()) {
+                1 -> status("waiting_for_approval", pendingControl)()
+                2 -> {
+                    slow.await(10, TimeUnit.SECONDS) // started first, finishes last, and shows nothing pending
+                    status("running")()
+                }
+                else -> status("waiting_for_approval", otherControl)()
+            }
+        }
+        on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}"""))
+        routes[EVENTS] = {
+            emit.await(10, TimeUnit.SECONDS)
+            heldStream(frame(1, approvalEvent))()
+        }
+        started(f)
+
+        val answer = backgroundScope.async { f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE) }
+        awaitUntil { requestsTo(STATUS).size == 2 }
+        emit.countDown()
+        f.live(KEY).first { it?.pending?.requestId == "ctl_other" }
+        slow.countDown()
+
+        assertEquals(AnswerResult.GONE, answer.await()) // that read saw nothing pending
+        assertEquals("ctl_other", f.live(KEY).value!!.pending!!.requestId)
+        assertEquals("waiting_for_approval", db.activeRunDao().forSession(KEY)!!.status)
+    }
+
+    @Test
+    fun truncatedAnswerResponseIsReconciled() = runTest {
+        val f = follower()
+        val release = CountDownLatch(1)
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        routes["/v1/runs/$RUN/approval"] = {
+            on(STATUS, status("running"))
+            MockResponse.Builder().body("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}""")
+                .addHeader("Content-Type", "application/json").onResponseBody(SocketEffect.CloseSocket()).build()
+        }
+        heldOpen(f, release)
+
+        assertEquals(AnswerResult.GONE, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        assertNull(f.live(KEY).value!!.pending)
+        release.countDown()
+    }
+
+    @Test
+    fun restartAfterPollingFallbackNeverRequestsEvents() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val g = follower(done) // a second follower whose gate is open before the run exists
+        g.resumeAll()
+        val f = follower()
+        messages()
+        on(STATUS, status("running"))
+        on(EVENTS, notFound())
+        started(f)
+        db.activeRunDao().observeAll().first { it.singleOrNull()?.polling == true }
+        f.pauseAll()
+
+        on(STATUS, status("completed"))
+        g.onRunStarted(KEY, RUN) // the callback carries no polling flag: only the stored row knows
+        done.await()
+
+        assertEquals(listOf(EVENTS), requests.map { it.target.substringBefore('?') }.filter { it.endsWith("/events") })
+    }
+
+    @Test
+    fun rejectionDuringFinishDrainStaysShown() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done, beforeFinished = {
+            try {
+                stop("apofis-b") // another run's request is refused while the drain runs
+                fail("expected Unauthorized")
+            } catch (_: ApiError.Unauthorized) {
+            }
+        })
+        messages()
+        addSession("apofis-b")
+        addRun("run_b", "apofis-b")
+        on("/v1/runs/run_b/stop", unauthorized)
+        on(EVENTS, sse(delta(0, "a"), terminal(1)))
+        started(f)
+        done.await()
+        awaitUntil { f.following.isEmpty() }
+
+        assertTrue(f.credentialsRejected.value)
     }
 }
