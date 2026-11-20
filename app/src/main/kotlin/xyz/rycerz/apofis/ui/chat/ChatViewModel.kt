@@ -213,7 +213,8 @@ class ChatViewModel(
     override fun onSendClick() {
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.send(sessionKey) { text ->
-            repo.send(sessionKey, text) // stored before any request; delivery problems show on the bubble
+            // The field empties only once the text is stored; delivery problems after that show on the bubble.
+            repo.send(sessionKey, text, onStored = ::stored)
             local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
         }
         if (started != null) local.update { it.copy(composerNote = null) }

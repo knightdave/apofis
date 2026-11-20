@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 
 /**
  * What the composer of one chat shows. [draft] is the text field: only user edits and a send taking it change it.
+ * While [sending], the field keeps the text being sent and takes no edits; it empties in the step that records the
+ * text as stored.
  * [revision] changes with every change to [draft] that is not a user edit; an edit made on an older revision is
  * dropped. [unsent] is text a send could not store, shown apart until the user puts it back or discards it.
  */
@@ -25,6 +27,11 @@ data class UnsentText(val id: Long, val text: String, val error: ComposeError)
 enum class ComposeError { NOT_STORED }
 
 private fun ComposerState.idle() = draft.isEmpty() && !sending && unsent == null
+
+/** Given to a send's store: [stored] says the text is durably accepted, so the field may empty now. */
+fun interface Stored {
+    fun stored()
+}
 
 /** A deleted chat whose send is still in flight: no edit applies to it. */
 private val GONE = ComposerState(revision = -1)
@@ -79,14 +86,16 @@ class Composer(private val scope: CoroutineScope) {
 
     /** A user edit on the field drawn from [basedOnRevision]; dropped when the draft was changed otherwise since. */
     fun edit(sessionKey: String, text: String, basedOnRevision: Long) =
-        change(sessionKey) { s, _ -> if (s.revision == basedOnRevision) s.copy(draft = text) else s }
+        change(sessionKey) { s, _ -> if (s.revision == basedOnRevision && !s.sending) s.copy(draft = text) else s }
 
     /**
-     * Sends the draft with [store] unless a send of this chat is in flight or the draft is blank (then null). [store]
-     * must throw only when nothing was stored: the text then becomes [ComposerState.unsent], joined after any earlier
-     * unsent text with a blank line. Cancellation ([clear]) lets it go.
+     * Sends the draft with [store] unless a send of this chat is in flight or the draft is blank (then null). The field
+     * keeps showing the text until it is stored: [store] calls [Stored.stored] once the text is durably accepted (or
+     * simply returns), and only then the field empties. [store] must throw only when nothing was stored: the text then
+     * leaves the field for [ComposerState.unsent], joined after any earlier unsent text with a blank line. Cancellation
+     * ([clear]) lets it go.
      */
-    fun send(sessionKey: String, store: suspend (String) -> Unit): Job? {
+    fun send(sessionKey: String, store: suspend Stored.(String) -> Unit): Job? {
         var text: String? = null
         var generation = 0L
         book.update { b ->
@@ -95,36 +104,39 @@ class Composer(private val scope: CoroutineScope) {
             if (sessionKey in b.gone) return@update b
             b.with(sessionKey) { s, tick ->
                 text = s.draft.takeUnless { s.sending || it.isBlank() }
-                if (text == null) s else s.copy(draft = "", sending = true, revision = tick)
+                if (text == null) s else s.copy(sending = true, revision = tick) // the field drawn before takes no edit
             }
         }
         val claimed = text ?: return null
+        var settled = false // guarded by the book's atomic updates below; set once
+        fun settle(failed: Boolean) = book.update { b ->
+            when {
+                settled -> b
+                b.generation != generation -> b // cleared meanwhile: nothing of it survives
+                sessionKey in b.gone -> b.copy(gone = b.gone - sessionKey) // deleted meanwhile: dropped
+                else -> b.with(sessionKey) { s, tick ->
+                    val unsent = if (!failed) s.unsent else UnsentText(tick, s.unsent?.let { it.text + "\n\n" + claimed } ?: claimed, ComposeError.NOT_STORED)
+                    s.copy(draft = "", sending = false, unsent = unsent, revision = tick)
+                }
+            }
+        }.also { settled = true }
         return scope.launch {
             var failed = false
             try {
-                store(claimed)
+                Stored { settle(failed = false) }.store(claimed)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 failed = true
             } finally {
-                book.update { b ->
-                    when {
-                        b.generation != generation -> b // cleared meanwhile: nothing of it survives
-                        sessionKey in b.gone -> b.copy(gone = b.gone - sessionKey) // deleted meanwhile: dropped
-                        else -> b.with(sessionKey) { s, tick ->
-                            val unsent = if (!failed) s.unsent else UnsentText(tick, s.unsent?.let { it.text + "\n\n" + claimed } ?: claimed, ComposeError.NOT_STORED)
-                            s.copy(sending = false, unsent = unsent)
-                        }
-                    }
-                }
+                settle(failed)
             }
         }
     }
 
     /** Puts the unsent text back: the unsent text, then a newline and the draft when the draft is not blank. */
     fun putBack(sessionKey: String) = change(sessionKey) { s, tick ->
-        val unsent = s.unsent ?: return@change s
+        val unsent = s.unsent?.takeIf { !s.sending } ?: return@change s // the field holds a send in flight
         s.copy(draft = if (s.draft.isBlank()) unsent.text else unsent.text + "\n" + s.draft, unsent = null, revision = tick)
     }
 

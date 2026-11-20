@@ -286,11 +286,12 @@ class ChatRepository(
 
     /**
      * Steers the session's running run, else queues [text] and tries to start it at once. The message is stored
-     * before any request. A hidden chat fails locally; an unknown one throws IllegalArgumentException.
+     * before any request; [onStored] runs once it is (before any request). A hidden chat fails locally; an unknown one
+     * throws IllegalArgumentException.
      */
-    suspend fun send(sessionKey: String, text: String) {
+    suspend fun send(sessionKey: String, text: String, onStored: () -> Unit = {}) {
         requireAppKey(sessionKey)
-        queue().submit(sessionKey, text)
+        queue().submit(sessionKey, text, onStored)
     }
 
     /** See [SendQueue.cancel]. */

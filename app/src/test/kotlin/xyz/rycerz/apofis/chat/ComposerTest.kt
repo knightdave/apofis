@@ -56,6 +56,21 @@ class ComposerTest {
     }
 
     @Test
+    fun theFieldEmptiesWhenStoredNotWhenTheSendEnds() = runBlocking {
+        type("a", "hello")
+        val stored = CompletableDeferred<Unit>()
+        val delivered = CompletableDeferred<Unit>()
+        val send = composer.send("a") { stored(); stored.complete(Unit); delivered.await() }!!
+        withTimeout(10_000) { stored.await() }
+        assertEquals("", composer.current("a").draft) // stored: emptied in that step
+        assertFalse(composer.current("a").sending)
+        type("a", "next") // typing goes on while the stored send is delivered
+        delivered.complete(Unit)
+        withTimeout(10_000) { send.join() }
+        assertEquals("next", composer.current("a").draft)
+    }
+
+    @Test
     fun anEditFromBeforePutBackIsDropped() {
         fail("a", "first")
         type("a", "second")
@@ -75,7 +90,9 @@ class ComposerTest {
         val release = CompletableDeferred<Unit>()
         val send = composer.send("a") { release.await() }!!
         composer.edit("a", "hello!", shown) // the field still showed the sent text
-        assertEquals("", composer.current("a").draft)
+        assertEquals("hello", composer.current("a").draft) // kept, unchanged, until it is stored
+        composer.edit("a", "hello!", composer.current("a").revision) // nor any edit while it is sent
+        assertEquals("hello", composer.current("a").draft)
         release.complete(Unit)
         withTimeout(10_000) { send.join() }
         assertEquals("", composer.current("a").draft)
@@ -89,11 +106,14 @@ class ComposerTest {
         val beforeSend = composer.current("a").revision
         val release = CompletableDeferred<Unit>()
         val send = composer.send("a") { release.await() }!!
-        val shown = composer.current("a").revision // the empty field drawn while the send is stored
+        val whileSending = composer.current("a").revision // the read-only field showing "first" while it is stored
         release.complete(Unit)
         runBlocking { withTimeout(10_000) { send.join() } }
+        composer.edit("a", "first!", whileSending) // a keystroke from that frame must not bring the sent text back
+        assertEquals("", composer.current("a").draft)
+        val shown = composer.current("a").revision // the empty field drawn once it was stored
 
-        // Keystrokes from the frame drawn during the send arrive after it ended: each one applies.
+        // Keystrokes from that frame arrive one by one: each one applies.
         var typed = ""
         for (ch in "second") {
             typed += ch

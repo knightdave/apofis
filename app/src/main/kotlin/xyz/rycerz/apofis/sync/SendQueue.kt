@@ -114,9 +114,10 @@ class SendQueue(
      * lock from the run check through the request, so a refresh cannot hide the session and a delete cannot remove the
      * row in between.
      */
-    internal suspend fun submit(sessionKey: String, text: String) {
+    internal suspend fun submit(sessionKey: String, text: String, onStored: () -> Unit = {}) {
         // Contract: a throw here means nothing was stored, so the caller may offer the text again.
         val row = store(sessionKey, text)
+        onStored() // committed with its worker armed: from here the row is the message
         if (row.state != PendingState.QUEUED) return
         try {
             val queued = drainLock.withLock { withRepositoryLock { steerIfRunning(row) } }
