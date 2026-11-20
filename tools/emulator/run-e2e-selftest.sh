@@ -169,7 +169,7 @@ run_id=20261120-111111-aaaa lock_tried='' locked=''
 rm -f "$t/rsh-calls"
 rc=0; o=$( (take_lock) 2>&1) || rc=$?
 check "lock of another run id: the run stops at stage 0 before any change" '[ "$rc" != 0 ] && [ "$(cat "$REMOTE_DIR/.state/lock.d/owner")" = 20261120-101659-80f8 ] && [ "$(ls -A "$REMOTE_DIR/.state")" = lock.d ] && [ "$(grep -c . "$t/rsh-calls")" = 1 ]'
-check "lock of another run id: fixed message with the owner and the manual commands" 'has "$o" "held by run 20261120-101659-80f8" && has "$o" "never takes a lock over" && has "$o" "pgrep -u \\\$(id -u) -af -- '\''-avd apofis-e2e|" && has "$o" "rm -f ~/$REMOTE_DIR/.state/lock.d/owner && rmdir ~/$REMOTE_DIR/.state/lock.d"'
+check "lock of another run id: fixed message with the owner and the manual commands" 'has "$o" "held by run 20261120-101659-80f8" && has "$o" "never takes a lock over" && has "$o" "pgrep -u \\\$(id -u) -af -- '\''[-]avd apofis-e2e|" && has "$o" "rm -f ~/$REMOTE_DIR/.state/lock.d/owner && rmdir ~/$REMOTE_DIR/.state/lock.d"'
 rm -f "$REMOTE_DIR/.state/lock.d/owner"
 rc=0; o=$( (take_lock) 2>&1) || rc=$?
 check "lock directory without an owner: refused as unknown, left alone" '[ "$rc" != 0 ] && has "$o" "held by run unknown" && [ -d "$REMOTE_DIR/.state/lock.d" ]'

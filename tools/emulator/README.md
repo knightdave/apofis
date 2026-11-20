@@ -140,7 +140,7 @@ the lock stays in place (`~/tmp/apofis-e2e/.state/lock.d`) and the script prints
 removes a lock it does not own, so a lock left by a dead run stays until you remove it:
 
 ```sh
-ssh obi-one "pgrep -u \$(id -u) -af -- '-avd apofis-e2e|run-e2e\.sh --(remote|in-shell)|adb -P 5037 nodaemon'" # must print nothing
+ssh obi-one "pgrep -u \$(id -u) -af -- '[-]avd apofis-e2e|run-e2e[.]sh --(remote|in-shell)|adb -P 503[7] nodaemon'" # must print nothing
 ssh obi-one 'rm -f ~/tmp/apofis-e2e/.state/lock.d/owner && rmdir ~/tmp/apofis-e2e/.state/lock.d'
 ```
 

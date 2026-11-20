@@ -36,6 +36,8 @@ RUNID_RE='[0-9]{8}-[0-9]{6}-[0-9a-f]{4}'
 EMU_RE='-avd apofis-e2e'
 ADB_RE='adb -P 5037 nodaemon'
 SCRIPT_RE='run-e2e\.sh --(remote|in-shell)'
+# The same, written so that it does not match the command line of the shell that runs it (for the manual check).
+MANUAL_RE='[-]avd apofis-e2e|run-e2e[.]sh --(remote|in-shell)|adb -P 503[7] nodaemon'
 PORT_RANGES='5037 5037 5554 5585 18642 18662' # adb server, emulator console/adb pairs, tunnel
 SMOKE=(connectViaLoopback connectViaPrivateAddress privateAddressAsksForLocalNetwork)
 SCENARIOS=(connectAndChat replySurvivesAirplaneMode replySurvivesScreenOff replySurvivesProcessDeath
@@ -694,7 +696,7 @@ listing() {
 lock_help() {
   log "FAILED: the emulator host lock $1. This script never takes a lock over or removes another run's lock."
   log "  If that run is dead, check that none of its processes is alive (this must print nothing):"
-  log "    ssh $HOST \"pgrep -u \\\$(id -u) -af -- '$EMU_RE|$SCRIPT_RE|$ADB_RE'\""
+  log "    ssh $HOST \"pgrep -u \\\$(id -u) -af -- '$MANUAL_RE'\""
   log "  then remove the lock (one file and its directory):"
   log "    ssh $HOST 'rm -f ~/$REMOTE_DIR/.state/lock.d/owner && rmdir ~/$REMOTE_DIR/.state/lock.d'"
 }
