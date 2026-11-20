@@ -115,6 +115,13 @@ interface PendingSendDao {
     @Query("SELECT * FROM PendingSendEntity WHERE state = 'queued' ORDER BY createdAt")
     suspend fun allQueued(): List<PendingSendEntity>
 
+    @Query("SELECT * FROM PendingSendEntity WHERE idempotencyKey = :idempotencyKey")
+    suspend fun get(idempotencyKey: String): PendingSendEntity?
+
+    /** Sessions with a run in progress: a send already started, or an active run. */
+    @Query("SELECT sessionKey FROM PendingSendEntity WHERE state = 'sending' UNION SELECT sessionKey FROM ActiveRunEntity")
+    suspend fun busySessionKeys(): List<String>
+
     @Upsert
     suspend fun upsert(p: PendingSendEntity)
 

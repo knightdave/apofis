@@ -30,12 +30,21 @@ private const val MAX_PAGES = 100
 // Process-wide: the app has a single database, so every repository instance must share one lock.
 private val lock = Mutex()
 
+/** For the send pipeline: runs [block] under the repository lock (taken after SendQueue's own lock, never before). */
+internal suspend fun <T> withRepositoryLock(block: suspend () -> T): T = lock.withLock { block() }
+
 /**
  * The only data source of the UI. The server transcript is the truth; Room caches it next to the user's unsent
  * messages. Sync calls fetch everything first and write once, so an [ApiError] leaves the cache untouched.
  * Every mutating call holds one lock across its fetch and write, so a slow call never undoes a later one.
+ * [sendQueue] is needed only by [send], [cancelSend] and [retrySend].
  */
-class ChatRepository(private val api: HermesApi, private val db: AppDatabase, private val now: () -> Long = System::currentTimeMillis) {
+class ChatRepository(
+    private val api: HermesApi,
+    private val db: AppDatabase,
+    private val now: () -> Long = System::currentTimeMillis,
+    private val sendQueue: SendQueue? = null,
+) {
     private val sessionDao = db.sessionDao()
 
     fun sessions(archived: Boolean = false): Flow<List<SessionEntity>> = sessionDao.observe(archived)
@@ -149,6 +158,31 @@ class ChatRepository(private val api: HermesApi, private val db: AppDatabase, pr
             if (session.existsOnServer) api.deleteSession(session.currentId)
             sessionDao.delete(sessionKey)
         }
+    }
+
+    /** Steers the session's running run; otherwise queues [text] and tries to start it at once. */
+    suspend fun send(sessionKey: String, text: String) {
+        requireAppKey(sessionKey)
+        val queue = checkNotNull(sendQueue) { "no send queue" }
+        val run = db.activeRunDao().forSession(sessionKey)
+        if (run?.status == "running") {
+            try {
+                api.steer(run.runId, text)
+            } catch (_: ApiError) {
+                queue.enqueueFailed(sessionKey, text, "steer_failed")
+            }
+            return
+        }
+        queue.enqueue(sessionKey, text)
+        queue.drain()
+    }
+
+    suspend fun cancelSend(idempotencyKey: String) = checkNotNull(sendQueue) { "no send queue" }.cancel(idempotencyKey)
+
+    suspend fun retrySend(idempotencyKey: String) {
+        val queue = checkNotNull(sendQueue) { "no send queue" }
+        queue.retry(idempotencyKey)
+        queue.drain()
     }
 
     suspend fun resolveKey(serverSessionId: String): String? =
