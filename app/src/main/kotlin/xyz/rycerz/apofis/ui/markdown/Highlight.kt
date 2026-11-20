@@ -197,7 +197,7 @@ private fun Char.isAsciiWord() = this in 'a'..'z' || this in 'A'..'Z' || this in
 
 /**
  * Ordinary `'` and `"` strings honour backslash escapes and end at their line (an unterminated one colors no more than
- * that line). Raw forms end only at their own closer: Go backtick strings, shell single quotes, Rust `r"..."` and
+ * that line). Raw forms end only at their own closer: Go backtick strings, shell single quotes (not `$'...'`), Rust `r"..."` and
  * `r#"..."#`, Dart `r'...'`, C# `@"..."` (where `""` is a quote), and triple-quoted strings. Python's `r"..."` keeps
  * the backslash rule, as Python does (`r"a\"b"` is one string).
  */
@@ -287,7 +287,8 @@ private fun scan(code: String, syn: Syntax, lang: Lang): AnnotatedString {
                 mark(Tone.STRING, start, i)
             }
             c == '"' || (c == '\'' && !syn.charQuote) || (c == '`' && syn.backtick) -> {
-                val raw = (c == '`' && lang == Lang.GO) || (c == '\'' && lang == Lang.SHELL)
+                // Shell: plain '...' has no escapes, ANSI-C $'...' has them.
+                val raw = (c == '`' && lang == Lang.GO) || (c == '\'' && lang == Lang.SHELL && (i == 0 || code[i - 1] != '$'))
                 i = quoteEnd(i, i + 1, n, escapes = !raw, multiline = c == '`')
                 mark(Tone.STRING, start, i)
             }

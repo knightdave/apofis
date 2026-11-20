@@ -202,4 +202,15 @@ class HighlightTest {
         }
         assertEquals(listOf("int" to K, "1'000" to N, "// count" to C), marks("int n = 1'000; // count", Lang.CPP))
     }
+
+    // ---- fix round 2 ----
+
+    @Test
+    fun shellAnsiCQuotesHaveEscapes() {
+        assertEquals(listOf("'O\\'Brien'" to S, "echo" to K, "# done" to C), marks("name=\$'O\\'Brien'; echo ok # done", Lang.SHELL))
+        assertEquals(
+            listOf("'a\\'b'" to S, "\"c\\\"d\"" to S, "'e\\'" to S, "echo" to K, "# c" to C),
+            marks("x=\$'a\\'b' y=\$\"c\\\"d\" z='e\\' ; echo # c", Lang.SHELL),
+        )
+    }
 }
