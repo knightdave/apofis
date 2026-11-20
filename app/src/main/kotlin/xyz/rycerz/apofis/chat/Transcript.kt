@@ -76,8 +76,10 @@ private class ReplyBuilder(first: MessageDto) {
     private val timestamp = first.timestamp
     private val steps = mutableListOf<Step>()
     private val texts = mutableListOf<String>()
+    private val rowIds = mutableListOf<Long>()
 
     fun addAssistant(row: MessageDto, waiting: MutableMap<String, Pair<ReplyBuilder, Int>>) {
+        rowIds += row.id
         row.reasoning?.takeIf { it.isNotBlank() }?.let { steps += ReasoningStep(it) }
         for (call in parseArray(row.toolCallsJson)) {
             val obj = call as? JsonObject ?: continue
@@ -91,11 +93,13 @@ private class ReplyBuilder(first: MessageDto) {
     }
 
     fun setResult(index: Int, row: MessageDto) {
+        rowIds += row.id
         steps[index] = withResult(steps[index] as ToolStep, row)
     }
 
     /** A result row whose call is unknown: shown once, as its own step. */
     fun addOrphan(row: MessageDto) {
+        rowIds += row.id
         steps += withResult(ToolStep(row.toolCallId ?: "", row.toolName ?: "", "", null, false, false, true), row)
     }
 
@@ -110,7 +114,7 @@ private class ReplyBuilder(first: MessageDto) {
         )
     }
 
-    fun build() = AssistantReply(key, steps.toList(), texts.joinToString("\n\n"), timestamp)
+    fun build() = AssistantReply(key, steps.toList(), texts.joinToString("\n\n"), timestamp, rowIds = rowIds.toList())
 }
 
 private fun JsonObject.str(name: String) = (get(name) as? JsonPrimitive)?.takeIf { it.isString }?.content

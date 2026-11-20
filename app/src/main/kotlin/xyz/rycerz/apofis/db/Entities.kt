@@ -18,6 +18,7 @@ data class SessionEntity(
     val preview: String?,
     val stale: Boolean,
     val existsOnServer: Boolean,
+    val hidden: Boolean = false, // hidden on the server: kept only while it holds unsent work, never shown
 )
 
 @Entity(primaryKeys = ["sessionKey", "position"])

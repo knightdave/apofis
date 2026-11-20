@@ -193,7 +193,8 @@ class TranscriptTest {
         assertFalse(step.running)
         assertEquals("ok", step.result)
         assertEquals("", (items[1] as AssistantReply).text)
-        assertEquals(AssistantReply("r5", emptyList(), "done", 5.0), items[3])
+        assertEquals(listOf(2L, 4L), (items[1] as AssistantReply).rowIds)
+        assertEquals(AssistantReply("r5", emptyList(), "done", 5.0, rowIds = listOf(5L)), items[3])
     }
 
     @Test
@@ -208,6 +209,7 @@ class TranscriptTest {
         assertEquals(listOf("r1", "n2", "r3"), items.map { it.key })
         assertTrue(((items[0] as AssistantReply).steps.single() as ToolStep).running)
         assertEquals("lost", ((items[2] as AssistantReply).steps.single() as ToolStep).result)
+        assertEquals(listOf(listOf(1L), listOf(3L)), items.filterIsInstance<AssistantReply>().map { it.rowIds })
     }
 
     @Test
