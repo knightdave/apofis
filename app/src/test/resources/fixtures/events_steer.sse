@@ -1,0 +1,65 @@
+: open
+
+id: 0
+data: {"event": "tool.started", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131432.4464123, "tool": "terminal", "preview": "sleep 20 + 1 command", "tool_call_id": "call_f80566bd16914a16abf55f23758fc0c4", "seq": 0}
+
+id: 1
+data: {"event": "run.steered", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131432.456392, "accepted": true, "seq": 1}
+
+id: 2
+data: {"event": "run.steered", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131432.4629917, "accepted": true, "seq": 2}
+
+: keepalive
+
+: keepalive
+
+id: 3
+data: {"event": "tool.completed", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131452.8229992, "tool": "terminal", "duration": 0, "error": false, "tool_call_id": "call_f80566bd16914a16abf55f23758fc0c4", "preview": "", "seq": 3}
+
+id: 4
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131454.8185973, "delta": "\n\nThe", "seq": 4}
+
+id: 5
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131454.8195007, "delta": " probe", "seq": 5}
+
+id: 6
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131454.8946662, "delta": " returned", "seq": 6}
+
+id: 7
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.0053053, "delta": " ap", "seq": 7}
+
+id: 8
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.0059495, "delta": "of", "seq": 8}
+
+id: 9
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.0066402, "delta": "is", "seq": 9}
+
+id: 10
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.00701, "delta": "-marker", "seq": 10}
+
+id: 11
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.0077496, "delta": ",", "seq": 11}
+
+id: 12
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.0084105, "delta": " with", "seq": 12}
+
+id: 13
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.1090474, "delta": " alpha", "seq": 13}
+
+id: 14
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.110046, "delta": " and", "seq": 14}
+
+id: 15
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.111928, "delta": " beta", "seq": 15}
+
+id: 16
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.113076, "delta": " included", "seq": 16}
+
+id: 17
+data: {"event": "message.delta", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.1137378, "delta": ".", "seq": 17}
+
+id: 18
+data: {"event": "run.completed", "run_id": "run_20d9e5fc939840e3a94e1fc63cba8a3e", "timestamp": 1795131455.3417182, "output": "The probe returned apofis-marker, with alpha and beta included.", "usage": {"input_tokens": 1000, "output_tokens": 100, "total_tokens": 1100}, "runtime": {"provider": "", "model": "", "route_source": "global"}, "completed": true, "partial": false, "interrupted": false, "seq": 18}
+
+: stream closed
+

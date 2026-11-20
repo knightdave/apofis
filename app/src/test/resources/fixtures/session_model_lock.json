@@ -1,0 +1,1 @@
+{"object": "hermes.session.model_lock", "session_id": "apofis-probe-1795134090-sessions-a-44c52612dee369937526cb4768cbfe8d", "runtime": {"provider": "example-provider", "model": "example-model", "route_source": "raw_request", "requested": {"provider": "example-provider", "model": "example-model"}, "model_lock": "accepted"}}
