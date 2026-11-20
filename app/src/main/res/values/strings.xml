@@ -120,4 +120,29 @@
     <string name="settings_licenses">Open-source licenses</string>
     <string name="licenses_lucide">Lucide icons</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
+
+    <string name="drawer_open">Open chat list</string>
+    <string name="drawer_new_chat">New chat</string>
+    <string name="drawer_search_hint">Search chats</string>
+    <string name="drawer_no_match">No chats match</string>
+    <string name="drawer_refresh_failed">Could not refresh</string>
+    <string name="drawer_pinned">Pinned</string>
+    <string name="drawer_archived">Archived</string>
+    <string name="drawer_working">working</string>
+    <string name="drawer_needs_answer">needs your answer</string>
+    <string name="drawer_rename">Rename</string>
+    <string name="drawer_pin">Pin</string>
+    <string name="drawer_unpin">Unpin</string>
+    <string name="drawer_archive">Archive</string>
+    <string name="drawer_unarchive">Unarchive</string>
+    <string name="drawer_delete">Delete</string>
+    <string name="drawer_rename_title">Rename chat</string>
+    <string name="drawer_rename_hint">Title</string>
+    <string name="drawer_save">Save</string>
+    <string name="drawer_delete_title">Delete this chat?</string>
+    <string name="drawer_delete_text">The chat will be deleted permanently from the server.</string>
+    <string name="drawer_delete_running">A reply is still running and will be stopped.</string>
+    <string name="drawer_error_closed">The connection was closed</string>
+    <string name="archived_title">Archived chats</string>
+    <string name="drawer_more_actions">More actions</string>
 </resources>

@@ -116,4 +116,29 @@
     <string name="settings_licenses">Licencje open source</string>
     <string name="licenses_lucide">Ikony Lucide</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
+
+    <string name="drawer_open">Otwórz listę czatów</string>
+    <string name="drawer_new_chat">Nowy czat</string>
+    <string name="drawer_search_hint">Szukaj czatów</string>
+    <string name="drawer_no_match">Brak pasujących czatów</string>
+    <string name="drawer_refresh_failed">Nie udało się odświeżyć</string>
+    <string name="drawer_pinned">Przypięte</string>
+    <string name="drawer_archived">Archiwum</string>
+    <string name="drawer_working">pracuje</string>
+    <string name="drawer_needs_answer">czeka na Twoją odpowiedź</string>
+    <string name="drawer_rename">Zmień nazwę</string>
+    <string name="drawer_pin">Przypnij</string>
+    <string name="drawer_unpin">Odepnij</string>
+    <string name="drawer_archive">Archiwizuj</string>
+    <string name="drawer_unarchive">Przywróć z archiwum</string>
+    <string name="drawer_delete">Usuń</string>
+    <string name="drawer_rename_title">Zmień nazwę czatu</string>
+    <string name="drawer_rename_hint">Tytuł</string>
+    <string name="drawer_save">Zapisz</string>
+    <string name="drawer_delete_title">Usunąć ten czat?</string>
+    <string name="drawer_delete_text">Czat zostanie trwale usunięty z serwera.</string>
+    <string name="drawer_delete_running">Odpowiedź wciąż trwa i zostanie zatrzymana.</string>
+    <string name="drawer_error_closed">Połączenie zostało zamknięte</string>
+    <string name="archived_title">Zarchiwizowane czaty</string>
+    <string name="drawer_more_actions">Więcej opcji</string>
 </resources>
