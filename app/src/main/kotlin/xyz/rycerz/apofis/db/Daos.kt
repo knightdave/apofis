@@ -173,6 +173,9 @@ interface ActiveRunDao {
     @Query("SELECT * FROM ActiveRunEntity WHERE sessionKey = :sessionKey ORDER BY startedAt DESC LIMIT 1")
     suspend fun forSession(sessionKey: String): ActiveRunEntity?
 
+    @Query("SELECT * FROM ActiveRunEntity WHERE sessionKey = :sessionKey ORDER BY startedAt")
+    suspend fun allForSession(sessionKey: String): List<ActiveRunEntity>
+
     @Upsert
     suspend fun upsert(r: ActiveRunEntity)
 

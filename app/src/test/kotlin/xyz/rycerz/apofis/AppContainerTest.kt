@@ -3,7 +3,12 @@ package xyz.rycerz.apofis
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import android.database.sqlite.SQLiteException
 import androidx.room.Room
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.SupportSQLiteStatement
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
@@ -14,12 +19,16 @@ import javax.crypto.KeyGenerator
 import java.util.Collections
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import kotlinx.coroutines.test.runTest
@@ -39,6 +48,7 @@ import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.sync.SendWorker
+import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private val A = Credentials("https://a.example/", "key-a")
 private val B = Credentials("https://b.example/", "key-b")
@@ -83,6 +93,8 @@ class AppContainerTest {
             assertEquals("closed", e.message)
         }
     }
+
+    private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
     private suspend fun expectFailure(c: Credentials) {
         try {
@@ -154,6 +166,44 @@ class AppContainerTest {
     }
 
     @Test
+    fun newKeyForTheSameServerKeepsDraftsAndTheSendBeingStored() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val server = recordingServer(requests)
+        try {
+            val first = Credentials(server.url("/").toString(), "k1")
+            container.connect(first)
+            val old = container.connected()!!
+            addSession("apofis-a")
+            addSession("apofis-b")
+            old.composer.edit("apofis-b", "half a thought")
+            old.composer.edit("apofis-a", "hello")
+            val held = CompletableDeferred<Unit>()
+            val locked = CompletableDeferred<Unit>()
+            val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+            locked.await()
+            val repo = old.repo
+            old.composer.send("apofis-a") { repo.send("apofis-a", it) }!! // waits for the lock: not stored yet
+            val switching = CompletableDeferred<Unit>()
+            container.beforeSwitch = { switching.complete(Unit) }
+            val connect = async(Dispatchers.IO) { container.connect(first.copy(apiKey = "k2")) }
+            switching.await()
+            held.complete(Unit)
+            lock.join()
+            connect.await()
+
+            val now = container.connected()!!
+            assertNotSame(old, now)
+            assertEquals("half a thought", now.composer.current("apofis-b").draft)
+            assertEquals("", now.composer.current("apofis-a").draft)
+            assertEquals(listOf("hello"), db.pendingSendDao().rows("apofis-a").map { it.text })
+            now.sendQueue.drain()
+            assertEquals(1, synchronized(requests) { requests.count { it == "POST /v1/runs" } })
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
     fun failureAfterTheSwitchBeganEndsDisconnected() = runTest {
         container.connect(A)
         addSession("apofis-a")
@@ -165,6 +215,153 @@ class AppContainerTest {
         assertNull(container.connection.value)
         assertNull(store.load())
         assertFalse(app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).contains(SWITCH_MARKER))
+    }
+
+    @Test
+    fun failedSameServerSaveThenRetryKeepsDraftsAndUnsentText() = runTest {
+        container.connect(A)
+        val first = container.connected()!!
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        failNextKeyUse = true
+
+        expectFailure(A.copy(apiKey = "key-a2"))
+        assertNull(container.connected())
+        container.connect(A.copy(apiKey = "key-a3")) // the user tries again
+
+        val now = container.connected()!!
+        assertEquals("half a thought", now.composer.current("apofis-a").draft)
+        assertEquals("not stored", now.composer.current("apofis-b").unsent?.text)
+    }
+
+    /** A switch to B whose commit of [failPut] or removal of [failRemove] fails, after the tables were cleared. */
+    private suspend fun failAfterTheClear(failPut: String? = null, failRemove: String? = null) {
+        val flaky = FlakyCacheApp(app)
+        container = AppContainer(flaky, store) { db }
+        container.connect(A)
+        val first = container.connected()!!
+        addSession("apofis-a")
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        val release = CompletableDeferred<Unit>()
+        first.composer.edit("apofis-c", "being stored")
+        first.composer.send("apofis-c") { release.await() }!!
+        container.beforeSwitch = { release.complete(Unit) }
+        val before = container.scope.coroutineContext.job.children.filter { it.isActive }.toSet()
+        flaky.failPutOf = failPut
+        flaky.failRemoveOf = failRemove
+
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: IllegalStateException) {
+        }
+
+        assertTrue(db.sessionDao().all().isEmpty())
+        assertTrue(container.composer.keys.isEmpty()) // cleared with the tables, in the same step
+        assertFalse(container.composer.job.children.any { it.isActive })
+        val left = container.scope.coroutineContext.job.children.filter { it.isActive }.toSet()
+        assertTrue("jobs left by the failed switch: ${left - before}", (left - before).isEmpty())
+        flaky.failPutOf = null
+        flaky.failRemoveOf = null
+    }
+
+    @Test
+    fun ownerCommitFailingAfterTheClearLeavesAnEmptyComposer() = runTest {
+        failAfterTheClear(failPut = "cache_base_url")
+    }
+
+    @Test
+    fun markerCommitFailingAfterTheClearLeavesAnEmptyComposer() = runTest {
+        failAfterTheClear(failRemove = SWITCH_MARKER)
+    }
+
+    @Test
+    fun switchFailingBeforeTheClearKeepsTextUntilAConfirmedSwitch() = runTest {
+        container.connect(A)
+        val first = container.connected()!!
+        addSession("apofis-a")
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        container.beforeSwitch = { throw IllegalStateException("setup failed") }
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: IllegalStateException) {
+        }
+        container.beforeSwitch = {}
+        assertEquals("half a thought", container.composer.current("apofis-a").draft)
+        assertEquals("not stored", container.composer.current("apofis-b").unsent?.text)
+
+        val c = Credentials("https://c.example/", "key-c")
+        assertTrue(container.willClearCache(c.baseUrl)) // the confirmation is shown for C
+        assertEquals("half a thought", container.composer.current("apofis-a").draft) // and nothing changed before it
+        container.connect(c) // confirmed
+
+        assertTrue(container.composer.keys.isEmpty())
+        assertTrue(db.sessionDao().all().isEmpty())
+    }
+
+    /** A container on a database that fails the statements [faults] is told to; A's text is in its composer. */
+    private suspend fun withTextOfA(faults: FaultyStatements): AppDatabase {
+        val faulty = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).openHelperFactory(faults).allowMainThreadQueries().build()
+        container = AppContainer(app, store) { faulty }
+        container.connect(A)
+        val first = container.connected()!!
+        faulty.sessionDao().upsert(SessionEntity(
+            key = "apofis-a", currentId = "apofis-a", lineageIds = "", title = null, pinned = false, archived = false,
+            startedAt = 1.0, lastActiveAt = null, messageCount = 0, preview = null, stale = false,
+            existsOnServer = false, hidden = false, // a local-only chat: its row exists only here
+        ))
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        return faulty
+    }
+
+    @Test
+    fun vacuumFailingAfterTheDeletesCommittedStillClearsTheComposer() = runTest {
+        val faults = FaultyStatements()
+        val faulty = withTextOfA(faults)
+        faults.failVacuum = true
+
+        container.connect(B) // VACUUM is best effort: the switch continues
+
+        assertEquals(B, container.connected()!!.credentials)
+        assertTrue(faulty.sessionDao().all().isEmpty())
+        assertTrue(container.composer.keys.isEmpty())
+        assertEquals("", container.composer.current("apofis-a").draft)
+        assertNull(container.composer.current("apofis-b").unsent)
+
+        val c = Credentials("https://c.example/", "key-c")
+        assertTrue(container.willClearCache(c.baseUrl)) // C still asks, and there is nothing left to discard
+        container.connect(c)
+        assertEquals(c, container.connected()!!.credentials)
+        assertTrue(container.composer.keys.isEmpty())
+        faulty.close()
+    }
+
+    @Test
+    fun deletesFailingLeaveTablesAndComposerIntact() = runTest {
+        val faults = FaultyStatements()
+        val faulty = withTextOfA(faults)
+        faults.failDeletes = true
+
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: SQLiteException) {
+        }
+
+        assertNull(container.connected()) // the marker rule: disconnected
+        assertEquals(listOf("apofis-a"), faulty.sessionDao().all().map { it.key })
+        assertEquals("half a thought", container.composer.current("apofis-a").draft)
+        assertEquals("not stored", container.composer.current("apofis-b").unsent?.text)
+        assertTrue(container.willClearCache(B.baseUrl)) // the next switch asks before anything is deleted
+        faulty.close()
     }
 
     @Test
@@ -355,6 +552,8 @@ class AppContainerTest {
 /** The real app, except that commits to the cache preferences throw while [failCommits] is set. */
 private class FlakyCacheApp(base: Application) : Application() {
     @Volatile var failCommits = false
+    @Volatile var failPutOf: String? = null // a commit that writes this key throws
+    @Volatile var failRemoveOf: String? = null // a commit that removes this key throws
 
     init {
         attachBaseContext(base)
@@ -366,13 +565,46 @@ private class FlakyCacheApp(base: Application) : Application() {
         return object : SharedPreferences by real {
             override fun edit(): SharedPreferences.Editor {
                 val e = real.edit()
+                var put: String? = null
+                var removed: String? = null
                 return object : SharedPreferences.Editor by e {
                     override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor = also { e.putBoolean(key, value) }
-                    override fun putString(key: String, value: String?): SharedPreferences.Editor = also { e.putString(key, value) }
-                    override fun remove(key: String): SharedPreferences.Editor = also { e.remove(key) }
-                    override fun commit(): Boolean = if (failCommits) throw IllegalStateException("disk") else e.commit()
+                    override fun putString(key: String, value: String?): SharedPreferences.Editor = also { put = key; e.putString(key, value) }
+                    override fun remove(key: String): SharedPreferences.Editor = also { removed = key; e.remove(key) }
+                    override fun commit(): Boolean =
+                        if (failCommits || (put != null && put == failPutOf) || (removed != null && removed == failRemoveOf)) {
+                            throw IllegalStateException("disk")
+                        } else {
+                            e.commit()
+                        }
                 }
             }
         }
+    }
+}
+
+/** Fails VACUUM or the table deletes while asked to, the way a storage error would. */
+private class FaultyStatements : SupportSQLiteOpenHelper.Factory {
+    @Volatile var failVacuum = false
+    @Volatile var failDeletes = false
+    private val real = FrameworkSQLiteOpenHelperFactory()
+
+    private fun check(sql: String) {
+        val s = sql.trimStart().uppercase()
+        if ((failVacuum && s.startsWith("VACUUM")) || (failDeletes && s.startsWith("DELETE FROM"))) throw SQLiteException("disk I/O error")
+    }
+
+    override fun create(configuration: SupportSQLiteOpenHelper.Configuration): SupportSQLiteOpenHelper {
+        val h = real.create(configuration)
+        return object : SupportSQLiteOpenHelper by h {
+            override val writableDatabase: SupportSQLiteDatabase get() = wrap(h.writableDatabase)
+            override val readableDatabase: SupportSQLiteDatabase get() = wrap(h.readableDatabase)
+        }
+    }
+
+    private fun wrap(d: SupportSQLiteDatabase) = object : SupportSQLiteDatabase by d {
+        override fun execSQL(sql: String) = check(sql).also { d.execSQL(sql) }
+        override fun execSQL(sql: String, bindArgs: Array<out Any?>) = check(sql).also { d.execSQL(sql, bindArgs) }
+        override fun compileStatement(sql: String): SupportSQLiteStatement = check(sql).let { d.compileStatement(sql) }
     }
 }

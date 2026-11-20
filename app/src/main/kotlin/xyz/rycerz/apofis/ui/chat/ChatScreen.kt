@@ -55,6 +55,8 @@ import androidx.compose.runtime.key
 import xyz.rycerz.apofis.chat.SendState
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.chat.ComposeError
+import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
@@ -95,10 +97,11 @@ fun ChatScreen(
         bottomBar = {
             Column(Modifier.navigationBarsPadding().imePadding()) {
                 state.composerNote?.let { ComposerNoteLine(it) }
+                state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                 Composer(
                     state.draft,
                     if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
-                    actions::onDraftChange,
+                    { actions.onDraftChange(it, state.draftRevision) },
                     onSend = {
                         actions.onSendClick()
                         scope.launch { listState.scrollToItem(0) }
@@ -174,6 +177,19 @@ fun ChatScreen(
             }
         }
     }
+    state.confirmDiscard?.let { unsent ->
+        key(unsent.id) {
+            ConfirmDialog(
+                title = R.string.chat_discard_title,
+                text = R.string.chat_discard_text,
+                quote = unsent.text,
+                confirm = R.string.chat_unsent_discard,
+                dismiss = R.string.chat_keep,
+                onConfirm = { actions.onConfirmDiscard(unsent.id) },
+                onDismiss = actions::onDismissDiscard,
+            )
+        }
+    }
     state.confirmRetry?.let { message ->
         val key = message.idempotencyKey ?: return@let
         key(key) { // a dialog for another message is a new dialog, never the old one with a swapped subject
@@ -199,7 +215,6 @@ fun ChatScreen(
 @Composable
 private fun ComposerNoteLine(note: ComposerNote) {
     val text = when (note) {
-        ComposerNote.SEND_FAILED -> R.string.chat_note_send_failed
         ComposerNote.REMOVED_MAY_HAVE_SENT -> R.string.chat_note_removed_may_have_sent
         ComposerNote.CANCEL_TOO_LATE -> R.string.chat_note_cancel_too_late
     }
@@ -207,8 +222,31 @@ private fun ComposerNoteLine(note: ComposerNote) {
         stringResource(text),
         Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(top = 6.dp).semantics { liveRegion = LiveRegionMode.Polite },
         style = MaterialTheme.typography.labelMedium,
-        color = if (note == ComposerNote.SEND_FAILED) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+}
+
+/** Text a send could not store: the reason, the start of the text, and Put back / Discard. */
+@Composable
+private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: () -> Unit) {
+    val reason = when (unsent.error) {
+        ComposeError.NOT_STORED -> R.string.chat_unsent_not_stored
+    }
+    Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp).padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f).semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }) {
+            Text(stringResource(reason), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error)
+            Text(
+                unsent.text,
+                style = MaterialTheme.typography.labelMedium,
+                fontStyle = FontStyle.Italic,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        TextButton(onClick = onPutBack) { Text(stringResource(R.string.chat_unsent_put_back)) }
+        TextButton(onClick = onDiscard) { Text(stringResource(R.string.chat_unsent_discard)) }
+    }
 }
 
 @Composable

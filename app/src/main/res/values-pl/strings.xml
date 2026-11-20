@@ -30,7 +30,7 @@
     <string name="connect_local_network_retry">Zezwól na dostęp do sieci lokalnej i spróbuj ponownie</string>
     <string name="connect_local_network_rationale">Potrzebne do łączenia z serwerami w sieci lokalnej</string>
     <string name="server_change_title">Zmienić serwer?</string>
-    <string name="server_change_text">Zapisane czaty zostaną usunięte z tego telefonu, a niewysłane wiadomości skasowane. Czaty pozostaną na poprzednim serwerze.</string>
+    <string name="server_change_text">Zapisane czaty zostaną usunięte z tego telefonu, a niewysłane wiadomości i szkice skasowane. Czaty pozostaną na poprzednim serwerze.</string>
     <string name="server_change_confirm">Zmień</string>
 
     <string name="chat_new_title">Nowy czat</string>
@@ -105,7 +105,11 @@
     <string name="chat_approval_no_command">Polecenie jest niedostępne, więc można tylko odmówić.</string>
     <string name="chat_unsupported_title">Hermes czeka na odpowiedź</string>
     <string name="chat_unsupported_text">Ta wersja aplikacji nie potrafi udzielić takiej odpowiedzi.</string>
-    <string name="chat_note_send_failed">Nie udało się zapisać wiadomości. Jej tekst wrócił do pola.</string>
+    <string name="chat_unsent_not_stored">Nie wysłano: nie udało się zapisać.</string>
+    <string name="chat_unsent_put_back">Przywróć</string>
+    <string name="chat_unsent_discard">Odrzuć</string>
+    <string name="chat_discard_title">Odrzucić niewysłaną wiadomość?</string>
+    <string name="chat_discard_text">Jej tekst zniknie bezpowrotnie.</string>
     <string name="chat_note_removed_may_have_sent">Usunięto z tego telefonu. Mogła już dotrzeć do serwera.</string>
     <string name="chat_note_cancel_too_late">Za późno na anulowanie: wiadomość jest już wysyłana.</string>
     <string name="chat_status_server_error">Błąd serwera</string>
@@ -134,4 +138,28 @@
     <string name="settings_licenses">Licencje open source</string>
     <string name="licenses_lucide">Ikony Lucide</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
+    <string name="drawer_open">Otwórz listę czatów</string>
+    <string name="drawer_new_chat">Nowy czat</string>
+    <string name="drawer_search_hint">Szukaj czatów</string>
+    <string name="drawer_no_match">Brak pasujących czatów</string>
+    <string name="drawer_refresh_failed">Nie udało się odświeżyć</string>
+    <string name="drawer_pinned">Przypięte</string>
+    <string name="drawer_archived">Archiwum</string>
+    <string name="drawer_working">pracuje</string>
+    <string name="drawer_needs_answer">czeka na Twoją odpowiedź</string>
+    <string name="drawer_rename">Zmień nazwę</string>
+    <string name="drawer_pin">Przypnij</string>
+    <string name="drawer_unpin">Odepnij</string>
+    <string name="drawer_archive">Archiwizuj</string>
+    <string name="drawer_unarchive">Przywróć z archiwum</string>
+    <string name="drawer_delete">Usuń</string>
+    <string name="drawer_rename_title">Zmień nazwę czatu</string>
+    <string name="drawer_rename_hint">Tytuł</string>
+    <string name="drawer_save">Zapisz</string>
+    <string name="drawer_delete_title">Usunąć ten czat?</string>
+    <string name="drawer_delete_text">Czat zostanie trwale usunięty z serwera.</string>
+    <string name="drawer_delete_running">Odpowiedź wciąż trwa i zostanie zatrzymana.</string>
+    <string name="drawer_error_closed">Połączenie zostało zamknięte</string>
+    <string name="archived_title">Zarchiwizowane czaty</string>
+    <string name="drawer_more_actions">Więcej opcji</string>
 </resources>
