@@ -60,12 +60,8 @@ class ChatRepositorySyncTest {
 
     @After
     fun tearDown() {
-        try {
-            responses.verify()
-        } finally {
-            db.close()
-            server.close()
-        }
+        db.close()
+        responses.closeAndVerify(server)
     }
 
     private fun respond(body: String, code: Int = 200) =

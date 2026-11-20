@@ -49,9 +49,8 @@ class ConnectViewModelTest {
     @After
     fun tearDown() {
         try {
-            holding.verify()
+            holding.closeAndVerify(server)
         } finally {
-            server.close()
             Dispatchers.resetMain()
         }
     }

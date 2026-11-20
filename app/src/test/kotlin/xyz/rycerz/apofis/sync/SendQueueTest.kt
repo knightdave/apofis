@@ -64,12 +64,8 @@ class SendQueueTest {
 
     @After
     fun tearDown() {
-        try {
-            holding.verify()
-        } finally {
-            db.close()
-            server.close()
-        }
+        db.close()
+        holding.closeAndVerify(server)
     }
 
     private fun respond(body: String, code: Int = 200) =
