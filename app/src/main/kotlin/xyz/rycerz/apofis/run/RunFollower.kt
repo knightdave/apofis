@@ -106,6 +106,9 @@ class RunFollower(
     /** Test-only: runs after a status read has returned and been recorded, before its result is applied. */
     internal var beforeStatusApply: suspend RunFollower.() -> Unit = {}
 
+    /** Test-only: runs with each observed status at the start of its (non-cancellable) store, to pause it there. */
+    internal var beforeStatusStore: suspend RunFollower.(status: String) -> Unit = {}
+
     /** True while a status read for [runId] is requested and not yet applied; for tests. */
     internal fun refreshOwed(runId: String): Boolean = refreshers[runId]?.owed == true
 
@@ -146,9 +149,10 @@ class RunFollower(
         val run = db.activeRunDao().forSession(sessionKey) ?: return
         // The intent is stored apart from the server's status, so a cancel seen after a restart still counts as this
         // user's stop, and a stop by another client never does.
-        db.activeRunDao().setStopRequested(run.runId)
-        edit(run) { it.copy(status = "stopping") }
-        io(run.runId) { api.stop(run.runId) }
+        // The status itself changes only when the server reports it, through the refresher.
+        val refresher = refresher(run)
+        refresher.stop { io(run.runId) { api.stop(run.runId) } }
+        refresher.request()
     }
 
     /**
@@ -216,7 +220,9 @@ class RunFollower(
         private val tickets = AtomicLong()
         private val applying = Mutex()
         private var applied = 0L // guarded by [applying]
-        @Volatile private var terminal = false // once a terminal status is stored, no other status is
+        private val stopping = Mutex() // guards the two fields below and orders the stop intent's writes
+        private var stopsInFlight = 0
+        private var stopAccepted = false // by the server, for this run; also true for an intent stored before a restart
         private var owedAfter = -1L // a read with a higher ticket is still wanted (-1: none); guarded by this
         private var worker: Job? = null // guarded by this
 
@@ -224,24 +230,80 @@ class RunFollower(
         suspend fun read(): RunStatus {
             val ticket = tickets.incrementAndGet()
             val s = io(run.runId) { api.runStatus(run.runId) }
-            // Stored before taking the lock, which a pause could interrupt: the send queue must never steer into it.
-            if (s.status in TERMINAL) storeTerminal(s.status)
+            val pending = s.pendingControls.firstOrNull()
+            // A terminal status is published before anything that can be cancelled: the send queue must never steer into it.
+            // A publish that fails to store is not lost: the next read tries again.
+            if (s.status in TERMINAL && !publish(s.status, pending, ticket)) request(retry = true)
             beforeStatusApply()
-            applying.withLock {
-                if (ticket > applied) {
-                    applied = ticket
-                    applyStatus(run, s, store = !terminal)
-                }
-            }
+            if (s.status !in TERMINAL && !publish(s.status, pending, ticket)) request(retry = true)
             // Only now: a read cancelled before its result was applied leaves the request standing.
             synchronized(this) { if (ticket > owedAfter) owedAfter = -1L }
             return s
         }
 
-        /** Not cancellable and idempotent (keyed by run id). */
-        suspend fun storeTerminal(status: String) {
-            terminal = true
-            withContext(NonCancellable) { db.activeRunDao().setStatus(run.runId, status) }
+        /**
+         * The one writer of the run's status, under [applying] and not cancellable: stores [status] (a conditional
+         * update that never replaces a terminal status), reads the row back and shows exactly what it holds, so the
+         * screen and the send queue always read the same row. A rejected store shows the row's status (a gone row
+         * shows no reply). A non-terminal status from an older read ([ticket]) than one already applied is ignored; a
+         * stream event passes no ticket. False when the database failed: nothing was shown and the caller retries.
+         */
+        suspend fun publish(status: String, pending: PendingControl?, ticket: Long? = null): Boolean = withContext(NonCancellable) {
+            try {
+                beforeStatusStore(status)
+                applying.withLock {
+                    val ordered = ticket != null && status !in TERMINAL
+                    if (ordered && ticket!! <= applied) return@withLock
+                    val held = db.activeRunDao().storeStatus(run.runId, stored(status))
+                    if (ordered) applied = ticket!!
+                    if (held == null) {
+                        state(run.sessionKey).update { if (it?.runId == run.runId) null else it }
+                    } else {
+                        val accepted = held == stored(status)
+                        edit(run) { it.copy(status = held, pending = if (accepted) pending else null) }
+                    }
+                }
+                true
+            } catch (_: SQLException) {
+                false
+            }
+        }
+
+        /**
+         * One stop request ([post]), not cancellable as a whole, so a cancelled caller never loses an accepted stop.
+         * The intent is stored before the request is sent (if it cannot be, nothing is sent and the error surfaces).
+         * Accepted: the intent stays, whatever other requests do. Failed: it is cleared only if no other stop is in
+         * flight and none was accepted. The in-flight count is kept in try/finally, so no exception can leak it.
+         */
+        suspend fun stop(post: suspend () -> Unit): Unit = withContext(NonCancellable) {
+            stopping.withLock { stopsInFlight++ }
+            var accepted = false
+            var failed = false
+            try {
+                stopping.withLock {
+                    if (stopsInFlight == 1 && !stopAccepted) {
+                        stopAccepted = db.activeRunDao().get(run.runId)?.stopRequested == true // from before a restart
+                    }
+                    db.activeRunDao().setStopRequested(run.runId)
+                }
+                try {
+                    post()
+                } catch (e: ApiError) {
+                    failed = true
+                    throw e
+                }
+                accepted = true
+            } finally {
+                stopping.withLock {
+                    stopsInFlight--
+                    if (accepted) {
+                        stopAccepted = true
+                        db.activeRunDao().setStopRequested(run.runId)
+                    } else if (failed && stopsInFlight == 0 && !stopAccepted) {
+                        db.activeRunDao().clearStopRequested(run.runId)
+                    }
+                }
+            }
         }
 
         /** [read]; a failure (other than a refused key) also schedules a retry. */
@@ -297,12 +359,6 @@ class RunFollower(
                 }
             }
         }
-    }
-
-    /** Called only by [Refresher.read]: shows [s] and, when [store], stores its status for the send queue. */
-    private suspend fun applyStatus(run: ActiveRunEntity, s: RunStatus, store: Boolean) {
-        edit(run) { it.copy(status = s.status, pending = s.pendingControls.firstOrNull()) }
-        if (store) withContext(NonCancellable) { db.activeRunDao().setStatus(run.runId, stored(s.status)) }
     }
 
     /**
@@ -483,7 +539,7 @@ class RunFollower(
                 is RunEvent.Truncated -> return fallBackToPolling()
                 is RunEvent.Terminal -> {
                     // Stored at once and not cancellable: the send queue must never steer into a finished run.
-                    refresher(run).storeTerminal(event.status)
+                    if (!refresher(run).publish(event.status, pending = null)) return Next.Check // not stored: read the status again
                     return Next.Finish(event.status)
                 }
                 is RunEvent.Reasoning, is RunEvent.Steered -> Unit

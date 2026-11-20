@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
@@ -28,6 +29,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.api.HoldingQueue
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ReplyOutcome
@@ -43,10 +45,12 @@ class ChatRepositorySyncTest {
     private lateinit var server: MockWebServer
     private lateinit var db: AppDatabase
     private lateinit var repo: ChatRepository
+    private val responses = HoldingQueue()
 
     @Before
     fun setUp() {
         server = MockWebServer()
+        server.dispatcher = responses
         server.start()
         db = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -57,7 +61,7 @@ class ChatRepositorySyncTest {
     @After
     fun tearDown() {
         db.close()
-        server.close()
+        responses.closeAndVerify(server)
     }
 
     private fun respond(body: String, code: Int = 200) =
@@ -420,16 +424,17 @@ class ChatRepositorySyncTest {
     @Test
     fun slowRefreshDoesNotResurrectDeletedChat() = runTest {
         db.sessionDao().upsert(session("apofis-s"))
-        server.enqueue(
-            MockResponse.Builder().code(200).body(page(sessionJson("apofis-s"))).addHeader("Content-Type", "application/json")
-                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        val listed = responses.hold(
+            MockResponse.Builder().code(200).body(page(sessionJson("apofis-s"))).addHeader("Content-Type", "application/json").build(),
         )
         respond(fixture("session_delete.json"))
         val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
         withContext(Dispatchers.IO) { server.takeRequest() } // the refresh is fetching
         // A second instance over the same database: the lock must be process-wide, not per repository.
         val other = ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), db)
-        val delete = launch(Dispatchers.Default) { other.delete("apofis-s") }
+        // Undispatched: it runs to its first suspension, the lock the refresh holds, before launch returns.
+        val delete = launch(Dispatchers.Default, CoroutineStart.UNDISPATCHED) { other.delete("apofis-s") }
+        listed.countDown()
         refresh.join()
         delete.join()
         assertNull(db.sessionDao().get("apofis-s"))
@@ -615,13 +620,14 @@ class ChatRepositorySyncTest {
     @Test
     fun ordinarySyncIsCancellableDuringItsWrite() = runTest {
         db.sessionDao().upsert(session("apofis-s"))
-        server.enqueue(
-            MockResponse.Builder().body(messagesJson("apofis-s", listOf(1, 2))).addHeader("Content-Type", "application/json")
-                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        val response = responses.hold(
+            MockResponse.Builder().body(messagesJson("apofis-s", listOf(1, 2))).addHeader("Content-Type", "application/json").build(),
         )
+        val writing = CompletableDeferred<Unit>()
+        repo.beforeSyncWrite = { writing.complete(Unit) }
         val sync = async(Dispatchers.Default) { repo.syncMessages("apofis-s") }
-        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS)!! }
-        // Holds the database while the response is on its way, so the sync's write has to wait after its fetch.
+        assertNotNull(withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) })
+        // Holds the database before the response is let through, so the sync's write has to wait after its fetch.
         val holding = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
         val holder = launch(Dispatchers.Default) {
@@ -631,7 +637,8 @@ class ChatRepositorySyncTest {
             }
         }
         holding.await()
-        withContext(Dispatchers.IO) { Thread.sleep(1000) } // the response has arrived; the write is waiting
+        response.countDown()
+        writing.await() // fetched: its write now waits for the held database
         sync.cancel()
         release.complete(Unit)
         holder.join()

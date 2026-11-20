@@ -91,6 +91,7 @@ class ChatViewModelTest {
     private val requests = CopyOnWriteArrayList<RecordedRequest>()
     private val store = ViewModelStore()
     private val latches = mutableListOf<CountDownLatch>()
+    private val latchTimeouts = AtomicInteger() // held streams served only because their wait timed out
 
     /** A gate for a held stream; every gate is opened in tearDown, so a failed test never blocks the next. */
     private fun latch() = CountDownLatch(1).also { latches += it }
@@ -132,6 +133,7 @@ class ChatViewModelTest {
         db.close()
         server.close()
         Dispatchers.resetMain()
+        assertEquals("held streams that timed out", 0, latchTimeouts.get())
     }
 
     private var created = 0
@@ -179,7 +181,7 @@ class ChatViewModelTest {
             if (attaches.incrementAndGet() == 1 && first.isNotEmpty()) {
                 sse(*first.toTypedArray()) // ends without a terminal event: a drop, then a resume
             } else {
-                release.await(10, TimeUnit.SECONDS)
+                if (!release.await(10, TimeUnit.SECONDS)) latchTimeouts.incrementAndGet()
                 sse(terminal(99))
             }
         }

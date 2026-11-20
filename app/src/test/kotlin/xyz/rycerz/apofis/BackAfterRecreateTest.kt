@@ -17,6 +17,7 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
+import xyz.rycerz.apofis.api.HoldingQueue
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
@@ -38,9 +39,9 @@ class BackAfterRecreateTest {
     fun firstRunBackAfterRotationCancelsTheCheck() {
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
         val server = MockWebServer()
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(3_000, TimeUnit.MILLISECONDS).build(),
-        )
+        val holding = HoldingQueue()
+        server.dispatcher = holding
+        val response = holding.hold(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
         server.start()
         try {
             // Without animations: the spinner's endless animation would keep every idle wait busy until the check ended.
@@ -61,6 +62,7 @@ class BackAfterRecreateTest {
 
             assertEquals(ConnectState.Idle, vm.state)
             assertFalse(back.busy.value)
+            response.countDown()
             Thread.sleep(3_500) // past the moment the response arrives
             until("the late result to be dropped") { true }
             assertEquals(ConnectState.Idle, vm.state)
@@ -68,7 +70,7 @@ class BackAfterRecreateTest {
             assertNull(app.container.connection.value)
             controller.pause().stop().destroy()
         } finally {
-            server.close()
+            holding.closeAndVerify(server)
         }
     }
 }
