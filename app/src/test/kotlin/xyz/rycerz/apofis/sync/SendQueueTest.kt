@@ -603,6 +603,73 @@ class SendQueueTest {
     }
 
     @Test
+    fun failedSessionCreateIsNotAnAttempt() = runTest {
+        addSession("apofis-a", existsOnServer = false)
+        dropConnection()
+        val key = queue.enqueue("apofis-a", "hi")
+        assertFalse(queue.drain())
+        assertFalse(pending(key).attempted)
+        assertTrue(recorded().all { it.target == "/api/sessions" })
+        clock += SEND_EXPIRY_MS + 1
+        queue.drain()
+        assertEquals("expired", pending(key).error)
+        assertEquals(RetryResult.STARTED, queue.retry(key))
+    }
+
+    @Volatile private var armed = false
+
+    /**
+     * A database that, once [armed], deletes the chat's pending rows on the query thread just before the next
+     * statement whose SQL contains [match]: the user deleting the chat between retry's read and its write.
+     */
+    private fun racingDb(match: String): AppDatabase {
+        lateinit var racing: AppDatabase
+        racing = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .setQueryCallback(Dispatchers.Unconfined) { sql, _ ->
+                if (armed && sql.contains(match)) {
+                    armed = false
+                    racing.openHelper.writableDatabase.execSQL("DELETE FROM PendingSendEntity WHERE sessionKey = 'apofis-a'")
+                }
+            }
+            .build()
+        racing.openHelper.writableDatabase.execSQL(
+            "INSERT INTO SessionEntity (`key`, currentId, lineageIds, pinned, archived, startedAt, messageCount, stale, existsOnServer, hidden) " +
+                "VALUES ('apofis-a', 'apofis-a', '', 0, 0, 1.0, 0, 0, 1, 0)",
+        )
+        return racing
+    }
+
+    @Test
+    fun retryAfterConcurrentDeleteIsNotFound() = runTest {
+        val racing = racingDb("`PendingSendEntity` SET")
+        val q = SendQueue(api, racing, { _, _ -> }, { clock })
+        respond("{}", 400)
+        val key = q.enqueue("apofis-a", "hi")
+        q.drain()
+        assertEquals("http_error", racing.pendingSendDao().get(key)!!.error)
+        armed = true
+        assertEquals(RetryResult.NOT_FOUND, q.retry(key))
+        assertFalse(armed) // the delete happened between the read and the write
+        assertTrue(racing.pendingSendDao().observe("apofis-a").first().isEmpty())
+        racing.close()
+    }
+
+    @Test
+    fun retryReplacingKeyAfterConcurrentDeleteIsNotFound() = runTest {
+        val racing = racingDb("DELETE FROM PendingSendEntity WHERE idempotencyKey")
+        val q = SendQueue(api, racing, { _, _ -> }, { clock })
+        val key = q.enqueue("apofis-a", "old")
+        clock += SEND_EXPIRY_MS + 1
+        q.drain()
+        armed = true
+        assertEquals(RetryResult.NOT_FOUND, q.retry(key))
+        assertFalse(armed)
+        assertTrue(racing.pendingSendDao().observe("apofis-a").first().isEmpty())
+        racing.close()
+    }
+
+    @Test
     fun workerWithoutConnectionSucceeds() = runTest {
         val worker = TestListenableWorkerBuilder<SendWorker>(ApplicationProvider.getApplicationContext<Context>()).build()
         assertEquals(ListenableWorker.Result.success(), worker.doWork())

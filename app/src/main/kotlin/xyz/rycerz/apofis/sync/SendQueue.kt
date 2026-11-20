@@ -134,15 +134,17 @@ class SendQueue(
             val unsafe = send.attempted && (steer || old)
             if (unsafe && !confirmedDuplicateRisk) return RetryResult.NEEDS_CONFIRMATION
             val queued = send.copy(state = PendingState.QUEUED, error = null, runId = null)
-            if (unsafe || old) {
+            // The chat may have been deleted since the read: a write that changes no row means nothing was queued.
+            val written = if (unsafe || old) {
                 db.withTransaction {
-                    if (pendingDao.delete(idempotencyKey) == 1) {
-                        pendingDao.upsert(queued.copy(idempotencyKey = UUID.randomUUID().toString(), createdAt = now(), attempted = false))
-                    }
+                    if (pendingDao.delete(idempotencyKey) == 0) return@withTransaction false
+                    pendingDao.upsert(queued.copy(idempotencyKey = UUID.randomUUID().toString(), createdAt = now(), attempted = false))
+                    true
                 }
             } else {
-                pendingDao.update(queued)
+                pendingDao.update(queued) == 1
             }
+            if (!written) return RetryResult.NOT_FOUND
         }
         schedule()
         return RetryResult.STARTED
@@ -199,6 +201,7 @@ class SendQueue(
             return@withRepositoryLock Attempt.FAILED
         }
         val sent = send.copy(attempted = true)
+        var requested = false // creating the session is not an attempt to deliver the message
         val run = try {
             if (!session.existsOnServer) {
                 api.createSession(session.currentId, titleFrom(send.text).ifEmpty { null }) // false: it already exists, fine
@@ -210,9 +213,14 @@ class SendQueue(
                 fail(send, if (send.attempted) SendError.EXPIRED_UNCERTAIN else SendError.EXPIRED) // never sent: attempted as before
                 return@withRepositoryLock Attempt.FAILED
             }
+            requested = true
             api.startRun(send.requestBody, send.idempotencyKey)
         } catch (e: ApiError) {
-            val row = if (refused(e)) send.copy(attempted = false) else sent
+            val row = when {
+                !requested -> send
+                refused(e) -> send.copy(attempted = false)
+                else -> sent
+            }
             return@withRepositoryLock when (e) {
                 is ApiError.Network, is ApiError.Unavailable -> {
                     pendingDao.update(row)
