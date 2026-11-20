@@ -92,8 +92,8 @@ internal const val CACHE_PREFS = "cache"
 private const val CACHE_URL = "cache_base_url" // the server the cached rows came from
 internal const val SWITCH_MARKER = "switch_in_progress" // present from the first write of a switch until its last
 
-private const val ANY_CACHED_ROW = "SELECT EXISTS(SELECT 1 FROM SessionEntity) OR EXISTS(SELECT 1 FROM MessageEntity) " +
-    "OR EXISTS(SELECT 1 FROM PendingSendEntity) OR EXISTS(SELECT 1 FROM ActiveRunEntity) OR EXISTS(SELECT 1 FROM ReplyOutcomeEntity)"
+private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity")
+private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
 
 // ApiError causes can carry server or transport text, so only the class name is ever logged.
 private fun logFailure(e: Throwable) = Log.w(TAG, "Background task failed: ${e.javaClass.name}")
@@ -209,9 +209,15 @@ class AppContainer(
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
                     commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
                     withRepositoryLock {
-                        db.clearAllTables()
-                        composer.clear() // the same step: no draft outlives its chat, nothing survives into the new server
+                        // Not clearAllTables(): it commits the deletes, then can fail in VACUUM before the composer is cleared.
+                        db.runInTransaction { CACHED_TABLES.forEach { db.openHelper.writableDatabase.execSQL("DELETE FROM `$it`") } }
+                        composer.clear() // right after the commit: no draft outlives its chat, nothing survives into the new server
                     }
+                    // Best effort: only shrinks the file; the cache counts as cleared whatever happens here.
+                    runCatching {
+                        db.query("PRAGMA wal_checkpoint(FULL)", null).close()
+                        db.openHelper.writableDatabase.execSQL("VACUUM")
+                    }.onFailure(::logFailure)
                 }
                 if (!credentials.save(c)) throw IOException("credentials not written")
                 next = build(c)

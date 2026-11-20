@@ -3,7 +3,12 @@ package xyz.rycerz.apofis
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import android.database.sqlite.SQLiteException
 import androidx.room.Room
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.SupportSQLiteStatement
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
@@ -300,6 +305,65 @@ class AppContainerTest {
         assertTrue(db.sessionDao().all().isEmpty())
     }
 
+    /** A container on a database that fails the statements [faults] is told to; A's text is in its composer. */
+    private suspend fun withTextOfA(faults: FaultyStatements): AppDatabase {
+        val faulty = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).openHelperFactory(faults).allowMainThreadQueries().build()
+        container = AppContainer(app, store) { faulty }
+        container.connect(A)
+        val first = container.connected()!!
+        faulty.sessionDao().upsert(SessionEntity(
+            key = "apofis-a", currentId = "apofis-a", lineageIds = "", title = null, pinned = false, archived = false,
+            startedAt = 1.0, lastActiveAt = null, messageCount = 0, preview = null, stale = false,
+            existsOnServer = false, hidden = false, // a local-only chat: its row exists only here
+        ))
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        return faulty
+    }
+
+    @Test
+    fun vacuumFailingAfterTheDeletesCommittedStillClearsTheComposer() = runTest {
+        val faults = FaultyStatements()
+        val faulty = withTextOfA(faults)
+        faults.failVacuum = true
+
+        container.connect(B) // VACUUM is best effort: the switch continues
+
+        assertEquals(B, container.connected()!!.credentials)
+        assertTrue(faulty.sessionDao().all().isEmpty())
+        assertTrue(container.composer.keys.isEmpty())
+        assertEquals("", container.composer.current("apofis-a").draft)
+        assertNull(container.composer.current("apofis-b").unsent)
+
+        val c = Credentials("https://c.example/", "key-c")
+        assertTrue(container.willClearCache(c.baseUrl)) // C still asks, and there is nothing left to discard
+        container.connect(c)
+        assertEquals(c, container.connected()!!.credentials)
+        assertTrue(container.composer.keys.isEmpty())
+        faulty.close()
+    }
+
+    @Test
+    fun deletesFailingLeaveTablesAndComposerIntact() = runTest {
+        val faults = FaultyStatements()
+        val faulty = withTextOfA(faults)
+        faults.failDeletes = true
+
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: SQLiteException) {
+        }
+
+        assertNull(container.connected()) // the marker rule: disconnected
+        assertEquals(listOf("apofis-a"), faulty.sessionDao().all().map { it.key })
+        assertEquals("half a thought", container.composer.current("apofis-a").draft)
+        assertEquals("not stored", container.composer.current("apofis-b").unsent?.text)
+        assertTrue(container.willClearCache(B.baseUrl)) // the next switch asks before anything is deleted
+        faulty.close()
+    }
+
     @Test
     fun failureWhileSwitchingServerEndsDisconnected() = runTest {
         container.connect(A)
@@ -516,5 +580,31 @@ private class FlakyCacheApp(base: Application) : Application() {
                 }
             }
         }
+    }
+}
+
+/** Fails VACUUM or the table deletes while asked to, the way a storage error would. */
+private class FaultyStatements : SupportSQLiteOpenHelper.Factory {
+    @Volatile var failVacuum = false
+    @Volatile var failDeletes = false
+    private val real = FrameworkSQLiteOpenHelperFactory()
+
+    private fun check(sql: String) {
+        val s = sql.trimStart().uppercase()
+        if ((failVacuum && s.startsWith("VACUUM")) || (failDeletes && s.startsWith("DELETE FROM"))) throw SQLiteException("disk I/O error")
+    }
+
+    override fun create(configuration: SupportSQLiteOpenHelper.Configuration): SupportSQLiteOpenHelper {
+        val h = real.create(configuration)
+        return object : SupportSQLiteOpenHelper by h {
+            override val writableDatabase: SupportSQLiteDatabase get() = wrap(h.writableDatabase)
+            override val readableDatabase: SupportSQLiteDatabase get() = wrap(h.readableDatabase)
+        }
+    }
+
+    private fun wrap(d: SupportSQLiteDatabase) = object : SupportSQLiteDatabase by d {
+        override fun execSQL(sql: String) = check(sql).also { d.execSQL(sql) }
+        override fun execSQL(sql: String, bindArgs: Array<out Any?>) = check(sql).also { d.execSQL(sql, bindArgs) }
+        override fun compileStatement(sql: String): SupportSQLiteStatement = check(sql).let { d.compileStatement(sql) }
     }
 }
