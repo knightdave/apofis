@@ -239,9 +239,12 @@ class AppDriver {
      * the only one in the app's database, local only, with no other id. Returns the key.
      */
     fun awaitChat(serverUrl: String): String {
-        waitFor("the chat after connecting to $serverUrl", 30_000) { hasDesc(str("settings_title")) && !has(str("connect_title")) }
+        waitFor("the chat after connecting to $serverUrl", 30_000) { hasDesc(str("drawer_open")) && !has(str("connect_title")) }
         // A fresh install has no synced chats, so the app must open a new local one; never write into another chat.
-        waitFor("a new, empty chat", 10_000) { has(str("chat_new_title")) && nodes { it.className == "android.widget.EditText" }.size == 1 }
+        // By the chat screen's own tags: the closed drawer (its New chat button, its search field) is in the tree too.
+        waitFor("a new, empty chat", 10_000) {
+            snapshot().let { t -> t.tagged("chat.title").any { str("chat_new_title") in t.texts(it) } } && composerField() != null
+        }
         log("connected to $serverUrl")
         val key = openChatKey()
         var row: ChatRow? = null
@@ -251,6 +254,9 @@ class AppDriver {
         if (count != "1" || r.currentId != key || r.lineage.isNotEmpty() || r.onServer) fail("Expected one new local chat in the app's database ($count rows)")
         return key
     }
+
+    /** The chat's message field, by its tag (not "the only text field": the closed drawer's search field is one too). */
+    fun composerField(): AccessibilityNodeInfo? = nodes { it.viewIdResourceName == "composer.field" && it.isEditable }.singleOrNull()
 
     /** The key of the chat open on screen, from the chat screen's tag; fails unless exactly one, an app session id. */
     fun openChatKey(): String {
@@ -331,7 +337,7 @@ class AppDriver {
      */
     fun send(chat: String, text: String, button: String = str("chat_send"), online: Boolean = true) {
         if (openChatKey() != chat) fail("The open chat is not the one this test opened")
-        val composer = nodes { it.className == "android.widget.EditText" }.singleOrNull() ?: fail("No composer. Screen: ${screen()}")
+        val composer = composerField() ?: fail("No composer. Screen: ${screen()}")
         setField(composer, text)
         device.waitForIdle()
         if (sentChat != null && sentChat != chat) fail("A scenario sends in one chat only")

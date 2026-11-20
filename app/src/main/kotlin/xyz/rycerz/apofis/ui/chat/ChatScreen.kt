@@ -266,6 +266,7 @@ private fun Title(state: ChatUiState, onOpenConnection: () -> Unit, onRetryLoad:
     ) {
         Text(
             state.title.ifEmpty { stringResource(R.string.chat_new_title) },
+            Modifier.testTag("chat.title"), // the end-to-end tests read the open chat's title here
             style = MaterialTheme.typography.titleMedium,
             color = scheme.onSurface,
             maxLines = 1,

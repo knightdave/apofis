@@ -30,6 +30,7 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 // Test tags (end-to-end tests find the buttons by these ids).
 internal const val SEND_TAG = "composer.send"
 internal const val STOP_TAG = "composer.stop"
+internal const val FIELD_TAG = "composer.field"
 
 /** Whether the main button works: a send in flight ([busy]) blocks another send or steer, never Stop. */
 internal fun primaryEnabled(mode: ComposerMode, busy: Boolean) = when (mode) {
@@ -64,7 +65,7 @@ internal fun Composer(
         TextField(
             draft,
             onDraftChange,
-            Modifier.weight(1f),
+            Modifier.weight(1f).testTag(FIELD_TAG),
             placeholder = { Text(stringResource(R.string.chat_message_hint)) },
             maxLines = 5,
             textStyle = MaterialTheme.typography.bodyLarge,
