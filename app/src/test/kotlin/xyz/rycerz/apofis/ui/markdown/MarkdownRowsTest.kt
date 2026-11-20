@@ -430,6 +430,11 @@ class MarkdownRowsTest {
         "text\n\t---\n3. a\n\n4. b", "\u00A0<!--\n\n**b**\n-->",
         // Lines longer than the scanner looks at.
         "para\n" + " ".repeat(20_005) + "x\n\nnext", "<!--\n" + "x".repeat(25_000) + "-->\n```\ncode\n```", "| a |\n|---|\n|" + " ".repeat(20_010) + "x\n",
+        "<!--\n" + "x".repeat(20_000) + "-->\n\n```sh\necho ok\n```\n\n**bold**",
+        "```sh\nkeep\n```" + " ".repeat(20_000) + "not a closer\nstill code\n```",
+        "```\nkeep\n```" + " ".repeat(25_000) + "\nafter *e*", "a\n" + " ".repeat(25_000) + "\n# heading",
+        "| a |\n|---|\n| 1 |\n" + "x".repeat(20_005) + "| 2 |\n| 3 |\n\n# after", "| a |\n" + "|---".repeat(6_000) + "x\n| 1 |\n\n# after",
+        "<b>\n```\nnot\n```\n" + "y".repeat(25_000), "text\n" + "-".repeat(25_000) + "x\n3. a\n\n# after",
     )
 
     @Test
@@ -550,5 +555,66 @@ class MarkdownRowsTest {
         }
         // Fences are the app's own cut at any indentation (milestone 1), with a tab as with spaces.
         assertEquals(listOf(BlockKind.CODE), allRows("\t```sh\nls\n\t```\n").map { it.kind })
+    }
+
+    @Test
+    fun aLongLineDecidesNothingFromItsFirstPartAlone() {
+        // An end marker past 20,000 characters still ends the comment: the fence and the bold text after it render.
+        val comment = allRows("<!--\n" + "x".repeat(20_000) + "-->\n\n```sh\necho ok\n```\n\n**bold**")
+        assertEquals(DisplayChunk.Code("echo ok", 20_016, first = true, last = true), comment.single { it.kind == BlockKind.CODE }.chunk)
+        assertEquals(DisplayChunk.Blocks(listOf(MdBlock.Paragraph(MdText("bold", listOf(MdSpan(0, 4, SpanKind.STRONG)))))), comment.last().chunk)
+        // Backticks, 20,000 spaces and text do not close a fence: the line stays code, verbatim, in the one block.
+        val text = "```sh\nkeep\n```" + " ".repeat(20_000) + "not a closer\nstill code\n```"
+        val code = parseBlocks(text)
+        assertEquals(listOf(BlockKind.CODE), code.map { it.kind })
+        assertEquals("keep\n```" + " ".repeat(20_000) + "not a closer\nstill code", text.substring(code[0].start, code[0].end))
+        assertEquals("sh" to true, code[0].lang to code[0].fenceClosed)
+        assertEquals(allRows(text), streamed(text, 997))
+    }
+
+    /** The source lines of [text] that no block covers: blank lines and fence lines only. */
+    private fun assertNothingDropped(text: String) {
+        val t = text.replace("\r\n", "\n").replace('\r', '\n')
+        val blocks = parseBlocks(t)
+        var lineStart = 0
+        while (lineStart <= t.length) {
+            val nl = t.indexOf('\n', lineStart).let { if (it < 0) t.length else it }
+            val covered = blocks.any { it.start <= lineStart && nl <= it.end && it.start < it.end }
+            val line = t.substring(lineStart, nl)
+            val trimmed = line.trim()
+            val opening = trimmed.startsWith("```") && blocks.any { it.kind == BlockKind.CODE && it.start == minOf(nl + 1, t.length) }
+            assertTrue("dropped line at $lineStart: ${line.take(60)}", covered || trimmed.isEmpty() || trimmed == "```" || opening)
+            lineStart = nl + 1
+        }
+        // Literal and code rows show their block's source exactly (line breaks at cuts aside).
+        val rows = allRows(text)
+        for (b in blocks) {
+            if (b.kind != BlockKind.CODE && b.mode != BlockMode.LITERAL) continue
+            val shown = rows.filter { it.key.startsWith("r1/b${b.index}/") }.map { (it.chunk as? DisplayChunk.Literal)?.text ?: (it.chunk as? DisplayChunk.Code)?.text }
+            if (shown.any { it == null }) continue // shown parsed after all (within the parser's limits)
+            assertEquals(t.substring(b.start, b.end).replace("\n", ""), shown.joinToString("").replace("\n", ""))
+        }
+    }
+
+    /** After a block holding a line over 20,000 characters, the rows are those of a fresh parse of what follows. */
+    private fun assertLongLinesStayContained(text: String) {
+        val t = text.replace("\r\n", "\n").replace('\r', '\n')
+        val blocks = parseBlocks(t)
+        val rows = allRows(text)
+        for (b in blocks) {
+            if (!b.stable || t.substring(b.start, b.end).split('\n').none { it.length > 20_000 }) continue
+            val after = rows.filter { it.key.substringAfter("/b").substringBefore('/').toInt() > b.index }.map { it.kind to shift(it.chunk, b.next) }
+            assertEquals(replyRows("r1", t.substring(b.next)).map { it.kind to it.chunk }, after)
+        }
+    }
+
+    private fun shift(c: DisplayChunk, by: Int) = if (c is DisplayChunk.Code) c.copy(start = c.start - by) else c
+
+    @Test
+    fun noSourceIsDroppedAndLongLinesStayContained() {
+        for (text in adversarial) {
+            assertNothingDropped(text)
+            assertLongLinesStayContained(text)
+        }
     }
 }

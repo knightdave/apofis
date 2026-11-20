@@ -52,8 +52,9 @@ import xyz.rycerz.apofis.ui.markdown.rawPieces
 internal const val CHUNK = 1500
 
 /**
- * The block scanner decides what a line is from its first this many characters (the most a table may hold, so table
- * budgets stay exact) and treats the rest as more of the same line, so no line costs more than this to classify.
+ * While a line is unfinished, the block scanner decides what it is from its first this many characters (the most a
+ * table may hold) and treats the rest as more of the same line, so a growing line costs at most this per update. A
+ * finished line is decided from all of it, once.
  */
 private const val LINE_LOOK = TABLE_MAX_CHARS
 
@@ -105,15 +106,18 @@ internal fun parseBlocks(text: CharSequence, from: Int = 0): List<LogicalBlock> 
 internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<LogicalBlock>, noBreakBefore: Int = 0) {
     val i = s.pos
     val nl = lineEnd(text, maxOf(i, noBreakBefore))
-    val end = minOf(nl, i + LINE_LOOK) // the part of the line that decides what it is
     val finished = nl < text.length
+    // What decides the line: all of it once finished (read once, as the next update starts after it), else its first
+    // LINE_LOOK characters, from which nothing that depends on the line's end is decided.
+    val end = if (finished) nl else minOf(nl, i + LINE_LOOK)
+    val whole = end == nl
     Work.scanSteps += nl - maxOf(i, noBreakBefore) + end - i + 1
     s.pos = nl + 1
     val first = firstNonSpace(text, i, end)
     val shallow = first - i < 4 && (i until first).all { text[it] == ' ' } // indented under four columns, by spaces only
     val fence = first + FENCE.length <= end && text.startsWith(FENCE, first)
     if (s.fenceBody >= 0) {
-        if (fence && firstNonSpace(text, first + FENCE.length, end) == end) {
+        if (fence && whole && firstNonSpace(text, first + FENCE.length, end) == end) {
             out += LogicalBlock(0, s.fenceBody, maxOf(s.fenceBody, i - 1), BlockKind.CODE, s.fenceLang, stable = finished, fenceClosed = true, BlockMode.PARSED, next = nl + 1)
             s.fenceBody = -1
         }
@@ -170,12 +174,12 @@ internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<Logical
     // An empty item, or one numbered other than 1, cannot interrupt a paragraph: "text\n-" underlines a heading.
     if (item && (!inParagraph || canInterrupt(text, i, end))) s.list = true
     val heading = shallow && isAtxHeading(text, first, end)
-    val html = if (shallow && first < end && text[first] == '<') htmlMarker(text, first, end, inParagraph) else null
+    val html = if (shallow && first < end && text[first] == '<') htmlMarker(text, first, end, inParagraph || !whole) else null
     if (html != null) {
         val closed = html.isNotEmpty() && text.substring(first + 2, end).contains(html, ignoreCase = true)
         s.htmlEnd = if (closed) null else html
     }
-    s.paraOpen = !heading && html == null && !(shallow && isRuleOrUnderline(text, first, end))
+    s.paraOpen = !heading && html == null && !(shallow && whole && isRuleOrUnderline(text, first, end))
     if (shallow && first < end && text[first] == '>') s.noTable = true
     s.paraEnd = nl
     // A header row must start a paragraph: not in a list or quote, not a list item, heading or HTML block.
@@ -213,7 +217,7 @@ private val blockHtmlTags = (
  * blank line when it is "" (a block-level tag, or any other complete tag alone on its line, which cannot interrupt a
  * paragraph). Null when no HTML block starts here.
  */
-private fun htmlMarker(text: CharSequence, first: Int, end: Int, inParagraph: Boolean): String? {
+private fun htmlMarker(text: CharSequence, first: Int, end: Int, noLoneTag: Boolean): String? {
     fun at(prefix: String) = text.startsWith(prefix, first)
     fun ends(k: Int, slash: Boolean) = k == end || text[k].isHtmlSpace() || text[k] == '>' || (slash && text.startsWith("/>", k))
     rawHtmlTags.firstOrNull { tag -> text.regionMatches(first + 1, tag, 0, tag.length, ignoreCase = true) && ends(first + 1 + tag.length, false) }
@@ -226,7 +230,7 @@ private fun htmlMarker(text: CharSequence, first: Int, end: Int, inParagraph: Bo
     var k = nameStart
     while (k < end && (text[k].isAsciiLetter() || text[k].isAsciiDigit() || text[k] == '-')) k++
     if (k > nameStart && text.substring(nameStart, k).lowercase() in blockHtmlTags && ends(k, true)) return ""
-    if (inParagraph) return null
+    if (noLoneTag) return null // in a paragraph, or the line is cut off (the rest of it must be blank)
     val tag = tagEnd(text, first, end)
     return if (tag > 0 && firstNonSpace(text, tag, end) == end) "" else null
 }

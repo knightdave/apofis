@@ -314,9 +314,9 @@ class BlocksTest {
     fun spacesInsideAnHtmlCommentCostTheSameAtAnyLength() {
         val comment = "<!--\n"
         assertEquals(workFor(comment + " ".repeat(20_000), comment + " ".repeat(20_001)), workFor(comment + " ".repeat(80_000), comment + " ".repeat(80_001)))
-        // The line break that finishes a long line: the scanner reads at most 20,000 characters of it, however long.
+        // The line break that finishes a long line reads that line once, whole; the next token never reads it again.
         for (prefix in listOf("", comment, "```\n")) {
-            assertEquals(prefix, workFor(prefix + "x".repeat(20_000), prefix + "x".repeat(20_000) + "\n"), workFor(prefix + "x".repeat(80_000), prefix + "x".repeat(80_000) + "\n"))
+            assertEquals(prefix, workFor(prefix + "x".repeat(20_000) + "\n", prefix + "x".repeat(20_000) + "\ny"), workFor(prefix + "x".repeat(80_000) + "\n", prefix + "x".repeat(80_000) + "\ny"))
         }
     }
 
