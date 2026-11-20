@@ -19,7 +19,7 @@ class SmokeE2eTest {
     @Test
     fun connectViaLoopback() {
         app.freshStart()
-        app.connect(app.url) // journals the new local chat: exercises the journal and run-e2e.sh's cleanup check
+        app.connect(app.url)
         app.screenshot(name.methodName)
     }
 

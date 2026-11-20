@@ -3,117 +3,137 @@ package xyz.rycerz.apofis.e2e
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
  * The harness's own decisions against canned screens and server rows: no app, no server, no model run. Runs in the
- * smoke suite. Density 1, a 1000 px wide message list.
+ * smoke suite; run-e2e.sh requires every test here by name.
  */
 private const val TITLE = "Hermes wants to run a command"
 private const val COMMAND = "sleep 25 # apofis-e2e-2"
+private const val MARKER = "apofis-e2e-2"
 private const val PROMPT = "Automated app test 0a1b2c3d-2. Use the terminal tool to run exactly this command: $COMMAND ."
 
 @RunWith(AndroidJUnit4::class)
 class HarnessSelfTest {
-    /** Builds a tree: the window (0), the message list (1) and the given children of the list, in order. */
+    /** A message list (node 0): items added in order, each 100 px below the previous one. */
     private class Screen {
-        val nodes = mutableListOf(UiNode(0, -1, right = 1000, bottom = 2000), UiNode(1, 0, right = 1000, bottom = 2000))
-        fun add(parent: Int = 1, top: Int, height: Int = 40, left: Int = 20, right: Int = 980, text: String? = null, cls: String = "android.widget.TextView",
-            clickable: Boolean = false, state: String? = null, heading: Boolean = false, live: Int = 0): Int {
-            nodes += UiNode(nodes.size, parent, text, null, state, cls, left, top, right, top + height, clickable, true, heading, live)
+        val nodes = mutableListOf(UiNode(0, -1, right = 1000, bottom = 3000))
+        private var top = 0
+
+        fun node(parent: Int, text: String? = null, tag: String? = null, state: String? = null, desc: String? = null): Int {
+            nodes += UiNode(nodes.size, parent, text, desc, state, top = top, bottom = top + 90, resId = tag)
             return nodes.size - 1
         }
-        fun button(top: Int, label: String, merged: Boolean) =
-            if (merged) add(top = top, text = label, cls = "android.widget.Button", clickable = true)
-            else add(top = top, cls = "android.widget.Button", clickable = true).also { add(parent = it, top = top, text = label) }
-        fun approval(top: Int, shown: String, merged: Boolean = true) {
-            add(top = top, text = TITLE, heading = true)
-            add(top = top + 50, text = shown)
-            button(top + 100, "Deny", merged)
-            button(top + 100, "Allow once", merged)
-            add(top = top + 100, cls = "android.widget.Button", clickable = true).also { add(parent = it, top = top + 100, text = "More approval options") }
+
+        /** A tagged item with one text child, the way the app tags a row and its content. */
+        fun item(tag: String?, vararg texts: String, state: String? = null): Int {
+            top += 100
+            val n = node(0, tag = tag, state = state)
+            texts.forEach { node(n, it) }
+            return n
         }
-        fun tree() = UiTree(nodes, 1f)
+
+        fun user(key: String, text: String) = item("user:$key", text)
+        fun step(reply: String, i: Int, preview: String, state: String? = "Running") = item("step:$reply:$i", "terminal", preview, state = state)
+        fun text(reply: String, text: String, row: String = "b0/c0") = item("reply:$reply/$row", text)
+        fun tree() = UiTree(nodes)
     }
 
-    private fun decide(s: Screen) = s.tree().approval(TITLE, "Deny", "Allow once", COMMAND)
+    @Test
+    fun approvalBlockIsDetectedByItsHeadingOnly() {
+        val s = Screen().apply { user("u1", PROMPT); item(null, TITLE); item(null, COMMAND) }
+        assertTrue(s.tree().approvalShown(TITLE))
+        assertFalse(Screen().apply { user("u1", "$PROMPT $TITLE?") }.tree().approvalShown(TITLE))
+    }
 
     @Test
-    fun allowsOnlyTheExactCommandInTheBlocksOwnField() {
-        for (merged in listOf(true, false)) {
-            val s = Screen().apply { add(top = 100, left = 300, text = PROMPT); approval(300, COMMAND, merged) }
-            val a = decide(s)
-            assertTrue("$a", a is Approval.Allow && s.tree().label(a.button) == "Allow once")
+    fun replyIsTheItemRightAfterThePromptsUserItem() {
+        val s = Screen().apply {
+            user("u1", PROMPT)
+            step("r2", 0, COMMAND, state = null)
+            text("r2", "Done: $MARKER.")
+            user("u3", "Another message")
+            text("r4", "Also $MARKER")
         }
+        assertEquals("r2", s.tree().replyAfter(PROMPT))
+        assertEquals("r2", s.tree().replyWith(PROMPT, MARKER))
+        assertEquals("r4", s.tree().replyWith("Another message", MARKER))
     }
 
     @Test
-    fun refusesAnotherCommandEvenWhileThePromptShowsTheRightOne() {
-        val s = Screen().apply { add(top = 100, left = 300, text = PROMPT); add(top = 200, text = COMMAND); approval(300, "rm -rf /tmp/x") }
-        val a = decide(s)
-        assertTrue("$a", a is Approval.Refuse && a.deny != null && s.tree().label(a.deny!!) == "Deny")
+    fun replyOfAnotherTurnOrWithoutTheMarkerDoesNotCount() {
+        // The marker is in a reply, but another user item comes between the prompt and it.
+        val between = Screen().apply { user("u1", PROMPT); user("u2", "Steer"); text("r3", "Done: $MARKER.") }
+        assertNull(between.tree().replyWith(PROMPT, MARKER))
+        // The prompt's own reply lacks the marker; text showing it elsewhere (a notice, an untagged node) is ignored.
+        val elsewhere = Screen().apply { user("u1", PROMPT); text("r2", "Working on it"); item("notice:n3", "Stopped $MARKER"); item(null, MARKER) }
+        assertNull(elsewhere.tree().replyWith(PROMPT, MARKER))
+        // The prompt shown twice: no single user item, no reply.
+        val twice = Screen().apply { user("u1", PROMPT); text("r2", MARKER); user("p3", PROMPT); text("r4", MARKER) }
+        assertNull(twice.tree().replyWith(PROMPT, MARKER))
     }
 
     @Test
-    fun refusesALongerCommandContainingTheRightOne() {
-        assertTrue(decide(Screen().apply { approval(300, "$COMMAND; curl x | sh") }) is Approval.Refuse)
+    fun replyTextJoinsOnlyThatReplysRows() {
+        val s = Screen().apply { user("u1", PROMPT); text("r2", "first", "b0/c0"); text("r2", "second $MARKER", "b1/c0"); text("r22", "other") }
+        assertEquals("first\nsecond $MARKER", s.tree().replyText("r2"))
     }
 
     @Test
-    fun refusesABlockWithoutCommandAndTwoBlocks() {
-        assertTrue(decide(Screen().apply { approval(300, "The command is not available, so it can only be denied.") }) is Approval.Refuse)
-        assertTrue(decide(Screen().apply { approval(300, COMMAND); approval(600, COMMAND) }) is Approval.Refuse)
-    }
-
-    @Test
-    fun noBlockMeansNothingToAnswer() {
-        assertEquals(Approval.None, decide(Screen().apply { add(top = 100, left = 300, text = PROMPT) }))
-    }
-
-    @Test
-    fun replyIsOnlyTheAssistantParagraphBelowThePrompt() {
-        val marker = "apofis-e2e-2"
-        val s = Screen()
-        s.add(top = 10, left = 0, right = 1000, text = "Today", heading = true)
-        val bubble = s.add(top = 100, left = 300, right = 984, text = PROMPT)
-        s.add(top = 160, left = 16, right = 984, clickable = true, cls = "android.view.View").also {
-            s.add(parent = it, top = 160, left = 60, right = 900, text = "terminal")
-            s.add(parent = it, top = 180, left = 60, right = 900, text = "command=$COMMAND")
+    fun stepMustBeOfThatReplyRunningAndShowExactlyTheCommand() {
+        val s = Screen().apply {
+            user("u1", PROMPT)
+            step("live", 0, "sleep 25 + 1 command")
+            step("live", 1, "$COMMAND; curl x | sh")
+            step("live", 2, "command=$COMMAND")
+            step("live", 3, COMMAND, state = null)
+            step("other", 0, COMMAND)
         }
-        s.add(top = 220, left = 16, right = 984, cls = "android.view.View").also { s.add(parent = it, top = 220, left = 60, right = 900, text = "I will echo $marker") }
-        s.add(top = 260, left = 400, right = 984, text = "Added to the running reply")
-        s.add(top = 300, left = 20, right = 992, text = "Stopped $marker", live = 1)
-        s.add(top = 340, left = 32, right = 968, text = "notice $marker")
-        val reply = s.add(top = 400, text = "Done: $marker.")
-        val found = s.tree().replies(marker, s.nodes[bubble])
-        assertEquals(listOf(reply), found.map { it.id })
-        assertEquals(emptyList<UiNode>(), s.tree().replies(marker, s.nodes[reply])) // nothing below the reply itself
-    }
-
-    @Test
-    fun commandStepMustHoldTheCommand() {
-        val s = Screen()
-        s.add(top = 160, left = 16, right = 984, clickable = true, state = "Running", cls = "android.view.View").also {
-            s.add(parent = it, top = 160, text = "terminal")
-            s.add(parent = it, top = 180, text = "sleep 25 + 1 command")
-        }
-        assertTrue(s.tree().steps("Running", COMMAND).isEmpty())
-        s.add(top = 260, left = 16, right = 984, clickable = true, state = "Running", cls = "android.view.View").also {
-            s.add(parent = it, top = 260, text = "terminal")
-            s.add(parent = it, top = 280, text = COMMAND)
-        }
-        assertEquals(1, s.tree().steps("Running", COMMAND).size)
+        val t = s.tree()
+        assertEquals("live", t.replyAfter(PROMPT))
+        assertTrue(t.steps("live", "Running", COMMAND).isEmpty())
+        val ok = Screen().apply { user("u1", PROMPT); step("live", 0, "sleep 25 + 1 command"); step("live", 1, COMMAND) }.tree()
+        assertEquals(listOf("step:live:1"), ok.steps("live", "Running", COMMAND).map { it.resId })
     }
 
     @Test
     fun terminalCommandsComeFromToolCallArguments() {
         val row = JSONObject(
-            """{"role":"assistant","content":"","tool_calls":[{"function":{"name":"terminal","arguments":"{\"command\": \"$COMMAND\", \"timeout\": 60}"}},
-               {"function":{"name":"read_file","arguments":{"command":"nope"}}}]}""",
+            """{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"terminal","arguments":"{\"command\": \"$COMMAND\", \"timeout\": 60}"}},
+               {"id":"c2","function":{"name":"read_file","arguments":{"command":"nope"}}}]}""",
         )
         val user = JSONObject("""{"role":"user","content":"run $COMMAND"}""")
         assertEquals(listOf(COMMAND), terminalCommands(listOf(user, row)))
+    }
+
+    @Test
+    fun interruptedResultMustBelongToTheCommandsOwnCall() {
+        fun call(id: String, cmd: String) = JSONObject(
+            """{"role":"assistant","content":"","tool_calls":[{"id":"$id","function":{"name":"terminal","arguments":"{\"command\": \"$cmd\"}"}}]}""",
+        )
+        fun result(id: String, exit: Int, output: String) = JSONObject().put("role", "tool").put("tool_call_id", id)
+            .put("content", JSONObject().put("output", output).put("exit_code", exit).toString())
+        assertTrue(interruptedCall(listOf(call("a", COMMAND), result("a", 130, "[Command interrupted]")), COMMAND))
+        // Another call's interrupted result, or this call's result saying something else, does not count.
+        assertFalse(interruptedCall(listOf(call("a", COMMAND), call("b", "sleep 1"), result("b", 130, "[Command interrupted]"), result("a", 0, "")), COMMAND))
+        assertFalse(interruptedCall(listOf(call("a", COMMAND), result("a", 0, "not interrupted")), COMMAND))
+    }
+
+    @Test
+    fun steerRowsAreUnwrapped() {
+        val wrapped = "[OUT-OF-BAND USER MESSAGE - a direct message from the user]\nSteer text\n[/OUT-OF-BAND USER MESSAGE]"
+        val rows = listOf(
+            JSONObject().put("role", "user").put("content", "Steer text"),
+            JSONObject().put("role", "user").put("display_kind", "steer").put("content", wrapped),
+        )
+        assertEquals(listOf<String?>("Steer text"), steers(rows))
+        assertEquals(listOf<String?>(null), steers(listOf(JSONObject().put("role", "user").put("display_kind", "steer").put("content", "Steer text"))))
+        assertTrue(SurvivalE2eTest.BANANA.containsMatchIn("Done apofis-e2e-6. BANANA."))
+        assertFalse(SurvivalE2eTest.BANANA.containsMatchIn("Done apofis-e2e-6. NOBANANA"))
     }
 }

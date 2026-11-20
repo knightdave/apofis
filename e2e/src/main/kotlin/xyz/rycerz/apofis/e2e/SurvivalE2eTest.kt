@@ -13,8 +13,10 @@ import org.junit.runner.RunWith
 /**
  * The milestone's survival scenarios against the real Hermes server (each costs one model run). Every scenario starts
  * from cleared app data, connects to the emulator's host alias (a private address, so local network access is
- * granted through adb), journals the new chat's id before sending, asserts on the screen and on the server's record
- * of that chat, and saves a screenshot. run-e2e.sh deletes the journaled sessions after checking each one's identity.
+ * granted through adb), journals this run's chat right after each send and again after the reply, asserts on the
+ * screen (chat items found by the app's test tags) and on the server's record of that chat, and saves a screenshot.
+ * run-e2e.sh deletes the journaled sessions after checking each one's identity, and checks the steer and the
+ * stopped run against the server once more from the build host.
  */
 @RunWith(AndroidJUnit4::class)
 class SurvivalE2eTest {
@@ -31,6 +33,7 @@ class SurvivalE2eTest {
     @Before
     fun start() {
         app.log("scenario ${name.methodName} starts")
+        app.scenario = name.methodName
         app.freshStart()
         session = app.connect(app.directUrl)
     }
@@ -38,8 +41,6 @@ class SurvivalE2eTest {
     @After
     fun cleanUp() {
         app.airplane(false)
-        // A compressed chat gets new ids: journal those too (already journaled ids are skipped).
-        app.appSessionIds().filter { it.startsWith("apofis-") }.forEach(app::journal)
         app.log("scenario ${name.methodName} ends")
     }
 
@@ -47,37 +48,37 @@ class SurvivalE2eTest {
     fun connectAndChat() {
         val marker = "apofis-e2e-1"
         val prompt = "Test ${app.nonce}-1. Reply with exactly: $marker"
-        app.send(prompt)
+        val chat = sendPrompt(prompt)
         awaitReply(marker, prompt)
-        assertOnce(prompt, marker)
+        assertOnce(chat, prompt, marker)
         app.screenshot(name.methodName)
     }
 
     @Test
     fun replySurvivesAirplaneMode() {
         val (prompt, command, marker) = longRun(25, 2)
-        app.send(prompt)
-        awaitToolStep(command)
+        val chat = sendPrompt(prompt)
+        awaitToolStep(prompt, command)
         val cut = SystemClock.uptimeMillis()
         app.airplane(true)
         // Proves a real interruption: the device's airplane mode is on and the app itself reports being offline
         // (not a generic "can't reach server", which other faults also produce).
-        app.waitFor("airplane mode on and the status line showing Offline", 30_000) { app.airplaneOn() && app.has(app.str("chat_status_offline")) }
+        app.waitFor("airplane mode on and the status line showing Offline", 30_000) { app.airplaneOn() && offline() }
         app.log("app sees the loss: ${app.screen()}")
         app.screenshot("2-airplane-offline")
         SystemClock.sleep((30_000 - (SystemClock.uptimeMillis() - cut)).coerceAtLeast(0))
         app.airplane(false)
         app.waitFor("airplane mode off", 10_000) { !app.airplaneOn() }
-        awaitReply(marker, prompt, command)
-        assertOnce(prompt, marker, command)
+        awaitReply(marker, prompt)
+        assertOnce(chat, prompt, marker, command)
         app.screenshot(name.methodName)
     }
 
     @Test
     fun replySurvivesScreenOff() {
         val (prompt, command, marker) = longRun(25, 3)
-        app.send(prompt)
-        awaitToolStep(command)
+        val chat = sendPrompt(prompt)
+        awaitToolStep(prompt, command)
         // Proves the starting state was read: the screen is reported awake before it is turned off.
         if (wakefulness() != "Awake") fail("The screen was not awake before the test turned it off")
         app.shell("input keyevent KEYCODE_SLEEP")
@@ -88,16 +89,16 @@ class SurvivalE2eTest {
         app.shell("input keyevent KEYCODE_WAKEUP")
         app.shell("wm dismiss-keyguard")
         app.waitFor("the screen on and the app in front", 20_000) { wakefulness() == "Awake" && app.device.currentPackageName == APP }
-        awaitReply(marker, prompt, command)
-        assertOnce(prompt, marker, command)
+        awaitReply(marker, prompt)
+        assertOnce(chat, prompt, marker, command)
         app.screenshot(name.methodName)
     }
 
     @Test
     fun replySurvivesProcessDeath() {
         val (prompt, command, marker) = longRun(25, 4)
-        app.send(prompt)
-        awaitToolStep(command)
+        val chat = sendPrompt(prompt)
+        awaitToolStep(prompt, command)
         // Proves the query works and names the process: pidof succeeds (exit 0) with one numeric pid.
         val (rc, pid) = app.pidof()
         if (rc != 0 || !Regex("\\d+").matches(pid)) fail("Could not read the app's pid before killing it (exit $rc, \"$pid\")")
@@ -110,9 +111,9 @@ class SurvivalE2eTest {
         app.log("app process $pid killed")
         SystemClock.sleep(30_000)
         app.launch()
-        awaitReply(marker, prompt, command)
+        awaitReply(marker, prompt)
         SystemClock.sleep(3_000) // a duplicate would show up right after the first copy
-        assertOnce(prompt, marker, command)
+        assertOnce(chat, prompt, marker, command)
         app.screenshot(name.methodName)
     }
 
@@ -120,41 +121,43 @@ class SurvivalE2eTest {
     fun offlineMessageSendsItself() {
         app.airplane(true)
         // Proves the device is offline before sending: airplane mode is on and the app says Offline.
-        app.waitFor("airplane mode on and the status line showing Offline", 30_000) { app.airplaneOn() && app.has(app.str("chat_status_offline")) }
+        app.waitFor("airplane mode on and the status line showing Offline", 30_000) { app.airplaneOn() && offline() }
         val marker = "apofis-e2e-5"
         val prompt = "Test ${app.nonce}-5. Reply with exactly: $marker"
-        app.send(prompt)
-        app.waitFor("the message bubble waiting to send", 15_000) { app.has(prompt) && app.has(app.str("chat_queued")) }
+        val chat = sendPrompt(prompt)
+        app.waitFor("the message bubble waiting to send", 15_000) { queued(prompt) }
         // Stays offline long enough that a send that ignored the network would have failed or gone out by now.
         SystemClock.sleep(15_000)
-        if (!app.airplaneOn() || !app.has(prompt) || !app.has(app.str("chat_queued")) || !app.has(app.str("chat_status_offline"))) {
+        if (!app.airplaneOn() || !queued(prompt) || !offline()) {
             fail("After 15 s offline the message should still be waiting and the status Offline. Screen: ${app.screen()}")
         }
         app.screenshot("5-offline-waiting")
         app.airplane(false)
         app.waitFor("airplane mode off", 10_000) { !app.airplaneOn() }
         awaitReply(marker, prompt, timeoutMs = 60_000)
-        assertOnce(prompt, marker)
+        assertOnce(chat, prompt, marker)
         app.screenshot(name.methodName)
     }
 
     @Test
     fun steerDuringRun() {
-        val (prompt, command, _) = longRun(20, 6)
-        val steering = "End your reply with the word BANANA"
-        app.send(prompt)
-        awaitToolStep(command)
+        val (prompt, command, marker) = longRun(20, 6)
+        val steering = steeringText(app.nonce)
+        val chat = sendPrompt(prompt)
+        awaitToolStep(prompt, command)
         app.send(steering, button = app.str("chat_steer"))
-        app.waitFor("the steering text as a user bubble", 30_000) { app.has(steering) }
-        // Proves the steer changed the reply: the turn's reply paragraph (below the prompt) ends with BANANA.
-        app.waitFor("a finished reply ending with BANANA", reply, meanwhile = { app.answerApproval(command) }) {
-            idle() && lastReply(prompt)?.let { BANANA.containsMatchIn(it) } == true
+        app.waitFor("the steering text as a user message", 30_000) { app.snapshot().user(steering) != null }
+        // Proves the steer changed the reply: the reply right after the steering message holds the marker and ends
+        // with the word BANANA.
+        app.waitFor("a finished reply after the steer with $marker, ending with BANANA", reply, meanwhile = app::failOnApproval) {
+            idle() && app.snapshot().replyWith(steering, marker)?.let { BANANA.containsMatchIn(app.snapshot().replyText(it)) } == true
         }
-        if (app.snapshot().bubbles(steering).size != 1) fail("The steering bubble is not shown once after the reply. Screen: ${app.screen()}")
-        // Proves the server did it: the command ran, the steer reached the run, and the stored final answer ends with BANANA.
-        serverAgrees("the command, the steer and a final answer ending with BANANA") { rows ->
-            command in terminalCommands(rows) && rows.any { steering in (it.str("content") ?: "") } &&
-                finals(rows).lastOrNull()?.let { BANANA.containsMatchIn(it) } == true
+        app.journalOwned()
+        // Proves the server did it: the command was called, exactly one steer row holding exactly the steering text,
+        // and the stored final answer holds the marker and ends with BANANA.
+        serverAgrees(chat, "the command, the steer row with exactly the steering text and a final answer ending with BANANA") { rows ->
+            command in terminalCommands(rows) && steers(rows) == listOf(steering) &&
+                finals(rows).lastOrNull()?.let { marker in it && BANANA.containsMatchIn(it) } == true
         }
         app.screenshot(name.methodName)
     }
@@ -162,14 +165,14 @@ class SurvivalE2eTest {
     @Test
     fun stopDuringRun() {
         val (prompt, command, _) = longRun(60, 7)
-        app.send(prompt)
-        awaitToolStep(command)
-        app.click(app.str("chat_stop"))
+        val chat = sendPrompt(prompt)
+        awaitToolStep(prompt, command)
+        app.journalRun(chat) // the build host checks this run's final status on the server
+        app.clickTag("composer.stop", app.str("chat_stop"))
         app.waitFor("the Stopped notice and the composer back in send mode", 60_000) { app.has(app.str("chat_outcome_stopped")) && idle() }
-        // Proves the stop reached the server: the scenario's command ran there and its tool result says interrupted.
-        serverAgrees("the command called and its result interrupted") { rows ->
-            command in terminalCommands(rows) && rows.any { it.str("role") == "tool" && "interrupted" in (it.str("content") ?: "").lowercase() }
-        }
+        app.journalOwned()
+        // Proves the stop reached the server: the scenario's own terminal call has its own result marked interrupted.
+        serverAgrees(chat, "the command called and its own result interrupted") { rows -> interruptedCall(rows, command) }
         app.screenshot(name.methodName)
     }
 
@@ -192,69 +195,78 @@ class SurvivalE2eTest {
     private fun wakefulness(): String =
         Regex("mWakefulness=(\\w+)").find(app.shell("dumpsys power"))?.groupValues?.get(1) ?: fail("dumpsys power did not report mWakefulness")
 
+    /** Sends [prompt] in the chat this scenario connected to; the journaled chat must be that one. */
+    private fun sendPrompt(prompt: String): String = app.send(prompt).also { if (it != session) fail("The message went to another chat than the one connected") }
+
     /** The composer is back to Send: no run is going on. */
-    private fun idle() = app.hasDesc(app.str("chat_send")) && !app.hasDesc(app.str("chat_stop"))
-
-    /** The one bubble showing [prompt]; null when it is missing or shown more than once. */
-    private fun bubble(tree: UiTree, prompt: String) = tree.bubbles(prompt).singleOrNull()
-
-    private fun lastReply(prompt: String): String? {
-        val tree = app.snapshot()
-        val b = bubble(tree, prompt) ?: return null
-        return tree.replies("", b).maxByOrNull { it.top }?.text
+    private fun idle(): Boolean {
+        val t = app.snapshot()
+        return t.tagged("composer.send").any { app.str("chat_send") in t.descs(it) } && t.tagged("composer.stop").isEmpty()
     }
 
-    /** Waits until the running step for exactly this scenario's command is on screen. */
-    private fun awaitToolStep(command: String) = app.waitFor("the running terminal step for \"$command\"", toolStep, meanwhile = { app.answerApproval(command) }) {
-        // Proves the expected command is the one running: a step in the Running state whose own text holds the command.
-        app.snapshot().steps(app.str("chat_tool_running"), command).isNotEmpty()
-    }.also { app.log("tool step running: $command") }
+    /** The status line (found by its tag) says Offline. */
+    private fun offline(): Boolean = app.snapshot().let { t -> t.tagged("status.line").any { app.str("chat_status_offline") in t.texts(it) } }
 
-    private fun awaitReply(marker: String, prompt: String, command: String? = null, timeoutMs: Long = reply) =
-        app.waitFor("a finished reply containing $marker", timeoutMs, meanwhile = { command?.let(app::answerApproval) }) {
-            // Proves a reply arrived for this turn: an assistant reply paragraph below the prompt holds the marker.
-            val tree = app.snapshot()
-            idle() && bubble(tree, prompt)?.let { tree.replies(marker, it).isNotEmpty() } == true
-        }.also { app.log("reply with $marker shown") }
+    /** The user message [prompt] is shown once, with its own "waiting to send" caption. */
+    private fun queued(prompt: String): Boolean = app.snapshot().let { t -> t.user(prompt)?.let { app.str("chat_queued") in t.texts(it.node) } == true }
 
-    /** Final assistant answers in [rows] (the stored reply text of each turn). */
-    private fun finals(rows: List<JSONObject>) =
-        rows.filter { it.str("role") == "assistant" && it.str("finish_reason") == "stop" }.mapNotNull { it.str("content") }.filter(String::isNotBlank)
+    /**
+     * Waits until the reply right after this scenario's user message shows a running step whose own text is exactly
+     * this scenario's command.
+     */
+    private fun awaitToolStep(prompt: String, command: String) =
+        app.waitFor("the running terminal step for \"$command\" in this turn's reply", toolStep, meanwhile = app::failOnApproval) {
+            val t = app.snapshot()
+            t.replyAfter(prompt)?.let { t.steps(it, app.str("chat_tool_running"), command).isNotEmpty() } == true
+        }.also { app.log("tool step running: $command") }
+
+    private fun awaitReply(marker: String, prompt: String, timeoutMs: Long = reply) {
+        app.waitFor("a finished reply containing $marker", timeoutMs, meanwhile = app::failOnApproval) {
+            // Proves a reply arrived for this turn: the reply item right after this prompt's user item holds the marker.
+            idle() && app.snapshot().replyWith(prompt, marker) != null
+        }
+        app.log("reply with $marker shown")
+        app.journalOwned() // once more after the reply: compression can give the chat a new id
+    }
 
     /** Polls the server's record of this chat until [check] holds (rows may be written just after the run ends). */
-    private fun serverAgrees(what: String, check: (List<JSONObject>) -> Boolean) {
+    private fun serverAgrees(chat: String, what: String, check: (List<JSONObject>) -> Boolean) {
         var rows = emptyList<JSONObject>()
         val end = SystemClock.uptimeMillis() + 30_000
         while (SystemClock.uptimeMillis() < end) {
-            rows = app.serverMessages(session)
+            rows = app.serverMessages(chat)
             if (check(rows)) return
             SystemClock.sleep(1_000)
         }
-        app.log("server rows of $session: ${rows.map { "${it.str("role")}/${it.str("display_kind")}/${it.str("finish_reason")}: ${it.str("content")?.take(120)}" }}")
-        fail("The server's record of $session does not show $what")
+        app.log("server rows of $chat: ${rows.map { "${it.str("role")}/${it.str("display_kind")}/${it.str("finish_reason")}: ${it.str("content")?.take(120)}" }}")
+        fail("The server's record of $chat does not show $what")
     }
 
     /**
      * The user's message and the reply each appear exactly once, on screen and on the server; with [command], the
      * server also shows that exact terminal command was called.
      */
-    private fun assertOnce(prompt: String, marker: String, command: String? = null) {
+    private fun assertOnce(chat: String, prompt: String, marker: String, command: String? = null) {
         val tree = app.snapshot()
-        val bubbles = tree.bubbles(prompt)
-        val replies = bubbles.singleOrNull()?.let { tree.replies(marker, it) }.orEmpty()
-        // Proves no duplicate on screen: one bubble with the prompt and one reply paragraph with the marker.
-        if (bubbles.size != 1 || replies.size != 1) {
+        // Proves no duplicate on screen: one user item with the prompt, and the reply right after it holds the marker
+        // while no other reply on screen does.
+        val key = tree.replyWith(prompt, marker)
+        val others = tree.items().filter { it.kind == "reply" && it.key != key }.map { it.key }.distinct().filter { marker in tree.replyText(it) }
+        if (key == null || others.isNotEmpty()) {
             app.log(app.dump())
-            fail("Expected the message and the reply once each on screen, found ${bubbles.size} and ${replies.size}")
+            fail("Expected the message and its reply with $marker once each on screen (reply $key, others $others)")
         }
         // Proves no duplicate on the server: one stored user message with the prompt and one final answer with the marker.
-        serverAgrees("the prompt once, one final answer with $marker${command?.let { " and the command \"$it\"" } ?: ""}") { rows ->
+        serverAgrees(chat, "the prompt once, one final answer with $marker${command?.let { " and the command \"$it\"" } ?: ""}") { rows ->
             rows.count { it.str("role") == "user" && prompt in (it.str("content") ?: "") } == 1 &&
                 finals(rows).count { marker in it } == 1 && (command == null || command in terminalCommands(rows))
         }
     }
 
-    private companion object {
-        val BANANA = Regex("BANANA\\W*$")
+    companion object {
+        val BANANA = Regex("\\bBANANA\\W*$")
+
+        /** The steering message; run-e2e.sh builds the same text to check the steer row on the server. */
+        fun steeringText(nonce: String) = "Test $nonce-6 steer: end your reply with the word BANANA"
     }
 }

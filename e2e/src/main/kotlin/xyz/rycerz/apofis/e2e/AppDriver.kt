@@ -10,7 +10,6 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.UiDevice
 import java.net.HttpURLConnection
 import java.net.URL
-import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.rules.TestWatcher
 import org.junit.runner.Description
@@ -18,31 +17,36 @@ import org.junit.runner.Description
 const val APP = "xyz.rycerz.apofis"
 const val LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
 const val OUT_DIR = "/data/local/tmp/apofis-e2e" // written as the shell user; run-e2e.sh pulls it
-const val SESSIONS = "$OUT_DIR/sessions.txt" // the session journal: every chat id the app created in this run
+const val SESSIONS = "$OUT_DIR/sessions.txt" // the session journal, created empty by run-e2e.sh before the tests run
 private const val TAG = "ApofisE2e"
 private val SESSION_ID = Regex("apofis-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+private val RUN_ID = Regex("run_[0-9a-f]{32}")
+private val SCENARIO = Regex("[A-Za-z]{1,40}")
 
 fun fail(message: String): Nothing = throw AssertionError(message)
 
 /**
  * Drives the app from this separate test process: shell commands, accessibility actions and the app's own string
  * resources. Arguments: apofisUrl (loopback, through adb reverse), apofisDirectUrl (the emulator's host alias,
- * 10.0.2.2), apofisNonce (this run's id, put into every prompt's first line, so into the chat's server title) and
- * apofisKey.
+ * 10.0.2.2), apofisNonce (this run's id, put into every prompt's first line, so into the chat's server title),
+ * apofisStart (the device clock in epoch seconds just before the instrumentation started) and apofisKey.
  */
 class AppDriver {
     val instrumentation = InstrumentationRegistry.getInstrumentation()
     val device: UiDevice = UiDevice.getInstance(instrumentation)
     private val args = InstrumentationRegistry.getArguments()
     private val res = instrumentation.context.packageManager.getResourcesForApplication(APP)
-    private val density = instrumentation.context.resources.displayMetrics.density
 
     fun arg(name: String): String = requireNotNull(args.getString(name)?.takeIf(String::isNotEmpty)) { "Instrumentation argument $name is missing" }
 
     val url get() = arg("apofisUrl")
     val directUrl get() = arg("apofisDirectUrl")
     val nonce get() = arg("apofisNonce").also { require(Regex("[0-9a-f]{8}").matches(it)) { "Bad apofisNonce" } }
+    private val runStart get() = arg("apofisStart").toLong()
     private val key get() = arg("apofisKey")
+
+    /** The scenario now running, written into each journal line. */
+    var scenario = "none"
 
     /** A string of the app, by resource name: the tests find elements by what the user sees. */
     fun str(name: String, vararg format: Any): String =
@@ -137,17 +141,17 @@ class AppDriver {
             val id = out.size
             out += UiNode(
                 id, parent, n.text?.toString(), n.contentDescription?.toString(), n.stateDescription?.toString(), n.className?.toString(),
-                r.left, r.top, r.right, r.bottom, n.isClickable, n.isEnabled, n.isHeading, n.liveRegion, n.isEditable,
+                r.left, r.top, r.right, r.bottom, n.isClickable, n.isEnabled, n.isHeading, n.liveRegion, n.isEditable, n.viewIdResourceName,
             )
             for (i in 0 until n.childCount) walk(n.getChild(i), id)
         }
         roots().filter { it.packageName == APP }.forEach { walk(it, -1) }
-        return UiTree(out, density)
+        return UiTree(out)
     }
 
     /** The snapshot as lines for logcat when an assertion fails (text fields are left out: one may hold the key). */
     fun dump(): String = snapshot().nodes.filterNot { it.editable }.joinToString("\n") {
-        "${it.id}<${it.parent} ${it.cls?.substringAfterLast('.')} [${it.left},${it.top},${it.right},${it.bottom}]" +
+        "${it.id}<${it.parent} ${it.resId ?: ""} ${it.cls?.substringAfterLast('.')} [${it.left},${it.top},${it.right},${it.bottom}]" +
             "${if (it.clickable) " click" else ""}${if (it.heading) " heading" else ""}${if (it.liveRegion != 0) " live" else ""}" +
             " text=${it.text} desc=${it.desc} state=${it.state}"
     }
@@ -201,11 +205,21 @@ class AppDriver {
         if (!device.click(bounds.centerX(), bounds.centerY())) fail("Tapping \"$label\" failed")
     }
 
-    fun tap(n: UiNode) {
-        if (!device.click((n.left + n.right) / 2, (n.top + n.bottom) / 2)) fail("Tapping ${n.text ?: n.desc} failed")
+    /**
+     * Clicks the enabled element tagged [tag] whose own or child content description is [desc], through its own
+     * accessibility action, so the click goes to that element and not to whatever is at its position.
+     */
+    fun clickTag(tag: String, desc: String) {
+        fun AccessibilityNodeInfo.descs(): List<String> =
+            listOfNotNull(contentDescription?.toString()) + (0 until childCount).mapNotNull(::getChild).flatMap { it.descs() }
+        fun find() = nodes { it.viewIdResourceName == tag && it.isEnabled && desc in it.descs() }.singleOrNull()
+        waitFor("an enabled \"$desc\" ($tag)", 10_000) { find() != null }
+        val target = find() ?: fail("No enabled \"$desc\" ($tag). Screen: ${screen()}")
+        if (!target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Clicking \"$desc\" ($tag) failed")
+        log("clicked \"$desc\" ($tag)")
     }
 
-    /** Fills the Connect screen, waits for the new chat and journals its id; returns that id. */
+    /** Fills the Connect screen and waits for the new chat; returns its id. Nothing is journaled: nothing was sent. */
     fun connect(serverUrl: String): String {
         fillConnect(serverUrl)
         click(str("connect_button"))
@@ -221,7 +235,7 @@ class AppDriver {
         device.waitForIdle()
     }
 
-    /** Waits for the chat, asserts it is a new, empty one, and journals its id before anything can reach the server. */
+    /** Waits for the chat and asserts it is a new, empty one (the only chat in the app's database); returns its id. */
     fun awaitChat(serverUrl: String): String {
         waitFor("the chat after connecting to $serverUrl", 30_000) { hasDesc(str("settings_title")) && !has(str("connect_title")) }
         // A fresh install has no synced chats, so the app must open a new local one; never write into another chat.
@@ -229,60 +243,91 @@ class AppDriver {
         log("connected to $serverUrl")
         var rows = emptyList<List<String>>()
         waitFor("the new chat in the app's database", 10_000) { appSessions().also { rows = it }.isNotEmpty() }
-        // After a confirmed pm clear the database holds only this chat: its id is this run's own creation receipt.
         if (rows.size != 1 || rows[0][2].isNotEmpty() || rows[0][0] != rows[0][1]) fail("Expected one new chat in the app's database, found $rows")
-        return rows[0][1].also(::journal)
+        return rows[0][1]
     }
 
-    /** Rows of the app's sessions table: key, currentId, lineageIds. Fails on anything it cannot parse. */
-    fun appSessions(): List<List<String>> {
-        val out = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT key, currentId, lineageIds FROM SessionEntity;\n")
+    /** Rows of the app's sessions table matching [where]: key, currentId, lineageIds. Fails on anything it cannot parse. */
+    fun appSessions(where: String = "1"): List<List<String>> {
+        val out = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT key, currentId, lineageIds FROM SessionEntity WHERE $where;\n")
         return out.lines().filter { it.isNotBlank() }.map { line ->
             val cols = line.split('|')
-            if (cols.size != 3 || !SESSION_ID.matches(cols[1])) fail("Unexpected output reading the app's sessions: $out")
+            if (cols.size != 3 || !SESSION_ID.matches(cols[0]) || !SESSION_ID.matches(cols[1]) ||
+                cols[2].split(',').any { it.isNotEmpty() && !SESSION_ID.matches(it) }
+            ) {
+                fail("Unexpected output reading the app's sessions")
+            }
             cols
         }
     }
 
-    /** Every session id in the app's database now, including compression lineage. */
-    fun appSessionIds() = appSessions().flatMap { (listOf(it[0], it[1]) + it[2].split(',')).filter(String::isNotBlank) }.distinct()
-
     /**
-     * Appends [id] to the device's session journal and reads it back; run-e2e.sh pulls the journal even when this
-     * process dies, and deletes each id on the server only after checking the server's own record of it.
+     * Journals the ids of this run's own chat: rows of the app's own database created after the run started whose
+     * title, as the app gave it to the server (the first line of the chat's first message, cut to 60 characters,
+     * read from the app's own pending send or stored user row), contains this run's nonce. The app keeps the title
+     * column empty until it refreshes the chat list, which it does not do in this milestone. Returns the chat keys.
      */
-    fun journal(id: String) {
-        if (!SESSION_ID.matches(id)) fail("Not an app session id: $id")
-        val r = sh("mkdir -p $OUT_DIR && { grep -qx '$id' $SESSIONS 2>/dev/null || echo '$id' >> $SESSIONS; } && grep -qx '$id' $SESSIONS && echo journaled").trim()
-        if (r != "journaled") fail("Could not journal session $id: $r")
-        log("journaled session $id")
+    fun journalOwned(): List<String> {
+        val n = nonce
+        val titled = "instr(substr(ltrim(%1\$s), 1, 60), '$n') > 0 AND (instr(%1\$s, char(10)) = 0 OR instr(%1\$s, char(10)) > instr(%1\$s, '$n'))"
+        val rows = appSessions(
+            "startedAt >= $runStart AND (key IN (SELECT sessionKey FROM PendingSendEntity WHERE ${titled.format("text")}) OR " +
+                "key IN (SELECT sessionKey FROM MessageEntity WHERE role = 'user' AND ${titled.format("content")}))",
+        )
+        rows.flatMap { (listOf(it[0], it[1]) + it[2].split(',')).filter(String::isNotEmpty) }.distinct().forEach { journal("session $it $scenario") }
+        return rows.map { it[0] }
     }
 
-    /** Types [text] into the composer and presses [button] (Send, or Send to the running reply). */
-    fun send(text: String, button: String = str("chat_send")) {
+    /** Journals the id of the run the app is following for chat [sessionKey] (exactly one), with that chat's id. */
+    fun journalRun(sessionKey: String): String {
+        if (!SESSION_ID.matches(sessionKey)) fail("Not an app session id")
+        val ids = shell("run-as $APP sqlite3 databases/apofis.db", "SELECT runId FROM ActiveRunEntity WHERE sessionKey = '$sessionKey';\n").lines().filter(String::isNotBlank)
+        val id = ids.singleOrNull()?.takeIf(RUN_ID::matches) ?: fail("Expected one active run for the chat, found ${ids.size}")
+        journal("run $id $sessionKey")
+        return id
+    }
+
+    /**
+     * Appends [line] to the device's session journal (once) and reads it back. run-e2e.sh pulls the journal even when
+     * this process dies, and the build host reads or deletes on the server only what it names, after checking each
+     * session's own record.
+     */
+    private fun journal(line: String) {
+        val p = line.split(' ')
+        val ok = p.size == 3 && when (p[0]) {
+            "session" -> SESSION_ID.matches(p[1]) && SCENARIO.matches(p[2])
+            "run" -> RUN_ID.matches(p[1]) && SESSION_ID.matches(p[2])
+            else -> false
+        }
+        if (!ok) fail("Not a journal line")
+        val r = sh("[ -f $SESSIONS ] && { grep -qx '$line' $SESSIONS || echo '$line' >> $SESSIONS; } && grep -qx '$line' $SESSIONS && echo journaled").trim()
+        if (r != "journaled") fail("Could not journal \"$line\": $r")
+        log("journaled $line")
+    }
+
+    /**
+     * Types [text] into the composer and presses the send button showing [button] (Send, or Send to the running
+     * reply); then journals this run's chat, which must exist in the app's database by then. Returns its key.
+     */
+    fun send(text: String, button: String = str("chat_send")): String {
         val composer = nodes { it.className == "android.widget.EditText" }.singleOrNull() ?: fail("No composer. Screen: ${screen()}")
         setField(composer, text)
         device.waitForIdle()
-        click(button)
+        clickTag("composer.send", button)
         log("sent: $text")
+        var keys = emptyList<String>()
+        waitFor("this run's chat in the app's database after sending", 10_000) { journalOwned().also { keys = it }.isNotEmpty() }
+        return keys.singleOrNull() ?: fail("Expected one chat of this run in the app's database, found ${keys.size}")
     }
 
-    /** Answers an approval request through [Approval]: Allow once only for exactly [command]; otherwise Deny and fail. */
-    fun answerApproval(command: String): Boolean {
-        val a = snapshot().approval(str("chat_approval_title"), str("chat_approval_deny"), str("chat_approval_once"), command)
-        return when (a) {
-            Approval.None -> false
-            is Approval.Allow -> {
-                log("APPROVAL for exactly \"$command\": allowing once")
-                tap(a.button)
-                SystemClock.sleep(1000)
-                true
-            }
-            is Approval.Refuse -> {
-                log("APPROVAL refused: ${a.why}")
-                a.deny?.let(::tap)
-                fail("Denied an approval request: ${a.why}")
-            }
+    /**
+     * The harness never approves anything: an approval block on screen fails the test at once, without touching it
+     * (the owner's server does not ask for approval for these commands).
+     */
+    fun failOnApproval() {
+        if (snapshot().approvalShown(str("chat_approval_title"))) {
+            log("APPROVAL requested by the server; not answered")
+            fail("The server asked for approval; the harness never approves, so the scenario fails")
         }
     }
 
@@ -320,21 +365,6 @@ class AppDriver {
         } finally {
             c.disconnect()
         }
-    }
-}
-
-/** Server rows helpers. */
-fun JSONObject.str(name: String): String? = if (isNull(name)) null else optString(name)
-
-/** The terminal commands the assistant called in [rows], from each tool call's own arguments. */
-fun terminalCommands(rows: List<JSONObject>): List<String> = rows.filter { it.str("role") == "assistant" }.flatMap { row ->
-    val calls = row.optJSONArray("tool_calls") ?: JSONArray()
-    (0 until calls.length()).map(calls::getJSONObject).mapNotNull { call ->
-        val fn = call.optJSONObject("function") ?: return@mapNotNull null
-        if (fn.str("name") != "terminal") return@mapNotNull null
-        val args = fn.opt("arguments")
-        val obj = args as? JSONObject ?: (args as? String)?.let { runCatching { JSONObject(it) }.getOrNull() }
-        obj?.str("command")?.trim()
     }
 }
 
