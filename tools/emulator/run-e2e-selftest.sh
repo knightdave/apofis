@@ -266,6 +266,7 @@ PATH="$t/bin:$PATH" APOFIS_E2E_LIB=1 bash -c '
   set +e
   tmp=$(mktemp -d) E2E_OUT=$2 run_id=run11 key=$3
   mapfile -t export_files <"$4"
+  exec {orig_out}>&1 {orig_err}>&2 # as main does
   trap local_cleanup EXIT
   trap "on_signal 130" INT
   import_export "$5/"
@@ -277,6 +278,7 @@ check "interrupt during import: the incoming files exist mid-import" '[ -e "$E2E
 kill -INT "$pid"
 rc=0; wait "$pid" || rc=$?
 check "interrupt during import: exit 130, no final directory, no incoming files" '[ "$rc" = 130 ] && nothing_kept run11 && lacks "$(cat "$t/out11")" "import returned"'
+check "interrupt inside a redirected call: the cleanup's messages still reach the terminal" 'has "$(cat "$t/out11")" "the key never left this host"'
 
 # 12. The cleanup has an overall limit: a hanging step ends in a reported failure, not a hang.
 s=$SECONDS rc=0

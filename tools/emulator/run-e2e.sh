@@ -544,7 +544,7 @@ scan_dir() {
 key='' nonce='' run_id='' tmp='' interrupted='' key_sent_local='' mode='' arg=''
 tun_fd='' tunnel_pid='' tunnel_port='' rin='' rout='' remote_pid='' remote_shell_pid='' last_line=''
 sessions_state='' journal=() export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
-incoming='' wd_pid=''
+incoming='' wd_pid='' orig_out='' orig_err=''
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
 rsh() { bounded "${RSH_TIMEOUT:-60}" ssh -o BatchMode=yes "$HOST" "$@"; }
@@ -782,6 +782,9 @@ cleanup_overrun() {
 local_cleanup() {
   local rc=$? bad='' r new
   set +e
+  # A signal can end the run inside a function call whose output is redirected (to /dev/null): the cleanup's own
+  # messages go to the original terminal.
+  [ -z "$orig_err" ] || exec 1>&"$orig_out" 2>&"$orig_err"
   # The whole cleanup is bounded: a watchdog interrupts it after TRAP_LIMIT seconds. It starts before the signals are
   # ignored, so it can still be stopped with TERM.
   trap cleanup_overrun ALRM
@@ -1022,6 +1025,7 @@ main() {
   run_id=$(date +%Y%m%d-%H%M%S)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')
   nonce=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
   tmp=$(mktemp -d)
+  exec {orig_out}>&1 {orig_err}>&2
   trap local_cleanup EXIT
   trap 'on_signal 130' INT
   trap 'on_signal 143' TERM
