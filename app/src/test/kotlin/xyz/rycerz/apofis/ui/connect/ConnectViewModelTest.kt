@@ -19,12 +19,14 @@ import mockwebserver3.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import xyz.rycerz.apofis.api.HoldingQueue
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.settings.Credentials
 
@@ -32,6 +34,7 @@ import xyz.rycerz.apofis.settings.Credentials
 @RunWith(RobolectricTestRunner::class)
 class ConnectViewModelTest {
     private lateinit var server: MockWebServer
+    private val holding = HoldingQueue()
     private val saved = mutableListOf<Credentials>()
     private var clearsCache = false
 
@@ -39,13 +42,17 @@ class ConnectViewModelTest {
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         server = MockWebServer()
+        server.dispatcher = holding
         server.start()
     }
 
     @After
     fun tearDown() {
-        server.close()
-        Dispatchers.resetMain()
+        try {
+            holding.closeAndVerify(server)
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     private fun vm(current: Credentials? = null) =
@@ -193,17 +200,16 @@ class ConnectViewModelTest {
 
     @Test
     fun leavingTheScreenCancelsTheProbeAndForgetsTheKey() = runTest {
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(500, TimeUnit.MILLISECONDS).build(),
-        )
+        val response = holding.hold(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
         val store = ViewModelStore()
         val vm = ViewModelProvider.create(store, viewModelFactory { initializer { vm() } })[ConnectViewModel::class]
         vm.onUrlChange(server.url("/").toString())
         vm.onKeyChange("sk-secret")
         val probe = vm.connect()!!
-        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }
+        assertNotNull(withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }) // the probe is in flight
         store.clear()
         probe.join()
+        response.countDown()
         withContext(Dispatchers.IO) { Thread.sleep(800) } // past the moment the response arrives
 
         assertTrue(saved.isEmpty())
@@ -212,17 +218,16 @@ class ConnectViewModelTest {
 
     @Test
     fun backCancelsTheProbeBeforeLeaving() = runTest {
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(500, TimeUnit.MILLISECONDS).build(),
-        )
+        val response = holding.hold(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
         val vm = vm()
         vm.onUrlChange(server.url("/").toString())
         vm.onKeyChange("sk-1")
         vm.connect()
-        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }
+        assertNotNull(withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }) // the probe is in flight
 
         assertTrue(vm.cancel()) // synchronous: nothing to wait for before navigating
         assertEquals(ConnectState.Idle, vm.state)
+        response.countDown()
         withContext(Dispatchers.IO) { Thread.sleep(800) } // past the moment the response arrives
         assertTrue(saved.isEmpty())
         assertEquals(ConnectState.Idle, vm.state) // a late result is ignored
@@ -250,9 +255,7 @@ class ConnectViewModelTest {
 
     @Test
     fun backHolderFollowsTheCheckAndCancelsIt() = runTest {
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(500, TimeUnit.MILLISECONDS).build(),
-        )
+        val response = holding.hold(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
         val back = ConnectBack()
         val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, back = back)
         assertFalse(back.busy.value)
@@ -261,9 +264,11 @@ class ConnectViewModelTest {
         vm.connect()
 
         assertTrue(back.busy.value) // set synchronously by connect()
+        assertNotNull(withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }) // the probe is in flight
         assertTrue(back.cancel())
         assertEquals(ConnectState.Idle, vm.state)
         assertFalse(back.busy.value)
+        response.countDown()
         withContext(Dispatchers.IO) { Thread.sleep(800) } // past the moment the response arrives
         assertTrue(saved.isEmpty())
     }

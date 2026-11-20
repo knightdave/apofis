@@ -6,6 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -27,6 +28,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.api.HoldingQueue
 import xyz.rycerz.apofis.api.buildRunBody
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.SendState
@@ -44,12 +46,14 @@ class SendQueueTest {
     private lateinit var db: AppDatabase
     private lateinit var api: HermesApi
     private lateinit var queue: SendQueue
+    private val holding = HoldingQueue()
     private val started = mutableListOf<Pair<String, String>>()
     @Volatile private var clock = 10_000_000L
 
     @Before
     fun setUp() {
         server = MockWebServer()
+        server.dispatcher = holding
         server.start()
         db = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
             .allowMainThreadQueries()
@@ -61,7 +65,7 @@ class SendQueueTest {
     @After
     fun tearDown() {
         db.close()
-        server.close()
+        holding.closeAndVerify(server)
     }
 
     private fun respond(body: String, code: Int = 200) =
@@ -141,9 +145,8 @@ class SendQueueTest {
     @Test
     fun lostResponseDoesNotDuplicate() = runTest {
         addSession("apofis-a")
-        server.enqueue(
-            MockResponse.Builder().code(202).body(fixture("run_start.json")).addHeader("Content-Type", "application/json")
-                .headersDelay(2, TimeUnit.SECONDS).build(),
+        val lost = holding.hold(
+            MockResponse.Builder().code(202).body(fixture("run_start.json")).addHeader("Content-Type", "application/json").build(),
         )
         respond(fixture("run_start_replayed.json"), 202)
         val key = queue.enqueue("apofis-a", "once only")
@@ -152,6 +155,7 @@ class SendQueueTest {
         val sent = take() // the server has the request; the client is cancelled before the response is stored
         first.cancel()
         first.join()
+        lost.countDown() // the response now goes to a closed call
         assertEquals("queued", pending(key).state)
         assertNull(db.activeRunDao().forSession("apofis-a"))
 
@@ -384,9 +388,8 @@ class SendQueueTest {
     fun steerIsStoredBeforeTheRequest() = runTest {
         addSession("apofis-a")
         running("apofis-a")
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json")
-                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        val response = holding.hold(
+            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json").build(),
         )
         val repo = ChatRepository(api, db, { clock }, queue)
         val job = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
@@ -396,6 +399,7 @@ class SendQueueTest {
         assertTrue(row.attempted)
         assertEquals("run_1", row.runId)
         assertEquals(SendState.SENDING, repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single().state)
+        response.countDown()
         job.join()
         assertEquals("steered", rows("apofis-a").single().state)
     }
@@ -497,14 +501,14 @@ class SendQueueTest {
     @Test
     fun expiryIsCheckedAgainAfterSlowSessionCreate() = runTest {
         addSession("apofis-a", existsOnServer = false)
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("session_create.json")).addHeader("Content-Type", "application/json")
-                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        val response = holding.hold(
+            MockResponse.Builder().code(200).body(fixture("session_create.json")).addHeader("Content-Type", "application/json").build(),
         )
         val key = queue.enqueue("apofis-a", "slow")
         val job = launch(Dispatchers.Default) { queue.drain() }
         take()
         clock += SEND_EXPIRY_MS + 1 // the deadline passes while the session is being created
+        response.countDown()
         job.join()
         assertEquals("failed", pending(key).state)
         assertEquals("expired", pending(key).error)
@@ -603,9 +607,8 @@ class SendQueueTest {
     fun refreshCannotHideSessionDuringSteer() = runTest {
         addSession("apofis-a")
         running("apofis-a")
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json")
-                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        val steer = holding.hold(
+            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json").build(),
         )
         val hidden = """{"id":"apofis-a","source":"api_server","title":"t","pinned":false,"archived":false,"hidden":true,""" +
             """"started_at":1.0,"last_active":2.0,"message_count":1,"preview":"p","_lineage_ids":[]}"""
@@ -617,6 +620,7 @@ class SendQueueTest {
         withContext(Dispatchers.Default) { kotlinx.coroutines.delay(200) }
         assertEquals(1, server.requestCount) // the refresh waits for the steer
         assertFalse(db.sessionDao().get("apofis-a")!!.hidden)
+        steer.countDown()
         send.join()
         refresh.join()
         assertEquals("steered", rows("apofis-a").single().state)
@@ -627,12 +631,14 @@ class SendQueueTest {
     fun failedSteerAfterDeleteLeavesNoRow() = runTest {
         addSession("apofis-a")
         running("apofis-a")
-        server.enqueue(MockResponse.Builder().code(400).body("{}").headersDelay(500, TimeUnit.MILLISECONDS).build())
+        val refused = holding.hold(MockResponse.Builder().code(400).body("{}").build())
         respond(fixture("session_delete.json"))
         val repo = ChatRepository(api, db, { clock }, queue)
         val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
         take()
-        val delete = launch(Dispatchers.Default) { repo.delete("apofis-a") }
+        // Undispatched: it runs to its first suspension, the lock the steer holds, before launch returns.
+        val delete = launch(Dispatchers.Default, CoroutineStart.UNDISPATCHED) { repo.delete("apofis-a") }
+        refused.countDown()
         send.join()
         delete.join()
         assertNull(db.sessionDao().get("apofis-a"))
@@ -738,14 +744,14 @@ class SendQueueTest {
         val old = SendQueue(api, db, { key, run -> started += key to run }, { clock }, active = { open })
         addSession("apofis-a")
         addSession("apofis-b")
-        server.enqueue(
-            MockResponse.Builder().code(200).body(fixture("run_start.json")).addHeader("Content-Type", "application/json")
-                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        val response = holding.hold(
+            MockResponse.Builder().code(200).body(fixture("run_start.json")).addHeader("Content-Type", "application/json").build(),
         )
         old.enqueue("apofis-a", "before the switch")
         val drain = launch(Dispatchers.Default) { old.drain() }
         take() // the first send is on the wire when the old instance is closed
         open = false
+        response.countDown() // the send completes only after the switch
         val after = queue.enqueue("apofis-b", "after the switch")
         val written = pending(after)
         drain.join()

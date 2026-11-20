@@ -4,13 +4,9 @@ import android.os.Looper
 import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
-import mockwebserver3.RecordedRequest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -21,6 +17,7 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
+import xyz.rycerz.apofis.api.HoldingQueue
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
@@ -42,20 +39,9 @@ class BackAfterRecreateTest {
     fun firstRunBackAfterRotationCancelsTheCheck() {
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
         val server = MockWebServer()
-        // The answer is held until the test has pressed Back, so the result always arrives late, however slow the machine.
-        val backPressed = CountDownLatch(1)
-        val answered = CountDownLatch(1)
-        val gaveUp = AtomicBoolean(false)
-        server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse {
-                // A timed-out wait never answers as if Back had happened: it records the timeout, which fails the test.
-                if (!backPressed.await(30, TimeUnit.SECONDS)) {
-                    gaveUp.set(true)
-                    return MockResponse.Builder().code(500).build()
-                }
-                return MockResponse.Builder().code(200).body(fixture("capabilities.json")).build().also { answered.countDown() }
-            }
-        }
+        val holding = HoldingQueue()
+        server.dispatcher = holding
+        val response = holding.hold(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
         server.start()
         try {
             // Without animations: the spinner's endless animation would keep every idle wait busy until the check ended.
@@ -72,21 +58,18 @@ class BackAfterRecreateTest {
             controller.recreate() // rotation while the check runs
             assertEquals(ConnectState.Testing, vm.state)
             assertTrue(back.target === vm) // the same retained view model
-            assertFalse("the server stopped waiting before Back", gaveUp.get())
             controller.get().onBackPressedDispatcher.onBackPressed()
 
             assertEquals(ConnectState.Idle, vm.state)
             assertFalse(back.busy.value)
-            backPressed.countDown() // now the server answers
-            assertTrue("the server did not answer", answered.await(10, TimeUnit.SECONDS))
+            response.countDown() // now the server answers, after Back
             until("the probe to finish") { probe.isCompleted }
-            assertFalse("the server stopped waiting before Back", gaveUp.get())
             assertEquals(ConnectState.Idle, vm.state)
             assertNull(app.container.credentials.load())
             assertNull(app.container.connection.value)
             controller.pause().stop().destroy()
         } finally {
-            server.close()
+            holding.closeAndVerify(server)
         }
     }
 }

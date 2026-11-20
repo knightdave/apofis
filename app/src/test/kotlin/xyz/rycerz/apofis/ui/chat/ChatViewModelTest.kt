@@ -93,6 +93,7 @@ class ChatViewModelTest {
     private val requests = CopyOnWriteArrayList<RecordedRequest>()
     private val store = ViewModelStore()
     private val latches = mutableListOf<CountDownLatch>()
+    private val latchTimeouts = AtomicInteger() // held streams served only because their wait timed out
 
     /** A gate for a held stream; every gate is opened in tearDown, so a failed test never blocks the next. */
     private fun latch() = CountDownLatch(1).also { latches += it }
@@ -120,19 +121,8 @@ class ChatViewModelTest {
         connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, f, AtomicBoolean(true), scope)
     }
 
-    private val gaveUp = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** Holds a response until the test opens the gate; a timeout never answers normally and fails the test. */
-    private fun CountDownLatch.hold() {
-        if (!await(10, TimeUnit.SECONDS)) {
-            gaveUp.set(true)
-            throw IllegalStateException("a held response timed out")
-        }
-    }
-
     @After
     fun tearDown() {
-        assertFalse("a held response timed out", gaveUp.get())
         latches.forEach { it.countDown() }
         // Every coroutine must end before the next test: the repository and send locks are process-wide, and a
         // view model coroutine left suspended on the reset main dispatcher would hold them for good.
@@ -145,6 +135,7 @@ class ChatViewModelTest {
         db.close()
         server.close()
         Dispatchers.resetMain()
+        assertEquals("held streams that timed out", 0, latchTimeouts.get())
     }
 
     private var created = 0
@@ -197,7 +188,7 @@ class ChatViewModelTest {
             if (attaches.incrementAndGet() == 1 && first.isNotEmpty()) {
                 sse(*first.toTypedArray()) // ends without a terminal event: a drop, then a resume
             } else {
-                release.hold()
+                if (!release.await(10, TimeUnit.SECONDS)) latchTimeouts.incrementAndGet()
                 sse(terminal(99))
             }
         }

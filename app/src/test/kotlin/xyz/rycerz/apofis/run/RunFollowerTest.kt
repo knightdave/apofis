@@ -43,6 +43,7 @@ import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
@@ -51,6 +52,7 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.sync.ChatRepository
+import xyz.rycerz.apofis.sync.SendQueue
 
 private const val KEY = "apofis-a"
 private const val RUN = "run_1"
@@ -73,6 +75,20 @@ class RunFollowerTest {
     private val finished = CopyOnWriteArrayList<String>()
     private val roomStatusAtDelay = CopyOnWriteArrayList<String?>()
 
+    /** Runs on the database thread just before each statement, so a test can act in the middle of a write. */
+    private val gates = CopyOnWriteArrayList<CountDownLatch>()
+    private val gateTimeouts = AtomicInteger()
+
+    /** A gate the test opens; tearDown fails the test if one was never opened or a [pass] timed out. */
+    private fun gate() = CountDownLatch(1).also { gates += it }
+
+    /** Waits (on a server thread) for the gate to open; a timeout is recorded and fails the test in tearDown. */
+    private fun CountDownLatch.pass() {
+        if (!await(10, TimeUnit.SECONDS)) gateTimeouts.incrementAndGet()
+    }
+
+    @Volatile private var beforeQuery: (sql: String, args: List<Any?>) -> Unit = { _, _ -> }
+
     @Before
     fun setUp() {
         server = MockWebServer()
@@ -86,26 +102,20 @@ class RunFollowerTest {
         server.start()
         db = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
             .allowMainThreadQueries()
+            .setQueryCallback(Dispatchers.Unconfined) { sql, args -> beforeQuery(sql, args) }
             .build()
         api = HermesApi(server.url("/").toString(), "secret-key")
         repo = ChatRepository(api, db)
     }
 
-    private val gaveUp = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** Holds a response until the test opens the gate; a timeout never answers normally and fails the test. */
-    private fun CountDownLatch.hold() {
-        if (!await(10, TimeUnit.SECONDS)) {
-            gaveUp.set(true)
-            throw IllegalStateException("a held response timed out")
-        }
-    }
-
     @After
     fun tearDown() {
-        assertFalse("a held response timed out", gaveUp.get())
+        val unopened = gates.count { it.count > 0 }
+        gates.forEach { it.countDown() } // no server thread stays blocked
         db.close()
         server.close()
+        assertEquals("gates never opened", 0, unopened)
+        assertEquals("gate waits that timed out", 0, gateTimeouts.get())
     }
 
     private fun TestScope.follower(
@@ -175,7 +185,7 @@ class RunFollowerTest {
     /** Messages that answer only after [gate] opens, so the live state before Finish can be read. */
     private fun gatedMessages(gate: CountDownLatch) {
         routes[MESSAGES] = {
-            gate.hold()
+            gate.pass()
             json(messagesBody)()
         }
     }
@@ -214,10 +224,10 @@ class RunFollowerTest {
     fun streamsThenReplacesWithServerRows() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         val steer = "[OUT-OF-BAND USER MESSAGE - sent while you were working]\\ntext p2\\n[/OUT-OF-BAND USER MESSAGE]"
         routes[MESSAGES] = {
-            gate.hold()
+            gate.pass()
             json(
                 """{"session_id":"$KEY","data":[{"id":10,"role":"user","content":" text p1 ","timestamp":1.0},""" +
                     """{"id":11,"role":"user","display_kind":"steer","content":"$steer","timestamp":1.5},""" +
@@ -289,7 +299,7 @@ class RunFollowerTest {
     fun silentCloseReconnects() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(STATUS, status("running"))
         // The second connection replays seq 2 once more: it must not be appended twice.
@@ -405,13 +415,13 @@ class RunFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
-        val stopped = CountDownLatch(1)
+        val stopped = gate()
         routes["/v1/runs/$RUN/stop"] = {
             stopped.countDown()
             json("""{"run_id":"$RUN","status":"stopping"}""")()
         }
         routes[EVENTS] = {
-            stopped.hold()
+            stopped.pass()
             sseResponse(delta(0, "a"), terminal(1, "cancelled"))
         }
         started(f)
@@ -457,14 +467,14 @@ class RunFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         val attaches = AtomicInteger()
         routes[EVENTS] = {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(delta(0, "a"), frame(1, approvalEvent))
             } else {
-                release.hold()
+                release.pass()
                 sseResponse(terminal(2))
             }
         }
@@ -476,7 +486,7 @@ class RunFollowerTest {
 
         val pending = f.live(KEY).first { it?.pending != null }!!.pending!!
         assertEquals("ctl_prompt", pending.requestId)
-        assertEquals("waiting_for_approval", db.activeRunDao().forSession(KEY)!!.status)
+        assertEquals("waiting_for_approval", db.activeRunDao().forSession(KEY)!!.status) // stored before it is shown
         assertEquals(AnswerResult.SENT, f.answerApproval(KEY, pending.requestId, pending.executionGeneration, ApprovalChoice.ONCE))
 
         val body = requestsTo("/v1/runs/$RUN/approval").single().body!!.utf8()
@@ -493,7 +503,7 @@ class RunFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
-        val release = CountDownLatch(1)
+        val release = gate()
         val current = java.util.concurrent.atomic.AtomicReference(status("waiting_for_approval", pendingControl))
         routes[STATUS] = { current.get()() }
         val attaches = AtomicInteger()
@@ -501,7 +511,7 @@ class RunFollowerTest {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(frame(1, approvalEvent))
             } else {
-                release.hold()
+                release.pass()
                 sseResponse(terminal(2))
             }
         }
@@ -578,7 +588,7 @@ class RunFollowerTest {
     fun unknownEventTypesIgnored() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(
             EVENTS,
@@ -604,7 +614,7 @@ class RunFollowerTest {
     fun toolStepsCarryDuration() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(
             EVENTS,
@@ -671,7 +681,7 @@ class RunFollowerTest {
     private suspend fun heldOpen(f: RunFollower, release: CountDownLatch) {
         messages()
         routes[EVENTS] = {
-            release.hold()
+            release.pass()
             sseResponse(terminal(5))
         }
         started(f)
@@ -680,7 +690,7 @@ class RunFollowerTest {
     @Test
     fun approvalReplacedReturnsChanged() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", otherControl))
         heldOpen(f, release)
 
@@ -697,7 +707,7 @@ class RunFollowerTest {
     @Test
     fun approvalGoneReturnsGone() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("running"))
         heldOpen(f, release)
 
@@ -710,7 +720,7 @@ class RunFollowerTest {
     @Test
     fun clarifyUsesSameRule() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         val clarify = """{"kind":"clarify","prompt_id":"cl_1","execution_generation":2,"command":null,"question":"Which?"}"""
         on(STATUS, status("waiting_for_approval", clarify))
         on("/v1/runs/$RUN/clarify", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"cl_1"}"""))
@@ -769,14 +779,14 @@ class RunFollowerTest {
     fun approvalRefreshFailureIsRetried() = runTest {
         val f = follower()
         messages()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, json("{}", 500), status("waiting_for_approval", pendingControl))
         val attaches = AtomicInteger()
         routes[EVENTS] = {
             if (attaches.incrementAndGet() == 1) {
                 sseResponse(delta(0, "a"), frame(1, approvalEvent), delta(2, "never applied"))
             } else {
-                release.hold()
+                release.pass()
                 sseResponse(terminal(9))
             }
         }
@@ -793,7 +803,7 @@ class RunFollowerTest {
     @Test
     fun unauthorizedStopCancelsFollower() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on("/v1/runs/$RUN/stop", json("""{"error":{"code":"invalid_api_key"}}""", 401))
         heldOpen(f, release)
         awaitUntil { requestsTo(EVENTS).isNotEmpty() }
@@ -983,7 +993,7 @@ class RunFollowerTest {
     fun transcriptNeverLosesUserTextDuringFinish() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         started(f)
@@ -1025,7 +1035,7 @@ class RunFollowerTest {
     @Test
     fun newerApprovalDuringPostIsShown() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("waiting_for_approval", otherControl)) // published while the POST was in flight
@@ -1041,7 +1051,7 @@ class RunFollowerTest {
     @Test
     fun alreadyResolvedReportsGone() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("running"))
@@ -1057,7 +1067,7 @@ class RunFollowerTest {
     @Test
     fun conflictWithReplacementReportsChanged() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("waiting_for_approval", otherControl))
@@ -1076,9 +1086,16 @@ class RunFollowerTest {
         messages()
         on(STATUS, status("running"))
         on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
+        val paused = AtomicBoolean(false)
+        beforeQuery = { sql, _ ->
+            if ("SET polling = 1" in sql) {
+                f.pauseAll() // lands while the truncation is stored
+                paused.set(true)
+            }
+        }
         started(f)
-        f.live(KEY).first { it?.text == "a" }
-        f.pauseAll() // lands while the follower handles the truncation
+        db.activeRunDao().observeAll().first { it.singleOrNull()?.polling == true } // the old process's write commits
+        assertTrue(paused.get())
 
         val done = CompletableDeferred<Unit>()
         val g = follower(done) // a later resume, here in a new process
@@ -1134,7 +1151,7 @@ class RunFollowerTest {
     @Test
     fun stopIntentIsStoredApartFromStatus() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("running"))
         on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
         heldOpen(f, release)
@@ -1173,7 +1190,7 @@ class RunFollowerTest {
         f.resumeAll()
 
         f.live(KEY).first { it?.text == "a" }
-        assertEquals("brand_new_state", f.live(KEY).value!!.status)
+        assertEquals("running", f.live(KEY).value!!.status) // shown as stored: the screen and the send queue agree
         assertEquals("running", db.activeRunDao().forSession(KEY)!!.status)
     }
 
@@ -1181,7 +1198,7 @@ class RunFollowerTest {
     fun terminalStatusIsStoredBeforeFinish() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         gatedMessages(gate)
         on(EVENTS, sse(terminal(0)))
         started(f)
@@ -1234,7 +1251,7 @@ class RunFollowerTest {
     @Test
     fun failedReadAfterPostKeepsApprovalAndRetries() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("waiting_for_approval", otherControl))
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}"""))
         heldOpen(f, release)
@@ -1249,7 +1266,7 @@ class RunFollowerTest {
     @Test
     fun malformedAnswerWithRequestStillPendingIsAnError() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         on("/v1/runs/$RUN/approval", json("not json"))
         heldOpen(f, release)
@@ -1266,7 +1283,7 @@ class RunFollowerTest {
     @Test
     fun malformedAnswerWithRequestGoneIsGone() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("running"))
@@ -1285,9 +1302,15 @@ class RunFollowerTest {
         messages()
         on(STATUS, status("running"), status("completed"))
         on(EVENTS, sse(delta(0, "a"), frame(null, """{"event":"replay.truncated","oldest_retained_seq":40}""")))
+        val paused = gate()
+        beforeQuery = { sql, _ ->
+            if ("SET polling = 1" in sql) {
+                f.pauseAll() // the old job is still writing polling = true
+                paused.countDown()
+            }
+        }
         started(f)
-        f.live(KEY).first { it?.text == "a" }
-        f.pauseAll() // the old job is still writing polling = true
+        awaitUntil { paused.count == 0L }
         f.resumeAll()
         done.await()
 
@@ -1300,10 +1323,17 @@ class RunFollowerTest {
         messages()
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         routes[MESSAGES] = { MockResponse.Builder().code(503).build() } // Finish never completes here
+        val paused = gate()
+        f.beforeStatusStore = { status ->
+            if (status == "completed" && paused.count > 0) {
+                pauseAll() // lands as the terminal status starts being stored, before anything is written
+                paused.countDown()
+                yield()
+            }
+        }
         started(f)
-        f.live(KEY).first { it?.text == "a" }
-        f.pauseAll() // lands while the terminal status is being stored
 
+        awaitUntil { paused.count == 0L } // the pause itself happened
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
     }
 
@@ -1359,7 +1389,7 @@ class RunFollowerTest {
     @Test
     fun acceptedAnswerStaysSentWhenTheReadIsRejected() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}"""))
         heldOpen(f, release)
@@ -1373,7 +1403,7 @@ class RunFollowerTest {
     @Test
     fun alreadyResolvedWithFailedReadRethrowsAndRetries() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("running"))
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}"""))
         heldOpen(f, release)
@@ -1394,14 +1424,14 @@ class RunFollowerTest {
     fun olderReadNeverOverwritesANewerApproval() = runTest {
         val f = follower()
         messages()
-        val slow = CountDownLatch(1)
-        val emit = CountDownLatch(1)
+        val slow = gate()
+        val emit = gate()
         val reads = AtomicInteger()
         routes[STATUS] = {
             when (reads.incrementAndGet()) {
                 1 -> status("waiting_for_approval", pendingControl)()
                 2 -> {
-                    slow.hold() // started first, finishes last, and shows nothing pending
+                    slow.pass() // started first, finishes last, and shows nothing pending
                     status("running")()
                 }
                 else -> status("waiting_for_approval", otherControl)()
@@ -1409,7 +1439,7 @@ class RunFollowerTest {
         }
         on("/v1/runs/$RUN/approval", json("""{"run_id":"$RUN","status":"already_resolved","prompt_id":"ctl_prompt"}"""))
         routes[EVENTS] = {
-            emit.hold()
+            emit.pass()
             heldStream(frame(1, approvalEvent))()
         }
         started(f)
@@ -1428,7 +1458,7 @@ class RunFollowerTest {
     @Test
     fun truncatedAnswerResponseIsReconciled() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         routes["/v1/runs/$RUN/approval"] = {
             on(STATUS, status("running"))
@@ -1491,7 +1521,7 @@ class RunFollowerTest {
     @Test
     fun refreshKeepsRetryingUntilAReadSucceeds() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         val failed = json("{}", 500)
         on(STATUS, status("waiting_for_approval", pendingControl), failed, failed, failed, failed, failed, failed, status("running"))
         on("/v1/runs/$RUN/approval", resolvedBody)
@@ -1509,7 +1539,7 @@ class RunFollowerTest {
         val resumed = AtomicBoolean(false)
         val readsWhilePaused = AtomicInteger()
         val f = follower(onDelay = { if (paused.compareAndSet(false, true)) pauseAll() }) // the gate closes during the backoff
-        val release = CountDownLatch(1)
+        val release = gate()
         val reads = AtomicInteger()
         routes[STATUS] = {
             if (paused.get() && !resumed.get()) readsWhilePaused.incrementAndGet()
@@ -1534,7 +1564,7 @@ class RunFollowerTest {
     @Test
     fun rejectionBetweenStatusReadAndItsApplyStaysShown() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
         heldOpen(f, release)
         addSession("apofis-b")
@@ -1552,6 +1582,7 @@ class RunFollowerTest {
         }
 
         assertEquals(AnswerResult.CHANGED, f.answerApproval(KEY, "ctl_gone", 2, ApprovalChoice.ONCE))
+        assertTrue(once.get()) // the rejection did land between the read and its apply
         assertTrue(f.credentialsRejected.value)
         release.countDown()
     }
@@ -1559,7 +1590,7 @@ class RunFollowerTest {
     @Test
     fun rejectedRefreshAfterAnswerStopsTheStream() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
         on("/v1/runs/$RUN/approval", resolvedBody)
         heldOpen(f, release)
@@ -1579,10 +1610,11 @@ class RunFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("completed"))
-        val once = AtomicBoolean(false)
+        val paused = gate()
         f.beforeStatusApply = {
-            if (once.compareAndSet(false, true)) {
-                pauseAll() // lands after the read returned, before its result is applied
+            if (paused.count > 0) {
+                pauseAll() // lands after the read returned, at the first point that can be cancelled
+                paused.countDown()
                 yield()
             }
         }
@@ -1591,13 +1623,14 @@ class RunFollowerTest {
         addRun()
         f.resumeAll()
 
+        awaitUntil { paused.count == 0L } // the pause itself happened
         awaitUntil { runBlocking { db.activeRunDao().forSession(KEY)?.status } == "completed" }
     }
 
     @Test
     fun cancelledRefreshStaysRequestedUntilApplied() = runTest {
         val f = follower()
-        val release = CountDownLatch(1)
+        val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), status("waiting_for_approval", otherControl))
         on("/v1/runs/$RUN/approval", resolvedBody)
         heldOpen(f, release)
@@ -1616,5 +1649,357 @@ class RunFollowerTest {
         f.resumeAll()
         f.live(KEY).first { it?.pending?.requestId == "ctl_other" }
         release.countDown()
+    }
+
+    // ---- the stored status is what the user sees ----
+
+    private val steerPath = "/v1/runs/$RUN/steer"
+
+    /**
+     * Sends "now" from inside the live update that first shows [status], before the follower takes another step, the
+     * way a user tapping send on what the screen shows would. Completes the returned deferred once it has sent.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun TestScope.sendWhenShown(f: RunFollower, status: String): CompletableDeferred<Unit> {
+        val sent = CompletableDeferred<Unit>()
+        val queue = SendQueue(api, db, { _, _ -> }, System::currentTimeMillis)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            f.live(KEY).collect {
+                if (it?.status == status && !sent.isCompleted) {
+                    runBlocking { queue.submit(KEY, "now") } // inline: the follower is still inside its update
+                    sent.complete(Unit)
+                }
+            }
+        }
+        return sent
+    }
+
+    @Test
+    fun sendRightAfterRunningIsShownIsSteered() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("queued"), status("running"))
+        on(EVENTS, sse(), heldStream())
+        on(steerPath, json(fixture("steer_response.json")))
+        f.resumeAll()
+        addSession()
+        addRun(status = "queued")
+        val sent = sendWhenShown(f, "running")
+        f.onRunStarted(KEY, RUN)
+
+        sent.await()
+        assertEquals(1, requestsTo(steerPath).size)
+        assertEquals(listOf("steered"), db.pendingSendDao().observe(KEY).first().map { it.state })
+    }
+
+    @Test
+    fun sendRightAfterApprovalIsShownIsNotSteered() = runTest {
+        val f = follower()
+        messages()
+        on(STATUS, status("waiting_for_approval", pendingControl))
+        on(EVENTS, heldStream(frame(1, approvalEvent)))
+        on(steerPath, json(fixture("steer_response.json")))
+        f.resumeAll()
+        addSession()
+        addRun()
+        val sent = sendWhenShown(f, "waiting_for_approval")
+        f.onRunStarted(KEY, RUN)
+
+        sent.await()
+        assertTrue(requestsTo(steerPath).isEmpty())
+        assertTrue(db.pendingSendDao().observe(KEY).first().none { it.runId == RUN })
+    }
+
+    @Test
+    fun sendRightAfterTerminalStatusIsShownIsNotSteered() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        messages()
+        on(STATUS, status("completed"))
+        on(EVENTS, sse())
+        on(steerPath, json(fixture("steer_response.json")))
+        f.resumeAll()
+        addSession()
+        addRun()
+        val sent = sendWhenShown(f, "completed")
+        f.onRunStarted(KEY, RUN)
+
+        sent.await()
+        done.await()
+        assertTrue(requestsTo(steerPath).isEmpty())
+    }
+
+    @Test
+    fun sendRightAfterStopIsShownIsNotSteered() = runTest {
+        val f = follower()
+        val release = gate()
+        on(STATUS, status("running"))
+        routes["/v1/runs/$RUN/stop"] = {
+            on(STATUS, status("stopping")) // the server reports it from now on
+            json("""{"run_id":"$RUN","status":"stopping"}""")()
+        }
+        on(steerPath, json(fixture("steer_response.json")))
+        heldOpen(f, release)
+        val sent = sendWhenShown(f, "stopping")
+
+        f.stop(KEY)
+        sent.await()
+        assertTrue(requestsTo(steerPath).isEmpty())
+        release.countDown()
+    }
+
+    @Test
+    fun failedStopKeepsTheStatusAndTheNextSendSteers() = runTest {
+        val f = follower()
+        val release = gate()
+        on(STATUS, status("running"))
+        on("/v1/runs/$RUN/stop", json("{}", 500))
+        on(steerPath, json(fixture("steer_response.json")))
+        heldOpen(f, release)
+
+        try {
+            f.stop(KEY)
+            fail("expected the stop's error")
+        } catch (e: ApiError.Http) {
+            assertEquals(500, e.status)
+        }
+        val row = db.activeRunDao().forSession(KEY)!!
+        assertEquals("running", row.status)
+        assertFalse(row.stopRequested) // a later cancel by someone else is not this user's stop
+        SendQueue(api, db, { _, _ -> }, System::currentTimeMillis).submit(KEY, "after the failed stop")
+        assertEquals(1, requestsTo(steerPath).size)
+        release.countDown()
+    }
+
+    @Test
+    fun statusReadReturningAfterTheTerminalEventNeverUndoesIt() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val finish = gate()
+        gatedMessages(finish) // keeps the run (and its live state) until the end
+        val emit = gate()
+        val read = gate()
+        routes[EVENTS] = {
+            emit.pass()
+            sseResponse(terminal(0))
+        }
+        routes[STATUS] = {
+            read.pass() // started before the terminal event, returns after it
+            status("running")()
+        }
+        started(f)
+
+        val answer = backgroundScope.async { f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE) }
+        awaitUntil { requestsTo(STATUS).size == 1 }
+        emit.countDown()
+        awaitUntil { f.live(KEY).value?.status == "completed" }
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status) // stored before it was shown
+        read.countDown()
+        assertEquals(AnswerResult.GONE, answer.await())
+
+        assertEquals("completed", f.live(KEY).value!!.status)
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        finish.countDown()
+        done.await() // the run ends before the database closes
+    }
+
+    @Test
+    fun statusReadBeforeTheTerminalEventEndsTerminal() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val finish = gate()
+        gatedMessages(finish)
+        val emit = gate()
+        routes[EVENTS] = {
+            emit.pass()
+            sseResponse(terminal(0))
+        }
+        on(STATUS, status("running"))
+        started(f)
+
+        assertEquals(AnswerResult.GONE, f.answerApproval(KEY, "ctl_prompt", 2, ApprovalChoice.ONCE))
+        assertEquals("running", f.live(KEY).value!!.status)
+        emit.countDown()
+        awaitUntil { f.live(KEY).value?.status == "completed" }
+
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        finish.countDown()
+        done.await() // the run ends before the database closes
+    }
+
+    @Test
+    fun lateRunningReadAfterRestartShowsTheStoredTerminalStatus() = runTest {
+        val f = follower() // a new process over a database that already stored the terminal status
+        on(STATUS, status("running"))
+        on(EVENTS, heldStream())
+        on(steerPath, json(fixture("steer_response.json")))
+        addSession()
+        addRun(status = "completed")
+        f.resumeAll()
+
+        awaitUntil { requestsTo(EVENTS).isNotEmpty() } // it attaches only once the read has been published
+        assertEquals("completed", f.live(KEY).value!!.status)
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        SendQueue(api, db, { _, _ -> }, System::currentTimeMillis).submit(KEY, "late")
+        assertTrue(requestsTo(steerPath).isEmpty())
+    }
+
+    @Test
+    fun failedTerminalStoreIsRetriedByTheNextObservation() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val atRetry = CopyOnWriteArrayList<String>()
+        val f = follower(done, onDelay = {
+            atRetry += "live=${live(KEY).value?.status} row=${db.activeRunDao().forSession(KEY)?.status}"
+            db.openHelper.writableDatabase.execSQL("DROP TRIGGER IF EXISTS fail_terminal")
+        })
+        // The first terminal write itself is attempted and fails in SQLite; the trigger is dropped at the retry delay.
+        db.openHelper.writableDatabase.execSQL(
+            "CREATE TRIGGER fail_terminal BEFORE UPDATE OF status ON ActiveRunEntity WHEN NEW.status = 'completed' " +
+                "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
+        val stores = AtomicInteger()
+        f.beforeStatusStore = { if (it == "completed") stores.incrementAndGet() }
+        val finish = gate()
+        gatedMessages(finish)
+        on(STATUS, status("completed"))
+        on(EVENTS, sse(terminal(0)))
+        started(f)
+
+        awaitUntil { f.live(KEY).value?.status == "completed" }
+        assertEquals("completed", db.activeRunDao().forSession(KEY)!!.status)
+        assertEquals(listOf("live=running row=running"), atRetry) // nothing terminal stored or shown before the retry
+        assertEquals(2, stores.get())
+        finish.countDown()
+        done.await()
+    }
+
+    private val stopPath = "/v1/runs/$RUN/stop"
+    private val stopAccepted = json("""{"run_id":"$RUN","status":"stopping"}""")
+
+    /** The position of [request] among the stop requests, in the order the server recorded them. */
+    private fun stopIndex(request: RecordedRequest) = requestsTo(stopPath).indexOfFirst { it === request }
+
+    /** A run whose stream ends in a cancellation only once [release] opens; its transcript sync answers at once. */
+    private suspend fun cancelledOnRelease(f: RunFollower, release: CountDownLatch) {
+        on(STATUS, status("stopping"))
+        messages()
+        routes[EVENTS] = {
+            release.pass()
+            sseResponse(terminal(5, "cancelled"))
+        }
+        started(f)
+    }
+
+    @Test
+    fun overlappingStopsKeepTheIntentOfTheOneAccepted() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val release = gate()
+        val firstAnswer = gate()
+        val secondAnswer = gate()
+        routes[stopPath] = { request ->
+            if (stopIndex(request) == 0) {
+                firstAnswer.pass()
+                json("{}", 500)()
+            } else {
+                secondAnswer.pass()
+                stopAccepted()
+            }
+        }
+        cancelledOnRelease(f, release)
+
+        val first = backgroundScope.async { runCatching { f.stop(KEY) } }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        val second = backgroundScope.async { f.stop(KEY) }
+        awaitUntil { requestsTo(stopPath).size == 2 }
+        firstAnswer.countDown()
+        assertTrue(first.await().exceptionOrNull() is ApiError.Http) // failed while the second is in flight
+        assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        secondAnswer.countDown()
+        second.await()
+        release.countDown()
+        done.await()
+
+        assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
+    }
+
+    @Test
+    fun overlappingStopsThatBothFailLeaveNoIntent() = runTest {
+        val f = follower()
+        val release = gate()
+        val firstAnswer = gate()
+        on(STATUS, status("running"))
+        routes[stopPath] = { request ->
+            if (stopIndex(request) == 0) firstAnswer.pass()
+            json("{}", 500)()
+        }
+        heldOpen(f, release)
+
+        val first = backgroundScope.async { runCatching { f.stop(KEY) } }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is ApiError.Http) // fails while the first is in flight
+        assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        firstAnswer.countDown()
+        assertTrue(first.await().exceptionOrNull() is ApiError.Http)
+
+        assertFalse(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        release.countDown()
+    }
+
+    @Test
+    fun stopWhoseIntentCannotBeStoredSendsNothingAndALaterStopCounts() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val release = gate()
+        val answer = gate()
+        routes[stopPath] = {
+            answer.pass()
+            stopAccepted()
+        }
+        cancelledOnRelease(f, release)
+        db.openHelper.writableDatabase.execSQL(
+            "CREATE TRIGGER fail_intent BEFORE UPDATE OF stopRequested ON ActiveRunEntity BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
+
+        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is SQLiteException) // the error surfaces
+        assertTrue(requestsTo(stopPath).isEmpty()) // and nothing was sent without a stored intent
+        db.openHelper.writableDatabase.execSQL("DROP TRIGGER fail_intent")
+        val second = backgroundScope.async { f.stop(KEY) }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        release.countDown() // the run is cancelled before the stop's answer arrives
+        done.await()
+
+        assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
+        answer.countDown()
+        second.await()
+    }
+
+    @Test
+    fun acceptedStopSurvivesItsCallerBeingCancelled() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val release = gate()
+        val firstAnswer = gate()
+        routes[stopPath] = { request ->
+            if (stopIndex(request) == 0) {
+                firstAnswer.pass()
+                stopAccepted()
+            } else {
+                json("{}", 500)()
+            }
+        }
+        cancelledOnRelease(f, release)
+
+        val first = backgroundScope.launch { f.stop(KEY) }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        first.cancel() // the caller goes away while the server takes the stop
+        assertTrue(runCatching { f.stop(KEY) }.exceptionOrNull() is ApiError.Http) // an overlapping stop fails
+        firstAnswer.countDown()
+        first.join()
+        assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        release.countDown()
+        done.await()
+
+        assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
     }
 }
