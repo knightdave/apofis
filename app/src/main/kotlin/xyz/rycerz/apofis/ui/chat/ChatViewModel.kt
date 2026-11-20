@@ -5,7 +5,6 @@ import android.net.ConnectivityManager
 import android.net.Network
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -100,7 +99,6 @@ private data class Local(
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null,
     val composerNote: ComposerNote? = null,
-    val sending: Boolean = false,
     val confirmCancel: String? = null,
 )
 
@@ -114,8 +112,7 @@ class ChatViewModel(
 ) : ViewModel(), ChatActions {
     private val repo = connected.repo
     private val follower = connected.follower
-    private val drafts = connected.drafts
-    private val draft = MutableStateFlow(drafts.get(sessionKey)) // read once; written back only by edits and sends
+    private val composer = connected.composer // draft, send in flight and send failure: outlive this view model
     private val local = MutableStateFlow(Local())
     private val host = connected.credentials.baseUrl.toHttpUrlOrNull()?.host.orEmpty()
     private val merger = LiveMerger()
@@ -126,7 +123,8 @@ class ChatViewModel(
         Env(s?.title.orEmpty(), o, r)
     }
 
-    val state: StateFlow<ChatUiState> = combine(content, draft, env, local) { (items, live), d, e, l ->
+    val state: StateFlow<ChatUiState> = combine(content, composer.state(sessionKey), env, local) { (items, live), c, e, l ->
+        val d = c.draft
         ChatUiState(
             sessionKey = sessionKey,
             title = e.title,
@@ -153,14 +151,16 @@ class ChatViewModel(
             notes = l.notes,
             answering = l.answering,
             confirmRetry = l.confirmRetry,
-            composerNote = l.composerNote,
-            sending = l.sending,
+            composerNote = if (c.error != null) ComposerNote.SEND_FAILED else l.composerNote,
+            sending = c.sending,
             confirmCancel = l.confirmCancel,
         )
     }.stateIn(
         viewModelScope,
         SharingStarted.Eagerly,
-        ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, draft.value, host),
+        composer.current(sessionKey).let {
+            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending)
+        },
     )
 
     init {
@@ -180,39 +180,17 @@ class ChatViewModel(
     }
 
     override fun onDraftChange(text: String) {
-        draft.value = text
-        drafts.set(sessionKey, text)
+        composer.edit(sessionKey, text)
         if (local.value.composerNote != null) local.update { it.copy(composerNote = null) }
     }
 
     override fun onSendClick() {
-        val text = draft.value
-        if (text.isBlank()) return
-        var claimed = false
-        local.update {
-            claimed = !it.sending
-            if (claimed) it.copy(sending = true, composerNote = null) else it
+        // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
+        val started = composer.send(sessionKey) { text ->
+            repo.send(sessionKey, text) // stored before any request; delivery problems show on the bubble
+            local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
         }
-        if (!claimed) return // one send at a time: a second tap before the redraw sends nothing
-        if (draft.compareAndSet(text, "")) drafts.update(sessionKey) { if (it == text) "" else it }
-        // In the connection's scope: leaving the chat right after the tap must not cancel storing the message. The
-        // updates below reach this view model's state while it is shown and are harmless after it was cleared.
-        connected.launch {
-            try {
-                repo.send(sessionKey, text) // stored before any request; delivery problems show on the bubble
-                local.update { it.copy(notes = emptyMap()) }
-            } catch (e: CancellationException) {
-                throw e // the connection closed: its chats and drafts go with it
-            } catch (_: Exception) {
-                // The repository's contract: a throw means nothing was stored. Never overwrite what was typed since; the
-                // holder gets it too, so the text is there when the chat is opened again.
-                drafts.update(sessionKey) { if (it.isEmpty()) text else text + "\n" + it }
-                draft.value = drafts.get(sessionKey)
-                local.update { it.copy(composerNote = ComposerNote.SEND_FAILED) }
-            } finally {
-                local.update { it.copy(sending = false) }
-            }
-        }
+        if (started != null) local.update { it.copy(composerNote = null) }
     }
 
     override fun onStopClick() = request { follower.stop(sessionKey) }

@@ -7,6 +7,7 @@ import java.time.ZoneId
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -21,6 +22,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.ApiError
 
@@ -67,7 +69,7 @@ class DrawerViewModel(
     private val repo = connection.repo
     private val follower = connection.follower
     private val sendQueue = connection.sendQueue
-    private val drafts = connection.drafts
+    private val composer = connection.composer
     private val db = connection.db
     private val ops = Mutex()
     private val tokens = AtomicLong()
@@ -292,11 +294,12 @@ class DrawerViewModel(
                 }
                 repo.delete(p.key)
                 deleted = true
+                composer.remove(p.key)
             } finally {
-                repo.endDelete(p.key)
+                // Even when cancelled while waiting for the lock: a mark left behind would block the chat until restart.
+                withContext(NonCancellable) { repo.endDelete(p.key) }
                 if (!deleted) connection.launch { sendQueue.drain() }
             }
-            drafts.remove(p.key)
             if (selectedFlow.value == p.key) openNew()
         }
     }

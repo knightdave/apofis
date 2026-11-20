@@ -14,6 +14,8 @@ import javax.crypto.KeyGenerator
 import java.util.Collections
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import mockwebserver3.Dispatcher
@@ -39,6 +41,7 @@ import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.sync.SendWorker
+import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private val A = Credentials("https://a.example/", "key-a")
 private val B = Credentials("https://b.example/", "key-b")
@@ -151,6 +154,44 @@ class AppContainerTest {
         assertEquals(1, db.pendingSendDao().allQueued().size)
         val infos = work.getWorkInfosForUniqueWork(SendWorker.WORK_NAME).get()
         assertTrue(infos.any { it.state == WorkInfo.State.ENQUEUED })
+    }
+
+    @Test
+    fun newKeyForTheSameServerKeepsDraftsAndTheSendBeingStored() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val server = recordingServer(requests)
+        try {
+            val first = Credentials(server.url("/").toString(), "k1")
+            container.connect(first)
+            val old = container.connected()!!
+            addSession("apofis-a")
+            addSession("apofis-b")
+            old.composer.edit("apofis-b", "half a thought")
+            old.composer.edit("apofis-a", "hello")
+            val held = CompletableDeferred<Unit>()
+            val locked = CompletableDeferred<Unit>()
+            val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+            locked.await()
+            val repo = old.repo
+            old.composer.send("apofis-a") { repo.send("apofis-a", it) }!! // waits for the lock: not stored yet
+            val switching = CompletableDeferred<Unit>()
+            container.beforeSwitch = { switching.complete(Unit) }
+            val connect = async(Dispatchers.IO) { container.connect(first.copy(apiKey = "k2")) }
+            switching.await()
+            held.complete(Unit)
+            lock.join()
+            connect.await()
+
+            val now = container.connected()!!
+            assertNotSame(old, now)
+            assertEquals("half a thought", now.composer.current("apofis-b").draft)
+            assertEquals("", now.composer.current("apofis-a").draft)
+            assertEquals(listOf("hello"), db.pendingSendDao().rows("apofis-a").map { it.text })
+            now.sendQueue.drain()
+            assertEquals(1, synchronized(requests) { requests.count { it == "POST /v1/runs" } })
+        } finally {
+            server.close()
+        }
     }
 
     @Test

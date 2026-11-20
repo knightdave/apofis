@@ -12,6 +12,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import java.util.concurrent.CountDownLatch
@@ -58,6 +59,8 @@ import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.SendQueue
+import xyz.rycerz.apofis.sync.isBeingDeleted
+import xyz.rycerz.apofis.sync.withRepositoryLock
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -204,7 +207,7 @@ class DrawerViewModelTest {
         val vm = vm()
         vm.selected.await { it == "apofis-a" }
         vm.rows.await { it.chats().isNotEmpty() }
-        connected.drafts.set("apofis-a", "half a thought")
+        connected.composer.edit("apofis-a", "half a thought")
         vm.onDeleteRequest("apofis-a")
         val prompt = vm.prompt.value!!
         assertEquals(PromptKind.DELETE, prompt.kind)
@@ -214,7 +217,7 @@ class DrawerViewModelTest {
         vm.prompt.await { it == null }
         assertNull(db.sessionDao().get("apofis-a"))
         assertFalse(db.sessionDao().get(next)!!.existsOnServer)
-        assertEquals("", connected.drafts.get("apofis-a"))
+        assertEquals("", connected.composer.current("apofis-a").draft)
     }
 
     @Test
@@ -300,17 +303,70 @@ class DrawerViewModelTest {
     }
 
     @Test
+    fun cancelledDeleteWaitingForTheLockLeavesTheChatUsable() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", "apofis-a", null, "running", 1L))
+        val gate = CountDownLatch(1)
+        routes["POST /v1/runs/run_a/stop"] = { gate.hold(); MockResponse.Builder().code(401).build() }
+        routes["POST /v1/runs"] = ok("""{"run_id":"run_1","status":"started","replayed":false}""")
+        val vm = vm()
+        vm.rows.await { it.chats().any { c -> c.running } }
+        vm.onDeleteRequest("apofis-a")
+        vm.confirmDelete(vm.prompt.value!!.token)
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.target == "/v1/runs/run_a/stop" }) delay(5) } }
+        assertTrue(isBeingDeleted("apofis-a"))
+
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await() // the delete's cleanup will have to wait for this
+        gate.countDown() // the stop is refused; the delete goes on to its cleanup, which waits for the lock
+        follower.credentialsRejected.await { it } // recorded as the refusal returns, just before the cleanup starts
+        store.clear() // the drawer goes away while its delete cleans up
+        held.complete(Unit)
+        lock.join()
+
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (isBeingDeleted("apofis-a")) delay(5) } }
+        assertTrue(db.sessionDao().get("apofis-a") != null)
+        // The chat can start runs again.
+        db.activeRunDao().delete("run_a")
+        db.pendingSendDao().upsert(PendingSendEntity("p1", "apofis-a", "hello", "{}", clock.get(), "queued", null, null))
+        connected.sendQueue.drain()
+        assertEquals(1, requests.count { it.target == "/v1/runs" })
+    }
+
+    @Test
+    fun sendFailingAfterTheChatWasDeletedLeavesNoEntry() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
+        val vm = vm()
+        vm.rows.await { it.chats().isNotEmpty() }
+        val composer = connected.composer
+        composer.edit("apofis-a", "hello")
+        val stored = CompletableDeferred<Unit>()
+        val send = composer.send("apofis-a") { stored.await(); connected.repo.send("apofis-a", it) }!!
+        vm.onDeleteRequest("apofis-a")
+        vm.confirmDelete(vm.prompt.value!!.token)
+        vm.prompt.await { it == null }
+        assertNull(db.sessionDao().get("apofis-a"))
+
+        stored.complete(Unit) // the send reaches the repository only now and finds no chat
+        withContext(Dispatchers.Default) { withTimeout(10_000) { send.join() } }
+        assertFalse("apofis-a" in composer.keys)
+    }
+
+    @Test
     fun archiveKeepsTheDraft() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
         routes["PATCH /api/sessions/apofis-a"] = ok(fixture("session_patch_archived.json"))
-        connected.drafts.set("apofis-a", "pack the charger")
+        connected.composer.edit("apofis-a", "pack the charger")
         val vm = vm()
         vm.selected.await { it == "apofis-a" }
         vm.rows.await { it.chats().isNotEmpty() } // the sheet is built from the loaded list
         vm.onLongPress("apofis-a")
         vm.archive(vm.prompt.value!!.token, true)
         vm.selected.await { it != "apofis-a" }
-        assertEquals("pack the charger", connected.drafts.get("apofis-a"))
+        assertEquals("pack the charger", connected.composer.current("apofis-a").draft)
     }
 
     @Test

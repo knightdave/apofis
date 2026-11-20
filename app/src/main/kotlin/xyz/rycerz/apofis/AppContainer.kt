@@ -27,7 +27,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.HermesApi
-import xyz.rycerz.apofis.chat.Drafts
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
@@ -55,13 +55,12 @@ class Connected internal constructor(
     follower: RunFollower,
     private val open: AtomicBoolean,
     private val scope: CoroutineScope,
+    /** The composers of this server's chats: kept across a new key for the same server, dropped with the server. */
+    val composer: Composer = Composer(scope),
 ) {
     private val liveApi = api
     private val liveRepo = repo
     private val liveFollower = follower
-
-    /** Drafts of this server's chats; they go with the connection. */
-    val drafts = Drafts()
 
     val isOpen: Boolean get() = open.get()
 
@@ -179,7 +178,7 @@ class AppContainer(
     }
 
     /**
-     * Switches to tested credentials: close the old graph, mark the switch, clear every table when the server
+     * Switches to tested credentials: let sends being stored finish (same server) and close the old graph, mark the switch, clear every table when the server
      * changes, write the credentials, build the new graph, record the cache owner, unmark. Any failure after the mark
      * ends disconnected with the credentials erased, and a mark left by process death forces that state on the next
      * start. Throws on failure. Not cancellable once started.
@@ -195,7 +194,10 @@ class AppContainer(
                     switching = true
                     current
                 }
+                // Same server: its chats stay, and so do their drafts and the sends being stored, which finish first.
+                val kept = old?.takeIf { it.credentials.baseUrl == c.baseUrl && cachePrefs.getString(CACHE_URL, null) == c.baseUrl }?.composer
                 beforeSwitch()
+                if (kept != null) kept.settle() else old?.composer?.close()
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
                 commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
@@ -204,7 +206,7 @@ class AppContainer(
                     withRepositoryLock { db.clearAllTables() }
                 }
                 if (!credentials.save(c)) throw IOException("credentials not written")
-                next = build(c)
+                next = build(c, kept)
                 commitOrThrow(cachePrefs.edit().putString(CACHE_URL, c.baseUrl))
                 commitOrThrow(cachePrefs.edit().remove(SWITCH_MARKER))
                 publish(next)
@@ -277,7 +279,7 @@ class AppContainer(
         if (!editor.commit()) throw IOException("preferences not written")
     }
 
-    private fun build(c: Credentials): Connected {
+    private fun build(c: Credentials, composer: Composer? = null): Connected {
         val open = AtomicBoolean(true)
         // Every request of a closed instance fails here, so a retained repository or follower cannot reach any server.
         val client = HermesApi.defaultClient().newBuilder()
@@ -293,6 +295,8 @@ class AppContainer(
         val queue = SendQueue(api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get)
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
         follower = RunFollower(api, db, repo, runScope, onRunFinished = { if (open.get()) queue.drain() })
-        return Connected(c, api, db, repo, queue, follower, open, runScope)
+        // Its own scope: closing this instance for a new key of the same server must not cancel a send being stored.
+        val kept = composer ?: Composer(CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Default + logOnly))
+        return Connected(c, api, db, repo, queue, follower, open, runScope, kept)
     }
 }

@@ -447,7 +447,7 @@ class ChatViewModelTest {
 
         awaitTrue { runBlocking { db.pendingSendDao().rows(KEY).isNotEmpty() } }
         assertEquals(listOf("Remember the milk"), db.pendingSendDao().rows(KEY).map { it.text })
-        assertEquals("", connected.drafts.get(KEY))
+        assertEquals("", connected.composer.current(KEY).draft)
     }
 
     @Test
@@ -465,23 +465,72 @@ class ChatViewModelTest {
         held.complete(Unit)
         lock.join()
 
-        awaitTrue { connected.drafts.get(KEY).isNotEmpty() }
-        assertEquals("first", connected.drafts.get(KEY))
+        awaitTrue { connected.composer.current(KEY).draft.isNotEmpty() }
+        assertEquals("first", connected.composer.current(KEY).draft)
         assertEquals("first", vm().state.value.draft) // there when the chat is opened again
+    }
+
+    @Test
+    fun sendFailingAfterTheChatReopenedReachesTheVisibleComposer() = runTest {
+        // No session row: send refuses before storing anything.
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("first")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear() // left while the send waits
+        val again = vm() // and opened again before it failed
+        again.onDraftChange("second")
+        held.complete(Unit)
+        lock.join()
+
+        val failed = again.await { !it.sending && it.composerNote == ComposerNote.SEND_FAILED }
+        assertEquals("first\nsecond", failed.draft)
+        again.onDraftChange(failed.draft + " too") // typing in the visible composer keeps the recovered text
+        assertEquals("first\nsecond too", connected.composer.current(KEY).draft)
+        assertEquals("first\nsecond too", again.await { it.draft.endsWith("too") }.draft)
+    }
+
+    @Test
+    fun reopenedChatKeepsTheSendInFlight() = runTest {
+        addSession()
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("first")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear()
+        val again = vm()
+        assertTrue(again.state.value.sending) // the first frame already shows it
+        again.onDraftChange("second")
+        again.onSendClick() // still in flight: ignored
+        assertTrue(again.await { it.draft == "second" }.sending)
+        held.complete(Unit)
+        lock.join()
+
+        val done = again.await { !it.sending && it.items.isNotEmpty() }
+        assertEquals("second", done.draft)
+        assertEquals(listOf("first"), db.pendingSendDao().rows(KEY).map { it.text })
     }
 
     @Test
     fun draftIsReadOnceAndWrittenOnlyByEdits() = runTest {
         addSession()
-        connected.drafts.set(KEY, "half a thought")
+        connected.composer.edit(KEY, "half a thought")
         val vm = vm()
         assertEquals("half a thought", vm.await { it.title == "Plans" }.draft)
         store.clear() // opened and left at once: the saved draft stays
-        assertEquals("half a thought", connected.drafts.get(KEY))
+        assertEquals("half a thought", connected.composer.current(KEY).draft)
 
         val again = vm()
         again.onDraftChange("half a thought, finished")
-        assertEquals("half a thought, finished", connected.drafts.get(KEY))
+        assertEquals("half a thought, finished", connected.composer.current(KEY).draft)
     }
 
     @Test
@@ -489,7 +538,8 @@ class ChatViewModelTest {
         addSession(onServer = true)
         routes[MESSAGES] = json(serverRows)
         val vm = vm()
-        awaitTrue { requests.count { it.target.startsWith(MESSAGES) } == 1 }
+        vm.await { it.items.isNotEmpty() } // the first transcript is committed (rows and stale = false in one transaction)
+        assertEquals(1, requests.count { it.target.startsWith(MESSAGES) })
         db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true))
         routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
         vm.onOpened()
