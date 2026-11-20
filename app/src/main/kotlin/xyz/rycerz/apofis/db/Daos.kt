@@ -144,6 +144,16 @@ interface PendingSendDao {
     @Upsert
     suspend fun upsert(p: PendingSendEntity)
 
+    /**
+     * The API key changed: Hermes scopes idempotency keys by API key, so a send the old key may have started could run
+     * again under the new one. Each such send waits for the user's confirmation (unconfirmed); rows that already need it stay.
+     */
+    @Query(
+        "UPDATE PendingSendEntity SET state = 'failed', error = 'unconfirmed', runId = NULL WHERE attempted = 1 " +
+            "AND state IN ('queued', 'failed') AND (error IS NULL OR error NOT IN ('steer_uncertain', 'expired_uncertain'))",
+    )
+    suspend fun quarantineAttempted()
+
     /** Changes the row only if it still exists (never recreates a deleted one); returns the rows changed. */
     @Update
     suspend fun update(p: PendingSendEntity): Int

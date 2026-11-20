@@ -218,6 +218,10 @@ class AppContainer(
                         db.query("PRAGMA wal_checkpoint(FULL)", null).close()
                         db.openHelper.writableDatabase.execSQL("VACUUM")
                     }.onFailure(::logFailure)
+                } else if (old?.credentials?.apiKey != c.apiKey) {
+                    // An unknown old key (an interrupted switch erased it) counts as changed. Under the marker, so a
+                    // death before this commit forces another switch, which quarantines again.
+                    withRepositoryLock { db.pendingSendDao().quarantineAttempted() }
                 }
                 if (!credentials.save(c)) throw IOException("credentials not written")
                 next = build(c)
