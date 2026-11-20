@@ -10,6 +10,8 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import xyz.rycerz.apofis.api.MessageDto
 
 private const val STEER_OPEN = "[OUT-OF-BAND USER MESSAGE"
@@ -157,6 +159,22 @@ private fun decodeResult(text: String): ResultFields? =
     } catch (e: IllegalArgumentException) {
         null
     }
+
+/**
+ * A tool result as it is stored. One longer than [TOOL_RESULT_DISPLAY_LIMIT] is cut before storage to what the list
+ * shows, its error decided first, so [buildTranscript] maps it the same way while a multi-megabyte row never has to fit
+ * a database cursor window (2 MB on Android). Nothing reads the rest of a result.
+ */
+fun storedToolResult(content: String): String {
+    if (content.length <= TOOL_RESULT_DISPLAY_LIMIT) return content
+    // One character over the limit keeps the cut visible; a cut non-object text stays a non-object.
+    val fields = decodeResult(content) ?: return content.take(TOOL_RESULT_DISPLAY_LIMIT + 1)
+    val shown = (fields.output as? JsonPrimitive)?.takeIf { it.isString }?.content ?: content
+    return buildJsonObject {
+        put("output", shown.take(TOOL_RESULT_DISPLAY_LIMIT + 1))
+        if (isError(fields)) put("error", true)
+    }.toString()
+}
 
 /**
  * A result failed when `error` is present and is not null, not boolean false and not the empty string

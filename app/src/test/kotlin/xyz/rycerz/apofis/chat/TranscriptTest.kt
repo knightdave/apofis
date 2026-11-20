@@ -276,6 +276,26 @@ class TranscriptTest {
     }
 
     @Test
+    fun storedToolResultMapsLikeTheFullOne() {
+        val big = "y".repeat(TOOL_RESULT_DISPLAY_LIMIT + 5)
+        val contents = listOf(
+            """{"output": "$big", "exit_code": 0}""",
+            """{"output": "$big", "error": "boom"}""",
+            """{"output": "$big", "error": false, "exit_code": 2}""",
+            """{"output": {"nested": "$big"}, "error": ""}""",
+            "plain text $big",
+            "[\"$big\"]",
+            "short",
+        )
+        for (content in contents) {
+            fun step(c: String) = toolSteps(buildTranscript(listOf(row(1, "assistant", toolCallsJson = call("c1")), row(2, "tool", c, toolCallId = "c1")))).single()
+            val stored = storedToolResult(content)
+            assertTrue(stored.length <= TOOL_RESULT_DISPLAY_LIMIT + 32)
+            assertEquals(content.take(40), step(content), step(stored))
+        }
+    }
+
+    @Test
     fun keysAreStable() {
         val input = rows("messages_steer.json") + rows("messages_tool_run.json")
         assertEquals(buildTranscript(input).map { it.key }, buildTranscript(input).map { it.key })

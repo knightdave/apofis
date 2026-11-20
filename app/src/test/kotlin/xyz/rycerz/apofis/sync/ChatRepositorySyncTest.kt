@@ -34,6 +34,8 @@ import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
+import xyz.rycerz.apofis.chat.TOOL_RESULT_DISPLAY_LIMIT
+import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
@@ -116,6 +118,31 @@ class ChatRepositorySyncTest {
         idempotencyKey = key, sessionKey = sessionKey, text = "unsent", requestBody = "{}", createdAt = createdAt,
         state = "queued", runId = null, error = null,
     )
+
+    @Test
+    fun multiMegabyteToolResultSyncsAndReadsBackThroughTheDatabase() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        val call = """[{"id":"c1","type":"function","function":{"name":"terminal","arguments":"{}"}}]""".replace("\"", "\\\"")
+        val huge = """{\"output\": \"${"x".repeat(3_000_000)}\", \"exit_code\": 1}"""
+        respond(
+            rawMessages(
+                "apofis-a",
+                listOf(
+                    """{"id":1,"role":"user","content":"run it","timestamp":1.0}""",
+                    """{"id":2,"role":"assistant","content":"","tool_calls":"$call","timestamp":2.0}""",
+                    """{"id":3,"role":"tool","content":"$huge","tool_call_id":"c1","timestamp":3.0}""",
+                ),
+            ),
+        )
+        assertTrue(repo.syncMessages("apofis-a"))
+
+        // Read back through a Room query, as the chat screen does when the chat is opened again.
+        val step = repo.transcript("apofis-a").first().filterIsInstance<AssistantReply>().single().steps.single() as ToolStep
+        assertEquals(TOOL_RESULT_DISPLAY_LIMIT, step.result!!.length)
+        assertTrue(step.resultTruncated)
+        assertTrue(step.error) // exit_code 1, decided before the cut
+        assertTrue(db.messageDao().rows("apofis-a").all { it.content.length <= TOOL_RESULT_DISPLAY_LIMIT + 100 })
+    }
 
     @Test
     fun filtersToAppSessions() = runTest {
