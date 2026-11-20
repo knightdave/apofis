@@ -48,7 +48,7 @@ internal object SseReader {
         val name = obj.str("event") ?: return null
         val seq = obj.long("seq") ?: id ?: -1
         return when (name) {
-            "tool.started" -> RunEvent.ToolStarted(seq, obj.str("tool_call_id").orEmpty(), obj.str("tool").orEmpty(), obj.str("preview").orEmpty())
+            "tool.started" -> RunEvent.ToolStarted(seq, obj.str("tool_call_id").orEmpty(), obj.str("tool").orEmpty(), obj.str("preview").orEmpty(), obj.timestamp())
             "tool.completed" -> RunEvent.ToolCompleted(
                 seq,
                 obj.str("tool_call_id").orEmpty(),
@@ -56,6 +56,7 @@ internal object SseReader {
                 obj.bool("error") ?: false,
                 obj.str("preview").orEmpty(),
                 obj["duration"]?.primitive()?.doubleOrNull ?: 0.0,
+                obj.timestamp(),
             )
             "message.delta" -> RunEvent.MessageDelta(seq, obj.str("delta").orEmpty())
             "message.interim" -> RunEvent.MessageInterim(seq, obj.str("text").orEmpty(), obj.bool("already_streamed") ?: false)
@@ -71,5 +72,6 @@ internal object SseReader {
     private fun kotlinx.serialization.json.JsonElement.primitive() = runCatching { jsonPrimitive }.getOrNull()
     private fun JsonObject.str(key: String) = this[key]?.primitive()?.contentOrNull
     private fun JsonObject.long(key: String) = this[key]?.primitive()?.longOrNull
+    private fun JsonObject.timestamp() = this["timestamp"]?.primitive()?.doubleOrNull ?: 0.0
     private fun JsonObject.bool(key: String) = this[key]?.primitive()?.booleanOrNull
 }

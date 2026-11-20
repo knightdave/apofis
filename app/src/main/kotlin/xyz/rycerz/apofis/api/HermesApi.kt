@@ -2,11 +2,13 @@ package xyz.rycerz.apofis.api
 
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
@@ -20,9 +22,16 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
-/** Client for the Hermes Agent API server. [baseUrl] may carry a path prefix; a malformed URL throws IllegalArgumentException. */
-class HermesApi(baseUrl: String, private val apiKey: String, private val client: OkHttpClient = defaultClient()) {
+/**
+ * Client for the Hermes Agent API server. [baseUrl] may carry a path prefix.
+ * The constructor throws IllegalArgumentException for a malformed [baseUrl] (the connect screen validates it first).
+ * Every call fails with [ApiError] or CancellationException; a malformed id throws IllegalArgumentException before any request.
+ */
+class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClient = defaultClient()) {
     private val base: HttpUrl = baseUrl.toHttpUrl()
+
+    // A redirect would resend private bodies and the Idempotency-Key elsewhere, so never follow one.
+    private val client = client.newBuilder().followRedirects(false).followSslRedirects(false).build()
 
     suspend fun capabilities(): Capabilities = get(url("v1/capabilities"))
 
@@ -85,7 +94,11 @@ class HermesApi(baseUrl: String, private val apiKey: String, private val client:
         val req = request(url("v1/runs", runId, "events")).header("Accept", "text/event-stream")
         // Last-Event-ID n replays seq > n, so the first attach must not send it.
         if (lastSeq != null) req.header("Last-Event-ID", lastSeq.toString())
-        exchange(req.build()) { response -> SseReader.events(response.body.source()).collect { send(it) } }
+        exchange(req.build()) { response ->
+            val type = response.body.contentType()
+            if (type?.type != "text" || type.subtype != "event-stream") throw ApiError.Protocol
+            SseReader.events(response.body.source()).collect { send(it) }
+        }
     }
 
     suspend fun steer(runId: String, text: String) = control(url("v1/runs", runId, "steer")) { put("text", text) }
@@ -118,8 +131,13 @@ class HermesApi(baseUrl: String, private val apiKey: String, private val client:
 
     private fun url(vararg segments: String, query: HttpUrl.Builder.() -> Unit = {}): HttpUrl =
         base.newBuilder().apply {
-            // addPathSegment replaces a trailing empty segment, so "http://h/" and "http://h" give the same URL.
-            segments.forEach { s -> if ('/' in s) addPathSegments(s) else addPathSegment(s) }
+            // The first part is a fixed path; the rest (ids and fixed names) are single encoded segments.
+            // addPathSegments replaces a trailing empty segment, so "http://h/" and "http://h" give the same URL.
+            addPathSegments(segments.first())
+            segments.drop(1).forEach { s ->
+                require(s.isNotEmpty() && '/' !in s && '\\' !in s && s != "." && s != "..") { "invalid id" }
+                addPathSegment(s)
+            }
             query()
         }.build()
 
@@ -129,7 +147,14 @@ class HermesApi(baseUrl: String, private val apiKey: String, private val client:
 
     private suspend inline fun <reified T> get(url: HttpUrl): T = exchange(request(url).build()) { decode<T>(it) }
 
-    private inline fun <reified T> decode(response: Response): T = json.decodeFromString<T>(response.body.string())
+    private inline fun <reified T> decode(response: Response): T {
+        val text = response.body.string()
+        return try {
+            json.decodeFromString<T>(text)
+        } catch (_: SerializationException) {
+            throw ApiError.Protocol
+        }
+    }
 
     /** Runs [request] on the IO dispatcher; cancelling the caller cancels the HTTP call at once. */
     private suspend fun <T> exchange(request: Request, onSuccess: suspend (Response) -> T): T = coroutineScope {
@@ -141,6 +166,8 @@ class HermesApi(baseUrl: String, private val apiKey: String, private val client:
                     onSuccess(response)
                 }
             } catch (e: IOException) {
+                // call.cancel() from the finally below makes the read fail; that is cancellation, not a network error.
+                if (call.isCanceled()) throw CancellationException("cancelled")
                 throw ApiError.Network(e)
             }
         }
@@ -152,8 +179,12 @@ class HermesApi(baseUrl: String, private val apiKey: String, private val client:
     }
 
     private fun errorOf(response: Response): ApiError {
-        val code = runCatching { json.decodeFromString<ErrorEnvelope>(response.body.string()).error.code }.getOrNull()
+        val text = response.body.string() // an IOException here is Network, like any other read
+        // Only a short machine code survives, and never one that echoes the key.
+        val code = runCatching { json.decodeFromString<ErrorEnvelope>(text).error.code }.getOrNull()
+            ?.takeIf { codeFormat.matches(it) && apiKey !in it }
         return when {
+            response.code in 300..399 -> ApiError.Http(response.code, null)
             response.code == 401 -> ApiError.Unauthorized
             response.code == 404 -> ApiError.NotFound
             response.code == 409 && code != null -> ApiError.Conflict(code)
@@ -164,6 +195,7 @@ class HermesApi(baseUrl: String, private val apiKey: String, private val client:
 
     companion object {
         private val JSON = "application/json".toMediaType()
+        private val codeFormat = Regex("[a-z0-9_]{1,64}")
         internal val json = Json {
             ignoreUnknownKeys = true
             explicitNulls = false

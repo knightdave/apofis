@@ -4,7 +4,7 @@ package xyz.rycerz.apofis.api
 sealed interface RunEvent {
     val seq: Long
 
-    data class ToolStarted(override val seq: Long, val toolCallId: String, val tool: String, val preview: String) : RunEvent
+    data class ToolStarted(override val seq: Long, val toolCallId: String, val tool: String, val preview: String, val timestamp: Double) : RunEvent
 
     /** [durationSeconds] is always 0 on current servers; use event timestamps instead. */
     data class ToolCompleted(
@@ -14,6 +14,7 @@ sealed interface RunEvent {
         val error: Boolean,
         val preview: String,
         val durationSeconds: Double,
+        val timestamp: Double,
     ) : RunEvent
 
     data class MessageDelta(override val seq: Long, val delta: String) : RunEvent

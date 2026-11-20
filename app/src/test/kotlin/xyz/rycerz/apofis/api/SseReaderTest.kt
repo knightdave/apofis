@@ -34,8 +34,8 @@ class SseReaderTest {
     fun parsesToolRun() = runTest {
         val events = read(fixture("events_tool_run.sse"))
         val started = events.first() as RunEvent.ToolStarted
-        assertEquals(RunEvent.ToolStarted(0, "call_bcfa62f8a89f42adb149a971df2bb7cf", "terminal", "sleep 20 + 1 command"), started)
-        assertEquals(RunEvent.ToolCompleted(1, "call_bcfa62f8a89f42adb149a971df2bb7cf", "terminal", false, "", 0.0), events[1])
+        assertEquals(RunEvent.ToolStarted(0, "call_bcfa62f8a89f42adb149a971df2bb7cf", "terminal", "sleep 20 + 1 command", 1795131287.0361226), started)
+        assertEquals(RunEvent.ToolCompleted(1, "call_bcfa62f8a89f42adb149a971df2bb7cf", "terminal", false, "", 0.0, 1795131307.3678918), events[1])
         val deltas = events.filterIsInstance<RunEvent.MessageDelta>()
         assertEquals("\n\nThe command completed successfully: apofis-marker.", deltas.joinToString("") { it.delta })
         assertEquals(RunEvent.Terminal(12, "completed", "The command completed successfully: apofis-marker."), events.last())
@@ -108,6 +108,23 @@ class SseReaderTest {
         val events = api.runEvents("run_1", null).toList()
         assertEquals(listOf(0L, 1L, 2L), events.map { it.seq })
         assertTrue(events.none { it is RunEvent.Terminal })
+    }
+
+    @Test
+    fun missingTimestampIsZero() = runTest {
+        val text = "id: 0\ndata: {\"event\": \"tool.started\", \"tool\": \"t\", \"tool_call_id\": \"c\", \"preview\": \"p\", \"seq\": 0}\n\n"
+        assertEquals(listOf(RunEvent.ToolStarted(0, "c", "t", "p", 0.0)), read(text))
+    }
+
+    @Test
+    fun nonEventStreamIsProtocol() = runTest {
+        server.enqueue(MockResponse.Builder().code(200).addHeader("Content-Type", "text/html").body("<html>login</html>").build())
+        server.enqueue(MockResponse.Builder().code(404).body(fixture("error_404_run.json")).build())
+        val api = HermesApi(server.url("/").toString(), "k")
+        val first = runCatching { api.runEvents("run_1", null).toList() }.exceptionOrNull()
+        assertEquals(ApiError.Protocol, first)
+        val second = runCatching { api.runEvents("run_1", null).toList() }.exceptionOrNull()
+        assertEquals(ApiError.NotFound, second)
     }
 
     @Test

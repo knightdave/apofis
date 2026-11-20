@@ -1,5 +1,12 @@
 package xyz.rycerz.apofis.api
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
@@ -8,6 +15,7 @@ import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.SocketEffect
 import okhttp3.OkHttpClient
+import okio.ByteString.Companion.encodeUtf8
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
@@ -16,6 +24,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -234,10 +243,116 @@ class HermesApiTest {
 
     @Test
     fun apiKeyNeverInErrors() = runTest {
-        respond(401, fixture("error_401.json"))
-        val e = expectError { api.capabilities() }
-        assertFalse(e.toString().contains("secret-key"))
-        assertFalse(e.message.orEmpty().contains("secret-key"))
+        // The key only uses [a-z0-9_], so a reflected code would pass the code format check.
+        val key = "k3y_secret_value"
+        val keyed = HermesApi(server.url("/").toString(), key)
+        val reflected = """{"error": {"message": "bad key $key", "type": "x", "code": "$key"}}"""
+        val cases = listOf(
+            401 to ApiError.Unauthorized,
+            404 to ApiError.NotFound,
+            409 to ApiError.Http(409, null),
+            503 to ApiError.Unavailable(null),
+            400 to ApiError.Http(400, null),
+            500 to ApiError.Http(500, null),
+        )
+        val errors = mutableListOf<ApiError>()
+        for ((code, expected) in cases) {
+            respond(code, reflected)
+            errors += expectError { keyed.runStatus("r") }.also { assertEquals(expected, it) }
+        }
+        respond(409, """{"error": {"code": "bad-$key"}}""")
+        errors += expectError { keyed.runStatus("r") }.also { assertEquals(ApiError.Http(409, null), it) }
+        respond(200, """{"leak": "$key"}""")
+        errors += expectError { keyed.runStatus("r") }.also { assertEquals(ApiError.Protocol, it) }
+
+        val failing = OkHttpClient.Builder().addInterceptor { throw java.io.IOException("connect to $key failed") }.build()
+        val network = expectError { HermesApi("http://h:8642", key, failing).runStatus("r") }
+        assertTrue(network is ApiError.Network)
+        assertEquals("Network(IOException)", network.toString())
+        assertEquals("Network(IOException)", network.message)
+        errors += network
+
+        for (e in errors) {
+            assertFalse(e.toString(), e.toString().contains(key))
+            assertFalse(e.toString(), e.message.orEmpty().contains(key))
+            assertFalse(e.toString(), e.localizedMessage.orEmpty().contains(key))
+        }
+    }
+
+    @Test
+    fun cancellationPropagates() = runBlocking {
+        server.enqueue(MockResponse.Builder().onResponseStart(SocketEffect.Stall).build())
+        var caught: Throwable? = null
+        val call = launch(Dispatchers.Default) {
+            try { api.runStatus("r") } catch (e: Throwable) { caught = e }
+        }
+        server.takeRequest()
+        call.cancelAndJoin()
+        assertTrue("$caught", caught is CancellationException)
+
+        server.enqueue(
+            MockResponse.Builder().addHeader("Content-Type", "text/event-stream").body(": open\n\n")
+                .onResponseBody(SocketEffect.Stall).build(),
+        )
+        caught = null
+        val stream = launch(Dispatchers.Default) {
+            try { api.runEvents("r", null).collect { } } catch (e: Throwable) { caught = e }
+        }
+        server.takeRequest()
+        delay(200)
+        stream.cancelAndJoin()
+        assertTrue("$caught", caught is CancellationException)
+    }
+
+    @Test
+    fun malformedSuccessIsProtocol() = runTest {
+        respond(200, "<html>login</html>")
+        assertEquals(ApiError.Protocol, expectError { api.capabilities() })
+        respond(200, """{"object": "hermes.run"}""")
+        assertEquals(ApiError.Protocol, expectError { api.runStatus("r") })
+        respond(200, """{"object": "list"}""")
+        assertEquals(ApiError.Protocol, expectError { api.listSessions() })
+    }
+
+    @Test
+    fun malformedBaseUrlThrows() {
+        assertThrows(IllegalArgumentException::class.java) { HermesApi("not a url", "k") }
+        assertThrows(IllegalArgumentException::class.java) { HermesApi("ftp://h", "k") }
+    }
+
+    @Test
+    fun ioFailureReadingErrorBodyIsNetwork() = runTest {
+        repeat(3) {
+            server.enqueue(
+                MockResponse.Builder().code(409).body(fixture("run_foreign_source.json"))
+                    .onResponseBody(SocketEffect.CloseSocket()).build(),
+            )
+        }
+        assertTrue(expectError { api.startRun("{}", "k") } is ApiError.Network)
+    }
+
+    @Test
+    fun redirectsAreNotFollowed() = runTest {
+        MockWebServer().use { other ->
+            other.start()
+            respond(307, "", "Location" to other.url("/v1/runs").toString())
+            assertEquals(ApiError.Http(307, null), expectError { api.startRun("""{"session_id":"s","input":"private"}""", "idem") })
+            assertEquals(1, server.requestCount)
+            assertEquals(0, other.requestCount)
+        }
+    }
+
+    @Test
+    fun idsAreSingleEncodedSegments() = runTest {
+        for (bad in listOf("a/b", "..", ".", "", "a\\b")) {
+            assertThrows(bad, IllegalArgumentException::class.java) { runBlocking { api.patchSession(bad, title = "t") } }
+            assertThrows(bad, IllegalArgumentException::class.java) { runBlocking { api.deleteSession(bad) } }
+            assertThrows(bad, IllegalArgumentException::class.java) { runBlocking { api.runEvents(bad, null).toList() } }
+        }
+        assertEquals(0, server.requestCount)
+        serve("session_get_archived.json")
+        api.getSession("a b?#%")
+        assertEquals("/api/sessions/a%20b%3F%23%25", server.takeRequest().target)
     }
 
     @Test
@@ -252,14 +367,14 @@ class HermesApiTest {
     @Test
     fun startRunSendsIdempotencyKeyAndExactBody() = runTest {
         serve("run_start.json", 202)
-        val body = buildRunBody("apofis-1", "say \"hi\"\nplease")
+        val body = "{ \"session_id\" :\"apofis-1\",\n\t\"input\":   \"caf\u00e9 \\\"hi\\\"\" }  "
         api.startRun(body, "idem-123")
         val req = server.takeRequest()
         assertEquals("POST", req.method)
         assertEquals("/v1/runs", req.url.encodedPath)
         assertEquals("idem-123", req.headers["Idempotency-Key"])
         assertEquals("Bearer secret-key", req.headers["Authorization"])
-        assertEquals(body, req.body!!.utf8())
+        assertEquals(body.encodeUtf8(), req.body)
     }
 
     @Test

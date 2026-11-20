@@ -87,7 +87,10 @@ internal data class ErrorEnvelope(val error: ErrorBody) {
     data class ErrorBody(val code: String?)
 }
 
-/** Any JSON value as text: a string as itself, null as "", anything else as its JSON. */
+/**
+ * Any JSON value as text: a string as itself, anything else as its JSON. JSON null becomes "" on purpose:
+ * bookkeeping rows (`session_meta`) have null content and the app treats null and empty content the same.
+ */
 internal object JsonTextSerializer : KSerializer<String> {
     override val descriptor = PrimitiveSerialDescriptor("JsonText", PrimitiveKind.STRING)
 
