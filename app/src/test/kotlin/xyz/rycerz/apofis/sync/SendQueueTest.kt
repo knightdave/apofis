@@ -550,6 +550,67 @@ class SendQueueTest {
     }
 
     @Test
+    fun steerStoredRightBeforeADeathStillSteersTheRunningReply() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        var checks = 0
+        val dying = SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }) // gone right after the commit
+        dying.submit("apofis-a", "also do this")
+        val stored = rows("apofis-a").single()
+        assertEquals("steering", stored.state) // the intent: this run, not a new turn
+        assertEquals("run_1", stored.runId)
+        assertFalse(stored.attempted)
+        assertEquals(0, server.requestCount)
+        respond(fixture("steer_response.json"))
+
+        assertTrue(queue.drain()) // the restarted app (or its worker)
+
+        assertEquals("/v1/runs/run_1/steer", take().target)
+        assertEquals("steered", rows("apofis-a").single().state)
+        assertEquals(1, server.requestCount) // never POSTed as a new run
+    }
+
+    @Test
+    fun storedSteerOfARunThatEndedBecomesTheNextTurn() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "also do this")
+        db.activeRunDao().delete("run_1") // the run ended before the restart
+        respond(runStart("run_2"), 202)
+
+        assertTrue(queue.drain())
+
+        assertEquals("/v1/runs", take().target)
+        assertEquals("sending", rows("apofis-a").single().state)
+    }
+
+    @Test
+    fun chatHiddenBetweenStoringAndSteeringIsNotSteered() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        val hidden = """{"id":"apofis-a","source":"api_server","title":"t","pinned":false,"archived":false,"hidden":true,""" +
+            """"started_at":1.0,"last_active":2.0,"message_count":1,"preview":"p","_lineage_ids":[]}"""
+        val list = holding.hold(
+            MockResponse.Builder().code(200).body("""{"object":"list","data":[$hidden],"has_more":false}""")
+                .addHeader("Content-Type", "application/json").build(),
+        )
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
+        take() // the refresh holds the repository lock while its list request is in flight
+        val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
+        withContext(Dispatchers.Default) { withTimeout(5_000) { db.pendingSendDao().observe("apofis-a").first { it.isNotEmpty() } } }
+        list.countDown() // the refresh now hides the chat, before the send can take the lock
+        refresh.join()
+        send.join()
+
+        assertEquals(1, server.requestCount) // no steer
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals("session_unavailable", row.error)
+    }
+
+    @Test
     fun steerIsStoredBeforeTheRequest() = runTest {
         addSession("apofis-a")
         running("apofis-a")
