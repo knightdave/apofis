@@ -26,6 +26,10 @@ import xyz.rycerz.apofis.db.SessionEntity
 private const val SESSION_PAGE = 200
 private const val MESSAGE_PAGE = 500
 private const val MAX_PAGES = 100
+private const val MAX_DETAIL_READS = 50
+
+// Process-wide: the app has a single database, so every repository instance must share one lock.
+private val lock = Mutex()
 
 /**
  * The only data source of the UI. The server transcript is the truth; Room caches it next to the user's unsent
@@ -34,7 +38,6 @@ private const val MAX_PAGES = 100
  */
 class ChatRepository(private val api: HermesApi, private val db: AppDatabase, private val now: () -> Long = System::currentTimeMillis) {
     private val sessionDao = db.sessionDao()
-    private val lock = Mutex()
 
     fun sessions(archived: Boolean = false): Flow<List<SessionEntity>> = sessionDao.observe(archived)
 
@@ -42,9 +45,10 @@ class ChatRepository(private val api: HermesApi, private val db: AppDatabase, pr
     fun transcript(sessionKey: String): Flow<List<ChatItem>> {
         requireAppKey(sessionKey)
         // Mapped once per change of the message rows, then reused when only pending sends or outcomes change.
-        val server = db.messageDao().observe(sessionKey).distinctUntilChanged().map { rows -> buildTranscript(rows.map { it.toDto() }) }
-        return combine(server, db.replyOutcomeDao().observe(sessionKey), db.pendingSendDao().observe(sessionKey)) { items, outcomes, pending ->
-            withOutcomes(items, outcomes) + pending.map { it.toItem() }
+        val server = db.messageDao().observe(sessionKey).distinctUntilChanged()
+            .map { rows -> rows.withIndex().associate { (i, row) -> row.id to i } to buildTranscript(rows.map { it.toDto() }) }
+        return combine(server, db.replyOutcomeDao().observe(sessionKey), db.pendingSendDao().observe(sessionKey)) { (positions, items), outcomes, pending ->
+            withOutcomes(positions, items, outcomes) + pending.map { it.toItem() }
         }
     }
 
@@ -75,12 +79,17 @@ class ChatRepository(private val api: HermesApi, private val db: AppDatabase, pr
         }
         listed.forEach { take(it, cachedFor(it)) }
         val listedKeys = (visible + hidden).mapTo(HashSet()) { it.key }
-        // The list never returns archived chats, so each one known locally is read by id; a 404 drops it.
-        for (row in cached) {
-            if (!row.archived || !row.existsOnServer || row.key in listedKeys) continue
+        val unlisted = cached.filter { it.existsOnServer && it.key !in listedKeys }
+        // The list never returns archived chats, so each one known locally is read by id. A chat the DAO keeps
+        // for unsent work is read too, since the list also omits hidden chats; at most MAX_DETAIL_READS of those
+        // per refresh, the rest stay as cached until a later refresh.
+        val retained = sessionDao.retainedKeys().toHashSet()
+        val toRead = unlisted.filter { it.archived } + unlisted.filter { !it.archived && it.key in retained }.take(MAX_DETAIL_READS)
+        for (row in toRead) {
             val dto = try {
                 api.getSession(row.currentId)
             } catch (_: ApiError.NotFound) {
+                hidden += row.copy(hidden = true) // gone from the server: written only if the DAO keeps it
                 continue
             }
             take(dto, row)
@@ -162,6 +171,7 @@ class ChatRepository(private val api: HermesApi, private val db: AppDatabase, pr
             while (last.size >= MESSAGE_PAGE) {
                 if (++pages > MAX_PAGES) throw ApiError.Protocol
                 val page = api.messages(tip, MESSAGE_PAGE, all.size)
+                if (isReservedId(page.sessionId)) throw ApiError.Protocol
                 if (page.sessionId != tip) break
                 all += page.messages
                 last = page.messages
@@ -226,19 +236,23 @@ private fun PendingSendEntity.toItem() = UserMessage(
 )
 
 /**
- * Each outcome goes to the reply that owns its message row, or else to the last reply whose first row id is
- * lower; with neither it is ignored.
+ * Each outcome goes to the reply that owns its message row, or else to the last reply whose rows all sit before
+ * that row's position ([positions]: message id to transcript position). An unknown row means the last reply.
  */
-private fun withOutcomes(items: List<ChatItem>, outcomes: List<ReplyOutcomeEntity>): List<ChatItem> {
+private fun withOutcomes(positions: Map<Long, Int>, items: List<ChatItem>, outcomes: List<ReplyOutcomeEntity>): List<ChatItem> {
     if (outcomes.isEmpty()) return items
+    val replies = items.indices.filter { items[it] is AssistantReply }
     val result = items.toMutableList()
     for (o in outcomes) {
         val outcome = ReplyOutcome.entries.firstOrNull { it.name.equals(o.outcome, ignoreCase = true) } ?: continue
-        val owner = items.indexOfFirst { it is AssistantReply && o.afterMessageId in it.rowIds }
-        val target = owner.takeIf { it >= 0 } ?: items.indices.lastOrNull {
-            val first = (items[it] as? AssistantReply)?.rowIds?.firstOrNull()
-            first != null && first < o.afterMessageId
-        } ?: continue
+        val at = positions[o.afterMessageId]
+        val target = replies.firstOrNull { o.afterMessageId in (items[it] as AssistantReply).rowIds }
+            ?: if (at == null) {
+                replies.lastOrNull()
+            } else {
+                replies.lastOrNull { r -> (items[r] as AssistantReply).rowIds.all { (positions[it] ?: Int.MAX_VALUE) < at } }
+            }
+            ?: continue
         result[target] = (result[target] as AssistantReply).copy(outcome = outcome)
     }
     return result

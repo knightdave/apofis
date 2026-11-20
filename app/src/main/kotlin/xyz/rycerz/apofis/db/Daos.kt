@@ -65,6 +65,10 @@ interface SessionDao {
     )
     suspend fun evictableKeys(): List<String>
 
+    /** Sessions that [replaceServerSessions] never evicts: those with a pending send or an active run. */
+    @Query("SELECT sessionKey FROM PendingSendEntity UNION SELECT sessionKey FROM ActiveRunEntity")
+    suspend fun retainedKeys(): List<String>
+
     @Query("DELETE FROM SessionEntity WHERE `key` = :key")
     suspend fun deleteRow(key: String)
 

@@ -357,7 +357,9 @@ class ChatRepositorySyncTest {
         respond(fixture("session_delete.json"))
         val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
         withContext(Dispatchers.IO) { server.takeRequest() } // the refresh is fetching
-        val delete = launch(Dispatchers.Default) { repo.delete("apofis-s") }
+        // A second instance over the same database: the lock must be process-wide, not per repository.
+        val other = ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), db)
+        val delete = launch(Dispatchers.Default) { other.delete("apofis-s") }
         refresh.join()
         delete.join()
         assertNull(db.sessionDao().get("apofis-s"))
@@ -404,6 +406,65 @@ class ChatRepositorySyncTest {
         repo.refreshSessions()
         assertEquals(listOf("apofis-arch"), repo.sessions(archived = true).first().map { it.key })
         assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun reservedTipOnLaterPageFailsAtOnce() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        respond(messagesJson("apofis-s", (1L..500L).toList()))
+        respond(messagesJson("apofis-push-1", listOf(501L)))
+        respond(messagesJson("apofis-s", listOf(1L))) // would let a retry succeed
+        assertEquals(ApiError.Protocol, expectError { repo.syncMessages("apofis-s") })
+        assertEquals(2, server.requestCount)
+        assertTrue(db.messageDao().observe("apofis-s").first().isEmpty())
+    }
+
+    private suspend fun unlistedWithPendingSend(detail: () -> Unit) {
+        db.sessionDao().upsert(session("apofis-h"))
+        respond(messagesJson("apofis-h", listOf(1L, 2L)))
+        repo.syncMessages("apofis-h")
+        db.pendingSendDao().upsert(pending("apofis-h", "idem-h"))
+        respond(page())
+        detail()
+        repo.refreshSessions()
+        assertEquals(3, server.requestCount)
+        assertEquals("/api/sessions/apofis-h", (1..3).map { server.takeRequest() }.last().url.encodedPath)
+        assertTrue(repo.sessions().first().isEmpty())
+        assertTrue(repo.sessions(archived = true).first().isEmpty())
+        assertTrue(db.messageDao().observe("apofis-h").first().isEmpty())
+        assertEquals(listOf("idem-h"), db.pendingSendDao().observe("apofis-h").first().map { it.idempotencyKey })
+    }
+
+    @Test
+    fun hiddenUnlistedChatWithPendingSendDisappears() = runTest {
+        unlistedWithPendingSend { respond("""{"object":"hermes.session","session":${sessionJson("apofis-h", hidden = true)}}""") }
+    }
+
+    @Test
+    fun goneUnlistedChatWithPendingSendDisappears() = runTest {
+        unlistedWithPendingSend { respond(fixture("error_404.json"), code = 404) }
+    }
+
+    @Test
+    fun outcomeOnNoticeFollowsPositionNotId() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        respond(
+            rawMessages(
+                "apofis-s",
+                listOf(
+                    """{"id":10,"role":"user","content":"hi","timestamp":1.0}""",
+                    """{"id":20,"role":"assistant","content":"a","timestamp":2.0}""",
+                    """{"id":5,"role":"system","display_kind":"model_switch","content":"switch","timestamp":3.0}""",
+                    """{"id":30,"role":"user","content":"again","timestamp":4.0}""",
+                    """{"id":40,"role":"assistant","content":"b","timestamp":5.0}""",
+                ),
+            ),
+        )
+        repo.syncMessages("apofis-s")
+        db.replyOutcomeDao().upsert(ReplyOutcomeEntity("apofis-s", 5L, "stopped", null))
+        db.replyOutcomeDao().upsert(ReplyOutcomeEntity("apofis-s", 999L, "failed", null)) // unknown row: last reply
+        val replies = repo.transcript("apofis-s").first().filterIsInstance<AssistantReply>()
+        assertEquals(listOf(ReplyOutcome.STOPPED, ReplyOutcome.FAILED), replies.map { it.outcome })
     }
 
     @Test
