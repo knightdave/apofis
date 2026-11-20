@@ -143,7 +143,15 @@ class RunFollower(
     }
 
     suspend fun stop(sessionKey: String) {
-        val run = db.activeRunDao().forSession(sessionKey) ?: return
+        stop(db.activeRunDao().forSession(sessionKey) ?: return)
+    }
+
+    /** Stops every active run of the chat, one request each, in order; the first failure throws and stops the rest. */
+    suspend fun stopAll(sessionKey: String) {
+        db.activeRunDao().allForSession(sessionKey).forEach { stop(it) }
+    }
+
+    private suspend fun stop(run: ActiveRunEntity) {
         // The intent is stored apart from the server's status, so a cancel seen after a restart still counts as this
         // user's stop, and a stop by another client never does.
         db.activeRunDao().setStopRequested(run.runId)

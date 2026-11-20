@@ -1091,6 +1091,36 @@ class RunFollowerTest {
     }
 
     @Test
+    fun stopAllStopsEveryRunOfTheChat() = runTest {
+        val f = follower()
+        addSession()
+        addRun(RUN)
+        db.activeRunDao().upsert(ActiveRunEntity("run_2", KEY, null, "queued", 2L))
+        addRun("run_other", key = "apofis-other")
+        on("/v1/runs/$RUN/stop", json("""{"run_id":"$RUN","status":"stopping"}"""))
+        on("/v1/runs/run_2/stop", json("""{"run_id":"run_2","status":"stopping"}"""))
+
+        f.stopAll(KEY)
+        assertEquals(1, requestsTo("/v1/runs/$RUN/stop").size)
+        assertEquals(1, requestsTo("/v1/runs/run_2/stop").size)
+        assertTrue(requestsTo("/v1/runs/run_other/stop").isEmpty())
+        assertTrue(db.activeRunDao().get(RUN)!!.stopRequested && db.activeRunDao().get("run_2")!!.stopRequested)
+    }
+
+    @Test
+    fun stopAllThrowsWhenAStopFails() = runTest {
+        val f = follower()
+        addSession()
+        addRun(RUN)
+        on("/v1/runs/$RUN/stop", json("""{"error":{"code":"boom"}}""", 500))
+        try {
+            f.stopAll(KEY)
+            fail("a failed stop must throw")
+        } catch (_: ApiError) {
+        }
+    }
+
+    @Test
     fun stopIntentIsStoredApartFromStatus() = runTest {
         val f = follower()
         val release = CountDownLatch(1)
