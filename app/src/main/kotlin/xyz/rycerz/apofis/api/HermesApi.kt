@@ -1,0 +1,178 @@
+package xyz.rycerz.apofis.api
+
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+
+/** Client for the Hermes Agent API server. [baseUrl] may carry a path prefix; a malformed URL throws IllegalArgumentException. */
+class HermesApi(baseUrl: String, private val apiKey: String, private val client: OkHttpClient = defaultClient()) {
+    private val base: HttpUrl = baseUrl.toHttpUrl()
+
+    suspend fun capabilities(): Capabilities = get(url("v1/capabilities"))
+
+    /** Archived rows are never returned by the server (unless also pinned); read those with [getSession]. */
+    suspend fun listSessions(limit: Int = 200, offset: Int = 0): SessionPage =
+        get(url("api/sessions") { addQueryParameter("limit", "$limit").addQueryParameter("offset", "$offset") })
+
+    suspend fun getSession(id: String): SessionDto = get<SessionEnvelope>(url("api/sessions", id)).session
+
+    /** Returns false when the id already exists. A deleted id gives [ApiError.Conflict] `session_deleted`. */
+    suspend fun createSession(id: String, title: String?, systemPrompt: String? = null): Boolean {
+        val body = jsonBody {
+            put("id", id)
+            if (title != null) put("title", title)
+            if (systemPrompt != null) put("system_prompt", systemPrompt)
+        }
+        return try {
+            exchange(post(url("api/sessions"), body)) { }
+            true
+        } catch (e: ApiError.Conflict) {
+            if (e.code == "session_exists") false else throw e
+        }
+    }
+
+    suspend fun patchSession(id: String, title: String? = null, pinned: Boolean? = null, archived: Boolean? = null, hidden: Boolean? = null): SessionDto {
+        val body = jsonBody {
+            if (title != null) put("title", title)
+            if (pinned != null) put("pinned", pinned)
+            if (archived != null) put("archived", archived)
+            if (hidden != null) put("hidden", hidden)
+        }
+        return exchange(request(url("api/sessions", id)).patch(body.toJsonRequestBody()).build()) { decode<SessionEnvelope>(it) }.session
+    }
+
+    /** A missing session counts as deleted. */
+    suspend fun deleteSession(id: String) {
+        try {
+            exchange(request(url("api/sessions", id)).delete().build()) { }
+        } catch (_: ApiError.NotFound) {
+        }
+    }
+
+    suspend fun messages(sessionId: String, limit: Int = 500, offset: Int = 0): MessagePage = get(
+        url("api/sessions", sessionId, "messages") {
+            addQueryParameter("limit", "$limit").addQueryParameter("offset", "$offset")
+                .addQueryParameter("order", "oldest").addQueryParameter("include_compacted", "true")
+        },
+    )
+
+    /** Sends [bodyJson] unchanged, so a retry with the same [idempotencyKey] is byte-identical. */
+    suspend fun startRun(bodyJson: String, idempotencyKey: String): RunStart {
+        val req = request(url("v1/runs")).header("Idempotency-Key", idempotencyKey).post(bodyJson.toRequestBody(JSON)).build()
+        return exchange(req) { decode(it) }
+    }
+
+    suspend fun runStatus(runId: String): RunStatus = get(url("v1/runs", runId))
+
+    /** Completes when the server closes the stream, with or without a terminal event. */
+    fun runEvents(runId: String, lastSeq: Long?): Flow<RunEvent> = channelFlow {
+        val req = request(url("v1/runs", runId, "events")).header("Accept", "text/event-stream")
+        // Last-Event-ID n replays seq > n, so the first attach must not send it.
+        if (lastSeq != null) req.header("Last-Event-ID", lastSeq.toString())
+        exchange(req.build()) { response -> SseReader.events(response.body.source()).collect { send(it) } }
+    }
+
+    suspend fun steer(runId: String, text: String) = control(url("v1/runs", runId, "steer")) { put("text", text) }
+
+    suspend fun stop(runId: String) = control(url("v1/runs", runId, "stop")) { }
+
+    suspend fun approve(runId: String, requestId: String, executionGeneration: Long, choice: ApprovalChoice) =
+        control(url("v1/runs", runId, "approval")) {
+            put("request_id", requestId)
+            put("execution_generation", executionGeneration)
+            put("choice", choice.name.lowercase())
+        }
+
+    suspend fun clarify(runId: String, requestId: String, executionGeneration: Long, answer: String) =
+        control(url("v1/runs", runId, "clarify")) {
+            put("request_id", requestId)
+            put("execution_generation", executionGeneration)
+            put("answer", answer)
+        }
+
+    suspend fun resolveUnknown(runId: String, admissionId: String, executionGeneration: Long) =
+        control(url("v1/runs", runId, "resolve-unknown")) {
+            put("admission_id", admissionId)
+            put("execution_generation", executionGeneration)
+        }
+
+    private suspend fun control(url: HttpUrl, body: JsonObjectBuilder.() -> Unit) {
+        exchange(post(url, jsonBody(body))) { }
+    }
+
+    private fun url(vararg segments: String, query: HttpUrl.Builder.() -> Unit = {}): HttpUrl =
+        base.newBuilder().apply {
+            // addPathSegment replaces a trailing empty segment, so "http://h/" and "http://h" give the same URL.
+            segments.forEach { s -> if ('/' in s) addPathSegments(s) else addPathSegment(s) }
+            query()
+        }.build()
+
+    private fun request(url: HttpUrl) = Request.Builder().url(url).header("Authorization", "Bearer $apiKey")
+
+    private fun post(url: HttpUrl, body: JsonObject) = request(url).post(body.toJsonRequestBody()).build()
+
+    private suspend inline fun <reified T> get(url: HttpUrl): T = exchange(request(url).build()) { decode<T>(it) }
+
+    private inline fun <reified T> decode(response: Response): T = json.decodeFromString<T>(response.body.string())
+
+    /** Runs [request] on the IO dispatcher; cancelling the caller cancels the HTTP call at once. */
+    private suspend fun <T> exchange(request: Request, onSuccess: suspend (Response) -> T): T = coroutineScope {
+        val call = client.newCall(request)
+        val work = async(Dispatchers.IO) {
+            try {
+                call.execute().use { response ->
+                    if (!response.isSuccessful) throw errorOf(response)
+                    onSuccess(response)
+                }
+            } catch (e: IOException) {
+                throw ApiError.Network(e)
+            }
+        }
+        try {
+            work.await()
+        } finally {
+            call.cancel()
+        }
+    }
+
+    private fun errorOf(response: Response): ApiError {
+        val code = runCatching { json.decodeFromString<ErrorEnvelope>(response.body.string()).error.code }.getOrNull()
+        return when {
+            response.code == 401 -> ApiError.Unauthorized
+            response.code == 404 -> ApiError.NotFound
+            response.code == 409 && code != null -> ApiError.Conflict(code)
+            response.code == 503 -> ApiError.Unavailable(response.header("Retry-After")?.trim()?.toLongOrNull())
+            else -> ApiError.Http(response.code, code)
+        }
+    }
+
+    companion object {
+        private val JSON = "application/json".toMediaType()
+        internal val json = Json {
+            ignoreUnknownKeys = true
+            explicitNulls = false
+        }
+
+        /** The server sends a keepalive every 10 s on event streams, so 60 s of silence means a dead connection. */
+        fun defaultClient(): OkHttpClient = OkHttpClient.Builder().readTimeout(60, TimeUnit.SECONDS).build()
+
+        private fun jsonBody(block: JsonObjectBuilder.() -> Unit) = buildJsonObject(block)
+        private fun JsonObject.toJsonRequestBody() = toString().toRequestBody(JSON)
+    }
+}
