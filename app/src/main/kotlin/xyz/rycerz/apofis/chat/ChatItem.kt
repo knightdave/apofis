@@ -40,6 +40,8 @@ data class ToolStep(
     val error: Boolean,
     val running: Boolean,
     val durationSeconds: Double? = null, // live steps only: the stored transcript has no timing
+    val args: String = "", // stored steps only: the full arguments (pretty JSON when they parse), cut to the display limit
+    val argsTruncated: Boolean = false,
 ) : Step
 
 enum class ReplyOutcome { STOPPED, FAILED, INTERRUPTED }

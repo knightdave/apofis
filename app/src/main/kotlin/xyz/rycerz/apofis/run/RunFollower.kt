@@ -40,6 +40,7 @@ import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.PendingState
 import xyz.rycerz.apofis.sync.RunStarter
 import xyz.rycerz.apofis.sync.SendError
+import xyz.rycerz.apofis.sync.deliveredIn
 import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private val TERMINAL = setOf("completed", "failed", "cancelled", "interrupted")
@@ -57,7 +58,6 @@ private const val POLL_MS = 3_000L
 private const val SAVE_EVERY_EVENTS = 20
 private const val SAVE_EVERY_NS = 500_000_000L
 private const val FINISH_ATTEMPTS = 5 // per resume, for a transcript sync that keeps failing transiently
-private const val DELIVERY_WINDOW_S = 60.0
 
 /** The result of answering an approval or clarify request. */
 enum class AnswerResult {
@@ -604,15 +604,7 @@ class RunFollower(
             val used = HashSet<String>() // one bubble confirms one send; a merged steer bubble confirms every steer in it
             val pendingDao = db.pendingSendDao()
             for (p in pendingDao.forRun(id)) {
-                val text = p.text.trim()
-                val since = p.createdAt / 1000.0 - DELIVERY_WINDOW_S
-                val confirmed = when (p.state) {
-                    PendingState.SENDING -> shown.firstOrNull { !it.steered && it.key !in used && it.timestamp >= since && it.text.trim() == text }
-                        ?.also { used += it.key } != null
-                    PendingState.STEERED -> shown.any { it.steered && it.timestamp >= since && it.text.contains(text) }
-                    else -> false
-                }
-                if (confirmed) {
+                if (deliveredIn(p, shown, used)) {
                     pendingDao.delete(p.idempotencyKey)
                 } else {
                     pendingDao.update(p.copy(state = PendingState.FAILED, error = SendError.UNCONFIRMED, runId = null))
