@@ -175,13 +175,51 @@ class ChatRepositorySyncTest {
 
     @Test
     fun pagesUntilHasMoreFalse() = runTest {
-        respond(page(sessionJson("apofis-a"), hasMore = true))
+        val first = (0 until 200).map { sessionJson("apofis-a$it") }
+        respond(page(*first.toTypedArray(), hasMore = true))
         respond(page(sessionJson("apofis-b"), hasMore = false))
         repo.refreshSessions()
-        assertEquals(setOf("apofis-a", "apofis-b"), repo.sessions().first().map { it.key }.toSet())
+        assertEquals((0 until 200).map { "apofis-a$it" }.toSet() + "apofis-b", repo.sessions().first().map { it.key }.toSet())
         assertEquals(2, server.requestCount)
         server.takeRequest()
-        assertEquals("1", server.takeRequest().url.queryParameter("offset"))
+        assertEquals("200", server.takeRequest().url.queryParameter("offset")) // the next recency window
+    }
+
+    private suspend fun cachedWithHistory(key: String) {
+        db.sessionDao().upsert(session(key))
+        respond(messagesJson(key, listOf(1L)))
+        repo.syncMessages(key)
+    }
+
+    @Test
+    fun backFilledPinDoesNotSkipTheNextWindowsFirstRow() = runTest {
+        cachedWithHistory("apofis-u200")
+        val pin = sessionJson("apofis-pin", pinned = true, archived = true)
+        // 200 recency rows plus the pin Hermes appends past the limit; has_more counts only the 200.
+        respond(page(*((0 until 200).map { sessionJson("apofis-u$it") } + pin).toTypedArray(), hasMore = true))
+        respond(page(sessionJson("apofis-u200"), pin, hasMore = false))
+        repo.refreshSessions()
+
+        server.takeRequest()
+        server.takeRequest()
+        assertEquals("200", server.takeRequest().url.queryParameter("offset"))
+        assertNotNull(db.sessionDao().get("apofis-u200"))
+        assertTrue(db.messageDao().hasRows("apofis-u200"))
+        assertEquals(1, db.sessionDao().all().count { it.key == "apofis-pin" })
+    }
+
+    @Test
+    fun pinInsideAFullWindowDoesNotEndTheListEarly() = runTest {
+        cachedWithHistory("apofis-last")
+        val pin = sessionJson("apofis-pin", pinned = true)
+        // A full window with the pin inside it: Hermes counts 199 unpinned rows and says has_more=false.
+        respond(page(*((0 until 199).map { sessionJson("apofis-u$it") } + pin).toTypedArray(), hasMore = false))
+        respond(page(sessionJson("apofis-last"), pin, hasMore = false))
+        repo.refreshSessions()
+
+        assertEquals(3, server.requestCount)
+        assertNotNull(db.sessionDao().get("apofis-last"))
+        assertTrue(db.messageDao().hasRows("apofis-last"))
     }
 
     @Test

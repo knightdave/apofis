@@ -111,8 +111,11 @@ class ChatRepository(
             val page = api.listSessions(SESSION_PAGE, offset)
             if (page.hasMore && page.data.isEmpty()) throw ApiError.Protocol // the rest of the list would be lost
             listed += page.data
-            offset += page.data.size
-            if (!page.hasMore) break
+            // Hermes pages a recency window of SESSION_PAGE rows and appends the pinned chats outside it to every page,
+            // and its has_more ignores pins inside the window. So step by the window, and stop only at a page that
+            // cannot have been a full window (fewer rows, pins included): a list stopped early would evict real chats.
+            if (!page.hasMore && page.data.size < SESSION_PAGE) break
+            offset += SESSION_PAGE
         }
         val cached = sessionDao.all()
         val index = HashMap<String, SessionEntity>()
@@ -128,7 +131,7 @@ class ChatRepository(
                 hidden += dto.toEntity(row).copy(hidden = true)
             }
         }
-        listed.forEach { take(it, cachedFor(it)) }
+        listed.distinctBy { it.id }.forEach { take(it, cachedFor(it)) }
         val listedKeys = (visible + hidden).mapTo(HashSet()) { it.key }
         val unlisted = cached.filter { it.existsOnServer && it.key !in listedKeys }
         // The list never returns archived chats, so each one known locally is read by id. A chat the DAO keeps
