@@ -257,10 +257,10 @@ class BlocksTest {
         val rows = ChatRows(ZoneId.of("UTC"))
         fun items(text: String) = Joined(emptyList<ChatItem>(), listOf<ChatItem>(AssistantReply("r1", emptyList(), text, 0.0, live = true)))
         rows.rows(items(before))
-        val scan = Work.scanSteps + Work.chunkSteps
+        val scan = Work.scanSteps + Work.chunkSteps + Work.lfChars
         val copies = Work.rowCopies
         rows.rows(items(after))
-        return (Work.scanSteps + Work.chunkSteps - scan) to (Work.rowCopies - copies)
+        return (Work.scanSteps + Work.chunkSteps + Work.lfChars - scan) to (Work.rowCopies - copies)
     }
 
     @Test
@@ -281,6 +281,23 @@ class BlocksTest {
         // The same for a long open literal paragraph streamed line by line.
         val prose = "a line of prose that goes on\n"
         assertEquals(workFor(prose.repeat(400), prose.repeat(401)), workFor(prose.repeat(20_000), prose.repeat(20_001)))
+    }
+
+    @Test
+    fun workPerAppendDoesNotGrowWithCrHistoryOrALongIndent() {
+        // After CRLF text, one more character costs the same however long the reply already is.
+        val crlf = "a short paragraph\r\n\r\n"
+        for (append in listOf("x", "\r", "\n", "\r\nnext")) {
+            assertEquals("appending ${append.replace("\r", "\\r").replace("\n", "\\n")}", workFor(crlf.repeat(100) + "tail", crlf.repeat(100) + "tail" + append), workFor(crlf.repeat(2000) + "tail", crlf.repeat(2000) + "tail" + append))
+        }
+        // A growing line of spaces, or text after a long indent, is not read again from its start on each token. (In a
+        // fence the lengths stay under CHUNK: a longer code line is cut again from its piece start, at most 20,000.)
+        for (prefix in listOf("para\n\n", "")) {
+            assertEquals(prefix, workFor(prefix + " ".repeat(100), prefix + " ".repeat(101)), workFor(prefix + " ".repeat(5000), prefix + " ".repeat(5001)))
+        }
+        val code = "```\n"
+        assertEquals(workFor(code + " ".repeat(100), code + " ".repeat(101)), workFor(code + " ".repeat(1400), code + " ".repeat(1401)))
+        assertEquals(workFor(code + " ".repeat(100) + "x", code + " ".repeat(100) + "xy"), workFor(code + " ".repeat(1400) + "x", code + " ".repeat(1400) + "xy"))
     }
 
     @Test

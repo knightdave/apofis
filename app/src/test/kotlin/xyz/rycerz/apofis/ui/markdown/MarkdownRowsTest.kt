@@ -417,6 +417,15 @@ class MarkdownRowsTest {
         "![".repeat(500) + "x" + "](https://u.v)".repeat(500),
         "1. a\n\n   > q\n   > | t |\n   > |---|\n\n2. b",
         "|" + "h|".repeat(150) + "\n|" + "-|".repeat(150) + "\n|c|\n",
+        "<div>\n```\nthis stays literal\n```\n[docs](https://example.org)\n</div>",
+        "<details>\n<summary>Run it</summary>\n\n```sh\nls\n```\n</details>",
+        "<!-- generated -->\n| Name | Status |\n| --- | --- |\n| API | OK |\n",
+        "<https://example.org> | Status\n---|---\nx | y\n",
+        "text\n<span>x</span>\n```\ncode\n```\n",
+        "<a href=\"x\" title='y' data-z=w>\n```\nnot code\n```\n\n```\ncode\n```",
+        // Lines of spaces growing token by token in every kind of block.
+        "| a |\n|---|\n| 1 |\n      \n     x", "- a\n\n      \n  b\n      ", "<!--\n      \n-->\n    ", "<div>\n     \n<p>\n   ",
+        "```\n     \n   ```\n    ", "para\n      \t  \r\n   \r   x",
     )
 
     @Test
@@ -490,5 +499,33 @@ class MarkdownRowsTest {
         val slices = sliceText(text)
         assertEquals(text.text, slices.joinToString("") { it.text })
         for (slice in slices.drop(1)) assertTrue(Character.getType(slice.text[0]) != Character.NON_SPACING_MARK.toInt())
+    }
+
+    @Test
+    fun aFenceDoesNotOpenInsideAnHtmlBlock() {
+        val div = "<div>\n```\nthis stays literal\n```\n[docs](https://example.org)\n</div>"
+        assertEquals(listOf(DisplayChunk.Blocks(listOf(para(div)))), allRows(div).map { it.chunk })
+        assertEquals(allRows(div), streamed(div, 1))
+        // A type 7 tag alone on a line starts an HTML block too, up to the blank line.
+        val tag = "<a href=\"x\" title='y' data-z=w>\n```\nnot code\n```\n\n```\ncode\n```"
+        assertEquals(
+            listOf(DisplayChunk.Blocks(listOf(para("<a href=\"x\" title='y' data-z=w>\n```\nnot code\n```"))), DisplayChunk.Code("code", tag.length - 8, first = true, last = true)),
+            allRows(tag).map { it.chunk },
+        )
+        // But it cannot interrupt a paragraph: there the fence opens as usual.
+        val inline = allRows("text\n<span>x</span>\n```\ncode\n```\n")
+        assertEquals(listOf(BlockKind.TEXT, BlockKind.CODE), inline.map { it.kind })
+        assertEquals(DisplayChunk.Blocks(listOf(para("text\n<span>x</span>"))), inline[0].chunk)
+    }
+
+    @Test
+    fun aTableMayFollowAnHtmlBlockThatEnded() {
+        val rows = allRows("<!-- generated -->\n| Name | Status |\n| --- | --- |\n| API | OK |\n")
+        assertEquals(DisplayChunk.Blocks(listOf(para("<!-- generated -->"))), rows[0].chunk)
+        assertEquals(MdBlock.Table(cells("Name", "Status"), listOf(Align.START, Align.START), listOf(cells("API", "OK"))), (rows[1].chunk as DisplayChunk.TableSlice).table)
+        assertEquals(2, rows.size)
+        // An autolink is no HTML block: its line can be a header.
+        val link = (allRows("<https://example.org> | Status\n---|---\nx | y\n").single().chunk as DisplayChunk.TableSlice).table
+        assertEquals(MdText("https://example.org", listOf(MdSpan(0, 19, SpanKind.LINK, "https://example.org"))), link.header[0])
     }
 }

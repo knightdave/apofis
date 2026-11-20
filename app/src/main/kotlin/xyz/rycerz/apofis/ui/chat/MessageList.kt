@@ -81,7 +81,7 @@ internal data class ScanState(
  * The logical blocks of [text] (line breaks LF only, see [lf]) from [from], which must be a line start between blocks;
  * indices count from 0 there.
  */
-internal fun parseBlocks(text: String, from: Int = 0): List<LogicalBlock> {
+internal fun parseBlocks(text: CharSequence, from: Int = 0): List<LogicalBlock> {
     val out = ArrayList<LogicalBlock>()
     val s = ScanState(pos = from)
     while (s.pos < text.length) scanLine(s, text, out)
@@ -96,7 +96,7 @@ internal fun parseBlocks(text: String, from: Int = 0): List<LogicalBlock> {
  * every line with a pipe) is a block of its own; only this scanner decides what is a table. Work and stack depth are
  * linear in the line and constant respectively, whatever the line holds.
  */
-internal fun scanLine(s: ScanState, text: String, out: MutableList<LogicalBlock>) {
+internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<LogicalBlock>) {
     val i = s.pos
     val nl = lineEnd(text, i)
     val end = nl // the line's content
@@ -112,13 +112,15 @@ internal fun scanLine(s: ScanState, text: String, out: MutableList<LogicalBlock>
         }
         return
     }
-    val html = s.htmlEnd
-    if (html != null) { // HTML source: no cut, list or table until its end marker
-        if (text.substring(i, end).contains(html, ignoreCase = true)) s.htmlEnd = null
+    val blank = first == end
+    val inHtml = s.htmlEnd
+    // HTML source: no fence, cut, list or table until its end, the line holding its marker or else a blank line
+    if (inHtml != null && !(inHtml.isEmpty() && blank)) {
+        if (inHtml.isNotEmpty() && text.substring(i, end).contains(inHtml, ignoreCase = true)) s.htmlEnd = null
         s.paraEnd = nl
         return
     }
-    val blank = first == end
+    s.htmlEnd = null
     if (s.tableStart >= 0) {
         when {
             blank -> {
@@ -157,54 +159,124 @@ internal fun scanLine(s: ScanState, text: String, out: MutableList<LogicalBlock>
         return
     }
     if (s.paraStart < 0) s.paraStart = i
+    val inParagraph = s.paraStart < i && s.paraOpen
     // An empty item, or one numbered other than 1, cannot interrupt a paragraph: "text\n-" underlines a heading.
-    if (item && (s.paraStart == i || !s.paraOpen || canInterrupt(text, i, end))) s.list = true
+    if (item && (!inParagraph || canInterrupt(text, i, end))) s.list = true
     val heading = isAtxHeading(text, first, end)
-    s.paraOpen = !heading && !isRuleOrUnderline(text, first, end)
-    if (text[first] == '>' || text[first] == '<') s.noTable = true
-    if (text[first] == '<' && first - i < 4) s.htmlEnd = htmlEnd(text, first, end)
+    val html = if (text[first] == '<' && first - i < 4) htmlMarker(text, first, end, inParagraph) else null
+    if (html != null) {
+        val closed = html.isNotEmpty() && text.substring(first + 2, end).contains(html, ignoreCase = true)
+        s.htmlEnd = if (closed) null else html
+    }
+    s.paraOpen = !heading && html == null && !isRuleOrUnderline(text, first, end)
+    if (text[first] == '>') s.noTable = true
     s.paraEnd = nl
-    // A header row must start a paragraph: not in a list, quote or HTML, not a list item or heading.
-    val cells = if (s.list || s.noTable || item || heading) 0 else rowCells(text, first, end)
+    // A header row must start a paragraph: not in a list or quote, not a list item, heading or HTML block.
+    val cells = if (s.list || s.noTable || item || heading || html != null) 0 else rowCells(text, first, end)
     s.headStart = if (cells > 0) i else -1
     s.headCells = cells
 }
 
 /** `#` to `######` then a space, a tab or the line end. */
-private fun isAtxHeading(text: String, first: Int, end: Int): Boolean {
+private fun isAtxHeading(text: CharSequence, first: Int, end: Int): Boolean {
     var k = first
     while (k < end && k - first < 7 && text[k] == '#') k++
     return k > first && k - first <= 6 && (k == end || text[k] == ' ' || text[k] == '\t')
 }
 
 /** Only `-`, `=`, `*` or `_` and spaces: a rule or a setext underline, which closes a paragraph. */
-private fun isRuleOrUnderline(text: String, first: Int, end: Int): Boolean {
+private fun isRuleOrUnderline(text: CharSequence, first: Int, end: Int): Boolean {
     for (k in first until end) if (text[k] !in "-=*_ \t") return false
     return true
 }
 
 private val rawHtmlTags = listOf("script", "pre", "style", "textarea")
 
+private val blockHtmlTags = (
+    "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt " +
+        "fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li " +
+        "link main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th " +
+        "thead title tr track ul"
+    ).split(' ').toSet()
+
 /**
- * The end marker of an HTML block starting at [first] that may run across blank lines (comment, processing
- * instruction, declaration, CDATA, or script, pre, style and textarea), when it does not end on this line; else null.
+ * Whether an HTML block starts at [first] (a `<`), as the parser decides it, and how it ends: at the line holding the
+ * returned marker (comment, processing instruction, declaration, CDATA, or script, pre, style and textarea), or at a
+ * blank line when it is "" (a block-level tag, or any other complete tag alone on its line, which cannot interrupt a
+ * paragraph). Null when no HTML block starts here.
  */
-private fun htmlEnd(text: String, first: Int, end: Int): String? {
-    val marker = when {
-        text.startsWith("<!--", first) -> "-->"
-        text.startsWith("<?", first) -> "?>"
-        text.startsWith("<![CDATA[", first) -> "]]>"
-        text.startsWith("<!", first) && first + 2 < end && text[first + 2].isLetter() -> ">"
-        else -> rawHtmlTags.firstOrNull { tag ->
-            val after = first + 1 + tag.length
-            text.regionMatches(first + 1, tag, 0, tag.length, ignoreCase = true) && (after == end || text[after] in " \t>")
-        }?.let { "</$it>" }
-    } ?: return null
-    return if (text.substring(first + 2, end).contains(marker, ignoreCase = true)) null else marker
+private fun htmlMarker(text: CharSequence, first: Int, end: Int, inParagraph: Boolean): String? {
+    fun at(prefix: String) = text.startsWith(prefix, first)
+    fun ends(k: Int, slash: Boolean) = k == end || text[k].isHtmlSpace() || text[k] == '>' || (slash && text.startsWith("/>", k))
+    rawHtmlTags.firstOrNull { tag -> text.regionMatches(first + 1, tag, 0, tag.length, ignoreCase = true) && ends(first + 1 + tag.length, false) }
+        ?.let { return "</$it>" }
+    if (at("<!--")) return "-->"
+    if (at("<?")) return "?>"
+    if (at("<!") && first + 2 < end && text[first + 2].isAsciiLetter()) return ">"
+    if (at("<![CDATA[")) return "]]>"
+    val nameStart = if (at("</")) first + 2 else first + 1
+    var k = nameStart
+    while (k < end && (text[k].isAsciiLetter() || text[k].isAsciiDigit() || text[k] == '-')) k++
+    if (k > nameStart && text.substring(nameStart, k).lowercase() in blockHtmlTags && ends(k, true)) return ""
+    if (inParagraph) return null
+    val tag = tagEnd(text, first, end)
+    return if (tag > 0 && firstNonSpace(text, tag, end) == end) "" else null
+}
+
+private fun Char.isAsciiLetter() = this in 'a'..'z' || this in 'A'..'Z'
+private fun Char.isAsciiDigit() = this in '0'..'9'
+private fun Char.isHtmlSpace() = this == ' ' || this == '\t' || this == '\u000B' || this == '\u000C'
+
+private fun skipHtmlSpace(text: CharSequence, from: Int, end: Int): Int {
+    var k = from
+    while (k < end && text[k].isHtmlSpace()) k++
+    return k
+}
+
+/**
+ * The index after a complete open or closing tag at [start] (a `<`), read as the parser reads it (tag name, then
+ * attributes each after a space, with optional unquoted or quoted values); else -1. One forward pass, constant stack.
+ */
+private fun tagEnd(text: CharSequence, start: Int, end: Int): Int {
+    var k = start + 1
+    val closing = k < end && text[k] == '/'
+    if (closing) k++
+    if (k >= end || !text[k].isAsciiLetter()) return -1
+    while (k < end && (text[k].isAsciiLetter() || text[k].isAsciiDigit() || text[k] == '-')) k++
+    if (closing) {
+        k = skipHtmlSpace(text, k, end)
+        return if (k < end && text[k] == '>') k + 1 else -1
+    }
+    while (true) {
+        val space = skipHtmlSpace(text, k, end)
+        if (space < end && text[space] == '>') return space + 1
+        if (text.startsWith("/>", space)) return space + 2
+        if (space == k || space >= end) return -1 // an attribute needs a space before it
+        k = space
+        val c = text[k]
+        if (!(c.isAsciiLetter() || c == '_' || c == ':')) return -1
+        while (k < end && (text[k].isAsciiLetter() || text[k].isAsciiDigit() || text[k] in "_.:-")) k++
+        val eq = skipHtmlSpace(text, k, end)
+        if (eq < end && text[eq] == '=') {
+            k = skipHtmlSpace(text, eq + 1, end)
+            if (k >= end) return -1
+            val q = text[k]
+            if (q == '"' || q == '\'') {
+                k++
+                while (k < end && text[k] != q) k++
+                if (k >= end) return -1
+                k++
+            } else {
+                val v = k
+                while (k < end && text[k] > ' ' && text[k] !in "\"'=<>`") k++
+                if (k == v) return -1
+            }
+        }
+    }
 }
 
 /** Adds the open blocks at the end of the text (none of them stable) to [out], leaving [s] as it was. */
-internal fun openBlocks(s: ScanState, text: String, out: MutableList<LogicalBlock>) {
+internal fun openBlocks(s: ScanState, text: CharSequence, out: MutableList<LogicalBlock>) {
     when {
         s.fenceBody >= 0 -> out += LogicalBlock(0, s.fenceBody, text.length, BlockKind.CODE, s.fenceLang, stable = false, fenceClosed = false, BlockMode.PARSED, next = text.length)
         s.tableStart >= 0 -> endTable(s.copy(), out, false, text.length)
@@ -249,15 +321,15 @@ private fun endTable(s: ScanState, out: MutableList<LogicalBlock>, stable: Boole
     s.tableStart = -1
 }
 
-private fun hasPipe(text: String, start: Int, end: Int): Boolean {
+private fun hasPipe(text: CharSequence, start: Int, end: Int): Boolean {
     for (k in start until end) if (text[k] == '|') return true
     return false
 }
 
-private fun onlyPipe(text: String, first: Int, end: Int) = text[first] == '|' && firstNonSpace(text, first + 1, end) == end
+private fun onlyPipe(text: CharSequence, first: Int, end: Int) = text[first] == '|' && firstNonSpace(text, first + 1, end) == end
 
 /** Columns of a GFM delimiter row such as `|:--|:-:|--:|` (at least one pipe), else -1. One pass, as the parser does. */
-private fun delimiterColumns(text: String, start: Int, end: Int): Int {
+private fun delimiterColumns(text: CharSequence, start: Int, end: Int): Int {
     var pipes = 0
     var valid = false
     var columns = 0
@@ -287,7 +359,7 @@ private fun delimiterColumns(text: String, start: Int, end: Int): Int {
 }
 
 /** Cells of a table row, split as the table parser splits it (`\|` does not split); 0 without a pipe. */
-private fun rowCells(text: String, first: Int, end: Int): Int {
+private fun rowCells(text: CharSequence, first: Int, end: Int): Int {
     if (!hasPipe(text, first, end)) return 0
     var start = first
     var cellEnd = end
@@ -316,7 +388,7 @@ private fun rowCells(text: String, first: Int, end: Int): Int {
 }
 
 /** A list item line (see [isListItem]) that may interrupt a paragraph: a bullet or `1.` with content after it. */
-private fun canInterrupt(text: String, start: Int, end: Int): Boolean {
+private fun canInterrupt(text: CharSequence, start: Int, end: Int): Boolean {
     var k = start
     while (k < end && k - start < 3 && text[k] == ' ') k++
     var m = k + 1
@@ -331,7 +403,7 @@ private fun canInterrupt(text: String, start: Int, end: Int): Boolean {
 }
 
 /** Up to three spaces, then `-`, `+`, `*` or 1 to 9 digits with `.` or `)`, then a space, a tab or the line end. */
-private fun isListItem(text: String, start: Int, end: Int): Boolean {
+private fun isListItem(text: CharSequence, start: Int, end: Int): Boolean {
     var k = start
     while (k < end && k - start < 3 && text[k] == ' ') k++
     if (k == end) return false
@@ -347,7 +419,7 @@ private fun isListItem(text: String, start: Int, end: Int): Boolean {
 }
 
 /** The unfinished line [start, end) could still become a list item: `-`, `+`, `*`, or digits with an optional `.` or `)`. */
-private fun mayBecomeListItem(text: String, start: Int, end: Int): Boolean {
+private fun mayBecomeListItem(text: CharSequence, start: Int, end: Int): Boolean {
     if (end - start == 1 && text[start] in "-+*") return true
     var d = start
     while (d < end && d - start < 9 && text[d].isDigit()) d++
@@ -362,6 +434,7 @@ internal object Work {
     var scanSteps = 0L // characters looked at by the block scanner
     var rowCopies = 0L // row references copied while assembling rows
     var largestParse = 0 // the longest source handed to the markdown parser
+    var lfChars = 0L // characters written while making line endings LF
     var parseFailures = 0L // blocks shown literally because parsing or slicing threw: a bug, never expected
 }
 
@@ -371,7 +444,7 @@ internal object Work {
  * pass: every character is inspected at most once. Pieces before the last depend only on characters before their
  * cut, so text appended at [end] never moves them.
  */
-internal fun chunkRanges(text: String, start: Int, end: Int, emit: (start: Int, end: Int, last: Boolean) -> Unit) {
+internal fun chunkRanges(text: CharSequence, start: Int, end: Int, emit: (start: Int, end: Int, last: Boolean) -> Unit) {
     var s = start
     var i = start
     var lastBreak = -1
@@ -398,9 +471,9 @@ internal fun chunkRanges(text: String, start: Int, end: Int, emit: (start: Int, 
 internal fun chunks(content: String): List<String> =
     ArrayList<String>().also { out -> chunkRanges(content, 0, content.length) { s, e, _ -> out += content.substring(s, e) } }
 
-private fun lineEnd(text: String, from: Int) = text.indexOf('\n', from).let { if (it < 0) text.length else it }
+private fun lineEnd(text: CharSequence, from: Int) = text.indexOf('\n', from).let { if (it < 0) text.length else it }
 
-private fun firstNonSpace(text: String, from: Int, end: Int): Int {
+private fun firstNonSpace(text: CharSequence, from: Int, end: Int): Int {
     var k = from
     while (k < end && text[k].isWhitespace()) k++
     return k
@@ -412,7 +485,7 @@ private fun textRow(key: String, b: LogicalBlock, c: Int, chunk: DisplayChunk, l
     return TextRow("$key/b${b.index}/c$c", chunk, b.kind, b.lang, first = c == 0, joinBelow = !last, fenceClosed = b.fenceClosed)
 }
 
-private fun blockRows(key: String, b: LogicalBlock, text: String): List<TextRow> {
+private fun blockRows(key: String, b: LogicalBlock, text: CharSequence): List<TextRow> {
     val chunks = displayChunks(text, b)
     return chunks.mapIndexed { c, chunk -> textRow(key, b, c, chunk, c == chunks.size - 1) }
 }
@@ -467,7 +540,8 @@ internal class ReplyText {
 
     private var key: String? = null
     private var text = "" // as given
-    private var norm = "" // [text] through [lf]; the same instance while it holds no CR
+    private var norm: CharSequence = "" // [text] through [lf]: [text] itself while it holds no CR, else a builder only appended to
+    private var blankTo = 0 // the last line holds only spaces from its start up to here (read once, not per token)
     private var closed = ArrayList<TextRow>() // rows of stable blocks; only appended to, so earlier views stay valid
     private var closedBlocks = 0
     private var checkpoint = ScanState() // the scanner at the start of the text's last line
@@ -487,18 +561,22 @@ internal class ReplyText {
             closedBlocks = 0
             checkpoint = ScanState()
             tail = emptyList()
+            blankTo = 0
         }
-        val new = when {
-            !appended -> lf(raw)
+        val oldLength = if (appended) norm.length else 0
+        val new: CharSequence = when {
+            !appended -> lf(raw).let { if (it === raw) it else StringBuilder(it) }
             norm === text && raw.indexOf('\r', text.length) < 0 -> raw
             else -> {
-                // A CR that ended the old text already stands for the line break; an LF right after it adds nothing.
+                // Only the appended part is made LF. A CR that ended the old text already stands for the line break,
+                // so an LF right after it adds nothing.
                 val from = if (text.endsWith('\r') && raw.getOrNull(text.length) == '\n') text.length + 1 else text.length
-                norm + lf(raw.substring(from))
+                val builder = norm as? StringBuilder ?: StringBuilder(norm).also { Work.lfChars += norm.length } // first CR in an append
+                Work.lfChars += raw.length - from
+                builder.append(lf(raw.substring(from)))
             }
         }
-        val old = if (appended) norm else ""
-        val grown = if (appended && new.indexOf('\n', old.length) < 0) grown(old, new.length) else null
+        val grown = if (appended && new.indexOf('\n', oldLength) < 0) grown(new, oldLength) else null
         var finished = 0 // blocks ended on finished lines: stable, and before the checkpoint
         val blocks = grown ?: ArrayList<LogicalBlock>().also { out ->
             val s = checkpoint.copy()
@@ -516,6 +594,8 @@ internal class ReplyText {
             }
             openBlocks(s, new, out)
             checkpoint = next
+            blankTo = firstNonSpace(new, next.pos, new.length) // the scanner just read this line; keep what it found
+            Work.scanSteps += blankTo - next.pos
             parsed = out.size
         }
         val firstIndex = closedBlocks
@@ -543,7 +623,7 @@ internal class ReplyText {
     }
 
     /** The rows of [b], reusing what [prev] (the block at the same start in the last update) still has right. */
-    private fun open(key: String, prev: Open?, b: LogicalBlock, text: String): Open {
+    private fun open(key: String, prev: Open?, b: LogicalBlock, text: CharSequence): Open {
         val p = prev?.block
         val same = p != null && p.start == b.start && p.kind == b.kind && p.mode == b.mode && p.lang == b.lang
         if (same && p!!.end == b.end && p.fenceClosed == b.fenceClosed) {
@@ -590,21 +670,35 @@ internal class ReplyText {
     }
 
     /**
-     * The tail after characters without a line break were appended to [old], when that provably only lengthens one
-     * open LITERAL paragraph or table or a fence to [length]: its last line is that block's, no appended character
-     * could turn the line into a fence opening (paragraph) or closing (fence), and the line does not follow a blank
-     * line in a list (where it could still end or continue the list). Else null.
+     * The tail after characters without a line break were appended to text[0, old), when that provably changes no
+     * block but lengthening one open LITERAL paragraph or table or a fence: its last line is that block's, no appended
+     * character could turn the line into a fence opening (paragraph) or closing (fence), and the line does not follow a
+     * blank line in a list (where it could still end or continue the list). A last line of only spaces that stays so
+     * changes nothing outside a fence and lengthens the code inside one. Else null. The line's leading spaces are read
+     * once, not again on each token.
      */
-    private fun grown(old: String, length: Int): List<LogicalBlock>? {
-        val b = tail.singleOrNull()?.block ?: return null
+    private fun grown(text: CharSequence, old: Int): List<LogicalBlock>? {
         val lineStart = checkpoint.pos
+        val from = maxOf(blankTo, lineStart)
+        val f = firstNonSpace(text, from, old)
+        blankTo = f
+        Work.scanSteps += f - from
+        val b = tail.singleOrNull()?.block
+        if (f == old) {
+            val g = firstNonSpace(text, old, text.length)
+            Work.scanSteps += g - old
+            if (g == text.length && checkpoint.htmlEnd.isNullOrEmpty()) { // still only spaces
+                if (checkpoint.fenceBody < 0) return tail.map { it.block }
+                return if (b != null && b.kind == BlockKind.CODE && !b.stable && b.end == old) listOf(b.copy(end = text.length)) else null
+            }
+        }
+        if (b == null) return null
         val code = b.kind == BlockKind.CODE
-        if (b.stable || b.end != old.length || lineStart < b.start || (!code && b.mode != BlockMode.LITERAL)) return null
-        val f = firstNonSpace(old, lineStart, old.length)
-        val ticks = old.length - f <= FENCE.length && (f until old.length).all { old[it] == '`' }
-        if (if (code) ticks else (f == old.length || ticks)) return null
+        if (b.stable || b.end != old || lineStart < b.start || (!code && b.mode != BlockMode.LITERAL)) return null
+        val ticks = old - f <= FENCE.length && (f until old).all { text[it] == '`' }
+        if (if (code) ticks else (f == old || ticks)) return null
         if (!code && checkpoint.pendingBlank) return null
-        return listOf(b.copy(end = length))
+        return listOf(b.copy(end = text.length))
     }
 }
 

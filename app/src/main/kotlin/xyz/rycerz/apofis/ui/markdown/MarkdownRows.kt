@@ -72,7 +72,7 @@ sealed interface DisplayChunk {
  * [rawPieces]. Whatever the parser should not get, or returns in a shape the slicer does not expect, shows as literal
  * text: a stored reply always opens.
  */
-fun displayChunks(source: String, block: LogicalBlock): List<DisplayChunk> {
+fun displayChunks(source: CharSequence, block: LogicalBlock): List<DisplayChunk> {
     if (block.kind == BlockKind.CODE || block.mode == BlockMode.LITERAL || !parseable(source, block)) {
         val out = ArrayList<DisplayChunk>()
         rawPieces(source, block, block.start) { s, e, _, last -> out += rawChunk(source, block, s, e, last) }
@@ -96,7 +96,7 @@ fun displayChunks(source: String, block: LogicalBlock): List<DisplayChunk> {
 }
 
 /** Whether [block] is within what the parser is given: [PARSE_MAX_CHARS] characters and [PARSE_MAX_BRACKETS] brackets. */
-private fun parseable(source: String, block: LogicalBlock): Boolean {
+private fun parseable(source: CharSequence, block: LogicalBlock): Boolean {
     if (block.end - block.start > PARSE_MAX_CHARS) return false
     var brackets = 0
     for (k in block.start until block.end) if (source[k] == '[' && ++brackets > PARSE_MAX_BRACKETS) return false
@@ -104,7 +104,7 @@ private fun parseable(source: String, block: LogicalBlock): Boolean {
 }
 
 /** The chunk for piece [s, e) of a LITERAL or CODE block. */
-internal fun rawChunk(source: String, block: LogicalBlock, s: Int, e: Int, last: Boolean): DisplayChunk =
+internal fun rawChunk(source: CharSequence, block: LogicalBlock, s: Int, e: Int, last: Boolean): DisplayChunk =
     if (block.kind == BlockKind.CODE) DisplayChunk.Code(source.substring(s, e), s, first = s == block.start, last = last)
     else DisplayChunk.Literal(source.substring(s, e))
 
@@ -112,7 +112,7 @@ internal fun rawChunk(source: String, block: LogicalBlock, s: Int, e: Int, last:
  * Cuts a LITERAL or CODE block from [from] (a piece start) to its end. [emit] gets each piece, the offset up to which
  * its cut was decided (it stays the same while the text up to there and an end beyond it stay), and whether it is last.
  */
-internal fun rawPieces(source: String, block: LogicalBlock, from: Int, emit: (start: Int, end: Int, decided: Int, last: Boolean) -> Unit) {
+internal fun rawPieces(source: CharSequence, block: LogicalBlock, from: Int, emit: (start: Int, end: Int, decided: Int, last: Boolean) -> Unit) {
     if (block.kind == BlockKind.CODE) codeRanges(source, from, block.end, emit)
     else chunkRanges(source, from, block.end) { s, e, last -> emit(s, e, if (last) block.end else s + CHUNK, last) }
 }
@@ -121,7 +121,7 @@ internal fun rawPieces(source: String, block: LogicalBlock, from: Int, emit: (st
  * Like [chunkRanges], but a line longer than [CHUNK] stays whole up to [TABLE_MAX_CHARS], so code is cut only at line
  * breaks (the break is dropped). One forward pass.
  */
-internal fun codeRanges(text: String, start: Int, end: Int, emit: (start: Int, end: Int, decided: Int, last: Boolean) -> Unit) {
+internal fun codeRanges(text: CharSequence, start: Int, end: Int, emit: (start: Int, end: Int, decided: Int, last: Boolean) -> Unit) {
     var s = start
     var i = start
     var lastBreak = -1
