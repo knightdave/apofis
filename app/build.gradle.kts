@@ -22,6 +22,11 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = System.getenv("APOFIS_VERSION_CODE")?.toInt() ?: 1
         versionName = System.getenv("APOFIS_VERSION_NAME") ?: "0.1.0-dev"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // End-to-end key for tools/emulator/run-e2e.sh: environment only, never a file. The URL comes from
+        // -Pandroid.testInstrumentationRunnerArguments.apofisUrl=...
+        System.getenv("APOFIS_KEY")?.let { testInstrumentationRunnerArguments["apofisKey"] = it }
     }
 
     // Release signing needs all four variables; with none set the release APK is unsigned.
@@ -67,6 +72,11 @@ android {
     }
 }
 
+// The end-to-end key is a runner argument, so a tracked connected test task would store it in Gradle's execution history.
+tasks.matching { it.name.startsWith("connected") }.configureEach {
+    doNotTrackState("Instrumentation arguments may hold credentials")
+}
+
 room {
     schemaDirectory("$projectDir/schemas")
 }
@@ -93,4 +103,9 @@ dependencies {
     testImplementation(libs.roborazzi)
     testImplementation(libs.roborazzi.compose)
     testImplementation(libs.androidx.test.espresso.core)
+
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.uiautomator)
 }
