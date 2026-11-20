@@ -85,6 +85,7 @@ class SendQueue(
     private val now: () -> Long,
     private val schedule: suspend () -> Unit = {},
     private val active: () -> Boolean = { true },
+    private val settle: suspend (runId: String) -> Unit = {},
 ) {
     private val pendingDao = db.pendingSendDao()
 
@@ -152,6 +153,26 @@ class SendQueue(
         } catch (_: QueueClosed) {
             false
         }
+    }
+
+    /**
+     * For SendWorker: [drain]; when queued sends still wait behind an active run (in the background no follower sees it
+     * end), [settle] checks each such run once, outside the drain lock since its Finish drains on its own, then drains again.
+     */
+    suspend fun drainSettlingRuns(): Boolean {
+        if (drain()) return true
+        val blocking = db.activeRunDao().blockingQueued()
+        if (blocking.isEmpty()) return false
+        for (runId in blocking) {
+            try {
+                settle(runId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // checked again on the worker's next try
+            }
+        }
+        return drain()
     }
 
     /**

@@ -22,7 +22,7 @@ class SendWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     override suspend fun doWork(): Result {
         val queue = (applicationContext as? SendQueueProvider)?.sendQueue ?: return Result.success()
         // Result.retry() takes no delay, so a server Retry-After cannot be honoured here; the exponential backoff applies.
-        return if (queue.drain()) Result.success() else Result.retry()
+        return if (queue.drainSettlingRuns()) Result.success() else Result.retry()
     }
 
     companion object {

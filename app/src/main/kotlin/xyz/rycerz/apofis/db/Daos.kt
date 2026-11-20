@@ -186,6 +186,10 @@ interface ActiveRunDao {
     @Query("SELECT * FROM ActiveRunEntity WHERE sessionKey = :sessionKey ORDER BY startedAt")
     suspend fun allForSession(sessionKey: String): List<ActiveRunEntity>
 
+    /** Active runs of chats with a queued send: the runs that send waits for. */
+    @Query("SELECT runId FROM ActiveRunEntity WHERE sessionKey IN (SELECT sessionKey FROM PendingSendEntity WHERE state = 'queued')")
+    suspend fun blockingQueued(): List<String>
+
     @Upsert
     suspend fun upsert(r: ActiveRunEntity)
 

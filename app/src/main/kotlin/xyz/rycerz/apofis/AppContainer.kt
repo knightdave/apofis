@@ -310,7 +310,10 @@ class AppContainer(
         lateinit var follower: RunFollower
         // The follower's own gate refuses a stream while the app is stopped; the run stays stored for the next start.
         val starter = RunStarter { session, run -> if (open.get()) follower.onRunStarted(session, run) }
-        val queue = SendQueue(api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get)
+        val queue = SendQueue(
+            api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get,
+            settle = { if (open.get()) follower.settle(it) },
+        )
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
         follower = RunFollower(api, db, repo, runScope, onRunFinished = { if (open.get()) queue.drain() })
         return Connected(c, api, db, repo, queue, follower, open, runScope, composer)

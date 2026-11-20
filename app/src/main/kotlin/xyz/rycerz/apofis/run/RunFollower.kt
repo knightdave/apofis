@@ -145,6 +145,22 @@ class RunFollower(
         refreshers.values.forEach { it.stopWorker() } // an unserved request survives for resumeAll
     }
 
+    /**
+     * For the send worker while the app is in the background, where no follower runs: one status read of [runId]. A run
+     * that ended, or that the server no longer knows, is finished by the same transcript transaction as a follower's
+     * Finish, whose hand-off drains the queue. No stream is opened; a run still going is left for a later check.
+     */
+    suspend fun settle(runId: String) {
+        if (foreground) return // a follower owns it
+        val run = db.activeRunDao().get(runId) ?: return
+        val status = try {
+            refresher(run).read().status
+        } catch (_: ApiError.NotFound) {
+            null
+        }
+        if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
+    }
+
     suspend fun stop(sessionKey: String) {
         stop(db.activeRunDao().forSession(sessionKey) ?: return)
     }

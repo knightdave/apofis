@@ -221,6 +221,47 @@ class RunFollowerTest {
     // ---- tests ----
 
     @Test
+    fun backgroundWorkerFinishesAnEndedRunThenSendsTheNextMessage() = runTest {
+        val f = follower() // never resumed: the app is in the background, so no follower runs
+        messages()
+        on(STATUS, status("completed")) // the run finished on the server meanwhile
+        on("/v1/runs", json("""{"run_id":"run_2","status":"started","replayed":false}""", 202))
+        addSession()
+        addRun()
+        addSend("p1", "sending", RUN)
+        val queue = SendQueue(api, db, f, System::currentTimeMillis, settle = { f.settle(it) })
+        val second = queue.enqueue(KEY, "second")
+
+        assertFalse(queue.drain()) // a plain drain only sees its own rows: the session looks busy for good
+        assertTrue(queue.drainSettlingRuns())
+
+        assertNull(db.activeRunDao().get(RUN))
+        assertNull(db.pendingSendDao().get("p1")) // confirmed by the synced transcript
+        assertEquals("sending", db.pendingSendDao().get(second)!!.state)
+        assertEquals("run_2", db.activeRunDao().forSession(KEY)!!.runId)
+        assertEquals(1, requestsTo("/v1/runs").size)
+        assertTrue(requestsTo(EVENTS).isEmpty()) // no stream in the background
+    }
+
+    @Test
+    fun backgroundWorkerLeavesARunningRunAlone() = runTest {
+        val f = follower()
+        on(STATUS, status("running"))
+        addSession()
+        addRun()
+        addSend("p1", "sending", RUN)
+        val queue = SendQueue(api, db, f, System::currentTimeMillis, settle = { f.settle(it) })
+        val second = queue.enqueue(KEY, "second")
+
+        assertFalse(queue.drainSettlingRuns())
+
+        assertNotNull(db.activeRunDao().get(RUN))
+        assertEquals("queued", db.pendingSendDao().get(second)!!.state)
+        assertTrue(requestsTo(MESSAGES).isEmpty())
+        assertTrue(requestsTo(EVENTS).isEmpty())
+    }
+
+    @Test
     fun streamsThenReplacesWithServerRows() = runTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
