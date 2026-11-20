@@ -1,4 +1,53 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Apofis</string>
+    <string name="back">Wstecz</string>
+    <string name="cancel">Anuluj</string>
+
+    <string name="connect_title">Połącz z Hermesem</string>
+    <string name="connect_intro">Podaj adres serwera API Hermes Agent i klucz API.</string>
+    <string name="connect_url_label">Adres serwera</string>
+    <string name="connect_key_label">Klucz API</string>
+    <string name="connect_key_keep">Zostaw puste, aby zachować obecny klucz</string>
+    <string name="connect_key_show">Pokaż</string>
+    <string name="connect_key_hide">Ukryj</string>
+    <string name="connect_key_show_description">Pokaż klucz API</string>
+    <string name="connect_key_hide_description">Ukryj klucz API</string>
+    <string name="connect_button">Połącz</string>
+    <string name="connect_testing">Sprawdzanie połączenia</string>
+    <string name="connect_saving">Zapisywanie połączenia</string>
+    <string name="connect_http_warning">Ten adres używa zwykłego HTTP: klucz API i wiadomości są wysyłane bez szyfrowania. Używaj http tylko wtedy, gdy VPN lub szyfrowana sieć nakładkowa chroni całą drogę między tym telefonem a serwerem.</string>
+    <string name="connect_error_missing_scheme">Zacznij adres od https:// lub http://</string>
+    <string name="connect_error_malformed_url">To nie jest prawidłowy adres</string>
+    <string name="connect_error_url_extra_parts">Usuń część użytkownik:hasło@ oraz wszystko po znaku ? lub #</string>
+    <string name="connect_error_unreachable">Nie można połączyć się z serwerem</string>
+    <string name="connect_error_not_hermes">To nie jest serwer API Hermesa</string>
+    <string name="connect_error_key_required">Podaj klucz API</string>
+    <string name="connect_error_key_invalid">Klucz zawiera niedozwolone znaki</string>
+    <string name="connect_error_key_rejected">Klucz odrzucony</string>
+    <string name="connect_error_save_failed">Nie udało się zapisać połączenia. Spróbuj ponownie.</string>
+    <string name="server_change_title">Zmienić serwer?</string>
+    <string name="server_change_text">Zapisane czaty zostaną usunięte z tego telefonu, a niewysłane wiadomości skasowane. Czaty pozostaną na poprzednim serwerze.</string>
+    <string name="server_change_confirm">Zmień</string>
+
+    <string name="chat_placeholder">Połączono z %1$s</string>
+
+    <string name="settings_title">Ustawienia</string>
+    <string name="settings_connection">Połączenie</string>
+    <string name="settings_server">Serwer</string>
+    <string name="settings_appearance">Wygląd</string>
+    <string name="settings_theme_system">Zgodnie z systemem</string>
+    <string name="settings_theme_light">Jasny</string>
+    <string name="settings_theme_dark">Ciemny</string>
+    <string name="settings_dynamic_color">Kolory dynamiczne</string>
+    <string name="settings_dynamic_color_summary">Kolory dopasowane do tapety</string>
+    <string name="settings_pure_black">Czyste tło</string>
+    <string name="settings_pure_black_summary">Czarne w ciemnym motywie, białe w jasnym</string>
+    <string name="settings_about">O aplikacji</string>
+    <string name="settings_version">Wersja</string>
+    <string name="settings_license">Licencja</string>
+    <string name="settings_source">Kod źródłowy</string>
+    <string name="settings_licenses">Licencje open source</string>
+    <string name="licenses_lucide">Ikony Lucide</string>
+    <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
 </resources>

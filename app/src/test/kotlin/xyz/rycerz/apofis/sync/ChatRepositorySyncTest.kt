@@ -580,4 +580,29 @@ class ChatRepositorySyncTest {
         respond(messagesJson("apofis-s", listOf(1)))
         assertTrue(repo.syncMessages("apofis-s"))
     }
+
+    @Test
+    fun closedRepositoryTouchesNothing() = runTest {
+        var open = true
+        val old = ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), db, now = { 1_000L }, active = { open })
+        val local = old.createLocalSession()
+        val before = db.sessionDao().all()
+        open = false
+
+        for (call in listOf<suspend () -> Unit>(
+            { old.createLocalSession() },
+            { old.delete(local) },
+            { old.rename(local, "phantom") },
+            { old.setPinned(local, true) },
+            { old.setArchived(local, true) },
+        )) {
+            val e = expectError(call)
+            assertTrue(e is IllegalStateException && e.message == "closed")
+        }
+        old.refreshSessions()
+        assertFalse(old.syncMessages(local))
+
+        assertEquals(before, db.sessionDao().all())
+        assertEquals(0, server.requestCount)
+    }
 }
