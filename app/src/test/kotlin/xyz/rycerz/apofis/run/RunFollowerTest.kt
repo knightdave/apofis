@@ -977,18 +977,19 @@ class RunFollowerTest {
     }
 
     @Test
-    fun retryableSyncFailureIsBoundedPerResume() = runTest {
-        val f = follower()
-        on(MESSAGES, json("{}", 503))
+    fun finishKeepsRetryingInTheForegroundUntilTheSyncSucceeds() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val calls = AtomicInteger()
+        routes[MESSAGES] = { if (calls.incrementAndGet() <= 5) MockResponse.Builder().code(503).build() else json(messagesBody)() }
         on(EVENTS, sse(terminal(0)))
         started(f)
-        testScheduler.advanceUntilIdle()
-        awaitUntil { f.following.isEmpty() }
+        done.await() // five transient failures, then connectivity is back: no resumeAll needed
 
-        assertEquals(5, requestsTo(MESSAGES).size)
-        assertTrue(finished.isEmpty())
-        assertNotNull(db.activeRunDao().forSession(KEY))
-        assertEquals("sending", db.pendingSendDao().get("p1")!!.state)
+        assertEquals(6, requestsTo(MESSAGES).size)
+        assertEquals(listOf(1000L, 2000L, 4000L, 8000L, 16000L), delays)
+        assertTrue(db.activeRunDao().all().isEmpty())
+        assertNull(f.live(KEY).value)
     }
 
     @Test

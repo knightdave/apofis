@@ -57,7 +57,6 @@ private const val MAX_RETRY_MS = 30_000L
 private const val POLL_MS = 3_000L
 private const val SAVE_EVERY_EVENTS = 20
 private const val SAVE_EVERY_NS = 500_000_000L
-private const val FINISH_ATTEMPTS = 5 // per resume, for a transcript sync that keeps failing transiently
 
 /** The result of answering an approval or clarify request. */
 enum class AnswerResult {
@@ -447,7 +446,6 @@ class RunFollower(
         private var backoff = if (next == Next.Check) 0L else FIRST_RETRY_MS // a resume checks the status at once
         private var unsaved = 0
         private var savedAt = System.nanoTime()
-        private var finishFailures = 0
         private val toolStarts = HashMap<String, Double>()
 
         suspend fun run() {
@@ -481,7 +479,7 @@ class RunFollower(
                         Next.Unknown -> return // status() stored it; waits for resolveUnknown
                         is Next.Finish -> {
                             if (finish(step.status)) return
-                            if (++finishFailures >= FINISH_ATTEMPTS) return // rows kept; the next resumeAll tries again
+                            // No cap while in the foreground: connectivity may come back without a resume. pauseAll ends it.
                             retryWait()
                             step
                         }
