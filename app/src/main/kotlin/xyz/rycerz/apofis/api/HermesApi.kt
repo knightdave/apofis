@@ -41,18 +41,20 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
 
     suspend fun getSession(id: String): SessionDto = get<SessionEnvelope>(url("api/sessions", id)).session
 
-    /** Returns false when the id already exists. A deleted id gives [ApiError.Conflict] `session_deleted`. */
-    suspend fun createSession(id: String, title: String?, systemPrompt: String? = null): Boolean {
+    /**
+     * The created session (its title as the server accepted it), or null when the id already exists. A deleted id gives
+     * [ApiError.Conflict] `session_deleted`; a title another chat holds gives [ApiError.Http] 400 `invalid_title`.
+     */
+    suspend fun createSession(id: String, title: String?, systemPrompt: String? = null): SessionDto? {
         val body = jsonBody {
             put("id", validId(id))
             if (title != null) put("title", title)
             if (systemPrompt != null) put("system_prompt", systemPrompt)
         }
         return try {
-            exchange(post(url("api/sessions"), body)) { }
-            true
+            exchange(post(url("api/sessions"), body)) { decode<SessionEnvelope>(it) }.session
         } catch (e: ApiError.Conflict) {
-            if (e.code == "session_exists") false else throw e
+            if (e.code == "session_exists") null else throw e
         }
     }
 

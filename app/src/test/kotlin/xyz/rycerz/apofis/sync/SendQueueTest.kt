@@ -145,6 +145,81 @@ class SendQueueTest {
         assertEquals(listOf("apofis-a" to RUN_ID), started)
     }
 
+    private fun created(title: String) =
+        """{"object":"hermes.session","session":{"id":"apofis-a","source":"api_server","title":"$title","pinned":false,""" +
+            """"archived":false,"hidden":false,"started_at":1.0,"message_count":0}}"""
+
+    private suspend fun local(title: String? = null, pinned: Boolean = false, archived: Boolean = false) {
+        addSession("apofis-a", existsOnServer = false)
+        db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(title = title, pinned = pinned, archived = archived))
+    }
+
+    @Test
+    fun firstSendStoresTheTitleTheServerAccepted() = runTest {
+        local()
+        respond(created("Hello there, cleaned by the server"), 201)
+        respond(fixture("run_start.json"), 202)
+        queue.enqueue("apofis-a", "Hello there\nsecond line")
+        assertTrue(queue.drain())
+        assertTrue(take().body!!.utf8().contains("\"title\":\"Hello there\""))
+        assertEquals("Hello there, cleaned by the server", db.sessionDao().get("apofis-a")!!.title)
+    }
+
+    @Test
+    fun firstLineAnotherChatHoldsGetsADisambiguatedTitle() = runTest {
+        local()
+        respond("""{"error":{"code":"invalid_title","message":"Title 'Hello' is already in use"}}""", 400)
+        respond(created("Hello (2)"), 201)
+        respond(fixture("run_start.json"), 202)
+        val key = queue.enqueue("apofis-a", "Hello")
+        assertTrue(queue.drain())
+        assertTrue(take().body!!.utf8().contains("\"title\":\"Hello\""))
+        assertTrue(take().body!!.utf8().contains("\"title\":\"Hello (2)\""))
+        assertEquals("/v1/runs", take().target)
+        assertEquals("sending", pending(key).state)
+        assertEquals("Hello (2)", db.sessionDao().get("apofis-a")!!.title)
+    }
+
+    @Test
+    fun localRenameIsTheTitleOfTheCreate() = runTest {
+        local(title = "My own name")
+        respond(created("My own name"), 201)
+        respond(fixture("run_start.json"), 202)
+        queue.enqueue("apofis-a", "Hello")
+        assertTrue(queue.drain())
+        assertTrue(take().body!!.utf8().contains("\"title\":\"My own name\""))
+        assertEquals("My own name", db.sessionDao().get("apofis-a")!!.title)
+    }
+
+    @Test
+    fun createWhoseAnswerWasLostReadsTheTitleItHolds() = runTest {
+        local()
+        respond(fixture("session_exists_409.json"), 409)
+        respond(created("Hello"))
+        respond(fixture("run_start.json"), 202)
+        queue.enqueue("apofis-a", "Hello")
+        assertTrue(queue.drain())
+        take()
+        assertEquals("/api/sessions/apofis-a", take().target)
+        assertEquals("Hello", db.sessionDao().get("apofis-a")!!.title)
+    }
+
+    @Test
+    fun offlinePinnedAndArchivedChatKeepsItsFlagsOnCreate() = runTest {
+        local(pinned = true, archived = true)
+        respond(created("Hello"), 201)
+        respond(fixture("session_patch.json"))
+        respond(fixture("run_start.json"), 202)
+        queue.enqueue("apofis-a", "Hello")
+        assertTrue(queue.drain())
+        take()
+        val patch = take()
+        assertEquals("PATCH", patch.method)
+        assertEquals("""{"pinned":true,"archived":true}""", patch.body!!.utf8())
+        val row = db.sessionDao().get("apofis-a")!!
+        assertTrue(row.existsOnServer && row.pinned && row.archived)
+    }
+
     @Test
     fun lostResponseDoesNotDuplicate() = runTest {
         addSession("apofis-a")
@@ -175,6 +250,7 @@ class SendQueueTest {
     fun sessionAlreadyExistsIsFine() = runTest {
         addSession("apofis-a", existsOnServer = false)
         respond(fixture("session_exists_409.json"), 409)
+        respond(created("hi")) // its title is read, since the create that made it was not answered here
         respond(fixture("run_start.json"), 202)
         val key = queue.enqueue("apofis-a", "hi")
         assertTrue(queue.drain())

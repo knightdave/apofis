@@ -7,10 +7,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.api.SessionDto
 import xyz.rycerz.apofis.api.buildRunBody
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
+import xyz.rycerz.apofis.db.SessionEntity
 
 /** Implemented by Task 8: told about every run this queue started. */
 fun interface RunStarter {
@@ -18,6 +20,7 @@ fun interface RunStarter {
 }
 
 const val SEND_EXPIRY_MS = 24L * 60 * 60 * 1000
+private const val TITLE_TRIES = 9 // titles tried when the first line is already another chat's title
 
 /**
  * [PendingSendEntity.state] values. In the transcript: [QUEUED] is QUEUED, [SENDING] is SENDING, [FAILED] is FAILED,
@@ -284,9 +287,9 @@ class SendQueue(
         var requested = false // creating the session is not an attempt to deliver the message
         val run = try {
             if (!session.existsOnServer) {
-                api.createSession(session.currentId, titleFrom(send.text).ifEmpty { null }) // false: it already exists, fine
+                val title = create(session, send.text)
                 ensureOpen()
-                sessionDao.upsert(session.copy(existsOnServer = true))
+                sessionDao.upsert(session.copy(existsOnServer = true, title = title))
             }
             ensureOpen()
             if (pendingDao.update(sent) == 0) return@withRepositoryLock Attempt.FAILED
@@ -329,6 +332,40 @@ class SendQueue(
             // The run started and is stored; a broken follower must not change that or stop the drain.
         }
         Attempt.STARTED
+    }
+
+    /**
+     * Creates [session] on the server, titled by its local rename or else by the first line of [text], and returns the
+     * title the server holds. Hermes keeps titles unique: a title another chat holds is retried as "title (2)", "(3)" and
+     * so on. A pinned or archived chat gets those flags too (idempotent), so the next refresh does not undo them; until
+     * this returns the chat counts as not created and the whole step is repeated.
+     */
+    private suspend fun create(session: SessionEntity, text: String): String? {
+        val base = session.title ?: titleFrom(text).ifEmpty { null }
+        var title = base
+        var tries = 1
+        var created: SessionDto? = null
+        while (true) {
+            try {
+                created = api.createSession(session.currentId, title) ?: readExisting(session.currentId)
+                break
+            } catch (e: ApiError.Http) {
+                if (e.code != "invalid_title" || base == null || tries++ >= TITLE_TRIES) throw e
+                title = "$base ($tries)"
+            }
+        }
+        if (session.pinned || session.archived) {
+            api.patchSession(session.currentId, pinned = session.pinned.takeIf { it }, archived = session.archived.takeIf { it })
+        }
+        return created?.title ?: title
+    }
+
+    /** It already exists (an earlier create whose answer was lost): what the server holds, if it can be read now. */
+    private suspend fun readExisting(id: String): SessionDto? = try {
+        api.getSession(id)
+    } catch (e: ApiError) {
+        if (e == ApiError.Unauthorized) throw e
+        null // the next session refresh brings the title
     }
 
     private fun expired(send: PendingSendEntity) = now() - send.createdAt > SEND_EXPIRY_MS

@@ -113,7 +113,7 @@ class HermesApiTest {
         }
         serveOnce("session_get_model_locked.json")
         api.getSession("x")
-        // Create receipts carry the same envelope as GET; createSession itself only returns a Boolean.
+        // Create receipts carry the same envelope as GET.
         serveOnce("session_create.json")
         api.getSession("x")
         serveOnce("session_create_foreign_source.json")
@@ -187,7 +187,7 @@ class HermesApiTest {
         api.deleteSession("x")
 
         serveOnce("session_exists_409.json", 409)
-        assertFalse(api.createSession("x", "t"))
+        assertNull(api.createSession("x", "t"))
 
         val errors = listOf(
             Triple("error_401.json", 401, ApiError.Unauthorized),
@@ -212,9 +212,9 @@ class HermesApiTest {
     @Test
     fun createSessionTwice() = runTest {
         serve("session_create.json", 201)
-        assertTrue(api.createSession("apofis-1", "Hello"))
+        assertEquals("apofis-probe 489a6b04aeee sessions-a f83c52", api.createSession("apofis-1", "Hello")!!.title)
         serve("session_exists_409.json", 409)
-        assertFalse(api.createSession("apofis-1", "Hello"))
+        assertNull(api.createSession("apofis-1", "Hello"))
         serve("session_recreate_deleted_409.json", 409)
         assertEquals(ApiError.Conflict("session_deleted"), expectError { api.createSession("apofis-1", null) })
 
