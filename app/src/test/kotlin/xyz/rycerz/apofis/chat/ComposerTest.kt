@@ -80,6 +80,63 @@ class ComposerTest {
         assertEquals("", composer.current("a").draft)
     }
 
+    private fun sendOk(key: String) = runBlocking { withTimeout(10_000) { composer.send(key) {}!!.join() } }
+
+    @Test
+    fun typingRightAfterASuccessfulSendKeepsEveryCharacter() {
+        type("a", "first")
+        val beforeSend = composer.current("a").revision
+        val release = CompletableDeferred<Unit>()
+        val send = composer.send("a") { release.await() }!!
+        val shown = composer.current("a").revision // the empty field drawn while the send is stored
+        release.complete(Unit)
+        runBlocking { withTimeout(10_000) { send.join() } }
+
+        // Keystrokes from the frame drawn during the send arrive after it ended: each one applies.
+        var typed = ""
+        for (ch in "second") {
+            typed += ch
+            composer.edit("a", typed, shown)
+        }
+        assertEquals("second", composer.current("a").draft)
+
+        sendOk("a")
+        composer.edit("a", "first!", beforeSend) // a keystroke from before the first send
+        assertEquals("", composer.current("a").draft)
+    }
+
+    @Test
+    fun anEditFromBeforeASendIsDroppedAfterTheSendEnded() {
+        type("a", "hello")
+        val shown = composer.current("a").revision
+        sendOk("a")
+        composer.edit("a", "hello!", shown)
+        assertEquals("", composer.current("a").draft)
+        assertTrue(composer.keys.isEmpty()) // idle again, so not kept
+    }
+
+    @Test
+    fun aRecreatedEntryNeverMatchesARevisionFromBeforeItsEviction() {
+        type("a", "hello")
+        val beforeSend = composer.current("a").revision
+        sendOk("a")
+        type("a", "x")
+        type("a", "") // the user empties the field: the entry is evicted
+        assertTrue(composer.keys.isEmpty())
+
+        composer.edit("a", "hello!", beforeSend)
+        assertEquals("", composer.current("a").draft)
+        composer.edit("a", "y", composer.current("a").revision)
+        assertEquals("y", composer.current("a").draft)
+
+        val beforeClear = composer.current("a").revision
+        composer.clear()
+        composer.edit("a", "y!", beforeClear)
+        assertEquals("", composer.current("a").draft)
+        type("a", "z")
+        assertEquals("z", composer.current("a").draft)
+    }
+
     @Test
     fun discardNeedsTheEntryTheUserSaw() {
         fail("a", "same")
