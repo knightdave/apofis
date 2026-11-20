@@ -1,10 +1,10 @@
 package xyz.rycerz.apofis.settings
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import androidx.core.content.edit
 import java.security.GeneralSecurityException
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -28,6 +28,7 @@ private const val IV_BYTES = 12
  * encrypted with an AES-GCM key that never leaves the Android Keystore. Neither value is ever logged.
  * [key] exists for tests: Robolectric has no AndroidKeyStore provider.
  */
+@SuppressLint("UseKtx") // the KTX edit drops commit()'s result, which save and clear return
 class CredentialStore(context: Context, private val key: () -> SecretKey = ::keystoreKey) {
     private val prefs = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -47,18 +48,16 @@ class CredentialStore(context: Context, private val key: () -> SecretKey = ::key
         }
     }
 
-    fun save(c: Credentials) {
+    /** False when the write did not reach the disk; callers must not treat the credentials as saved then. */
+    fun save(c: Credentials): Boolean {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key()) // the provider picks a fresh random IV
         val blob = cipher.iv + cipher.doFinal(c.apiKey.toByteArray(Charsets.UTF_8))
         check(cipher.iv.size == IV_BYTES)
-        prefs.edit(commit = true) {
-            putString(BASE_URL, c.baseUrl)
-            putString(API_KEY, Base64.encodeToString(blob, Base64.NO_WRAP))
-        }
+        return prefs.edit().putString(BASE_URL, c.baseUrl).putString(API_KEY, Base64.encodeToString(blob, Base64.NO_WRAP)).commit()
     }
 
-    fun clear() = prefs.edit(commit = true) { clear() }
+    fun clear(): Boolean = prefs.edit().clear().commit()
 }
 
 @Synchronized

@@ -1,11 +1,17 @@
 package xyz.rycerz.apofis.ui.connect
 
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import org.junit.After
@@ -151,6 +157,55 @@ class ConnectViewModelTest {
         assertEquals(ConnectState.ConfirmServerChange, failing.state)
         runTest { failing.confirmServerChange()?.join() }
         assertEquals(ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED), failing.state)
+    }
+
+    @Test
+    fun urlWithCredentialsQueryOrFragmentIsRefused() {
+        val vm = vm()
+        for (url in listOf("https://user:token@hermes.example/", "https://hermes.example/?key=sk-1", "https://hermes.example/#sk-1", "https://hermes.example/?")) {
+            vm.submit(url, "k")
+            assertEquals(url, ConnectState.Failed(Field.URL, Reason.URL_EXTRA_PARTS), vm.state)
+        }
+        assertTrue(saved.isEmpty())
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun keyThatCannotBeAHeaderIsRefused() {
+        val vm = vm()
+        for (key in listOf("sk-1\nX-Evil: 1", "klucz-\u017c")) {
+            vm.submit(server.url("/").toString(), key)
+            assertEquals(ConnectState.Failed(Field.KEY, Reason.KEY_INVALID), vm.state)
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun cacheLookupFailureIsAFieldError() {
+        server.enqueue(MockResponse.Builder().code(200).body(fixture("capabilities.json")).build())
+        val vm = ConnectViewModel(null, willClearCache = { throw IllegalStateException("database closed") }, save = { saved += it })
+        vm.submit(server.url("/").toString(), "k")
+        assertEquals(ConnectState.Failed(Field.KEY, Reason.SAVE_FAILED), vm.state)
+        assertTrue(saved.isEmpty())
+    }
+
+    @Test
+    fun leavingTheScreenCancelsTheProbeAndForgetsTheKey() = runTest {
+        server.enqueue(
+            MockResponse.Builder().code(200).body(fixture("capabilities.json")).headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        val store = ViewModelStore()
+        val vm = ViewModelProvider.create(store, viewModelFactory { initializer { vm() } })[ConnectViewModel::class]
+        vm.onUrlChange(server.url("/").toString())
+        vm.onKeyChange("sk-secret")
+        val probe = vm.connect()!!
+        withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS) }
+        store.clear()
+        probe.join()
+        withContext(Dispatchers.IO) { Thread.sleep(800) } // past the moment the response arrives
+
+        assertTrue(saved.isEmpty())
+        assertEquals("", vm.apiKey.text.toString())
     }
 
     @Test

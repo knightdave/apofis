@@ -23,8 +23,8 @@ class MainActivity : ComponentActivity() {
         lifecycle.addObserver(
             LifecycleEventObserver { _, event ->
                 when (event) {
-                    Lifecycle.Event.ON_START -> container.onForeground()
-                    Lifecycle.Event.ON_STOP -> container.onBackground()
+                    Lifecycle.Event.ON_START -> container.onStart()
+                    Lifecycle.Event.ON_STOP -> container.onStop()
                     else -> Unit
                 }
             },

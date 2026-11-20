@@ -35,3 +35,5 @@ nix develop -c ./gradlew testDebugUnitTest lintDebug
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+The icons in `app/src/main/res/drawable/lucide_*.xml` are converted from [Lucide](https://github.com/lucide-icons/lucide) and are under the ISC license, see [licenses/LUCIDE-LICENSE](licenses/LUCIDE-LICENSE).

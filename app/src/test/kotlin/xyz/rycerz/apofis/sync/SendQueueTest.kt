@@ -674,4 +674,47 @@ class SendQueueTest {
         val worker = TestListenableWorkerBuilder<SendWorker>(ApplicationProvider.getApplicationContext<Context>()).build()
         assertEquals(ListenableWorker.Result.success(), worker.doWork())
     }
+
+    @Test
+    fun closedQueueTouchesNothing() = runTest {
+        var open = true
+        val closing = SendQueue(api, db, { _, _ -> started += "x" to "x" }, { clock }, active = { open })
+        addSession("apofis-a")
+        addSession("apofis-b")
+        running("apofis-b")
+        open = false
+        val key = queue.enqueue("apofis-a", "written after the switch")
+        val before = pending(key)
+
+        assertFalse(closing.drain())
+        closing.submit("apofis-b", "steer after the switch")
+
+        assertEquals(0, server.requestCount)
+        assertEquals(before, pending(key))
+        assertTrue(rows("apofis-b").isEmpty())
+        assertTrue(started.isEmpty())
+    }
+
+    @Test
+    fun drainStartedBeforeTheSwitchCannotSendRowsWrittenAfterIt() = runTest {
+        var open = true
+        val old = SendQueue(api, db, { key, run -> started += key to run }, { clock }, active = { open })
+        addSession("apofis-a")
+        addSession("apofis-b")
+        server.enqueue(
+            MockResponse.Builder().code(200).body(fixture("run_start.json")).addHeader("Content-Type", "application/json")
+                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        old.enqueue("apofis-a", "before the switch")
+        val drain = launch(Dispatchers.Default) { old.drain() }
+        take() // the first send is on the wire when the old instance is closed
+        open = false
+        val after = queue.enqueue("apofis-b", "after the switch")
+        val written = pending(after)
+        drain.join()
+
+        assertEquals(1, server.requestCount)
+        assertEquals(written, pending(after))
+        assertTrue(started.isEmpty()) // no stream is attached for the old server either
+    }
 }

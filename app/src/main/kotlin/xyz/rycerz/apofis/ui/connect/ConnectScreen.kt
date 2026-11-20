@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui.connect
 
+import android.view.WindowManager
+import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -14,9 +16,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextObfuscationMode
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -32,11 +31,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
@@ -50,9 +51,11 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 private fun Reason.text() = when (this) {
     Reason.MISSING_SCHEME -> R.string.connect_error_missing_scheme
     Reason.MALFORMED_URL -> R.string.connect_error_malformed_url
+    Reason.URL_EXTRA_PARTS -> R.string.connect_error_url_extra_parts
     Reason.UNREACHABLE -> R.string.connect_error_unreachable
     Reason.NOT_HERMES -> R.string.connect_error_not_hermes
     Reason.KEY_REQUIRED -> R.string.connect_error_key_required
+    Reason.KEY_INVALID -> R.string.connect_error_key_invalid
     Reason.KEY_REJECTED -> R.string.connect_error_key_rejected
     Reason.SAVE_FAILED -> R.string.connect_error_save_failed
 }
@@ -68,6 +71,14 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
     val keyError = failed?.takeIf { it.field == Field.KEY }?.reason?.text()?.let { stringResource(it) }
     var keyVisible by rememberSaveable { mutableStateOf(false) }
 
+    // The key can be shown here, so the window is secure while this screen is up: it never appears in Recents,
+    // and screenshots and screen recordings of this screen are blocked.
+    val window = LocalActivity.current?.window
+    DisposableEffect(window) {
+        window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -75,7 +86,7 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                 navigationIcon = {
                     if (onBack != null) {
                         IconButton(onClick = onBack) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.back))
+                            Icon(painterResource(R.drawable.lucide_arrow_left), contentDescription = stringResource(R.string.back))
                         }
                     }
                 },
@@ -102,7 +113,7 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
                 value = vm.url,
                 onValueChange = vm::onUrlChange,
                 label = { Text(stringResource(R.string.connect_url_label)) },
-                placeholder = { Text("https://hermes.example:8642") },
+                placeholder = { Text(stringResource(R.string.connect_url_example)) },
                 singleLine = true,
                 enabled = !testing,
                 isError = urlError != null,
@@ -114,7 +125,7 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
             )
             if (vm.httpWarning) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Icon(Icons.Outlined.Warning, contentDescription = null, tint = ApofisTheme.colors.warning, modifier = Modifier.size(20.dp))
+                    Icon(painterResource(R.drawable.lucide_triangle_exclamation_point), contentDescription = null, tint = ApofisTheme.colors.warning, modifier = Modifier.size(20.dp))
                     Text(
                         stringResource(R.string.connect_http_warning),
                         style = MaterialTheme.typography.bodyMedium,

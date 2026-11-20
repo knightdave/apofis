@@ -54,10 +54,15 @@ private val drainLock = Mutex()
 
 private enum class Attempt { STARTED, FAILED, STOP }
 
+/** Thrown inside the locks once the owning connection is closed; the public entry points catch it. */
+private class QueueClosed : Exception()
+
 /**
  * The durable path from "send" to "run started". Each message is stored with its exact request body and
  * idempotency key before any request, so a retry is byte-identical and the server never runs it twice.
  * [schedule] is called whenever a send is left queued; the app passes `{ SendWorker.schedule(context) }`.
+ * [active] turns false when the app switches servers: drain, submit and steering then stop before their next request
+ * or row write, so a queue bound to the old server never sends or changes rows that belong to the new one.
  */
 class SendQueue(
     private val api: HermesApi,
@@ -65,6 +70,7 @@ class SendQueue(
     private val starter: RunStarter,
     private val now: () -> Long,
     private val schedule: () -> Unit = {},
+    private val active: () -> Boolean = { true },
 ) {
     private val pendingDao = db.pendingSendDao()
 
@@ -79,11 +85,16 @@ class SendQueue(
      * the session and a delete cannot remove the row in between.
      */
     internal suspend fun submit(sessionKey: String, text: String) {
-        val queued = drainLock.withLock {
-            withRepositoryLock {
-                val row = insert(sessionKey, text, steer = true)
-                if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
+        val queued = try {
+            drainLock.withLock {
+                withRepositoryLock {
+                    ensureOpen()
+                    val row = insert(sessionKey, text, steer = true)
+                    if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
+                }
             }
+        } catch (_: QueueClosed) {
+            return
         }
         if (queued) {
             schedule()
@@ -96,22 +107,27 @@ class SendQueue(
      * send starts on a later drain, as the server runs one turn per session at a time. True when nothing is left queued.
      */
     suspend fun drain(): Boolean = drainLock.withLock {
-        // Steers run under drainLock, so a row still steering here was cut off by process death.
-        pendingDao.withState(PendingState.STEERING).forEach { fail(it, SendError.STEER_UNCERTAIN) }
-        val busy = pendingDao.busySessionKeys().toHashSet()
-        for (send in pendingDao.allQueued()) {
-            if (expired(send)) {
-                fail(send, if (send.attempted) SendError.EXPIRED_UNCERTAIN else SendError.EXPIRED)
-                continue
+        try {
+            ensureOpen()
+            // Steers run under drainLock, so a row still steering here was cut off by process death.
+            pendingDao.withState(PendingState.STEERING).forEach { fail(it, SendError.STEER_UNCERTAIN) }
+            val busy = pendingDao.busySessionKeys().toHashSet()
+            for (send in pendingDao.allQueued()) {
+                if (expired(send)) {
+                    fail(send, if (send.attempted) SendError.EXPIRED_UNCERTAIN else SendError.EXPIRED)
+                    continue
+                }
+                if (send.sessionKey in busy) continue
+                when (attempt(send)) {
+                    Attempt.STARTED -> busy += send.sessionKey
+                    Attempt.FAILED -> Unit
+                    Attempt.STOP -> return@withLock false
+                }
             }
-            if (send.sessionKey in busy) continue
-            when (attempt(send)) {
-                Attempt.STARTED -> busy += send.sessionKey
-                Attempt.FAILED -> Unit
-                Attempt.STOP -> return@withLock false
-            }
+            pendingDao.allQueued().isEmpty()
+        } catch (_: QueueClosed) {
+            false
         }
-        pendingDao.allQueued().isEmpty()
     }
 
     /** Removes a queued or failed send; one started or steered cannot be taken back. */
@@ -173,12 +189,15 @@ class SendQueue(
     /** Under both locks. Returns true when the steer was refused and the row became a queued run send. */
     private suspend fun steer(row: PendingSendEntity): Boolean {
         val sent = row.copy(attempted = true)
+        ensureOpen()
         if (pendingDao.update(sent) == 0) return false
         try {
             api.steer(checkNotNull(row.runId), row.text)
+            ensureOpen()
             pendingDao.update(sent.copy(state = PendingState.STEERED))
             return false
         } catch (e: ApiError) {
+            ensureOpen()
             // A failed steer drops its run id, so cleanup of the run's rows cannot delete the undelivered text.
             val failed = sent.copy(state = PendingState.FAILED, runId = null)
             when {
@@ -194,6 +213,7 @@ class SendQueue(
 
     // Under the repository lock, so a user delete or a refresh cannot interleave with creating the chat and starting its run.
     private suspend fun attempt(send: PendingSendEntity): Attempt = withRepositoryLock {
+        ensureOpen()
         val sessionDao = db.sessionDao()
         val session = sessionDao.get(send.sessionKey)
         if (session == null || session.hidden || isReservedId(session.key) || isReservedId(session.currentId)) {
@@ -205,17 +225,21 @@ class SendQueue(
         val run = try {
             if (!session.existsOnServer) {
                 api.createSession(session.currentId, titleFrom(send.text).ifEmpty { null }) // false: it already exists, fine
+                ensureOpen()
                 sessionDao.upsert(session.copy(existsOnServer = true))
             }
+            ensureOpen()
             if (pendingDao.update(sent) == 0) return@withRepositoryLock Attempt.FAILED
             // The deadline is read with nothing suspending before startRun: a send never starts after it.
             if (expired(send)) {
                 fail(send, if (send.attempted) SendError.EXPIRED_UNCERTAIN else SendError.EXPIRED) // never sent: attempted as before
                 return@withRepositoryLock Attempt.FAILED
             }
+            ensureOpen()
             requested = true
             api.startRun(send.requestBody, send.idempotencyKey)
         } catch (e: ApiError) {
+            ensureOpen()
             val row = when {
                 !requested -> send
                 refused(e) -> send.copy(attempted = false)
@@ -234,6 +258,7 @@ class SendQueue(
             fail(send, SendError.SESSION_UNAVAILABLE) // the API refused the session id before sending
             return@withRepositoryLock Attempt.FAILED
         }
+        ensureOpen() // the run started on the old server; its rows are about to be cleared, and no stream attaches
         db.withTransaction {
             if (pendingDao.update(sent.copy(state = PendingState.SENDING, runId = run.runId, error = null)) == 1) {
                 db.activeRunDao().upsert(ActiveRunEntity(run.runId, send.sessionKey, lastSeq = null, status = "running", startedAt = now()))
@@ -251,8 +276,14 @@ class SendQueue(
 
     private fun expired(send: PendingSendEntity) = now() - send.createdAt > SEND_EXPIRY_MS
 
-    private suspend fun fail(send: PendingSendEntity, code: String) =
-        pendingDao.update(send.copy(state = PendingState.FAILED, error = code, runId = null))
+    private suspend fun fail(send: PendingSendEntity, code: String): Int {
+        ensureOpen()
+        return pendingDao.update(send.copy(state = PendingState.FAILED, error = code, runId = null))
+    }
+
+    private fun ensureOpen() {
+        if (!active()) throw QueueClosed()
+    }
 }
 
 /** A definite refusal: the server did not accept the request. Anything else may have been accepted. */
