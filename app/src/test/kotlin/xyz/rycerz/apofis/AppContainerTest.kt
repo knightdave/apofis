@@ -47,6 +47,7 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
+import xyz.rycerz.apofis.sync.RetryResult
 import xyz.rycerz.apofis.sync.SendWorker
 import xyz.rycerz.apofis.sync.withRepositoryLock
 
@@ -163,6 +164,99 @@ class AppContainerTest {
         assertEquals(1, db.pendingSendDao().allQueued().size)
         val infos = work.getWorkInfosForUniqueWork(SendWorker.WORK_NAME).get()
         assertTrue(infos.any { it.state == WorkInfo.State.ENQUEUED })
+    }
+
+    @Test
+    fun newKeyForTheSameServerQuarantinesSendsTheOldKeyMayHaveStarted() = runTest {
+        container.connect(A)
+        val old = container.connected()!!
+        addSession("apofis-a")
+        val tried = old.sendQueue.enqueue("apofis-a", "accepted under key A, response lost")
+        db.pendingSendDao().update(db.pendingSendDao().get(tried)!!.copy(attempted = true))
+        val fresh = old.sendQueue.enqueue("apofis-a", "never sent")
+
+        container.connect(A.copy(apiKey = "key-a2"))
+
+        // Hermes scopes idempotency keys by API key: the same key under the new one could start a second run.
+        val quarantined = db.pendingSendDao().get(tried)!!
+        assertEquals("failed", quarantined.state)
+        assertEquals("unconfirmed", quarantined.error)
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, container.connected()!!.sendQueue.retry(tried))
+        assertEquals("queued", db.pendingSendDao().get(fresh)!!.state)
+    }
+
+    @Test
+    fun retryInFlightAcrossAKeyChangeEndsQuarantined() = runTest {
+        container.connect(A)
+        val old = container.connected()!!
+        addSession("apofis-a")
+        val tried = old.sendQueue.enqueue("apofis-a", "accepted under key A, then refused")
+        db.pendingSendDao().update(db.pendingSendDao().get(tried)!!.copy(state = "failed", error = "unauthorized", attempted = true))
+        val reading = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        old.sendQueue.beforeRetryWrite = {
+            reading.complete(Unit)
+            release.await()
+        }
+        val retry = async(Dispatchers.IO) { old.sendQueue.retry(tried) } // no confirmation needed under key A
+        reading.await() // read and decided, not yet written
+        val switch = async(Dispatchers.IO) { container.connect(A.copy(apiKey = "key-a2")) }
+        val prefs = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
+        eventually("switch marked") { prefs.contains(SWITCH_MARKER) } // the quarantine step is next
+        release.complete(Unit)
+        retry.await()
+        switch.await()
+
+        // The old retry's write can never land after the quarantine: the new key never resends it unasked.
+        val row = db.pendingSendDao().get(tried)!!
+        assertEquals("failed", row.state)
+        assertEquals("unconfirmed", row.error)
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, container.connected()!!.sendQueue.retry(tried))
+    }
+
+    @Test
+    fun sameKeyAgainKeepsAttemptedSendsQueued() = runTest {
+        container.connect(A)
+        val old = container.connected()!!
+        addSession("apofis-a")
+        val tried = old.sendQueue.enqueue("apofis-a", "tried")
+        db.pendingSendDao().update(db.pendingSendDao().get(tried)!!.copy(attempted = true))
+
+        container.connect(A)
+
+        assertEquals("queued", db.pendingSendDao().get(tried)!!.state)
+    }
+
+    @Test
+    fun reconnectAfterAnInterruptedSwitchQuarantinesAttemptedSends() = runTest {
+        container.connect(A)
+        addSession("apofis-a")
+        val tried = container.connected()!!.sendQueue.enqueue("apofis-a", "tried")
+        db.pendingSendDao().update(db.pendingSendDao().get(tried)!!.copy(attempted = true))
+        app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).edit().putBoolean(SWITCH_MARKER, true).commit()
+        val restarted = AppContainer(app, store) { db } // the old key is gone: it cannot be shown to be unchanged
+        assertNull(restarted.connected())
+
+        restarted.connect(A)
+
+        assertEquals("unconfirmed", db.pendingSendDao().get(tried)!!.error)
+    }
+
+    @Test
+    fun returningToTheForegroundRefreshesTheChatList() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val server = recordingServer(requests)
+        try {
+            container.connect(Credentials(server.url("/").toString(), "k1"))
+            container.onStart()
+            container.awaitLifecycle()
+            // Another client may have added turns while the phone slept: the list (and with it stale flags) is read again.
+            eventually("session refresh") { synchronized(requests) { "GET /api/sessions" in requests } }
+        } finally {
+            container.onStop()
+            container.awaitLifecycle()
+            server.close()
+        }
     }
 
     @Test

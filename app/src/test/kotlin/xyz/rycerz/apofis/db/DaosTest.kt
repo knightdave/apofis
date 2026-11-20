@@ -2,6 +2,9 @@ package xyz.rycerz.apofis.db
 
 import android.content.Context
 import android.database.sqlite.SQLiteConstraintException
+import android.database.sqlite.SQLiteDatabase
+import java.io.File
+import org.json.JSONObject
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.flow.first
@@ -50,6 +53,46 @@ class DaosTest {
             content = content, reasoning = null, toolCallsJson = null, toolCallId = null, toolName = null,
             timestamp = position.toDouble(), finishReason = null,
         )
+
+    @Test
+    fun migrationTo2DropsUncutTranscriptsAndKeepsUnsentWork() = runTest {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        app.deleteDatabase("v1.db")
+        // Version 1 exactly as exported, with a row too large for a cursor window.
+        val schema = JSONObject(File("schemas/xyz.rycerz.apofis.db.AppDatabase/1.json").readText()).getJSONObject("database")
+        SQLiteDatabase.openOrCreateDatabase(app.getDatabasePath("v1.db").apply { parentFile!!.mkdirs() }, null).use { v1 ->
+            val entities = schema.getJSONArray("entities")
+            for (i in 0 until entities.length()) {
+                val e = entities.getJSONObject(i)
+                v1.execSQL(e.getString("createSql").replace("\${TABLE_NAME}", e.getString("tableName")))
+            }
+            val setup = schema.getJSONArray("setupQueries")
+            for (i in 0 until setup.length()) v1.execSQL(setup.getString(i))
+            v1.execSQL(
+                "INSERT INTO SessionEntity (`key`, currentId, lineageIds, pinned, archived, startedAt, messageCount, stale, existsOnServer, hidden) " +
+                    "VALUES ('apofis-a', 'apofis-a', '', 0, 0, 1.0, 2, 0, 1, 0)",
+            )
+            v1.execSQL(
+                "INSERT INTO MessageEntity (sessionKey, position, id, role, content, timestamp) VALUES ('apofis-a', 0, 1, 'tool', ?, 1.0)",
+                arrayOf("y".repeat(3_000_000)),
+            )
+            v1.execSQL(
+                "INSERT INTO PendingSendEntity (idempotencyKey, sessionKey, text, requestBody, createdAt, state, attempted) " +
+                    "VALUES ('k', 'apofis-a', 'unsent', '{}', 1, 'queued', 0)",
+            )
+            v1.version = 1
+        }
+
+        val migrated = Room.databaseBuilder(app, AppDatabase::class.java, "v1.db").addMigrations(MIGRATION_1_2).allowMainThreadQueries().build()
+        try {
+            assertTrue(migrated.messageDao().rows("apofis-a").isEmpty()) // readable again: fetched anew when opened
+            assertTrue(migrated.sessionDao().get("apofis-a")!!.stale)
+            assertEquals("unsent", migrated.pendingSendDao().get("k")!!.text)
+        } finally {
+            migrated.close()
+            app.deleteDatabase("v1.db")
+        }
+    }
 
     @Test
     fun replaceSessionIsAtomicAndOrdered() = runTest {

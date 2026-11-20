@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -15,6 +16,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -77,7 +79,8 @@ interface ChatActions {
 
     /** Sends the current draft; ignored while a send is being stored. */
     fun onSendClick() {}
-    fun onStopClick() {}
+    /** [runId]: the run the Stop button was drawn for. */
+    fun onStopClick(runId: String) {}
     fun onRetry(idempotencyKey: String) {}
     fun onConfirmRetry(idempotencyKey: String) {}
     fun onDismissRetry(idempotencyKey: String) {}
@@ -181,8 +184,15 @@ class ChatViewModel(
         },
     )
 
+    private var opening: Job? = null
+
     init {
-        onOpened()
+        // One check now, again whenever the chat turns stale, and again after every completed session refresh (on return
+        // to the foreground, from the drawer, after a run): a chat still stale after a failed fetch is fetched then.
+        viewModelScope.launch {
+            combine(repo.refreshed, repo.session(sessionKey).map { it?.stale == true }.distinctUntilChanged()) { _, _ -> }
+                .collect { onOpened() }
+        }
     }
 
     /**
@@ -190,10 +200,13 @@ class ChatViewModel(
      * Decided by the session row alone; unsent bubbles say nothing about the cache. A local-only chat makes no request.
      * A failure shows on the status line.
      */
-    fun onOpened() = request {
-        val session = repo.session(sessionKey).first()
-        if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
-            repo.syncMessages(sessionKey)
+    fun onOpened() {
+        if (opening?.isActive == true) return // one load at a time: the one running reads the newest state anyway
+        opening = launchRequest {
+            val session = repo.session(sessionKey).first()
+            if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
+                repo.syncMessages(sessionKey)
+            }
         }
     }
 
@@ -205,13 +218,14 @@ class ChatViewModel(
     override fun onSendClick() {
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.send(sessionKey) { text ->
-            repo.send(sessionKey, text) // stored before any request; delivery problems show on the bubble
+            // The field empties only once the text is stored; delivery problems after that show on the bubble.
+            repo.send(sessionKey, text, onStored = ::stored)
             local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
         }
         if (started != null) local.update { it.copy(composerNote = null) }
     }
 
-    override fun onStopClick() = request { follower.stop(sessionKey) }
+    override fun onStopClick(runId: String) = request { follower.stop(sessionKey, runId) }
 
     override fun onRetry(idempotencyKey: String) = request {
         // NOT_FOUND needs nothing: the transcript already follows the stored rows.
@@ -299,6 +313,10 @@ class ChatViewModel(
 
     /** Runs [block]; every API failure shows on the status line, a success clears it. */
     private fun request(block: suspend () -> Unit) {
+        launchRequest(block)
+    }
+
+    private fun launchRequest(block: suspend () -> Unit): Job =
         viewModelScope.launch {
             val failure = try {
                 block()
@@ -315,7 +333,6 @@ class ChatViewModel(
             }
             local.update { it.copy(failure = failure) }
         }
-    }
 }
 
 /**

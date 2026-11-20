@@ -57,7 +57,6 @@ private const val MAX_RETRY_MS = 30_000L
 private const val POLL_MS = 3_000L
 private const val SAVE_EVERY_EVENTS = 20
 private const val SAVE_EVERY_NS = 500_000_000L
-private const val FINISH_ATTEMPTS = 5 // per resume, for a transcript sync that keeps failing transiently
 
 /** The result of answering an approval or clarify request. */
 enum class AnswerResult {
@@ -88,6 +87,7 @@ class RunFollower(
     private val scope: CoroutineScope,
     private val delayMs: suspend (Long) -> Unit = { delay(it) },
     private val onRunFinished: suspend (sessionKey: String) -> Unit = {},
+    private val active: () -> Boolean = { true }, // false once this follower's connection is closed
 ) : RunStarter {
     private val lives = ConcurrentHashMap<String, MutableStateFlow<LiveReply?>>()
     private val jobs = HashMap<String, Job>() // by run id; it also guards [foreground] and [stopping]
@@ -145,8 +145,25 @@ class RunFollower(
         refreshers.values.forEach { it.stopWorker() } // an unserved request survives for resumeAll
     }
 
-    suspend fun stop(sessionKey: String) {
-        stop(db.activeRunDao().forSession(sessionKey) ?: return)
+    /**
+     * For the send worker while the app is in the background, where no follower runs: one status read of [runId]. A run
+     * that ended, or that the server no longer knows, is finished by the same transcript transaction as a follower's
+     * Finish, whose hand-off drains the queue. No stream is opened; a run still going is left for a later check.
+     */
+    suspend fun settle(runId: String) {
+        if (foreground) return // a follower owns it
+        val run = db.activeRunDao().get(runId) ?: return
+        val status = try {
+            refresher(run).read().status
+        } catch (_: ApiError.NotFound) {
+            null
+        }
+        if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
+    }
+
+    /** Stops the run the user saw ([runId] of [sessionKey]); nothing when it is gone, never the run that followed it. */
+    suspend fun stop(sessionKey: String, runId: String) {
+        stop(db.activeRunDao().get(runId)?.takeIf { it.sessionKey == sessionKey } ?: return)
     }
 
     /** Stops every active run of the chat, one request each, in order; the first failure throws and stops the rest. */
@@ -284,14 +301,18 @@ class RunFollower(
          * flight and none was accepted. The in-flight count is kept in try/finally, so no exception can leak it.
          */
         suspend fun stop(post: suspend () -> Unit): Unit = withContext(NonCancellable) {
-            stopping.withLock { stopsInFlight++ }
+            var registered = false
             var accepted = false
             var failed = false
             try {
                 stopping.withLock {
-                    if (stopsInFlight == 1 && !stopAccepted) {
-                        stopAccepted = db.activeRunDao().get(run.runId)?.stopRequested == true // from before a restart
+                    // The first stop in flight loads an intent stored before a restart, in the same step that counts it,
+                    // so an overlapping stop can never skip the load and later clear that intent.
+                    if (stopsInFlight == 0 && !stopAccepted) {
+                        stopAccepted = db.activeRunDao().get(run.runId)?.stopRequested == true
                     }
+                    stopsInFlight++
+                    registered = true
                     db.activeRunDao().setStopRequested(run.runId)
                 }
                 try {
@@ -302,7 +323,7 @@ class RunFollower(
                 }
                 accepted = true
             } finally {
-                stopping.withLock {
+                if (registered) stopping.withLock {
                     stopsInFlight--
                     if (accepted) {
                         stopAccepted = true
@@ -431,7 +452,6 @@ class RunFollower(
         private var backoff = if (next == Next.Check) 0L else FIRST_RETRY_MS // a resume checks the status at once
         private var unsaved = 0
         private var savedAt = System.nanoTime()
-        private var finishFailures = 0
         private val toolStarts = HashMap<String, Double>()
 
         suspend fun run() {
@@ -465,7 +485,7 @@ class RunFollower(
                         Next.Unknown -> return // status() stored it; waits for resolveUnknown
                         is Next.Finish -> {
                             if (finish(step.status)) return
-                            if (++finishFailures >= FINISH_ATTEMPTS) return // rows kept; the next resumeAll tries again
+                            // No cap while in the foreground: connectivity may come back without a resume. pauseAll ends it.
                             retryWait()
                             step
                         }
@@ -610,11 +630,12 @@ class RunFollower(
             try {
                 if (sync) {
                     var wrote = false
+                    var settled = false
                     try {
                         // The hand-off runs inside the repository call, only after its transaction has committed.
-                        // The fetch's success is recorded as it returns, before the database phase and the drain.
-                        repo.syncMessages(key, onFetched = { recordKey(accepted = true) }, afterCommit = { handOff() }) { rows ->
-                            write(status, buildTranscript(rows))
+                        // Each page request's success is recorded as it returns, before mapping, the database phase and the drain.
+                        repo.syncMessages(key, onResponse = { recordKey(accepted = true) }, afterCommit = { handOff(settled) }) { rows ->
+                            settled = write(status, buildTranscript(rows))
                             wrote = true
                         }
                     } catch (e: ApiError) {
@@ -632,8 +653,8 @@ class RunFollower(
                     if (wrote) return true
                 }
                 withContext(NonCancellable) {
-                    withRepositoryLock { db.withTransaction { write(status, items = null) } }
-                    handOff() // reached only when the transaction returned normally
+                    val settled = withRepositoryLock { db.withTransaction { write(status, items = null) } }
+                    handOff(settled) // reached only when the transaction returned normally
                 }
                 return true
             } catch (_: SQLException) {
@@ -642,22 +663,26 @@ class RunFollower(
         }
 
         private suspend fun syncQuietly() = quietly {
-            val fetched = try {
-                repo.syncMessages(key)
+            try {
+                repo.syncMessages(key, onResponse = { recordKey(accepted = true) }) // at the HTTP boundary, not after the write
             } catch (e: ApiError.Unauthorized) {
                 rejectedFor(id)
                 throw e
             }
-            if (fetched) recordKey(accepted = true)
         }
 
         /**
          * Inside the repository lock and a transaction. A pending send is removed only when the transcript the user
          * would see ([items]; null: unknown) shows it; otherwise it becomes failed `unconfirmed` and stays on screen.
          */
-        private suspend fun write(status: String?, items: List<ChatItem>?) {
+        private suspend fun write(status: String?, items: List<ChatItem>?): Boolean {
             beforeFinishWrite()
-            val stopped = db.activeRunDao().get(id)?.stopRequested == true
+            // Still owned, checked under the repository lock that a switch, a cache clear and a delete also take: a closed
+            // connection's follower settles nothing (a same-server switch keeps the row for the new one), and a deleted
+            // or cleared run never comes back. There is no foreign key to refuse an orphan outcome.
+            if (!active()) return false
+            val owned = db.activeRunDao().get(id)?.takeIf { it.sessionKey == key && db.sessionDao().get(key) != null } ?: return false
+            val stopped = owned.stopRequested
             val outcome = when (status) {
                 "failed" -> ReplyOutcome.FAILED
                 "interrupted" -> ReplyOutcome.INTERRUPTED
@@ -678,12 +703,15 @@ class RunFollower(
                 db.replyOutcomeDao().upsert(ReplyOutcomeEntity(key, db.messageDao().maxId(key) ?: 0, outcome.name, detail = null))
             }
             db.activeRunDao().delete(id)
+            return true
         }
 
-        private suspend fun handOff() {
+        /** Drops this follower's memory of the run; only a transaction that [settled] the run starts the next work. */
+        private suspend fun handOff(settled: Boolean) {
             seqs -= id
             refreshers -= id
             state(key).update { if (it?.runId == id) null else it }
+            if (!settled) return
             try {
                 onRunFinished(key)
             } catch (e: CancellationException) {

@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.room.Room
+import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -40,6 +41,7 @@ import mockwebserver3.RecordedRequest
 import mockwebserver3.SocketEffect
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -72,7 +74,6 @@ import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.RetryResult
 import xyz.rycerz.apofis.sync.SendQueue
-import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private const val KEY = "apofis-a"
 private const val RUN = "run_1"
@@ -98,6 +99,9 @@ class ChatViewModelTest {
     /** A gate for a held stream; every gate is opened in tearDown, so a failed test never blocks the next. */
     private fun latch() = CountDownLatch(1).also { latches += it }
 
+    /** When set, a send waits at the start of its store (before anything is stored) until it completes. */
+    @Volatile private var storeGate: CompletableDeferred<Unit>? = null
+
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
@@ -114,7 +118,7 @@ class ChatViewModelTest {
             .build()
         val api = HermesApi(server.url("/").toString(), "secret-key")
         lateinit var f: RunFollower
-        val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, {})
+        val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, { storeGate?.await() })
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue)
         f = RunFollower(api, db, repo, scope, delayMs = { delay(minOf(it, 20L)) })
         follower = f
@@ -124,6 +128,7 @@ class ChatViewModelTest {
     @After
     fun tearDown() {
         latches.forEach { it.countDown() }
+        storeGate?.complete(Unit)
         // Every coroutine must end before the next test: the repository and send locks are process-wide, and a
         // view model coroutine left suspended on the reset main dispatcher would hold them for good.
         // A send or drain still running in a view model would otherwise meet a closed database while holding those locks.
@@ -364,29 +369,51 @@ class ChatViewModelTest {
     fun failedSendGivesTheTextBackWithoutLosingTheNewDraft() = runTest {
         // No session row: send refuses before storing anything.
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it }
         vm.onDraftChange("first")
         vm.await { it.draft == "first" }
         vm.onSendClick()
-        vm.await { it.draft.isEmpty() && it.sending }
-        vm.onDraftChange("second")
-        vm.await { it.draft == "second" }
+        val sending = vm.await { it.sending }
+        assertEquals("first", sending.draft) // kept, shown as being sent, until it is stored
+        vm.onDraftChange("first!") // read-only while it is sent: no keystroke changes it
+        assertEquals("first", connected.composer.current(KEY).draft)
         held.complete(Unit)
-        lock.join()
 
         val back = vm.await { it.unsent != null && !it.sending }
-        assertEquals("second", back.draft) // the text field is never written by a failure
+        assertEquals("", back.draft) // the text moved to the notice, nothing lost
         assertEquals("first", back.unsent?.text)
         assertEquals(ComposeError.NOT_STORED, back.unsent?.error)
         assertEquals(null, back.composerNote)
         assertTrue(db.pendingSendDao().rows(KEY).isEmpty())
 
+        vm.onDraftChange("second", back.draftRevision)
+        vm.await { it.draft == "second" }
         vm.onPutBack()
         val merged = vm.await { it.unsent == null }
         assertEquals("first\nsecond", merged.draft)
+    }
+
+    @Test
+    fun sendKeepsTheTextUntilWorkManagerAndRoomHaveAcceptedIt() = runTest {
+        addSession()
+        val vm = vm()
+        val scheduling = CompletableDeferred<Unit>().also { storeGate = it }
+        vm.onDraftChange("kept")
+        vm.onSendClick()
+        assertEquals("kept", vm.await { it.sending }.draft) // the worker is not armed yet
+        val roomHeld = CompletableDeferred<Unit>()
+        val roomRelease = CompletableDeferred<Unit>()
+        val room = launch(Dispatchers.IO) { db.withTransaction { roomHeld.complete(Unit); roomRelease.await() } }
+        roomHeld.await()
+        scheduling.complete(Unit) // armed; the insert now waits for the open transaction
+        assertEquals("kept", vm.state.value.draft)
+        assertTrue(vm.state.value.sending)
+        roomRelease.complete(Unit)
+        room.join()
+
+        val done = vm.await { !it.sending && it.draft.isEmpty() }
+        assertNull(done.unsent)
+        assertEquals(listOf("kept"), db.pendingSendDao().rows(KEY).map { it.text })
     }
 
     @Test
@@ -492,16 +519,12 @@ class ChatViewModelTest {
     fun sendSurvivesLeavingTheChat() = runTest {
         addSession()
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it } // the send waits before storing anything
         vm.onDraftChange("Remember the milk")
         vm.onSendClick()
         vm.await { it.sending }
         store.clear() // the user switched chats before the message was stored
         held.complete(Unit)
-        lock.join()
 
         awaitTrue { runBlocking { db.pendingSendDao().rows(KEY).isNotEmpty() } }
         assertEquals(listOf("Remember the milk"), db.pendingSendDao().rows(KEY).map { it.text })
@@ -512,16 +535,12 @@ class ChatViewModelTest {
     fun failedSendAfterLeavingGoesBackToTheDraft() = runTest {
         // No session row: send refuses before storing anything.
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it } // the send waits before storing anything
         vm.onDraftChange("first")
         vm.onSendClick()
         vm.await { it.sending }
         store.clear()
         held.complete(Unit)
-        lock.join()
 
         awaitTrue { connected.composer.current(KEY).unsent != null }
         assertEquals("first", connected.composer.current(KEY).unsent?.text)
@@ -532,52 +551,49 @@ class ChatViewModelTest {
     fun sendFailingAfterTheChatReopenedReachesTheVisibleComposer() = runTest {
         // No session row: send refuses before storing anything.
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it } // the send waits before storing anything
         vm.onDraftChange("first")
         vm.onSendClick()
         vm.await { it.sending }
         store.clear() // left while the send waits
         val again = vm() // and opened again before it failed
-        again.onDraftChange("second")
+        assertEquals("first", again.state.value.draft) // the text being sent is what the reopened field shows
+        val beforeFailure = again.state.value.draftRevision
+        again.onDraftChange("first, edited") // read-only while it is sent
         held.complete(Unit)
-        lock.join()
 
         val failed = again.await { !it.sending && it.unsent != null }
-        assertEquals("second", failed.draft)
-        again.onDraftChange("second!") // a keystroke from the frame drawn before the failure arrived
-        assertEquals("first", connected.composer.current(KEY).unsent?.text)
-        val shown = again.state.value.draftRevision
+        assertEquals("", failed.draft)
+        assertEquals("first", failed.unsent?.text)
+        again.onDraftChange("second", beforeFailure) // a keystroke from the frame drawn before the failure arrived
+        assertEquals("", connected.composer.current(KEY).draft)
+        again.onDraftChange("second", failed.draftRevision)
+        val shown = again.await { it.draft == "second" }.draftRevision
         again.onPutBack()
-        assertEquals("first\nsecond!", again.await { it.unsent == null }.draft)
+        assertEquals("first\nsecond", again.await { it.unsent == null }.draft)
         again.onDraftChange("second!?", shown) // a keystroke from the frame before Put back is dropped
-        assertEquals("first\nsecond!", connected.composer.current(KEY).draft)
+        assertEquals("first\nsecond", connected.composer.current(KEY).draft)
     }
 
     @Test
     fun reopenedChatKeepsTheSendInFlight() = runTest {
         addSession()
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it }
         vm.onDraftChange("first")
         vm.onSendClick()
         vm.await { it.sending }
         store.clear()
         val again = vm()
         assertTrue(again.state.value.sending) // the first frame already shows it
-        again.onDraftChange("second")
+        assertEquals("first", again.state.value.draft)
+        again.onDraftChange("second") // read-only while it is sent
         again.onSendClick() // still in flight: ignored
-        assertTrue(again.await { it.draft == "second" }.sending)
+        assertEquals("first", connected.composer.current(KEY).draft)
         held.complete(Unit)
-        lock.join()
 
         val done = again.await { !it.sending && it.items.isNotEmpty() }
-        assertEquals("second", done.draft)
+        assertEquals("", done.draft)
         assertEquals(listOf("first"), db.pendingSendDao().rows(KEY).map { it.text })
     }
 
@@ -602,10 +618,45 @@ class ChatViewModelTest {
         val vm = vm()
         vm.await { it.items.isNotEmpty() } // the first transcript is committed (rows and stale = false in one transaction)
         assertEquals(1, requests.count { it.target.startsWith(MESSAGES) })
-        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true))
         routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
-        vm.onOpened()
+        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true)) // a refresh saw it change: fetched at once
         assertEquals(StatusLine.SERVER_ERROR, vm.await { it.status == StatusLine.SERVER_ERROR }.status)
+        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
+        vm.onOpened() // still stale after the failure: opening it again fetches again
+        awaitTrue { requests.count { it.target.startsWith(MESSAGES) } == 3 }
+        assertEquals(StatusLine.SERVER_ERROR, vm.state.value.status)
+    }
+
+    @Test
+    fun staleChatWhoseFetchFailedIsFetchedAfterTheNextSuccessfulRefresh() = runTest {
+        addSession(onServer = true, stale = true)
+        routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
+        val vm = vm()
+        vm.await { it.status == StatusLine.SERVER_ERROR } // the phone went to sleep with the chat still stale
+        assertEquals(1, requests.count { it.target.startsWith(MESSAGES) })
+        routes[MESSAGES] = json(serverRows)
+        routes["/api/sessions"] = json(
+            """{"object":"list","data":[{"id":"$KEY","source":"api_server","title":"Plans","pinned":false,"archived":false,""" +
+                """"hidden":false,"started_at":1.0,"last_active":2.0,"message_count":2,"preview":"p","_lineage_ids":[]}],"has_more":false}""",
+        )
+
+        connected.repo.refreshSessions() // the refresh on waking up succeeds; the stale bit was true all along
+
+        vm.await { it.items.any { i -> i.key == "r11" } } // fetched with no tap on the drawer
+        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
+    }
+
+    @Test
+    fun shownChatMarkedStaleIsFetchedWithoutReopening() = runTest {
+        addSession(onServer = true)
+        routes[MESSAGES] = json("""{"session_id":"$KEY","data":[{"id":10,"role":"user","content":"hello","timestamp":$now}]}""")
+        val vm = vm()
+        vm.await { it.items.size == 1 } // the first transcript is committed
+        routes[MESSAGES] = json(serverRows) // another client added a turn
+
+        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true)) // as a session refresh marks it
+
+        vm.await { it.items.any { i -> i.key == "r11" } }
         assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
     }
 
@@ -613,22 +664,18 @@ class ChatViewModelTest {
     fun sendIsSingleFlightAndTakesTheCurrentDraft() = runTest {
         addSession()
         val vm = vm()
-        val held = CompletableDeferred<Unit>()
-        val locked = CompletableDeferred<Unit>()
-        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
-        locked.await()
+        val held = CompletableDeferred<Unit>().also { storeGate = it }
         vm.onDraftChange("fir")
         vm.onDraftChange("first") // edited after the button was drawn: the send takes what is typed now
         vm.onSendClick()
         vm.onSendClick() // a second tap before the screen redraws
-        vm.await { it.sending && it.draft.isEmpty() }
+        assertEquals("first", vm.await { it.sending }.draft)
         vm.onDraftChange("second")
-        vm.onSendClick() // still in flight: ignored, the new draft stays
+        vm.onSendClick() // still in flight: ignored
         held.complete(Unit)
-        lock.join()
 
         val done = vm.await { !it.sending && it.items.isNotEmpty() }
-        assertEquals("second", done.draft)
+        assertEquals("", done.draft)
         assertEquals(listOf("first"), db.pendingSendDao().rows(KEY).map { it.text })
     }
 

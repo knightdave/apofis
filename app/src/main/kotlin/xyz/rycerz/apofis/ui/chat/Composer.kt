@@ -66,6 +66,7 @@ internal fun Composer(
             draft,
             onDraftChange,
             Modifier.weight(1f).testTag(FIELD_TAG),
+            readOnly = busy, // it shows the text being stored, which no keystroke may change
             placeholder = { Text(stringResource(R.string.chat_message_hint)) },
             maxLines = 5,
             textStyle = MaterialTheme.typography.bodyLarge,

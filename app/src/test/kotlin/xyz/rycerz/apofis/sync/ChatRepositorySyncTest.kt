@@ -13,6 +13,11 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import kotlinx.coroutines.test.runTest
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -34,6 +39,8 @@ import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
+import xyz.rycerz.apofis.chat.TOOL_RESULT_DISPLAY_LIMIT
+import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
@@ -118,6 +125,88 @@ class ChatRepositorySyncTest {
     )
 
     @Test
+    fun multiMegabyteToolArgumentSyncsAndReadsBackFromAFreshDatabase() = runTest {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        app.deleteDatabase("args.db")
+        fun open() = Room.databaseBuilder(app, AppDatabase::class.java, "args.db").allowMainThreadQueries().build()
+        val first = open()
+        first.sessionDao().upsert(session("apofis-a"))
+        val args = buildJsonObject {
+            put("path", "/tmp/big")
+            put("content", "x".repeat(3_000_000)) // a large file write: only the argument is large
+        }.toString()
+        val calls = buildJsonArray {
+            addJsonObject {
+                put("id", "c1")
+                put("type", "function")
+                putJsonObject("function") {
+                    put("name", "write_file")
+                    put("arguments", args)
+                }
+            }
+        }.toString()
+        val assistant = buildJsonObject {
+            put("id", 2)
+            put("role", "assistant")
+            put("content", "")
+            put("tool_calls", calls)
+            put("timestamp", 2.0)
+        }.toString()
+        respond(
+            rawMessages(
+                "apofis-a",
+                listOf(
+                    """{"id":1,"role":"user","content":"write it","timestamp":1.0}""",
+                    assistant,
+                    """{"id":3,"role":"tool","content":"{\"output\":\"ok\"}","tool_call_id":"c1","timestamp":3.0}""",
+                ),
+            ),
+        )
+        assertTrue(ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), first).syncMessages("apofis-a"))
+        first.close()
+
+        val reopened = open() // the chat opened again later: a new reader of the stored rows
+        try {
+            val reply = ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), reopened).transcript("apofis-a").first()
+                .filterIsInstance<AssistantReply>().single()
+            val step = reply.steps.single() as ToolStep
+            assertEquals("write_file", step.name)
+            assertEquals(TOOL_RESULT_DISPLAY_LIMIT, step.args.length)
+            assertTrue(step.argsTruncated)
+            assertTrue(step.argsPreview.startsWith("path=/tmp/big, content=xxx"))
+            assertEquals("ok", step.result)
+        } finally {
+            reopened.close()
+            app.deleteDatabase("args.db")
+        }
+    }
+
+    @Test
+    fun multiMegabyteToolResultSyncsAndReadsBackThroughTheDatabase() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        val call = """[{"id":"c1","type":"function","function":{"name":"terminal","arguments":"{}"}}]""".replace("\"", "\\\"")
+        val huge = """{\"output\": \"${"x".repeat(3_000_000)}\", \"exit_code\": 1}"""
+        respond(
+            rawMessages(
+                "apofis-a",
+                listOf(
+                    """{"id":1,"role":"user","content":"run it","timestamp":1.0}""",
+                    """{"id":2,"role":"assistant","content":"","tool_calls":"$call","timestamp":2.0}""",
+                    """{"id":3,"role":"tool","content":"$huge","tool_call_id":"c1","timestamp":3.0}""",
+                ),
+            ),
+        )
+        assertTrue(repo.syncMessages("apofis-a"))
+
+        // Read back through a Room query, as the chat screen does when the chat is opened again.
+        val step = repo.transcript("apofis-a").first().filterIsInstance<AssistantReply>().single().steps.single() as ToolStep
+        assertEquals(TOOL_RESULT_DISPLAY_LIMIT, step.result!!.length)
+        assertTrue(step.resultTruncated)
+        assertTrue(step.error) // exit_code 1, decided before the cut
+        assertTrue(db.messageDao().rows("apofis-a").all { it.content.length <= TOOL_RESULT_DISPLAY_LIMIT + 100 })
+    }
+
+    @Test
     fun filtersToAppSessions() = runTest {
         respond(
             page(
@@ -148,13 +237,51 @@ class ChatRepositorySyncTest {
 
     @Test
     fun pagesUntilHasMoreFalse() = runTest {
-        respond(page(sessionJson("apofis-a"), hasMore = true))
+        val first = (0 until 200).map { sessionJson("apofis-a$it") }
+        respond(page(*first.toTypedArray(), hasMore = true))
         respond(page(sessionJson("apofis-b"), hasMore = false))
         repo.refreshSessions()
-        assertEquals(setOf("apofis-a", "apofis-b"), repo.sessions().first().map { it.key }.toSet())
+        assertEquals((0 until 200).map { "apofis-a$it" }.toSet() + "apofis-b", repo.sessions().first().map { it.key }.toSet())
         assertEquals(2, server.requestCount)
         server.takeRequest()
-        assertEquals("1", server.takeRequest().url.queryParameter("offset"))
+        assertEquals("200", server.takeRequest().url.queryParameter("offset")) // the next recency window
+    }
+
+    private suspend fun cachedWithHistory(key: String) {
+        db.sessionDao().upsert(session(key))
+        respond(messagesJson(key, listOf(1L)))
+        repo.syncMessages(key)
+    }
+
+    @Test
+    fun backFilledPinDoesNotSkipTheNextWindowsFirstRow() = runTest {
+        cachedWithHistory("apofis-u200")
+        val pin = sessionJson("apofis-pin", pinned = true, archived = true)
+        // 200 recency rows plus the pin Hermes appends past the limit; has_more counts only the 200.
+        respond(page(*((0 until 200).map { sessionJson("apofis-u$it") } + pin).toTypedArray(), hasMore = true))
+        respond(page(sessionJson("apofis-u200"), pin, hasMore = false))
+        repo.refreshSessions()
+
+        server.takeRequest()
+        server.takeRequest()
+        assertEquals("200", server.takeRequest().url.queryParameter("offset"))
+        assertNotNull(db.sessionDao().get("apofis-u200"))
+        assertTrue(db.messageDao().hasRows("apofis-u200"))
+        assertEquals(1, db.sessionDao().all().count { it.key == "apofis-pin" })
+    }
+
+    @Test
+    fun pinInsideAFullWindowDoesNotEndTheListEarly() = runTest {
+        cachedWithHistory("apofis-last")
+        val pin = sessionJson("apofis-pin", pinned = true)
+        // A full window with the pin inside it: Hermes counts 199 unpinned rows and says has_more=false.
+        respond(page(*((0 until 199).map { sessionJson("apofis-u$it") } + pin).toTypedArray(), hasMore = false))
+        respond(page(sessionJson("apofis-last"), pin, hasMore = false))
+        repo.refreshSessions()
+
+        assertEquals(3, server.requestCount)
+        assertNotNull(db.sessionDao().get("apofis-last"))
+        assertTrue(db.messageDao().hasRows("apofis-last"))
     }
 
     @Test
@@ -213,6 +340,17 @@ class ChatRepositorySyncTest {
         assertEquals(SendState.QUEUED, queued.state)
         assertNull(queued.error)
         assertTrue(queued.attempted)
+    }
+
+    @Test
+    fun admittedRunSendShowsAsSentAndKeepsItsTurnAnchor() = runTest {
+        db.sessionDao().upsert(session("apofis-s"))
+        db.pendingSendDao().upsert(pending("apofis-s", "a").copy(state = "sending", runId = "run_1", attempted = true))
+
+        val item = repo.transcript("apofis-s").first().single() as UserMessage
+        assertEquals(SendState.SENT, item.state) // the server admitted its run: no longer "Sending"
+        assertEquals("run_1", item.runId)
+        assertEquals("a", item.idempotencyKey)
     }
 
     @Test
@@ -613,7 +751,7 @@ class ChatRepositorySyncTest {
 
         // No server copy to read: no request, the block does not run.
         db.sessionDao().upsert(session("apofis-l", existsOnServer = false))
-        assertFalse(repo.syncMessages("apofis-l") { fail("must not run") })
+        assertFalse(repo.syncMessages("apofis-l", afterReplace = { fail("must not run") }))
         assertFalse(repo.syncMessages("apofis-l"))
     }
 

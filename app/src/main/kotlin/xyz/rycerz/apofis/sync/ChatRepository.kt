@@ -3,6 +3,10 @@ package xyz.rycerz.apofis.sync
 import androidx.room.withTransaction
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.sync.Mutex
@@ -18,6 +22,8 @@ import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.chat.buildTranscript
+import xyz.rycerz.apofis.chat.storedToolCalls
+import xyz.rycerz.apofis.chat.storedToolResult
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.MessageEntity
 import xyz.rycerz.apofis.db.PendingSendEntity
@@ -57,6 +63,11 @@ class ChatRepository(
     private val active: () -> Boolean = { true },
 ) {
     private val sessionDao = db.sessionDao()
+
+    private val refreshes = MutableStateFlow(0L)
+
+    /** Counts the session list refreshes that completed and were stored; a shown chat checks itself again on each. */
+    val refreshed: StateFlow<Long> = refreshes.asStateFlow()
 
     /** Test-only: runs in the plain [syncMessages] after its fetch has returned, right before its write. */
     internal var beforeSyncWrite: suspend () -> Unit = {}
@@ -110,8 +121,11 @@ class ChatRepository(
             val page = api.listSessions(SESSION_PAGE, offset)
             if (page.hasMore && page.data.isEmpty()) throw ApiError.Protocol // the rest of the list would be lost
             listed += page.data
-            offset += page.data.size
-            if (!page.hasMore) break
+            // Hermes pages a recency window of SESSION_PAGE rows and appends the pinned chats outside it to every page,
+            // and its has_more ignores pins inside the window. So step by the window, and stop only at a page that
+            // cannot have been a full window (fewer rows, pins included): a list stopped early would evict real chats.
+            if (!page.hasMore && page.data.size < SESSION_PAGE) break
+            offset += SESSION_PAGE
         }
         val cached = sessionDao.all()
         val index = HashMap<String, SessionEntity>()
@@ -127,7 +141,7 @@ class ChatRepository(
                 hidden += dto.toEntity(row).copy(hidden = true)
             }
         }
-        listed.forEach { take(it, cachedFor(it)) }
+        listed.distinctBy { it.id }.forEach { take(it, cachedFor(it)) }
         val listedKeys = (visible + hidden).mapTo(HashSet()) { it.key }
         val unlisted = cached.filter { it.existsOnServer && it.key !in listedKeys }
         // The list never returns archived chats, so each one known locally is read by id. A chat the DAO keeps
@@ -155,17 +169,23 @@ class ChatRepository(
                 sessionDao.deleteReplyOutcomes(row.key)
             }
         }
-        if (active()) onCached(sessionDao.all().mapTo(HashSet()) { it.key })
+        if (active()) {
+            onCached(sessionDao.all().mapTo(HashSet()) { it.key })
+            refreshes.update { it + 1 }
+        }
     }
 
     /** True when server rows of this chat are cached on the phone. */
     suspend fun hasCachedMessages(sessionKey: String): Boolean = db.messageDao().hasRows(sessionKey)
 
-    /** True when the transcript was fetched: a request was made and the server accepted it. */
-    suspend fun syncMessages(sessionKey: String): Boolean {
+    /**
+     * True when the transcript was fetched: a request was made and the server accepted it. [onResponse] runs as each
+     * page request returns successfully, before any mapping or database work.
+     */
+    suspend fun syncMessages(sessionKey: String, onResponse: () -> Unit = {}): Boolean {
         requireAppKey(sessionKey)
         return lock.withLock {
-            val (tip, rows) = fetchRows(sessionKey) ?: return@withLock false
+            val (tip, rows) = fetchRows(sessionKey, onResponse) ?: return@withLock false
             beforeSyncWrite()
             db.withTransaction { replaceRows(sessionKey, tip, rows) }
             true
@@ -176,19 +196,19 @@ class ChatRepository(
      * Like [syncMessages], and runs [afterReplace] with the fetched rows inside the transaction that writes them, so
      * no observer sees a state between the two. Only the fetch is cancellable: from the write on, through
      * [afterCommit] (run after the lock is released, only when the transaction committed with the block run), the
-     * call completes even if the caller is cancelled. [onFetched] runs as soon as the fetch has returned, before
-     * the write. True when the transcript was fetched.
+     * call completes even if the caller is cancelled. [onResponse] runs as each page request returns successfully,
+     * before any mapping or database work. True when the transcript was fetched.
      */
     suspend fun syncMessages(
         sessionKey: String,
-        onFetched: () -> Unit = {},
+        onResponse: () -> Unit = {},
         afterCommit: suspend () -> Unit = {},
         afterReplace: suspend (List<MessageDto>) -> Unit,
     ): Boolean {
         requireAppKey(sessionKey)
         lock.lock()
         val fetched = try {
-            fetchRows(sessionKey)
+            fetchRows(sessionKey, onResponse)
         } catch (e: Throwable) {
             lock.unlock()
             throw e
@@ -197,7 +217,6 @@ class ChatRepository(
             lock.unlock()
             return false
         }
-        onFetched()
         val (tip, rows) = fetched
         withContext(NonCancellable) {
             val written = try {
@@ -213,10 +232,10 @@ class ChatRepository(
     }
 
     /** Under the lock: the server transcript as rows, or null when the chat has no server copy (no request made). */
-    private suspend fun fetchRows(sessionKey: String): Pair<String, List<MessageEntity>>? {
+    private suspend fun fetchRows(sessionKey: String, onResponse: () -> Unit): Pair<String, List<MessageEntity>>? {
         val session = sessionDao.get(sessionKey) ?: return null
         if (!session.existsOnServer || session.hidden || !active()) return null
-        val (tip, messages) = fetchMessages(session.currentId) ?: return null
+        val (tip, messages) = fetchMessages(session.currentId, onResponse) ?: return null
         return tip to messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
     }
 
@@ -280,11 +299,12 @@ class ChatRepository(
 
     /**
      * Steers the session's running run, else queues [text] and tries to start it at once. The message is stored
-     * before any request. A hidden chat fails locally; an unknown one throws IllegalArgumentException.
+     * before any request; [onStored] runs once it is (before any request). A hidden chat fails locally; an unknown one
+     * throws IllegalArgumentException.
      */
-    suspend fun send(sessionKey: String, text: String) {
+    suspend fun send(sessionKey: String, text: String, onStored: () -> Unit = {}) {
         requireAppKey(sessionKey)
-        queue().submit(sessionKey, text)
+        queue().submit(sessionKey, text, onStored)
     }
 
     /** See [SendQueue.cancel]. */
@@ -305,10 +325,10 @@ class ChatRepository(
      * starts over once; a second change, a reserved tip or endless paging is [ApiError.Protocol].
      * Null when the repository was closed before a request.
      */
-    private suspend fun fetchMessages(id: String): Pair<String, List<MessageDto>>? {
+    private suspend fun fetchMessages(id: String, onResponse: () -> Unit): Pair<String, List<MessageDto>>? {
         repeat(2) {
             if (!active()) return null
-            val first = api.messages(id, MESSAGE_PAGE, 0)
+            val first = api.messages(id, MESSAGE_PAGE, 0).also { onResponse() }
             val tip = first.sessionId
             if (isReservedId(tip)) throw ApiError.Protocol
             val all = first.messages.toMutableList()
@@ -317,7 +337,7 @@ class ChatRepository(
             while (last.size >= MESSAGE_PAGE) {
                 if (++pages > MAX_PAGES) throw ApiError.Protocol
                 if (!active()) return null
-                val page = api.messages(tip, MESSAGE_PAGE, all.size)
+                val page = api.messages(tip, MESSAGE_PAGE, all.size).also { onResponse() }
                 if (isReservedId(page.sessionId)) throw ApiError.Protocol
                 if (page.sessionId != tip) break
                 all += page.messages
@@ -389,8 +409,9 @@ private fun SessionDto.toEntity(cached: SessionEntity?): SessionEntity {
 }
 
 private fun MessageDto.toEntity(sessionKey: String, position: Int) = MessageEntity(
-    sessionKey = sessionKey, position = position, id = id, role = role, displayKind = displayKind, content = content,
-    reasoning = reasoning, toolCallsJson = toolCallsJson, toolCallId = toolCallId, toolName = toolName,
+    sessionKey = sessionKey, position = position, id = id, role = role, displayKind = displayKind,
+    content = if (role == "tool") storedToolResult(content) else content,
+    reasoning = reasoning, toolCallsJson = storedToolCalls(toolCallsJson), toolCallId = toolCallId, toolName = toolName,
     timestamp = timestamp, finishReason = finishReason,
 )
 
@@ -404,8 +425,8 @@ private fun PendingSendEntity.toItem() = UserMessage(
     key = "p$idempotencyKey", text = text, steered = state == PendingState.STEERING || state == PendingState.STEERED,
     timestamp = createdAt / 1000.0,
     state = when (state) {
-        PendingState.SENDING, PendingState.STEERING -> SendState.SENDING
-        PendingState.STEERED -> SendState.SENT
+        PendingState.STEERING -> SendState.SENDING // the steer request is still in flight
+        PendingState.SENDING, PendingState.STEERED -> SendState.SENT // its run was admitted, or it reached the run
         PendingState.FAILED -> SendState.FAILED
         else -> SendState.QUEUED
     },

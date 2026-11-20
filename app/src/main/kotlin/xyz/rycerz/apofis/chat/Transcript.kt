@@ -10,11 +10,14 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import xyz.rycerz.apofis.api.MessageDto
 
 private const val STEER_OPEN = "[OUT-OF-BAND USER MESSAGE"
 private const val STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 private const val ARG_VALUE_LIMIT = 40
+private const val STORED_PREVIEW = "apofis_preview" // the arguments preview of a call stored by [storedToolCalls]
 
 /** Turns stored session rows (oldest first) into chat items. Linear in the number of rows. */
 fun buildTranscript(rows: List<MessageDto>): List<ChatItem> {
@@ -89,7 +92,7 @@ private class ReplyBuilder(first: MessageDto) {
             waiting[id] = this to steps.size
             val args = fullArgs(fn?.get("arguments"))
             steps += ToolStep(
-                id, name, argsPreview(fn?.get("arguments")), null, false, false, true,
+                id, name, obj.str(STORED_PREVIEW) ?: argsPreview(fn?.get("arguments")), null, false, false, true,
                 args = args.take(TOOL_RESULT_DISPLAY_LIMIT), argsTruncated = args.length > TOOL_RESULT_DISPLAY_LIMIT,
             )
         }
@@ -157,6 +160,47 @@ private fun decodeResult(text: String): ResultFields? =
     } catch (e: IllegalArgumentException) {
         null
     }
+
+/**
+ * The tool calls of an assistant row as they are stored. A list longer than [TOOL_RESULT_DISPLAY_LIMIT] is rebuilt
+ * from what the transcript shows of each call (its id, its name, its preview and its full arguments cut one
+ * character past the limit), so a multi-megabyte argument never has to fit a database cursor window, while
+ * [buildTranscript] shows the same steps. A call without an id is never shown, so it is not kept.
+ */
+fun storedToolCalls(text: String?): String? {
+    if (text == null || text.length <= TOOL_RESULT_DISPLAY_LIMIT) return text
+    val calls = parseArray(text).mapNotNull { call ->
+        val obj = call as? JsonObject ?: return@mapNotNull null
+        val fn = obj["function"] as? JsonObject
+        val id = obj.str("id") ?: obj.str("call_id") ?: return@mapNotNull null
+        val arguments = fn?.get("arguments")
+        buildJsonObject {
+            put("id", id)
+            put("function", buildJsonObject {
+                put("name", fn?.str("name") ?: obj.str("name") ?: "")
+                put("arguments", fullArgs(arguments).take(TOOL_RESULT_DISPLAY_LIMIT + 1))
+            })
+            put(STORED_PREVIEW, argsPreview(arguments))
+        }
+    }
+    return JsonArray(calls).toString()
+}
+
+/**
+ * A tool result as it is stored. One longer than [TOOL_RESULT_DISPLAY_LIMIT] is cut before storage to what the list
+ * shows, its error decided first, so [buildTranscript] maps it the same way while a multi-megabyte row never has to fit
+ * a database cursor window (2 MB on Android). Nothing reads the rest of a result.
+ */
+fun storedToolResult(content: String): String {
+    if (content.length <= TOOL_RESULT_DISPLAY_LIMIT) return content
+    // One character over the limit keeps the cut visible; a cut non-object text stays a non-object.
+    val fields = decodeResult(content) ?: return content.take(TOOL_RESULT_DISPLAY_LIMIT + 1)
+    val shown = (fields.output as? JsonPrimitive)?.takeIf { it.isString }?.content ?: content
+    return buildJsonObject {
+        put("output", shown.take(TOOL_RESULT_DISPLAY_LIMIT + 1))
+        if (isError(fields)) put("error", true)
+    }.toString()
+}
 
 /**
  * A result failed when `error` is present and is not null, not boolean false and not the empty string

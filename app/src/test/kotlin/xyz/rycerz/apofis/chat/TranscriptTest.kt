@@ -276,6 +276,47 @@ class TranscriptTest {
     }
 
     @Test
+    fun storedToolResultMapsLikeTheFullOne() {
+        val big = "y".repeat(TOOL_RESULT_DISPLAY_LIMIT + 5)
+        val contents = listOf(
+            """{"output": "$big", "exit_code": 0}""",
+            """{"output": "$big", "error": "boom"}""",
+            """{"output": "$big", "error": false, "exit_code": 2}""",
+            """{"output": {"nested": "$big"}, "error": ""}""",
+            "plain text $big",
+            "[\"$big\"]",
+            "short",
+        )
+        for (content in contents) {
+            fun step(c: String) = toolSteps(buildTranscript(listOf(row(1, "assistant", toolCallsJson = call("c1")), row(2, "tool", c, toolCallId = "c1")))).single()
+            val stored = storedToolResult(content)
+            assertTrue(stored.length <= TOOL_RESULT_DISPLAY_LIMIT + 32)
+            assertEquals(content.take(40), step(content), step(stored))
+        }
+    }
+
+    @Test
+    fun storedToolCallsMapLikeTheFullOnes() {
+        val big = "z".repeat(TOOL_RESULT_DISPLAY_LIMIT + 5)
+        val lists = listOf(
+            // a large JSON-object argument next to a small call
+            """[{"id":"c1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"/tmp/a\",\"content\":\"$big\"}"}},""" +
+                """{"call_id":"c2","name":"terminal","arguments":{"command":"ls"}}]""",
+            // a large argument that is not JSON, and one call without an id (never shown)
+            """[{"id":"c1","function":{"name":"echo","arguments":"plain $big"}},{"function":{"name":"x","arguments":"{}"}}]""",
+            // many small calls together over the limit
+            "[" + (1..400).joinToString(",") { """{"id":"c$it","function":{"name":"t","arguments":"{\"n\":$it}"}}""" } + "]",
+        )
+        for (calls in lists) {
+            fun steps(c: String?) = toolSteps(buildTranscript(listOf(row(1, "assistant", toolCallsJson = c))))
+            val stored = storedToolCalls(calls)!!
+            assertTrue(stored.length < 3 * TOOL_RESULT_DISPLAY_LIMIT || calls.length < 3 * TOOL_RESULT_DISPLAY_LIMIT)
+            assertEquals(calls.take(40), steps(calls), steps(stored))
+        }
+        assertEquals(call("c1"), storedToolCalls(call("c1"))) // small lists are stored as they came
+    }
+
+    @Test
     fun keysAreStable() {
         val input = rows("messages_steer.json") + rows("messages_tool_run.json")
         assertEquals(buildTranscript(input).map { it.key }, buildTranscript(input).map { it.key })

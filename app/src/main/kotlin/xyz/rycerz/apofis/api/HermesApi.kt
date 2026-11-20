@@ -41,18 +41,20 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
 
     suspend fun getSession(id: String): SessionDto = get<SessionEnvelope>(url("api/sessions", id)).session
 
-    /** Returns false when the id already exists. A deleted id gives [ApiError.Conflict] `session_deleted`. */
-    suspend fun createSession(id: String, title: String?, systemPrompt: String? = null): Boolean {
+    /**
+     * The created session (its title as the server accepted it), or null when the id already exists. A deleted id gives
+     * [ApiError.Conflict] `session_deleted`; a title another chat holds gives [ApiError.Http] 400 `invalid_title`.
+     */
+    suspend fun createSession(id: String, title: String?, systemPrompt: String? = null): SessionDto? {
         val body = jsonBody {
             put("id", validId(id))
             if (title != null) put("title", title)
             if (systemPrompt != null) put("system_prompt", systemPrompt)
         }
         return try {
-            exchange(post(url("api/sessions"), body)) { }
-            true
+            exchange(post(url("api/sessions"), body)) { decode<SessionEnvelope>(it) }.session
         } catch (e: ApiError.Conflict) {
-            if (e.code == "session_exists") false else throw e
+            if (e.code == "session_exists") null else throw e
         }
     }
 
@@ -94,7 +96,7 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         val req = request(url("v1/runs", runId, "events")).header("Accept", "text/event-stream")
         // Last-Event-ID n replays seq > n, so the first attach must not send it.
         if (lastSeq != null) req.header("Last-Event-ID", lastSeq.toString())
-        exchange(req.build()) { response ->
+        exchange(req.build(), stream = true) { response ->
             val type = response.body.contentType()
             if (type?.type != "text" || type.subtype != "event-stream") throw ApiError.Protocol
             SseReader.events(response.body.source()).collect { send(it) }
@@ -169,9 +171,13 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         }
     }
 
-    /** Runs [request] on the IO dispatcher; cancelling the caller cancels the HTTP call at once. */
-    private suspend fun <T> exchange(request: Request, onSuccess: suspend (Response) -> T): T = coroutineScope {
+    /**
+     * Runs [request] on the IO dispatcher; cancelling the caller cancels the HTTP call at once. Every call but an event
+     * [stream] keeps the client's overall deadline.
+     */
+    private suspend fun <T> exchange(request: Request, stream: Boolean = false, onSuccess: suspend (Response) -> T): T = coroutineScope {
         val call = client.newCall(request)
+        if (stream) call.timeout().clearTimeout() // an event stream lasts as long as its run
         val work = async(Dispatchers.IO) {
             try {
                 call.execute().use { response ->
@@ -219,8 +225,11 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
             explicitNulls = false
         }
 
-        /** The server sends a keepalive every 10 s on event streams, so 60 s of silence means a dead connection. */
-        fun defaultClient(): OkHttpClient = OkHttpClient.Builder().readTimeout(60, TimeUnit.SECONDS).build()
+        /**
+         * The server sends a keepalive every 10 s on event streams, so 60 s of silence means a dead connection. Other
+         * calls also get an overall deadline: a response trickling in faster than the read timeout must still end.
+         */
+        fun defaultClient(): OkHttpClient = OkHttpClient.Builder().readTimeout(60, TimeUnit.SECONDS).callTimeout(120, TimeUnit.SECONDS).build()
 
         private fun jsonBody(block: JsonObjectBuilder.() -> Unit) = buildJsonObject(block)
         private fun JsonObject.toJsonRequestBody() = toString().toRequestBody(JSON)
