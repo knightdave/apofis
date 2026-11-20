@@ -24,6 +24,7 @@ import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.run.AnswerResult
 import xyz.rycerz.apofis.run.Connection
@@ -46,6 +47,8 @@ data class ChatUiState(
     val composerNote: ComposerNote? = null, // one line above the composer about the last send or cancel
     val sending: Boolean = false, // a send is being stored; the send button is disabled meanwhile
     val confirmCancel: String? = null, // the idempotency key of the unsent message the user asked to remove
+    val unsent: UnsentText? = null, // text a send could not store, in its own notice above the composer
+    val confirmDiscard: String? = null, // the unsent text the user asked to discard, while that is still the unsent text
 )
 
 /** A request Hermes waits on, by id and execution generation: a new generation is a different request. */
@@ -62,7 +65,6 @@ enum class StatusLine { IDLE, WORKING, QUEUED, OFFLINE, UNREACHABLE, KEY_REJECTE
 enum class ComposerMode { SEND_DISABLED, SEND, STEER, STOP }
 
 enum class ComposerNote {
-    SEND_FAILED, // nothing was stored; the text is back in the composer
     REMOVED_MAY_HAVE_SENT, // cancelled on this phone, but it may already have reached the server
     CANCEL_TOO_LATE, // it started sending before the cancel: nothing was removed
 }
@@ -85,6 +87,16 @@ interface ChatActions {
     fun onConfirmCancel(idempotencyKey: String, mayHaveSentShown: Boolean) {}
     fun onDismissCancel(idempotencyKey: String) {}
 
+    /** Puts the unsent text back into the composer, before what is typed there. */
+    fun onPutBack() {}
+
+    /** Asks before discarding the unsent text ([ChatUiState.confirmDiscard]). */
+    fun onDiscardUnsent() {}
+
+    /** [text]: the unsent text the dialog showed; discarded only if it is still exactly that. */
+    fun onConfirmDiscard(text: String) {}
+    fun onDismissDiscard() {}
+
     /** Answers the request the block was drawing, by its own ids. */
     fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) {}
     fun onClarify(requestId: String, executionGeneration: Long, answer: String) {}
@@ -100,6 +112,7 @@ private data class Local(
     val confirmRetry: UserMessage? = null,
     val composerNote: ComposerNote? = null,
     val confirmCancel: String? = null,
+    val confirmDiscard: String? = null,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean)
@@ -151,15 +164,17 @@ class ChatViewModel(
             notes = l.notes,
             answering = l.answering,
             confirmRetry = l.confirmRetry,
-            composerNote = if (c.error != null) ComposerNote.SEND_FAILED else l.composerNote,
+            composerNote = l.composerNote,
             sending = c.sending,
             confirmCancel = l.confirmCancel,
+            unsent = c.unsent,
+            confirmDiscard = l.confirmDiscard?.takeIf { it == c.unsent?.text },
         )
     }.stateIn(
         viewModelScope,
         SharingStarted.Eagerly,
         composer.current(sessionKey).let {
-            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending)
+            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent)
         },
     )
 
@@ -211,6 +226,20 @@ class ChatViewModel(
     /** Closes the confirmation only if it is still the one for [idempotencyKey]. */
     override fun onDismissRetry(idempotencyKey: String) =
         local.update { if (it.confirmRetry?.idempotencyKey == idempotencyKey) it.copy(confirmRetry = null) else it }
+
+    override fun onPutBack() = composer.putBack(sessionKey)
+
+    override fun onDiscardUnsent() {
+        val text = composer.current(sessionKey).unsent?.text ?: return
+        local.update { it.copy(confirmDiscard = text) }
+    }
+
+    override fun onConfirmDiscard(text: String) {
+        composer.discard(sessionKey, text)
+        onDismissDiscard()
+    }
+
+    override fun onDismissDiscard() = local.update { it.copy(confirmDiscard = null) }
 
     override fun onCancel(idempotencyKey: String) = local.update { it.copy(confirmCancel = idempotencyKey) }
 

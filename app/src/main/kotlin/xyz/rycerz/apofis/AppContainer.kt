@@ -55,7 +55,7 @@ class Connected internal constructor(
     follower: RunFollower,
     private val open: AtomicBoolean,
     private val scope: CoroutineScope,
-    /** The composers of this server's chats: kept across a new key for the same server, dropped with the server. */
+    /** The composers of this server's chats: the container's holder for this base URL, shared by its connections. */
     val composer: Composer = Composer(scope),
 ) {
     private val liveApi = api
@@ -127,6 +127,10 @@ class AppContainer(
     private val published = MutableStateFlow<Connected?>(null)
     private val switchLock = Mutex()
 
+    // The composer holder of the saved base URL: kept across connections and failed or cancelled saves, replaced only
+    // once a save for another URL has committed. Guarded by this.
+    private var holder: Pair<String, Composer>? = null
+
     /**
      * Test hooks: [beforeResume] runs on the lifecycle path after the started check, before the follower opens its gate;
      * [afterResume] once it has opened it; [beforeSwitch] at the start of a switch.
@@ -178,8 +182,9 @@ class AppContainer(
     }
 
     /**
-     * Switches to tested credentials: let sends being stored finish (same server) and close the old graph, mark the switch, clear every table when the server
-     * changes, write the credentials, build the new graph, record the cache owner, unmark. Any failure after the mark
+     * Switches to tested credentials: let sends being stored finish and close the old graph, mark the switch, clear
+     * every table when the server changes, write the credentials, build the new graph, record the cache owner (only
+     * then is the composer of another server replaced), unmark. Any failure after the mark
      * ends disconnected with the credentials erased, and a mark left by process death forces that state on the next
      * start. Throws on failure. Not cancellable once started.
      */
@@ -187,6 +192,7 @@ class AppContainer(
         switchLock.withLock {
             var old: Connected? = null
             var next: Connected? = null
+            var fresh: Composer? = null // made for this save, not yet the holder: closed if the save fails
             var done = false
             try {
                 old = synchronized(this@AppContainer) {
@@ -194,10 +200,9 @@ class AppContainer(
                     switching = true
                     current
                 }
-                // Same server: its chats stay, and so do their drafts and the sends being stored, which finish first.
-                val kept = old?.takeIf { it.credentials.baseUrl == c.baseUrl && cachePrefs.getString(CACHE_URL, null) == c.baseUrl }?.composer
                 beforeSwitch()
-                if (kept != null) kept.settle() else old?.composer?.close()
+                val previous = synchronized(this@AppContainer) { holder }
+                previous?.second?.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
                 commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
@@ -206,8 +211,16 @@ class AppContainer(
                     withRepositoryLock { db.clearAllTables() }
                 }
                 if (!credentials.save(c)) throw IOException("credentials not written")
-                next = build(c, kept)
+                val reused = previous?.takeIf { it.first == c.baseUrl }?.second
+                if (reused == null) fresh = newComposer()
+                next = build(c, reused ?: fresh!!)
                 commitOrThrow(cachePrefs.edit().putString(CACHE_URL, c.baseUrl))
+                fresh?.let { f ->
+                    // Another server, committed: only now do the old server's drafts go.
+                    synchronized(this@AppContainer) { holder = c.baseUrl to f }
+                    fresh = null
+                    previous?.second?.close()
+                }
                 commitOrThrow(cachePrefs.edit().remove(SWITCH_MARKER))
                 publish(next)
                 done = true
@@ -218,6 +231,7 @@ class AppContainer(
                     publish(null)
                     runCatching { old?.close() }.onFailure(::logFailure)
                     runCatching { next?.close() }.onFailure(::logFailure)
+                    fresh?.close()
                     runCatching { WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME) }.onFailure(::logFailure)
                     disconnect()
                 }
@@ -243,7 +257,10 @@ class AppContainer(
             disconnect()
             null
         } else {
-            credentials.load()?.let(::build)?.also { scope.launch { scheduleQueuedSends() } }
+            credentials.load()?.let { c ->
+                val composer = holder?.takeIf { it.first == c.baseUrl }?.second ?: newComposer().also { holder = c.baseUrl to it }
+                build(c, composer)
+            }?.also { scope.launch { scheduleQueuedSends() } }
         }
     }
 
@@ -279,7 +296,10 @@ class AppContainer(
         if (!editor.commit()) throw IOException("preferences not written")
     }
 
-    private fun build(c: Credentials, composer: Composer? = null): Connected {
+    /** Its own scope, a child of the app's: closing a connection must not cancel a send being stored. */
+    private fun newComposer() = Composer(CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Default + logOnly))
+
+    private fun build(c: Credentials, composer: Composer): Connected {
         val open = AtomicBoolean(true)
         // Every request of a closed instance fails here, so a retained repository or follower cannot reach any server.
         val client = HermesApi.defaultClient().newBuilder()
@@ -295,8 +315,6 @@ class AppContainer(
         val queue = SendQueue(api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get)
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
         follower = RunFollower(api, db, repo, runScope, onRunFinished = { if (open.get()) queue.drain() })
-        // Its own scope: closing this instance for a new key of the same server must not cancel a send being stored.
-        val kept = composer ?: Composer(CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Default + logOnly))
-        return Connected(c, api, db, repo, queue, follower, open, runScope, kept)
+        return Connected(c, api, db, repo, queue, follower, open, runScope, composer)
     }
 }

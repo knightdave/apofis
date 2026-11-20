@@ -104,7 +104,11 @@
     <string name="chat_approval_no_command">The command is not available, so it can only be denied.</string>
     <string name="chat_unsupported_title">Hermes is waiting for an answer</string>
     <string name="chat_unsupported_text">This version of the app cannot give this kind of answer.</string>
-    <string name="chat_note_send_failed">The message could not be saved. Its text is back in the box.</string>
+    <string name="chat_unsent_not_stored">Not sent: could not be saved.</string>
+    <string name="chat_unsent_put_back">Put back</string>
+    <string name="chat_unsent_discard">Discard</string>
+    <string name="chat_discard_title">Discard this unsent message?</string>
+    <string name="chat_discard_text">Its text will be gone for good.</string>
     <string name="chat_note_removed_may_have_sent">Removed from this phone. It may already have reached the server.</string>
     <string name="chat_note_cancel_too_late">Too late to cancel: the message is already being sent.</string>
     <string name="chat_status_server_error">Server error</string>

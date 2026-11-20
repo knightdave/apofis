@@ -17,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
@@ -209,6 +210,46 @@ class AppContainerTest {
     }
 
     @Test
+    fun failedSameServerSaveThenRetryKeepsDraftsAndUnsentText() = runTest {
+        container.connect(A)
+        val first = container.connected()!!
+        first.composer.edit("apofis-a", "half a thought")
+        first.composer.edit("apofis-b", "not stored")
+        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        failNextKeyUse = true
+
+        expectFailure(A.copy(apiKey = "key-a2"))
+        assertNull(container.connected())
+        container.connect(A.copy(apiKey = "key-a3")) // the user tries again
+
+        val now = container.connected()!!
+        assertEquals("half a thought", now.composer.current("apofis-a").draft)
+        assertEquals("not stored", now.composer.current("apofis-b").unsent?.text)
+    }
+
+    @Test
+    fun failedSwitchLeavesNoJobOfADiscardedComposer() = runTest {
+        val flaky = FlakyCacheApp(app)
+        container = AppContainer(flaky, store) { db }
+        container.connect(A)
+        container.connected()!!.composer.edit("apofis-a", "half a thought")
+        val before = container.scope.coroutineContext.job.children.filter { it.isActive }.toSet()
+        flaky.failPutOf = "cache_base_url" // fails after the new graph was built
+
+        try {
+            container.connect(B)
+            fail("a failed switch must not report success")
+        } catch (_: IllegalStateException) {
+        }
+
+        val left = container.scope.coroutineContext.job.children.filter { it.isActive }.toSet()
+        assertTrue("jobs left by the failed switch: ${left - before}", (left - before).isEmpty())
+        flaky.failPutOf = null
+        container.connect(A)
+        assertEquals("half a thought", container.connected()!!.composer.current("apofis-a").draft) // A's composer stayed
+    }
+
+    @Test
     fun failureWhileSwitchingServerEndsDisconnected() = runTest {
         container.connect(A)
         addSession("apofis-a")
@@ -396,6 +437,7 @@ class AppContainerTest {
 /** The real app, except that commits to the cache preferences throw while [failCommits] is set. */
 private class FlakyCacheApp(base: Application) : Application() {
     @Volatile var failCommits = false
+    @Volatile var failPutOf: String? = null // a commit that writes this key throws
 
     init {
         attachBaseContext(base)
@@ -407,11 +449,13 @@ private class FlakyCacheApp(base: Application) : Application() {
         return object : SharedPreferences by real {
             override fun edit(): SharedPreferences.Editor {
                 val e = real.edit()
+                var put: String? = null
                 return object : SharedPreferences.Editor by e {
                     override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor = also { e.putBoolean(key, value) }
-                    override fun putString(key: String, value: String?): SharedPreferences.Editor = also { e.putString(key, value) }
+                    override fun putString(key: String, value: String?): SharedPreferences.Editor = also { put = key; e.putString(key, value) }
                     override fun remove(key: String): SharedPreferences.Editor = also { e.remove(key) }
-                    override fun commit(): Boolean = if (failCommits) throw IllegalStateException("disk") else e.commit()
+                    override fun commit(): Boolean =
+                        if (failCommits || (put != null && put == failPutOf)) throw IllegalStateException("disk") else e.commit()
                 }
             }
         }

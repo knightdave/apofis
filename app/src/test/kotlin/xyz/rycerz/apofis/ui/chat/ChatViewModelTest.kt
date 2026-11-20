@@ -52,6 +52,8 @@ import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ComposeError
+import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Notice
 import xyz.rycerz.apofis.chat.ReasoningStep
@@ -379,10 +381,54 @@ class ChatViewModelTest {
         held.complete(Unit)
         lock.join()
 
-        val back = vm.await { it.composerNote != null && !it.sending }
-        assertEquals("first\nsecond", back.draft)
-        assertEquals(ComposerNote.SEND_FAILED, back.composerNote)
+        val back = vm.await { it.unsent != null && !it.sending }
+        assertEquals("second", back.draft) // the text field is never written by a failure
+        assertEquals(UnsentText("first", ComposeError.NOT_STORED), back.unsent)
+        assertEquals(null, back.composerNote)
         assertTrue(db.pendingSendDao().rows(KEY).isEmpty())
+
+        vm.onPutBack()
+        val merged = vm.await { it.unsent == null }
+        assertEquals("first\nsecond", merged.draft)
+    }
+
+    @Test
+    fun discardAsksOnceAndRemovesOnlyTheTextShown() = runTest {
+        connected.composer.edit(KEY, "first")
+        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        val vm = vm()
+        assertEquals("first", vm.state.value.unsent?.text) // the first frame already shows it
+        vm.onDiscardUnsent()
+        assertEquals("first", vm.await { it.confirmDiscard != null }.confirmDiscard)
+        vm.onDismissDiscard()
+        assertEquals("first", vm.await { it.confirmDiscard == null }.unsent?.text)
+
+        vm.onDiscardUnsent()
+        vm.await { it.confirmDiscard != null }
+        vm.onConfirmDiscard("first")
+        val done = vm.await { it.unsent == null }
+        assertEquals(null, done.confirmDiscard)
+        assertEquals("", done.draft)
+    }
+
+    @Test
+    fun unsentNoticeAndCancelWarningAreSeparate() = runTest {
+        addSession()
+        db.pendingSendDao().upsert(PendingSendEntity("q1", KEY, "later", "{}", System.currentTimeMillis(), "queued", null, null, attempted = true))
+        connected.composer.edit(KEY, "first")
+        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        val vm = vm()
+        vm.await { it.items.isNotEmpty() }
+        vm.onCancel("q1")
+        val asking = vm.await { it.confirmCancel != null }
+        assertEquals("q1", asking.confirmCancel)
+        assertTrue((asking.items.single() as UserMessage).attempted) // the dialog shows its stronger warning
+        assertEquals("first", asking.unsent?.text)
+
+        vm.onConfirmCancel("q1", mayHaveSentShown = true)
+        val done = vm.await { it.composerNote != null }
+        assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, done.composerNote)
+        assertEquals("first", done.unsent?.text)
     }
 
     @Test
@@ -465,9 +511,9 @@ class ChatViewModelTest {
         held.complete(Unit)
         lock.join()
 
-        awaitTrue { connected.composer.current(KEY).draft.isNotEmpty() }
-        assertEquals("first", connected.composer.current(KEY).draft)
-        assertEquals("first", vm().state.value.draft) // there when the chat is opened again
+        awaitTrue { connected.composer.current(KEY).unsent != null }
+        assertEquals("first", connected.composer.current(KEY).unsent?.text)
+        assertEquals("first", vm().state.value.unsent?.text) // there when the chat is opened again
     }
 
     @Test
@@ -487,11 +533,12 @@ class ChatViewModelTest {
         held.complete(Unit)
         lock.join()
 
-        val failed = again.await { !it.sending && it.composerNote == ComposerNote.SEND_FAILED }
-        assertEquals("first\nsecond", failed.draft)
-        again.onDraftChange(failed.draft + " too") // typing in the visible composer keeps the recovered text
-        assertEquals("first\nsecond too", connected.composer.current(KEY).draft)
-        assertEquals("first\nsecond too", again.await { it.draft.endsWith("too") }.draft)
+        val failed = again.await { !it.sending && it.unsent != null }
+        assertEquals("second", failed.draft)
+        again.onDraftChange("second!") // a keystroke from the frame drawn before the failure arrived
+        assertEquals("first", connected.composer.current(KEY).unsent?.text)
+        again.onPutBack()
+        assertEquals("first\nsecond!", again.await { it.unsent == null }.draft)
     }
 
     @Test

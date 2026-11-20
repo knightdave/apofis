@@ -102,7 +102,11 @@
     <string name="chat_approval_no_command">Polecenie jest niedostępne, więc można tylko odmówić.</string>
     <string name="chat_unsupported_title">Hermes czeka na odpowiedź</string>
     <string name="chat_unsupported_text">Ta wersja aplikacji nie potrafi udzielić takiej odpowiedzi.</string>
-    <string name="chat_note_send_failed">Nie udało się zapisać wiadomości. Jej tekst wrócił do pola.</string>
+    <string name="chat_unsent_not_stored">Nie wysłano: nie udało się zapisać.</string>
+    <string name="chat_unsent_put_back">Przywróć</string>
+    <string name="chat_unsent_discard">Odrzuć</string>
+    <string name="chat_discard_title">Odrzucić niewysłaną wiadomość?</string>
+    <string name="chat_discard_text">Jej tekst zniknie bezpowrotnie.</string>
     <string name="chat_note_removed_may_have_sent">Usunięto z tego telefonu. Mogła już dotrzeć do serwera.</string>
     <string name="chat_note_cancel_too_late">Za późno na anulowanie: wiadomość jest już wysyłana.</string>
     <string name="chat_status_server_error">Błąd serwera</string>

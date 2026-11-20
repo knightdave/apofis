@@ -469,6 +469,8 @@ class DrawerViewModelTest {
         assertEquals("apofis-b", vm(lastChat = "apofis-b").selected.await { it != null })
         store.clear()
         assertEquals("apofis-a", vm(lastChat = "apofis-gone").selected.await { it != null })
+        // Stored by a collector of the selection, which may run just after the selection was published.
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while ("apofis-a" !in saved) delay(5) } }
         assertTrue("apofis-a" in saved)
     }
 

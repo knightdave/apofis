@@ -38,6 +38,8 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import xyz.rycerz.apofis.api.PendingControl
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ComposeError
+import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
@@ -230,6 +232,13 @@ class ScreenshotTest {
     fun chat_approval_without_command() = chatShot(
         "chat_approval_without_command",
         chat(listOf(question), StatusLine.WORKING, ComposerMode.STOP, live = live(pending = PendingControl("approval", "ctl_1", 2, null, null))),
+    )
+
+    @Test
+    fun chat_unsent_notice() = chatShot(
+        "chat_unsent_notice",
+        chat(listOf(question, answer), composer = ComposerMode.SEND, draft = "And hidden files too?")
+            .copy(unsent = UnsentText("Which of these can I safely delete?", ComposeError.NOT_STORED)),
     )
 
     @Test
