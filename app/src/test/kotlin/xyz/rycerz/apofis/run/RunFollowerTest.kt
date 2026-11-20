@@ -2058,11 +2058,13 @@ class RunFollowerTest {
         val f = follower(done)
         val release = gate()
         val firstAnswer = gate()
+        val secondAnswer = gate()
         routes[stopPath] = { request ->
             if (stopIndex(request) == 0) {
                 firstAnswer.pass()
                 stopAccepted()
             } else {
+                secondAnswer.pass()
                 json("{}", 500)()
             }
         }
@@ -2070,14 +2072,48 @@ class RunFollowerTest {
 
         val first = backgroundScope.launch { f.stop(KEY, RUN) }
         awaitUntil { requestsTo(stopPath).size == 1 }
+        val second = backgroundScope.async { runCatching { f.stop(KEY, RUN) } }
+        awaitUntil { requestsTo(stopPath).size == 2 } // both stops are in flight
         first.cancel() // the caller goes away while the server takes the stop
-        assertTrue(runCatching { f.stop(KEY, RUN) }.exceptionOrNull() is ApiError.Http) // an overlapping stop fails
         firstAnswer.countDown()
         first.join()
+        // Only now the overlapping stop fails, as the last one in flight: it clears the intent unless the cancelled
+        // caller's acceptance was recorded.
+        secondAnswer.countDown()
+        assertTrue(second.await().exceptionOrNull() is ApiError.Http)
         assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
         release.countDown()
         done.await()
 
+        assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
+    }
+
+    @Test
+    fun stopIntentFromBeforeARestartSurvivesTwoOverlappingFailedStops() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        val release = gate()
+        val firstAnswer = gate()
+        val secondAnswer = gate()
+        routes[stopPath] = { request ->
+            if (stopIndex(request) == 0) firstAnswer.pass() else secondAnswer.pass()
+            json("{}", 500)()
+        }
+        cancelledOnRelease(f, release)
+        db.activeRunDao().setStopRequested(RUN) // accepted by the server before the process restarted
+
+        val first = backgroundScope.async { runCatching { f.stop(KEY, RUN) } }
+        awaitUntil { requestsTo(stopPath).size == 1 }
+        val second = backgroundScope.async { runCatching { f.stop(KEY, RUN) } }
+        awaitUntil { requestsTo(stopPath).size == 2 }
+        firstAnswer.countDown()
+        assertTrue(first.await().exceptionOrNull() is ApiError.Http)
+        secondAnswer.countDown()
+        assertTrue(second.await().exceptionOrNull() is ApiError.Http)
+
+        assertTrue(db.activeRunDao().forSession(KEY)!!.stopRequested)
+        release.countDown()
+        done.await()
         assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
     }
 }

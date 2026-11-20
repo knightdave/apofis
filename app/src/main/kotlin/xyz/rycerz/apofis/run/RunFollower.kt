@@ -300,14 +300,18 @@ class RunFollower(
          * flight and none was accepted. The in-flight count is kept in try/finally, so no exception can leak it.
          */
         suspend fun stop(post: suspend () -> Unit): Unit = withContext(NonCancellable) {
-            stopping.withLock { stopsInFlight++ }
+            var registered = false
             var accepted = false
             var failed = false
             try {
                 stopping.withLock {
-                    if (stopsInFlight == 1 && !stopAccepted) {
-                        stopAccepted = db.activeRunDao().get(run.runId)?.stopRequested == true // from before a restart
+                    // The first stop in flight loads an intent stored before a restart, in the same step that counts it,
+                    // so an overlapping stop can never skip the load and later clear that intent.
+                    if (stopsInFlight == 0 && !stopAccepted) {
+                        stopAccepted = db.activeRunDao().get(run.runId)?.stopRequested == true
                     }
+                    stopsInFlight++
+                    registered = true
                     db.activeRunDao().setStopRequested(run.runId)
                 }
                 try {
@@ -318,7 +322,7 @@ class RunFollower(
                 }
                 accepted = true
             } finally {
-                stopping.withLock {
+                if (registered) stopping.withLock {
                     stopsInFlight--
                     if (accepted) {
                         stopAccepted = true
