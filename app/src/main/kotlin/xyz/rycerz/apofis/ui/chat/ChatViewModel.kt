@@ -5,7 +5,6 @@ import android.net.ConnectivityManager
 import android.net.Network
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,6 +24,7 @@ import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.run.AnswerResult
 import xyz.rycerz.apofis.run.Connection
@@ -47,6 +47,9 @@ data class ChatUiState(
     val composerNote: ComposerNote? = null, // one line above the composer about the last send or cancel
     val sending: Boolean = false, // a send is being stored; the send button is disabled meanwhile
     val confirmCancel: String? = null, // the idempotency key of the unsent message the user asked to remove
+    val unsent: UnsentText? = null, // text a send could not store, in its own notice above the composer
+    val confirmDiscard: UnsentText? = null, // the unsent entry the user asked to discard, while it is still the one shown
+    val draftRevision: Long = 0, // the draft's revision: an edit is applied only on the revision it was typed on
 )
 
 /** A request Hermes waits on, by id and execution generation: a new generation is a different request. */
@@ -63,14 +66,14 @@ enum class StatusLine { IDLE, WORKING, QUEUED, OFFLINE, UNREACHABLE, KEY_REJECTE
 enum class ComposerMode { SEND_DISABLED, SEND, STEER, STOP }
 
 enum class ComposerNote {
-    SEND_FAILED, // nothing was stored; the text is back in the composer
     REMOVED_MAY_HAVE_SENT, // cancelled on this phone, but it may already have reached the server
     CANCEL_TOO_LATE, // it started sending before the cancel: nothing was removed
 }
 
 /** Everything the chat screen can ask for; no-ops by default so previews and screenshots need no view model. */
 interface ChatActions {
-    fun onDraftChange(text: String) {}
+    /** [basedOnRevision]: [ChatUiState.draftRevision] of the state the field showed. */
+    fun onDraftChange(text: String, basedOnRevision: Long) {}
 
     /** Sends the current draft; ignored while a send is being stored. */
     fun onSendClick() {}
@@ -86,6 +89,16 @@ interface ChatActions {
     fun onConfirmCancel(idempotencyKey: String, mayHaveSentShown: Boolean) {}
     fun onDismissCancel(idempotencyKey: String) {}
 
+    /** Puts the unsent text back into the composer, before what is typed there. */
+    fun onPutBack() {}
+
+    /** Asks before discarding the unsent text ([ChatUiState.confirmDiscard]). */
+    fun onDiscardUnsent() {}
+
+    /** [id]: the unsent entry the dialog showed; discarded only if it is still that entry. */
+    fun onConfirmDiscard(id: Long) {}
+    fun onDismissDiscard() {}
+
     /** Answers the request the block was drawing, by its own ids. */
     fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) {}
     fun onClarify(requestId: String, executionGeneration: Long, answer: String) {}
@@ -100,8 +113,8 @@ private data class Local(
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null,
     val composerNote: ComposerNote? = null,
-    val sending: Boolean = false,
     val confirmCancel: String? = null,
+    val confirmDiscard: Long? = null,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean)
@@ -114,7 +127,7 @@ class ChatViewModel(
 ) : ViewModel(), ChatActions {
     private val repo = connected.repo
     private val follower = connected.follower
-    private val draft = MutableStateFlow("")
+    private val composer = connected.composer // draft, send in flight and send failure: outlive this view model
     private val local = MutableStateFlow(Local())
     private val host = connected.credentials.baseUrl.toHttpUrlOrNull()?.host.orEmpty()
     private val merger = LiveMerger()
@@ -125,7 +138,8 @@ class ChatViewModel(
         Env(s?.title.orEmpty(), o, r)
     }
 
-    val state: StateFlow<ChatUiState> = combine(content, draft, env, local) { (items, live), d, e, l ->
+    val state: StateFlow<ChatUiState> = combine(content, composer.state(sessionKey), env, local) { (items, live), c, e, l ->
+        val d = c.draft
         ChatUiState(
             sessionKey = sessionKey,
             title = e.title,
@@ -153,54 +167,48 @@ class ChatViewModel(
             answering = l.answering,
             confirmRetry = l.confirmRetry,
             composerNote = l.composerNote,
-            sending = l.sending,
+            sending = c.sending,
             confirmCancel = l.confirmCancel,
+            unsent = c.unsent,
+            confirmDiscard = c.unsent?.takeIf { it.id == l.confirmDiscard },
+            draftRevision = c.revision,
         )
     }.stateIn(
         viewModelScope,
         SharingStarted.Eagerly,
-        ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, "", host),
+        composer.current(sessionKey).let {
+            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision)
+        },
     )
 
     init {
-        // Decided by the session row alone; unsent bubbles say nothing about the cache. A local-only chat makes no request.
-        request {
-            val session = repo.session(sessionKey).first()
-            if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
-                repo.syncMessages(sessionKey)
-            }
+        onOpened()
+    }
+
+    /**
+     * The chat was opened, now or again (a tap on its row while it is shown): fetches its history when it needs it.
+     * Decided by the session row alone; unsent bubbles say nothing about the cache. A local-only chat makes no request.
+     * A failure shows on the status line.
+     */
+    fun onOpened() = request {
+        val session = repo.session(sessionKey).first()
+        if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
+            repo.syncMessages(sessionKey)
         }
     }
 
-    override fun onDraftChange(text: String) {
-        draft.value = text
+    override fun onDraftChange(text: String, basedOnRevision: Long) {
+        composer.edit(sessionKey, text, basedOnRevision)
         if (local.value.composerNote != null) local.update { it.copy(composerNote = null) }
     }
 
     override fun onSendClick() {
-        val text = draft.value
-        if (text.isBlank()) return
-        var claimed = false
-        local.update {
-            claimed = !it.sending
-            if (claimed) it.copy(sending = true, composerNote = null) else it
+        // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
+        val started = composer.send(sessionKey) { text ->
+            repo.send(sessionKey, text) // stored before any request; delivery problems show on the bubble
+            local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
         }
-        if (!claimed) return // one send at a time: a second tap before the redraw sends nothing
-        draft.compareAndSet(text, "")
-        viewModelScope.launch {
-            try {
-                repo.send(sessionKey, text) // stored before any request; delivery problems show on the bubble
-                local.update { it.copy(notes = emptyMap()) }
-            } catch (e: CancellationException) {
-                throw e // the message is stored, or this screen is gone: nothing to give back
-            } catch (_: Exception) {
-                // The repository's contract: a throw means nothing was stored. Never overwrite what was typed since.
-                draft.update { if (it.isEmpty()) text else text + "\n" + it }
-                local.update { it.copy(composerNote = ComposerNote.SEND_FAILED) }
-            } finally {
-                local.update { it.copy(sending = false) }
-            }
-        }
+        if (started != null) local.update { it.copy(composerNote = null) }
     }
 
     override fun onStopClick() = request { follower.stop(sessionKey) }
@@ -221,6 +229,20 @@ class ChatViewModel(
     /** Closes the confirmation only if it is still the one for [idempotencyKey]. */
     override fun onDismissRetry(idempotencyKey: String) =
         local.update { if (it.confirmRetry?.idempotencyKey == idempotencyKey) it.copy(confirmRetry = null) else it }
+
+    override fun onPutBack() = composer.putBack(sessionKey)
+
+    override fun onDiscardUnsent() {
+        val id = composer.current(sessionKey).unsent?.id ?: return
+        local.update { it.copy(confirmDiscard = id) }
+    }
+
+    override fun onConfirmDiscard(id: Long) {
+        composer.discard(sessionKey, id)
+        onDismissDiscard()
+    }
+
+    override fun onDismissDiscard() = local.update { it.copy(confirmDiscard = null) }
 
     override fun onCancel(idempotencyKey: String) = local.update { it.copy(confirmCancel = idempotencyKey) }
 

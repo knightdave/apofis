@@ -3,10 +3,24 @@ package xyz.rycerz.apofis.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.lifecycle.ViewModelStoreOwner
+import xyz.rycerz.apofis.ui.drawer.ArchivedScreen
+import xyz.rycerz.apofis.ui.drawer.DrawerActions
+import xyz.rycerz.apofis.ui.drawer.DrawerContent
+import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
+import xyz.rycerz.apofis.ui.drawer.PromptHost
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
@@ -14,7 +28,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -27,20 +40,20 @@ import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.viewmodel.compose.rememberViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
-import xyz.rycerz.apofis.sync.ChatRepository
-import xyz.rycerz.apofis.ui.chat.ChatActions
 import xyz.rycerz.apofis.ui.chat.ChatScreen
+import xyz.rycerz.apofis.ui.chat.ChatViewModel
+import xyz.rycerz.apofis.ui.chat.ChatActions
 import xyz.rycerz.apofis.ui.chat.ChatUiState
 import xyz.rycerz.apofis.ui.chat.ComposerMode
 import xyz.rycerz.apofis.ui.chat.StatusLine
-import xyz.rycerz.apofis.ui.chat.ChatViewModel
-import xyz.rycerz.apofis.ui.chat.onlineFlow
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
+import androidx.compose.foundation.layout.RowScope
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
@@ -69,6 +82,9 @@ fun AppNav(container: AppContainer) {
         else -> chosen ?: Screen.CHAT
     }
 
+    // Holds the drawer (open chat, drafts): outlives the chat screen (Settings, Connection), not the connection.
+    val chatOwner = key(conn) { rememberViewModelStoreOwner() }
+
     when (screen) {
         Screen.CONNECT, Screen.RECONNECT -> key(screen) {
             val reconnect = screen == Screen.RECONNECT
@@ -91,7 +107,7 @@ fun AppNav(container: AppContainer) {
             BackHandler(enabled = canGoBack, onBack = leave)
             ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
-        Screen.CHAT -> if (conn != null) ChatRoute(conn, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })
+        Screen.CHAT -> if (conn != null) ChatRoute(container, conn, chatOwner, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })
         Screen.SETTINGS -> {
             BackHandler { chosen = Screen.CHAT }
             val scope = rememberCoroutineScope()
@@ -120,58 +136,106 @@ fun AppNav(container: AppContainer) {
 }
 
 /**
- * The chat: until the drawer exists, the restored chat while it still exists, else the most recent one, else a new
- * local chat. Choosing never leaves a blank screen: while loading, or after a failure (with Retry), the chat screen
- * itself is shown, so Settings stays reachable.
+ * The chat with the drawer. [owner] lives as long as the connection and holds the drawer, which owns the open chat. Only the chat on screen has a view model: switching chats clears the old one.
+ * Choosing never leaves a blank screen: while loading, or after a failure (with Retry), the chat screen itself shows.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChatRoute(conn: Connected, onSettings: () -> Unit, onConnection: () -> Unit) {
-    var chatKey by rememberSaveable(conn) { mutableStateOf<String?>(null) }
-    var chosen by remember(conn) { mutableStateOf<String?>(null) } // chatKey once checked against the database
-    var failed by remember(conn) { mutableStateOf(false) }
-    var attempt by remember(conn) { mutableIntStateOf(0) }
-    LaunchedEffect(conn, attempt) {
-        failed = false
-        try {
-            val key = pickChat(conn.repo, chatKey)
-            chatKey = key
-            chosen = key
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            failed = true
-        }
-    }
-    val settings: @Composable RowScope.() -> Unit = {
-        IconButton(onClick = onSettings) {
-            Icon(painterResource(R.drawable.lucide_settings), contentDescription = stringResource(R.string.settings_title), Modifier.size(20.dp))
-        }
-    }
-    val sessionKey = chosen
-    if (sessionKey == null) {
-        val status = if (failed) StatusLine.LOAD_FAILED else StatusLine.IDLE
-        ChatScreen(
-            ChatUiState("", "", status, emptyList(), ComposerMode.SEND_DISABLED, ""),
-            object : ChatActions {},
-            onOpenConnection = onConnection,
-            onRetryLoad = { attempt++ },
-            appBarActions = settings,
-        )
-        return
-    }
-    key(conn, sessionKey) {
-        // Scoped to this chat: switching chats or servers clears the view model and its flows.
-        val owner = rememberViewModelStoreOwner()
-        val context = LocalContext.current.applicationContext
-        val vm = viewModel(viewModelStoreOwner = owner) { ChatViewModel(sessionKey, conn, context.onlineFlow()) }
-        val state by vm.state.collectAsState()
-        ChatScreen(state, vm, onOpenConnection = onConnection, appBarActions = settings)
-    }
-}
+private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner, onSettings: () -> Unit, onConnection: () -> Unit) {
+    val prefs = container.preferences
+    val drawer = viewModel(viewModelStoreOwner = owner) { DrawerViewModel(conn, lastChat = prefs.lastChat, onSelected = { prefs.lastChat = it }) }
+    val selected by drawer.selected.collectAsState()
+    val loadFailed by drawer.loadFailed.collectAsState()
+    val rows by drawer.rows.collectAsState()
+    val archived by drawer.archived.collectAsState()
+    val query by drawer.query.collectAsState()
+    val refreshFailed by drawer.refreshFailed.collectAsState()
+    val prompt by drawer.prompt.collectAsState()
+    var showArchived by rememberSaveable { mutableStateOf(false) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
 
-/** A restored key whose chat is gone becomes a new local chat; without one, the most recent chat or a new one. */
-private suspend fun pickChat(repo: ChatRepository, saved: String?): String = when {
-    saved == null -> repo.sessions().first().firstOrNull()?.key ?: repo.createLocalSession()
-    repo.session(saved).first() != null -> saved
-    else -> repo.createLocalSession()
+    LaunchedEffect(drawerState) {
+        snapshotFlow { drawerState.targetValue }.collect {
+            if (it == DrawerValue.Open) {
+                keyboard?.hide()
+                focus.clearFocus()
+                drawer.onOpen()
+            }
+        }
+    }
+    BackHandler(drawerState.isOpen) { scope.launch { drawerState.close() } }
+    LaunchedEffect(showArchived, archived.isEmpty()) { if (showArchived && archived.isEmpty()) showArchived = false }
+
+    val open = object : DrawerActions by drawer {
+        override fun onSelect(key: String) {
+            drawer.onSelect(key)
+            showArchived = false
+            scope.launch { drawerState.close() }
+        }
+    }
+    val drawerButton: @Composable () -> Unit = {
+        IconButton(onClick = {
+            keyboard?.hide()
+            scope.launch { drawerState.open() }
+        }) {
+            Icon(painterResource(R.drawable.lucide_menu), contentDescription = stringResource(R.string.drawer_open), Modifier.size(20.dp))
+        }
+    }
+    val newChatButton: @Composable RowScope.() -> Unit = {
+        IconButton(onClick = drawer::newChat) {
+            Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = stringResource(R.string.drawer_new_chat), Modifier.size(20.dp))
+        }
+    }
+    if (showArchived) {
+        BackHandler { showArchived = false }
+        ArchivedScreen(archived, open, onBack = { showArchived = false })
+    } else {
+        ModalNavigationDrawer(
+            drawerContent = {
+                ModalDrawerSheet(Modifier.fillMaxWidth(0.75f), drawerContainerColor = MaterialTheme.colorScheme.surface) {
+                    DrawerContent(
+                        rows,
+                        query,
+                        refreshFailed,
+                        hasArchived = archived.isNotEmpty(),
+                        actions = open,
+                        onQuery = drawer::onQuery,
+                        onNewChat = {
+                            drawer.newChat()
+                            scope.launch { drawerState.close() }
+                        },
+                        onArchived = { showArchived = true },
+                        onSettings = onSettings,
+                    )
+                }
+            },
+            drawerState = drawerState,
+        ) {
+            val sessionKey = selected
+            if (sessionKey == null) {
+                ChatScreen(
+                    ChatUiState("", "", if (loadFailed) StatusLine.LOAD_FAILED else StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, ""),
+                    object : ChatActions {},
+                    onOpenConnection = onConnection,
+                    onRetryLoad = drawer::retryLoad,
+                    navigationIcon = drawerButton,
+                    appBarActions = newChatButton,
+                )
+            } else {
+                key(sessionKey) {
+                    // Scoped to this chat being on screen: leaving clears the view model, its collectors and its
+                    // connectivity subscription. Its draft lives in the connection's holder, not here.
+                    val chatOwner = rememberViewModelStoreOwner()
+                    val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
+                    LaunchedEffect(vm) { drawer.reopened.drop(1).filterNotNull().filter { it.key == sessionKey }.collect { vm.onOpened() } }
+                    val state by vm.state.collectAsState()
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton)
+                }
+            }
+        }
+    }
+    prompt?.let { PromptHost(it, drawer) }
 }

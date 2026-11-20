@@ -29,6 +29,11 @@ class Preferences(context: Context) {
     suspend fun setDynamicColor(value: Boolean) = write(dynamic, value) { putBoolean(DYNAMIC_COLOR, value) }
     suspend fun setPureBlack(value: Boolean) = write(black, value) { putBoolean(PURE_BLACK, value) }
 
+    /** The chat open last, restored after the process was killed when it still exists. */
+    var lastChat: String?
+        get() = prefs.getString(LAST_CHAT, null)
+        set(value) = prefs.edit { putString(LAST_CHAT, value) }
+
     private suspend fun <T> write(flow: MutableStateFlow<T>, value: T, put: SharedPreferences.Editor.() -> Unit) {
         flow.value = value
         withContext(Dispatchers.IO) { prefs.edit(commit = true, action = put) }
@@ -38,5 +43,6 @@ class Preferences(context: Context) {
         const val THEME_MODE = "theme_mode"
         const val DYNAMIC_COLOR = "dynamic_color"
         const val PURE_BLACK = "pure_black"
+        const val LAST_CHAT = "last_chat"
     }
 }

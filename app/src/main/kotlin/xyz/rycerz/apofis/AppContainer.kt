@@ -16,14 +16,18 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
@@ -34,6 +38,7 @@ import xyz.rycerz.apofis.sync.RunStarter
 import xyz.rycerz.apofis.sync.SendQueue
 import xyz.rycerz.apofis.sync.SendWorker
 import xyz.rycerz.apofis.sync.withRepositoryLock
+import xyz.rycerz.apofis.ui.chat.onlineFlow
 import xyz.rycerz.apofis.ui.connect.ConnectBack
 
 /**
@@ -50,12 +55,17 @@ class Connected internal constructor(
     follower: RunFollower,
     private val open: AtomicBoolean,
     private val scope: CoroutineScope,
+    /** The composer of the cached chats: the container's one, shared by its connections. */
+    val composer: Composer = Composer(scope),
 ) {
     private val liveApi = api
     private val liveRepo = repo
     private val liveFollower = follower
 
     val isOpen: Boolean get() = open.get()
+
+    /** Runs [block] in the connection's scope: it outlives any screen and ends with the connection. */
+    internal fun launch(block: suspend CoroutineScope.() -> Unit): Job = scope.launch(block = block)
     val api: HermesApi get() = liveApi.also { checkOpen() }
     val repo: ChatRepository get() = liveRepo.also { checkOpen() }
     val follower: RunFollower get() = liveFollower.also { checkOpen() }
@@ -82,8 +92,8 @@ internal const val CACHE_PREFS = "cache"
 private const val CACHE_URL = "cache_base_url" // the server the cached rows came from
 internal const val SWITCH_MARKER = "switch_in_progress" // present from the first write of a switch until its last
 
-private const val ANY_CACHED_ROW = "SELECT EXISTS(SELECT 1 FROM SessionEntity) OR EXISTS(SELECT 1 FROM MessageEntity) " +
-    "OR EXISTS(SELECT 1 FROM PendingSendEntity) OR EXISTS(SELECT 1 FROM ActiveRunEntity) OR EXISTS(SELECT 1 FROM ReplyOutcomeEntity)"
+private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity")
+private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
 
 // ApiError causes can carry server or transport text, so only the class name is ever logged.
 private fun logFailure(e: Throwable) = Log.w(TAG, "Background task failed: ${e.javaClass.name}")
@@ -99,6 +109,9 @@ class AppContainer(
     val preferences = Preferences(app)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + logOnly)
 
+    /** Device connectivity, one network callback for the whole app, registered only while someone listens. */
+    val online: Flow<Boolean> by lazy { app.onlineFlow().shareIn(scope, SharingStarted.WhileSubscribed(5_000), replay = 1) }
+
     /** Back during a connect check; here so it outlives rotation. */
     val connectBack = ConnectBack()
 
@@ -113,6 +126,12 @@ class AppContainer(
     private var switchFailedBefore = false
     private val published = MutableStateFlow<Connected?>(null)
     private val switchLock = Mutex()
+
+    /**
+     * Drafts, sends being stored and unsent text of the cached chats: shared by every connection, emptied only in the
+     * step that clears the cached tables. Its own scope, so closing a connection does not cancel a send being stored.
+     */
+    internal val composer = Composer(CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Default + logOnly))
 
     /**
      * Test hooks: [beforeResume] runs on the lifecycle path after the started check, before the follower opens its gate;
@@ -165,8 +184,9 @@ class AppContainer(
     }
 
     /**
-     * Switches to tested credentials: close the old graph, mark the switch, clear every table when the server
-     * changes, write the credentials, build the new graph, record the cache owner, unmark. Any failure after the mark
+     * Switches to tested credentials: let sends being stored finish and close the old graph, mark the switch, clear
+     * every table and the composer when the server changes, write the credentials, build the new graph, record the
+     * cache owner, unmark. Any failure after the mark
      * ends disconnected with the credentials erased, and a mark left by process death forces that state on the next
      * start. Throws on failure. Not cancellable once started.
      */
@@ -182,12 +202,22 @@ class AppContainer(
                     current
                 }
                 beforeSwitch()
+                composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
                 commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
                     commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
-                    withRepositoryLock { db.clearAllTables() }
+                    withRepositoryLock {
+                        // Not clearAllTables(): it commits the deletes, then can fail in VACUUM before the composer is cleared.
+                        db.runInTransaction { CACHED_TABLES.forEach { db.openHelper.writableDatabase.execSQL("DELETE FROM `$it`") } }
+                        composer.clear() // right after the commit: no draft outlives its chat, nothing survives into the new server
+                    }
+                    // Best effort: only shrinks the file; the cache counts as cleared whatever happens here.
+                    runCatching {
+                        db.query("PRAGMA wal_checkpoint(FULL)", null).close()
+                        db.openHelper.writableDatabase.execSQL("VACUUM")
+                    }.onFailure(::logFailure)
                 }
                 if (!credentials.save(c)) throw IOException("credentials not written")
                 next = build(c)
@@ -279,6 +309,6 @@ class AppContainer(
         val queue = SendQueue(api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get)
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
         follower = RunFollower(api, db, repo, runScope, onRunFinished = { if (open.get()) queue.drain() })
-        return Connected(c, api, db, repo, queue, follower, open, runScope)
+        return Connected(c, api, db, repo, queue, follower, open, runScope, composer)
     }
 }

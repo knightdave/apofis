@@ -1,5 +1,34 @@
 package xyz.rycerz.apofis.ui
 
+import android.os.Looper
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.ui.Modifier
+import com.github.takahirom.roborazzi.captureScreenRoboImage
+import java.time.Duration
+import java.time.LocalDate
+import java.time.ZoneOffset
+import org.robolectric.Robolectric
+import org.robolectric.Shadows.shadowOf
+import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.ui.drawer.ActionError
+import xyz.rycerz.apofis.ui.drawer.ArchivedScreen
+import xyz.rycerz.apofis.ui.drawer.DrawerActions
+import xyz.rycerz.apofis.ui.drawer.DrawerContent
+import xyz.rycerz.apofis.ui.drawer.DrawerRow
+import xyz.rycerz.apofis.ui.drawer.Prompt
+import xyz.rycerz.apofis.ui.drawer.PromptActions
+import xyz.rycerz.apofis.ui.drawer.PromptHost
+import xyz.rycerz.apofis.ui.drawer.PromptKind
+import xyz.rycerz.apofis.ui.drawer.groupSessions
 import androidx.compose.runtime.Composable
 import com.github.takahirom.roborazzi.RoborazziOptions
 import com.github.takahirom.roborazzi.captureRoboImage
@@ -11,6 +40,8 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import xyz.rycerz.apofis.api.PendingControl
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ComposeError
+import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
@@ -26,6 +57,7 @@ import xyz.rycerz.apofis.ui.chat.ComposerMode
 import xyz.rycerz.apofis.ui.chat.StatusLine
 import xyz.rycerz.apofis.ui.chat.withLive
 import xyz.rycerz.apofis.ui.connect.ConnectScreen
+import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
@@ -64,6 +96,18 @@ class ScreenshotTest {
         vm.onKeyChange("sk-123")
         vm.connect()?.join()
         shot("connect_error", ThemeMode.LIGHT) { ConnectScreen(vm, onBack = null) }
+    }
+
+    @Test
+    fun connect_server_change() {
+        val vm = ConnectViewModel(current = null, willClearCache = { true }, save = {}, check = {}) // the server answers at once
+        vm.onUrlChange("https://hermes.example:8642")
+        vm.onKeyChange("sk-123")
+        val check = vm.connect()!!
+        shadowOf(Looper.getMainLooper()).idle() // runs what is queued now, then returns
+        assertTrue(check.isCompleted)
+        assertEquals(ConnectState.ConfirmServerChange, vm.state)
+        windowShot("connect_server_change") { ConnectScreen(vm, onBack = null) }
     }
 
     @Composable
@@ -206,5 +250,104 @@ class ScreenshotTest {
     )
 
     @Test
+    fun chat_unsent_notice() = chatShot(
+        "chat_unsent_notice",
+        chat(listOf(question, answer), composer = ComposerMode.SEND, draft = "And hidden files too?")
+            .copy(unsent = UnsentText(1, "Which of these can I safely delete?", ComposeError.NOT_STORED)),
+    )
+
+    @Test
     fun chat_load_failed() = chatShot("chat_load_failed", ChatUiState("", "", StatusLine.LOAD_FAILED, emptyList(), ComposerMode.SEND_DISABLED, ""))
+
+    // ---- drawer ----
+
+    private val today = LocalDate.of(2026, 3, 10) // fixed: the goldens never depend on the recording date or zone
+    private val utc = ZoneOffset.UTC
+
+    private fun at(daysAgo: Long, hour: Int) = today.minusDays(daysAgo).atTime(hour, 0).toEpochSecond(utc).toDouble()
+
+    private fun session(key: String, title: String?, active: Double, pinned: Boolean = false) = SessionEntity(
+        key = key, currentId = key, lineageIds = "", title = title, pinned = pinned, archived = false, startedAt = active,
+        lastActiveAt = active, messageCount = 4, preview = null, stale = false, existsOnServer = true,
+    )
+
+    private val sessions = listOf(
+        session("apofis-1", "Largest files", at(0, 11)),
+        session("apofis-2", "Kubernetes upgrade checklist", at(30, 9), pinned = true),
+        session("apofis-3", "Trip to Lisbon: three days, mostly on foot, with a list of bakeries", at(0, 9)),
+        session("apofis-4", "Sourdough starter schedule", at(1, 22)),
+        session("apofis-5", null, at(1, 8)),
+        session("apofis-6", "Birthday gift ideas", at(6, 18)),
+        session("apofis-7", "Plan the garden beds", at(9, 12)),
+    )
+
+    private fun rows(query: String = "") = groupSessions(sessions, query, "apofis-1", today, utc).map {
+        when ((it as? DrawerRow.Chat)?.key) {
+            "apofis-3" -> it.copy(running = true)
+            "apofis-4" -> it.copy(needsInput = true)
+            else -> it
+        }
+    }
+
+    @Composable
+    private fun DrawerOpen(rows: List<DrawerRow>, query: String = "", hasArchived: Boolean = true, refreshFailed: Boolean = false) {
+        ModalNavigationDrawer(
+            drawerContent = {
+                ModalDrawerSheet(Modifier.fillMaxWidth(0.75f), drawerContainerColor = MaterialTheme.colorScheme.surface) {
+                    DrawerContent(rows, query, refreshFailed, hasArchived, object : DrawerActions {}, {}, {}, {}, {})
+                }
+            },
+            drawerState = rememberDrawerState(DrawerValue.Open),
+        ) {
+            ChatScreen(chat(listOf(question, answer)), object : ChatActions {}, onOpenConnection = {})
+        }
+    }
+
+    /** Captures every window, so dialogs and bottom sheets are in the image. */
+    private fun windowShot(name: String, mode: ThemeMode = ThemeMode.LIGHT, content: @Composable () -> Unit) {
+        val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
+        activity.setContent { ApofisTheme(mode = mode, dynamicColor = false, pureBlack = false, content = content) }
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2)) // sheet and dialog enter animations end
+        captureScreenRoboImage("src/test/screenshots/$name.png", options)
+    }
+
+    private fun prompt(kind: PromptKind, running: Boolean = false, error: ActionError? = null) =
+        Prompt(kind, "apofis-3", "Trip to Lisbon: three days, mostly on foot, with a list of bakeries", pinned = false, archived = false, running = running, token = 1, error = error)
+
+    @Test
+    fun drawer_groups_light() = shot("drawer_groups_light", ThemeMode.LIGHT) { DrawerOpen(rows()) }
+
+    @Test
+    fun drawer_groups_dark() = shot("drawer_groups_dark", ThemeMode.DARK) { DrawerOpen(rows(), refreshFailed = true) }
+
+    @Test
+    fun drawer_search() = shot("drawer_search", ThemeMode.LIGHT) { DrawerOpen(rows("plan"), query = "plan", hasArchived = false) }
+
+    @Test
+    fun drawer_empty() = shot("drawer_empty", ThemeMode.LIGHT) { DrawerOpen(emptyList(), hasArchived = false) }
+
+    @Test
+    fun drawer_actions_sheet() = windowShot("drawer_actions_sheet") {
+        DrawerOpen(rows())
+        PromptHost(prompt(PromptKind.ACTIONS, error = ActionError.NETWORK), object : PromptActions {})
+    }
+
+    @Test
+    fun drawer_delete_confirm() = windowShot("drawer_delete_confirm") {
+        DrawerOpen(rows())
+        PromptHost(prompt(PromptKind.DELETE, running = true), object : PromptActions {})
+    }
+
+    @Test
+    fun archived_list() = shot("archived_list", ThemeMode.LIGHT) {
+        ArchivedScreen(
+            listOf(
+                DrawerRow.Chat("apofis-8", "Old apartment search", selected = false, running = false, needsInput = false),
+                DrawerRow.Chat("apofis-9", "Conference talk outline", selected = false, running = false, needsInput = false),
+                DrawerRow.Chat("apofis-10", "", selected = false, running = false, needsInput = false),
+            ),
+            object : DrawerActions {},
+            onBack = {},
+        )
+    }
 }

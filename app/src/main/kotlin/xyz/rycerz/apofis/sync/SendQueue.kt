@@ -249,6 +249,7 @@ class SendQueue(
             fail(send, SendError.SESSION_UNAVAILABLE)
             return@withRepositoryLock Attempt.FAILED
         }
+        if (isBeingDeleted(session.key)) return@withRepositoryLock Attempt.FAILED // stays queued; sent if the delete fails
         val sent = send.copy(attempted = true)
         var requested = false // creating the session is not an attempt to deliver the message
         val run = try {

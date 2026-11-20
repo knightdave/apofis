@@ -52,7 +52,7 @@ class BackAfterRecreateTest {
             val vm: ConnectViewModel = back.target!!
             vm.onUrlChange(server.url("/").toString())
             vm.onKeyChange("sk-1")
-            vm.connect()
+            val probe = vm.connect()!!
             assertTrue(server.takeRequest(5, TimeUnit.SECONDS) != null)
 
             controller.recreate() // rotation while the check runs
@@ -62,9 +62,8 @@ class BackAfterRecreateTest {
 
             assertEquals(ConnectState.Idle, vm.state)
             assertFalse(back.busy.value)
-            response.countDown()
-            Thread.sleep(3_500) // past the moment the response arrives
-            until("the late result to be dropped") { true }
+            response.countDown() // now the server answers, after Back
+            until("the probe to finish") { probe.isCompleted }
             assertEquals(ConnectState.Idle, vm.state)
             assertNull(app.container.credentials.load())
             assertNull(app.container.connection.value)

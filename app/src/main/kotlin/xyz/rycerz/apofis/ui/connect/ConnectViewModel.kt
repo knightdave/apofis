@@ -57,6 +57,8 @@ class ConnectViewModel(
     private val save: suspend (Credentials) -> Unit,
     failedBefore: Boolean = false,
     private val back: ConnectBack? = null,
+    /** Asks the server whether it is Hermes; replaceable so a test needs no network. */
+    private val check: suspend (HermesApi) -> Unit = { it.capabilities() },
 ) : ViewModel() {
     var url by mutableStateOf(current?.baseUrl.orEmpty())
         private set
@@ -123,7 +125,7 @@ class ConnectViewModel(
     // Every failure other than cancellation ends as a field error.
     private suspend fun probe(api: HermesApi, c: Credentials, mine: Int): ConnectState {
         try {
-            api.capabilities()
+            check(api)
         } catch (e: CancellationException) {
             throw e
         } catch (e: ApiError) {

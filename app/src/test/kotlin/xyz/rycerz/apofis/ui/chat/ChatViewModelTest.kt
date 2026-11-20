@@ -52,6 +52,8 @@ import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ComposeError
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Notice
 import xyz.rycerz.apofis.chat.ReasoningStep
@@ -139,6 +141,11 @@ class ChatViewModelTest {
     private var created = 0
 
     private val vms = mutableListOf<ChatViewModel>()
+
+    /** A user edit made on the current state, as the screen does after a redraw. */
+    private fun ChatViewModel.onDraftChange(text: String) = onDraftChange(text, connected.composer.current(KEY).revision)
+
+    private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
     private fun vm(): ChatViewModel = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected, online) } })
         .get("vm${created++}", ChatViewModel::class).also { vms += it }
@@ -370,10 +377,70 @@ class ChatViewModelTest {
         held.complete(Unit)
         lock.join()
 
-        val back = vm.await { it.composerNote != null && !it.sending }
-        assertEquals("first\nsecond", back.draft)
-        assertEquals(ComposerNote.SEND_FAILED, back.composerNote)
+        val back = vm.await { it.unsent != null && !it.sending }
+        assertEquals("second", back.draft) // the text field is never written by a failure
+        assertEquals("first", back.unsent?.text)
+        assertEquals(ComposeError.NOT_STORED, back.unsent?.error)
+        assertEquals(null, back.composerNote)
         assertTrue(db.pendingSendDao().rows(KEY).isEmpty())
+
+        vm.onPutBack()
+        val merged = vm.await { it.unsent == null }
+        assertEquals("first\nsecond", merged.draft)
+    }
+
+    @Test
+    fun discardAsksOnceAndRemovesOnlyTheTextShown() = runTest {
+        connected.composer.edit(KEY, "first")
+        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        val vm = vm()
+        assertEquals("first", vm.state.value.unsent?.text) // the first frame already shows it
+        vm.onDiscardUnsent()
+        assertEquals("first", vm.await { it.confirmDiscard != null }.confirmDiscard?.text)
+        vm.onDismissDiscard()
+        assertEquals("first", vm.await { it.confirmDiscard == null }.unsent?.text)
+
+        vm.onDiscardUnsent()
+        vm.onConfirmDiscard(vm.await { it.confirmDiscard != null }.confirmDiscard!!.id)
+        val done = vm.await { it.unsent == null }
+        assertEquals(null, done.confirmDiscard)
+        assertEquals("", done.draft)
+    }
+
+    @Test
+    fun aStaleDiscardConfirmationNeverOpensForANewEntryWithTheSameText() = runTest {
+        connected.composer.edit(KEY, "same")
+        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        val vm = vm()
+        vm.onDiscardUnsent()
+        vm.await { it.confirmDiscard != null }
+        vm.onPutBack() // the entry goes another way while the dialog was open
+        assertEquals(null, vm.await { it.unsent == null }.confirmDiscard)
+
+        vm.onSendClick() // "same" fails again: a new entry with identical text
+        val again = vm.await { it.unsent != null && !it.sending }
+        assertEquals("same", again.unsent?.text)
+        assertEquals(null, again.confirmDiscard)
+    }
+
+    @Test
+    fun unsentNoticeAndCancelWarningAreSeparate() = runTest {
+        addSession()
+        db.pendingSendDao().upsert(PendingSendEntity("q1", KEY, "later", "{}", System.currentTimeMillis(), "queued", null, null, attempted = true))
+        connected.composer.edit(KEY, "first")
+        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        val vm = vm()
+        vm.await { it.items.isNotEmpty() }
+        vm.onCancel("q1")
+        val asking = vm.await { it.confirmCancel != null }
+        assertEquals("q1", asking.confirmCancel)
+        assertTrue((asking.items.single() as UserMessage).attempted) // the dialog shows its stronger warning
+        assertEquals("first", asking.unsent?.text)
+
+        vm.onConfirmCancel("q1", mayHaveSentShown = true)
+        val done = vm.await { it.composerNote != null }
+        assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, done.composerNote)
+        assertEquals("first", done.unsent?.text)
     }
 
     @Test
@@ -419,6 +486,127 @@ class ChatViewModelTest {
         vm.onConfirmCancel("q1", mayHaveSentShown = true)
         assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, vm.await { it.composerNote != null }.composerNote)
         assertTrue(vm.await { it.items.isEmpty() }.items.isEmpty())
+    }
+
+    @Test
+    fun sendSurvivesLeavingTheChat() = runTest {
+        addSession()
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("Remember the milk")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear() // the user switched chats before the message was stored
+        held.complete(Unit)
+        lock.join()
+
+        awaitTrue { runBlocking { db.pendingSendDao().rows(KEY).isNotEmpty() } }
+        assertEquals(listOf("Remember the milk"), db.pendingSendDao().rows(KEY).map { it.text })
+        assertEquals("", connected.composer.current(KEY).draft)
+    }
+
+    @Test
+    fun failedSendAfterLeavingGoesBackToTheDraft() = runTest {
+        // No session row: send refuses before storing anything.
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("first")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear()
+        held.complete(Unit)
+        lock.join()
+
+        awaitTrue { connected.composer.current(KEY).unsent != null }
+        assertEquals("first", connected.composer.current(KEY).unsent?.text)
+        assertEquals("first", vm().state.value.unsent?.text) // there when the chat is opened again
+    }
+
+    @Test
+    fun sendFailingAfterTheChatReopenedReachesTheVisibleComposer() = runTest {
+        // No session row: send refuses before storing anything.
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("first")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear() // left while the send waits
+        val again = vm() // and opened again before it failed
+        again.onDraftChange("second")
+        held.complete(Unit)
+        lock.join()
+
+        val failed = again.await { !it.sending && it.unsent != null }
+        assertEquals("second", failed.draft)
+        again.onDraftChange("second!") // a keystroke from the frame drawn before the failure arrived
+        assertEquals("first", connected.composer.current(KEY).unsent?.text)
+        val shown = again.state.value.draftRevision
+        again.onPutBack()
+        assertEquals("first\nsecond!", again.await { it.unsent == null }.draft)
+        again.onDraftChange("second!?", shown) // a keystroke from the frame before Put back is dropped
+        assertEquals("first\nsecond!", connected.composer.current(KEY).draft)
+    }
+
+    @Test
+    fun reopenedChatKeepsTheSendInFlight() = runTest {
+        addSession()
+        val vm = vm()
+        val held = CompletableDeferred<Unit>()
+        val locked = CompletableDeferred<Unit>()
+        val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
+        locked.await()
+        vm.onDraftChange("first")
+        vm.onSendClick()
+        vm.await { it.sending }
+        store.clear()
+        val again = vm()
+        assertTrue(again.state.value.sending) // the first frame already shows it
+        again.onDraftChange("second")
+        again.onSendClick() // still in flight: ignored
+        assertTrue(again.await { it.draft == "second" }.sending)
+        held.complete(Unit)
+        lock.join()
+
+        val done = again.await { !it.sending && it.items.isNotEmpty() }
+        assertEquals("second", done.draft)
+        assertEquals(listOf("first"), db.pendingSendDao().rows(KEY).map { it.text })
+    }
+
+    @Test
+    fun draftIsReadOnceAndWrittenOnlyByEdits() = runTest {
+        addSession()
+        connected.composer.edit(KEY, "half a thought")
+        val vm = vm()
+        assertEquals("half a thought", vm.await { it.title == "Plans" }.draft)
+        store.clear() // opened and left at once: the saved draft stays
+        assertEquals("half a thought", connected.composer.current(KEY).draft)
+
+        val again = vm()
+        again.onDraftChange("half a thought, finished")
+        assertEquals("half a thought, finished", connected.composer.current(KEY).draft)
+    }
+
+    @Test
+    fun openingAgainFetchesAStaleChatAndReportsFailure() = runTest {
+        addSession(onServer = true)
+        routes[MESSAGES] = json(serverRows)
+        val vm = vm()
+        vm.await { it.items.isNotEmpty() } // the first transcript is committed (rows and stale = false in one transaction)
+        assertEquals(1, requests.count { it.target.startsWith(MESSAGES) })
+        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(stale = true))
+        routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
+        vm.onOpened()
+        assertEquals(StatusLine.SERVER_ERROR, vm.await { it.status == StatusLine.SERVER_ERROR }.status)
+        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
     }
 
     @Test

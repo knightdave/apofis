@@ -28,7 +28,7 @@
     <string name="connect_error_key_rejected">Key rejected</string>
     <string name="connect_error_save_failed">Could not save the connection. Try again.</string>
     <string name="server_change_title">Switch server?</string>
-    <string name="server_change_text">Cached chats will be removed from this phone and unsent messages will be deleted. The chats stay on the old server.</string>
+    <string name="server_change_text">Cached chats will be removed from this phone, and unsent messages and drafts will be deleted. The chats stay on the old server.</string>
     <string name="server_change_confirm">Switch</string>
 
     <string name="chat_new_title">New chat</string>
@@ -104,7 +104,11 @@
     <string name="chat_approval_no_command">The command is not available, so it can only be denied.</string>
     <string name="chat_unsupported_title">Hermes is waiting for an answer</string>
     <string name="chat_unsupported_text">This version of the app cannot give this kind of answer.</string>
-    <string name="chat_note_send_failed">The message could not be saved. Its text is back in the box.</string>
+    <string name="chat_unsent_not_stored">Not sent: could not be saved.</string>
+    <string name="chat_unsent_put_back">Put back</string>
+    <string name="chat_unsent_discard">Discard</string>
+    <string name="chat_discard_title">Discard this unsent message?</string>
+    <string name="chat_discard_text">Its text will be gone for good.</string>
     <string name="chat_note_removed_may_have_sent">Removed from this phone. It may already have reached the server.</string>
     <string name="chat_note_cancel_too_late">Too late to cancel: the message is already being sent.</string>
     <string name="chat_status_server_error">Server error</string>
@@ -135,4 +139,28 @@
     <string name="settings_licenses">Open-source licenses</string>
     <string name="licenses_lucide">Lucide icons</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
+    <string name="drawer_open">Open chat list</string>
+    <string name="drawer_new_chat">New chat</string>
+    <string name="drawer_search_hint">Search chats</string>
+    <string name="drawer_no_match">No chats match</string>
+    <string name="drawer_refresh_failed">Could not refresh</string>
+    <string name="drawer_pinned">Pinned</string>
+    <string name="drawer_archived">Archived</string>
+    <string name="drawer_working">working</string>
+    <string name="drawer_needs_answer">needs your answer</string>
+    <string name="drawer_rename">Rename</string>
+    <string name="drawer_pin">Pin</string>
+    <string name="drawer_unpin">Unpin</string>
+    <string name="drawer_archive">Archive</string>
+    <string name="drawer_unarchive">Unarchive</string>
+    <string name="drawer_delete">Delete</string>
+    <string name="drawer_rename_title">Rename chat</string>
+    <string name="drawer_rename_hint">Title</string>
+    <string name="drawer_save">Save</string>
+    <string name="drawer_delete_title">Delete this chat?</string>
+    <string name="drawer_delete_text">The chat will be deleted permanently from the server.</string>
+    <string name="drawer_delete_running">A reply is still running and will be stopped.</string>
+    <string name="drawer_error_closed">The connection was closed</string>
+    <string name="archived_title">Archived chats</string>
+    <string name="drawer_more_actions">More actions</string>
 </resources>
