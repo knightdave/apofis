@@ -18,6 +18,15 @@ expect 0 allowed "package: xyz.rycerz.apofis
 uses-permission: name='android.permission.INTERNET'
 permission: xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
 uses-permission: name='xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'"
+expect 0 workmanager "package: xyz.rycerz.apofis
+uses-permission: name='android.permission.INTERNET'
+uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
+uses-permission: name='android.permission.WAKE_LOCK'
+uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'
+uses-permission: name='xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'"
+expect 1 foreground-service "uses-permission: name='android.permission.INTERNET'
+uses-permission: name='android.permission.WAKE_LOCK'
+uses-permission: name='android.permission.FOREGROUND_SERVICE'"
 expect 1 camera "uses-permission: name='android.permission.INTERNET'
 uses-permission: name='android.permission.CAMERA'"
 expect 1 camera-sdk-23 "uses-permission: name='android.permission.INTERNET'
