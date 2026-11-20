@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.Query
 import androidx.room.Transaction
+import androidx.room.Update
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
@@ -128,8 +129,12 @@ interface PendingSendDao {
     @Upsert
     suspend fun upsert(p: PendingSendEntity)
 
+    /** Changes the row only if it still exists (never recreates a deleted one); returns the rows changed. */
+    @Update
+    suspend fun update(p: PendingSendEntity): Int
+
     @Query("DELETE FROM PendingSendEntity WHERE idempotencyKey = :idempotencyKey")
-    suspend fun delete(idempotencyKey: String)
+    suspend fun delete(idempotencyKey: String): Int
 }
 
 @Dao

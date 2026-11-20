@@ -34,8 +34,8 @@ object PendingState {
 /** Every [PendingSendEntity.error] value. Chosen here, never taken from the server or an exception. */
 object SendError {
     const val EXPIRED = "expired"
-    const val EXPIRED_UNCERTAIN = "expired_uncertain" // expired after a request whose outcome is unknown
-    const val STEER_UNCERTAIN = "steer_uncertain" // the steer may have been delivered
+    const val EXPIRED_UNCERTAIN = "expired_uncertain" // expired after a request the server may have accepted
+    const val STEER_UNCERTAIN = "steer_uncertain" // the only error of a failed steer the server may have delivered
     const val PERMISSION_DENIED = "permission_denied"
     const val SESSION_DELETED = "session_deleted"
     const val SESSION_UNAVAILABLE = "session_unavailable"
@@ -44,9 +44,6 @@ object SendError {
     const val NOT_FOUND = "not_found"
     const val PROTOCOL = "protocol"
     const val HTTP_ERROR = "http_error"
-
-    /** Errors after which the message may already have reached the server: a retry needs the user's confirmation. */
-    val UNCERTAIN = setOf(EXPIRED_UNCERTAIN, STEER_UNCERTAIN)
 }
 
 enum class RetryResult { STARTED, NEEDS_CONFIRMATION, NOT_FOUND }
@@ -73,16 +70,20 @@ class SendQueue(
 
     /** Stores [text] as a queued send for [sessionKey]; returns its idempotency key. */
     suspend fun enqueue(sessionKey: String, text: String): String =
-        insert(sessionKey, text, steer = false).idempotencyKey.also { schedule() }
+        withRepositoryLock { insert(sessionKey, text, steer = false) }.idempotencyKey.also { schedule() }
 
     /**
      * For ChatRepository.send: steers the session's running run, else queues [text] and drains. The row is stored
      * before any request; a hidden session fails locally; an unknown session throws IllegalArgumentException.
+     * The repository lock is held from the session check through the steer request, so a refresh cannot hide
+     * the session and a delete cannot remove the row in between.
      */
     internal suspend fun submit(sessionKey: String, text: String) {
         val queued = drainLock.withLock {
-            val row = insert(sessionKey, text, steer = true)
-            if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
+            withRepositoryLock {
+                val row = insert(sessionKey, text, steer = true)
+                if (row.state == PendingState.STEERING) steer(row) else row.state == PendingState.QUEUED
+            }
         }
         if (queued) {
             schedule()
@@ -99,7 +100,10 @@ class SendQueue(
         pendingDao.withState(PendingState.STEERING).forEach { fail(it, SendError.STEER_UNCERTAIN) }
         val busy = pendingDao.busySessionKeys().toHashSet()
         for (send in pendingDao.allQueued()) {
-            if (failIfExpired(send)) continue
+            if (expired(send)) {
+                fail(send, if (send.attempted) SendError.EXPIRED_UNCERTAIN else SendError.EXPIRED)
+                continue
+            }
             if (send.sessionKey in busy) continue
             when (attempt(send)) {
                 Attempt.STARTED -> busy += send.sessionKey
@@ -117,31 +121,35 @@ class SendQueue(
     }
 
     /**
-     * Queues a failed send again as a normal run send. After an uncertain failure the message may already have run,
-     * so nothing changes until the user confirms ([confirmedDuplicateRisk]). A confirmed or expired retry gets a new
-     * key and creation time, since the server must treat it as a new message.
+     * Queues a failed send again as a normal run send. Within 24 hours a run send keeps its key and body, which is
+     * always safe. Where the message may already have reached the server and the key cannot protect it (an attempted
+     * steer, or an attempted run send past 24 hours), nothing changes until the user confirms [confirmedDuplicateRisk].
+     * A confirmed or expired retry gets a new key and creation time.
      */
     suspend fun retry(idempotencyKey: String, confirmedDuplicateRisk: Boolean = false): RetryResult {
         drainLock.withLock {
             val send = pendingDao.get(idempotencyKey)?.takeIf { it.state == PendingState.FAILED } ?: return RetryResult.NOT_FOUND
-            val uncertain = send.error in SendError.UNCERTAIN
-            if (uncertain && !confirmedDuplicateRisk) return RetryResult.NEEDS_CONFIRMATION
+            val steer = send.error == SendError.STEER_UNCERTAIN // a failed steer keeps attempted only with this error
+            val old = expired(send)
+            val unsafe = send.attempted && (steer || old)
+            if (unsafe && !confirmedDuplicateRisk) return RetryResult.NEEDS_CONFIRMATION
             val queued = send.copy(state = PendingState.QUEUED, error = null, runId = null)
-            if (uncertain || send.error == SendError.EXPIRED || now() - send.createdAt > SEND_EXPIRY_MS) {
+            if (unsafe || old) {
                 db.withTransaction {
-                    pendingDao.delete(idempotencyKey)
-                    pendingDao.upsert(queued.copy(idempotencyKey = UUID.randomUUID().toString(), createdAt = now(), attempted = false))
+                    if (pendingDao.delete(idempotencyKey) == 1) {
+                        pendingDao.upsert(queued.copy(idempotencyKey = UUID.randomUUID().toString(), createdAt = now(), attempted = false))
+                    }
                 }
             } else {
-                pendingDao.upsert(queued)
+                pendingDao.update(queued)
             }
         }
         schedule()
         return RetryResult.STARTED
     }
 
-    /** Inserted under the lock that checked the session, so a concurrent delete cannot leave an orphan row. */
-    private suspend fun insert(sessionKey: String, text: String, steer: Boolean): PendingSendEntity = withRepositoryLock {
+    /** Called under the repository lock that checked the session, so a concurrent delete cannot leave an orphan row. */
+    private suspend fun insert(sessionKey: String, text: String, steer: Boolean): PendingSendEntity {
         require(!isReservedId(sessionKey)) { "reserved session id" }
         val session = requireNotNull(db.sessionDao().get(sessionKey)) { "unknown session" }
         val run = if (steer) db.activeRunDao().forSession(sessionKey)?.takeIf { it.status == "running" } else null
@@ -157,26 +165,26 @@ class SendQueue(
             }
         }
         pendingDao.upsert(row)
-        row
+        return row
     }
 
-    /** Under drainLock. Returns true when the steer was refused and the row became a queued run send. */
+    /** Under both locks. Returns true when the steer was refused and the row became a queued run send. */
     private suspend fun steer(row: PendingSendEntity): Boolean {
         val sent = row.copy(attempted = true)
-        pendingDao.upsert(sent)
+        if (pendingDao.update(sent) == 0) return false
         try {
             api.steer(checkNotNull(row.runId), row.text)
-            pendingDao.upsert(sent.copy(state = PendingState.STEERED))
+            pendingDao.update(sent.copy(state = PendingState.STEERED))
             return false
         } catch (e: ApiError) {
-            when (e) {
-                // The run is gone or no longer steerable: the text was not delivered.
-                ApiError.NotFound, is ApiError.Conflict -> {
-                    pendingDao.upsert(row.copy(state = PendingState.QUEUED, runId = null, attempted = false))
-                    return true
-                }
-                is ApiError.Network, is ApiError.Unavailable -> fail(sent, SendError.STEER_UNCERTAIN)
-                else -> fail(sent, errorCode(e))
+            // A failed steer drops its run id, so cleanup of the run's rows cannot delete the undelivered text.
+            val failed = sent.copy(state = PendingState.FAILED, runId = null)
+            when {
+                // The run is gone or no longer steerable: the text was not delivered, so send it as a new turn.
+                e == ApiError.NotFound || e is ApiError.Conflict ->
+                    return pendingDao.update(row.copy(state = PendingState.QUEUED, runId = null, attempted = false)) == 1
+                refused(e) -> pendingDao.update(failed.copy(error = errorCode(e), attempted = false))
+                else -> pendingDao.update(failed.copy(error = SendError.STEER_UNCERTAIN))
             }
             return false
         }
@@ -190,27 +198,38 @@ class SendQueue(
             fail(send, SendError.SESSION_UNAVAILABLE)
             return@withRepositoryLock Attempt.FAILED
         }
+        val sent = send.copy(attempted = true)
         val run = try {
             if (!session.existsOnServer) {
                 api.createSession(session.currentId, titleFrom(send.text).ifEmpty { null }) // false: it already exists, fine
                 sessionDao.upsert(session.copy(existsOnServer = true))
             }
-            // Checked again after any lock wait and session creation: a send never starts after its deadline.
-            if (failIfExpired(send)) return@withRepositoryLock Attempt.FAILED
-            if (!send.attempted) pendingDao.upsert(send.copy(attempted = true))
+            if (pendingDao.update(sent) == 0) return@withRepositoryLock Attempt.FAILED
+            // The deadline is read with nothing suspending before startRun: a send never starts after it.
+            if (expired(send)) {
+                fail(send, if (send.attempted) SendError.EXPIRED_UNCERTAIN else SendError.EXPIRED) // never sent: attempted as before
+                return@withRepositoryLock Attempt.FAILED
+            }
             api.startRun(send.requestBody, send.idempotencyKey)
         } catch (e: ApiError) {
-            if (e is ApiError.Network || e is ApiError.Unavailable) return@withRepositoryLock Attempt.STOP
-            fail(pendingDao.get(send.idempotencyKey) ?: send, errorCode(e))
-            // Every later send would be refused too; they wait for fixed credentials.
-            return@withRepositoryLock if (e == ApiError.Unauthorized) Attempt.STOP else Attempt.FAILED
+            val row = if (refused(e)) send.copy(attempted = false) else sent
+            return@withRepositoryLock when (e) {
+                is ApiError.Network, is ApiError.Unavailable -> {
+                    pendingDao.update(row)
+                    Attempt.STOP
+                }
+                // Every later send would be refused too; they wait for fixed credentials.
+                ApiError.Unauthorized -> fail(row, SendError.UNAUTHORIZED).let { Attempt.STOP }
+                else -> fail(row, errorCode(e)).let { Attempt.FAILED }
+            }
         } catch (_: IllegalArgumentException) {
             fail(send, SendError.SESSION_UNAVAILABLE) // the API refused the session id before sending
             return@withRepositoryLock Attempt.FAILED
         }
         db.withTransaction {
-            pendingDao.upsert(send.copy(state = PendingState.SENDING, runId = run.runId, error = null, attempted = true))
-            db.activeRunDao().upsert(ActiveRunEntity(run.runId, send.sessionKey, lastSeq = null, status = "running", startedAt = now()))
+            if (pendingDao.update(sent.copy(state = PendingState.SENDING, runId = run.runId, error = null)) == 1) {
+                db.activeRunDao().upsert(ActiveRunEntity(run.runId, send.sessionKey, lastSeq = null, status = "running", startedAt = now()))
+            }
         }
         try {
             starter.onRunStarted(send.sessionKey, run.runId)
@@ -222,18 +241,21 @@ class SendQueue(
         Attempt.STARTED
     }
 
-    private suspend fun failIfExpired(send: PendingSendEntity): Boolean {
-        if (now() - send.createdAt <= SEND_EXPIRY_MS) return false
-        val current = pendingDao.get(send.idempotencyKey) ?: send
-        fail(current, if (current.attempted) SendError.EXPIRED_UNCERTAIN else SendError.EXPIRED)
-        return true
-    }
+    private fun expired(send: PendingSendEntity) = now() - send.createdAt > SEND_EXPIRY_MS
 
     private suspend fun fail(send: PendingSendEntity, code: String) =
-        pendingDao.upsert(send.copy(state = PendingState.FAILED, error = code))
+        pendingDao.update(send.copy(state = PendingState.FAILED, error = code, runId = null))
 }
 
-/** The fixed code stored for a definite failure. Network and Unavailable are handled by the callers. */
+/** A definite refusal: the server did not accept the request. Anything else may have been accepted. */
+private fun refused(e: ApiError): Boolean = when (e) {
+    ApiError.Unauthorized, ApiError.NotFound, is ApiError.Conflict -> true
+    is ApiError.Unavailable -> true // the server keeps no reservation for a run it did not admit
+    is ApiError.Http -> e.status in 400..499
+    is ApiError.Network, ApiError.Protocol -> false
+}
+
+/** The fixed code stored for a failure. */
 private fun errorCode(e: ApiError): String = when (e) {
     ApiError.Unauthorized -> SendError.UNAUTHORIZED
     ApiError.NotFound -> SendError.NOT_FOUND

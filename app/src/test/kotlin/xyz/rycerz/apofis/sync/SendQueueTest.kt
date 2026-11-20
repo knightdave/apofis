@@ -230,6 +230,7 @@ class SendQueueTest {
         assertFalse(queue.drain())
         assertEquals("queued", pending(key).state)
         assertNull(pending(key).error)
+        assertFalse(pending(key).attempted) // a 503 is a definite refusal
     }
 
     @Test
@@ -282,12 +283,14 @@ class SendQueueTest {
     fun failedSteerBecomesFailedMessageThatRetryQueues() = runTest {
         addSession("apofis-a")
         running("apofis-a")
-        respond("{}", 500)
+        respond("{}", 400)
         val repo = ChatRepository(api, db, { clock }, queue)
         repo.send("apofis-a", "also this")
         val item = repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single()
         assertEquals(SendState.FAILED, item.state)
         assertEquals("http_error", pending(item.idempotencyKey!!).error)
+        assertFalse(pending(item.idempotencyKey).attempted)
+        assertNull(pending(item.idempotencyKey).runId)
         assertEquals("also this", item.text)
 
         db.activeRunDao().delete("run_1") // the run ended
@@ -402,6 +405,8 @@ class SendQueueTest {
         val row = rows("apofis-a").single()
         assertEquals("failed", row.state)
         assertEquals("steer_uncertain", row.error)
+        assertNull(row.runId) // run-end cleanup by run id must not delete an undelivered steer
+        assertTrue(row.attempted)
         assertEquals(RetryResult.NEEDS_CONFIRMATION, repo.retrySend(row.idempotencyKey))
         assertEquals("steer_uncertain", pending(row.idempotencyKey).error)
         assertEquals(RetryResult.STARTED, repo.retrySend(row.idempotencyKey, confirmedDuplicateRisk = true))
@@ -423,6 +428,7 @@ class SendQueueTest {
         assertTrue(queue.drain())
         assertEquals("failed", pending("k").state)
         assertEquals("steer_uncertain", pending("k").error)
+        assertNull(pending("k").runId)
         assertEquals(0, server.requestCount)
     }
 
@@ -465,6 +471,7 @@ class SendQueueTest {
         job.join()
         assertEquals("failed", pending(key).state)
         assertEquals("expired", pending(key).error)
+        assertFalse(pending(key).attempted) // never sent
         assertEquals(1, server.requestCount)
     }
 
@@ -507,6 +514,92 @@ class SendQueueTest {
         assertEquals("unauthorized", pending(a).error)
         assertEquals("queued", pending(b).state)
         assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun unreadableRunAckThenLateRetryNeedsConfirmation() = runTest {
+        addSession("apofis-a")
+        respond("not json", 202)
+        val key = queue.enqueue("apofis-a", "hi")
+        assertTrue(queue.drain())
+        assertEquals("protocol", pending(key).error)
+        assertTrue(pending(key).attempted)
+        clock += SEND_EXPIRY_MS + 1
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, queue.retry(key))
+        assertEquals("failed", pending(key).state)
+        assertEquals(RetryResult.STARTED, queue.retry(key, confirmedDuplicateRisk = true))
+        assertNull(db.pendingSendDao().get(key))
+    }
+
+    @Test
+    fun unreadableRunAckRetriedEarlyReusesKeyAndBody() = runTest {
+        addSession("apofis-a")
+        respond("not json", 202)
+        respond(fixture("run_start_replayed.json"), 202)
+        val key = queue.enqueue("apofis-a", "hi")
+        queue.drain()
+        clock += SEND_EXPIRY_MS - 1
+        assertEquals(RetryResult.STARTED, queue.retry(key))
+        assertTrue(queue.drain())
+        val (first, second) = recorded()
+        assertEquals(first.body!!.utf8(), second.body!!.utf8())
+        assertEquals(key, first.headers["Idempotency-Key"])
+        assertEquals(key, second.headers["Idempotency-Key"])
+        assertEquals("sending", pending(key).state)
+    }
+
+    @Test
+    fun steerGatewayTimeoutNeedsConfirmation() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        respond("{}", 504)
+        val repo = ChatRepository(api, db, { clock }, queue)
+        repo.send("apofis-a", "maybe steered")
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertTrue(row.attempted)
+        assertNull(row.runId)
+        assertEquals(RetryResult.NEEDS_CONFIRMATION, repo.retrySend(row.idempotencyKey))
+    }
+
+    @Test
+    fun refreshCannotHideSessionDuringSteer() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        server.enqueue(
+            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json")
+                .headersDelay(500, TimeUnit.MILLISECONDS).build(),
+        )
+        val hidden = """{"id":"apofis-a","source":"api_server","title":"t","pinned":false,"archived":false,"hidden":true,""" +
+            """"started_at":1.0,"last_active":2.0,"message_count":1,"preview":"p","_lineage_ids":[]}"""
+        respond("""{"object":"list","data":[$hidden],"has_more":false}""")
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
+        assertEquals("/v1/runs/run_1/steer", take().target)
+        val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
+        withContext(Dispatchers.Default) { kotlinx.coroutines.delay(200) }
+        assertEquals(1, server.requestCount) // the refresh waits for the steer
+        assertFalse(db.sessionDao().get("apofis-a")!!.hidden)
+        send.join()
+        refresh.join()
+        assertEquals("steered", rows("apofis-a").single().state)
+        assertTrue(db.sessionDao().get("apofis-a")!!.hidden)
+    }
+
+    @Test
+    fun failedSteerAfterDeleteLeavesNoRow() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        server.enqueue(MockResponse.Builder().code(400).body("{}").headersDelay(500, TimeUnit.MILLISECONDS).build())
+        respond(fixture("session_delete.json"))
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
+        take()
+        val delete = launch(Dispatchers.Default) { repo.delete("apofis-a") }
+        send.join()
+        delete.join()
+        assertNull(db.sessionDao().get("apofis-a"))
+        assertTrue(rows("apofis-a").isEmpty())
     }
 
     @Test
