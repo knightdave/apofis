@@ -160,6 +160,12 @@
     <string name="copy_done">Skopiowano</string>
     <string name="copy_too_large">Za duże, by skopiować</string>
     <string name="copy_failed">Nie udało się skopiować</string>
+    <string name="chat_copy">Kopiuj</string>
+    <string name="chat_select">Zaznacz tekst</string>
+    <string name="select_title">Zaznacz tekst</string>
+    <string name="chat_show_more">Pokaż więcej</string>
+    <string name="chat_show_less">Pokaż mniej</string>
+    <string name="chat_show_full">Pokaż całą wiadomość</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
     <string name="drawer_open">Otwórz listę czatów</string>
     <string name="drawer_new_chat">Nowy czat</string>
