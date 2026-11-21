@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis
 
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.os.Debug
 import android.os.Handler
 import android.os.HandlerThread
@@ -8,30 +9,38 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.FrameMetrics
 import android.view.MotionEvent
+import android.view.ViewTreeObserver
 import android.view.Window
 import android.view.WindowInsets
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import android.os.Looper
-import android.view.Choreographer
-import android.view.ViewTreeObserver
-import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.key
 import kotlin.math.PI
 import kotlin.math.cos
-import androidx.lifecycle.Lifecycle
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -45,15 +54,19 @@ import xyz.rycerz.apofis.ui.chat.ChatActions
 import xyz.rycerz.apofis.ui.chat.ChatScreen
 import xyz.rycerz.apofis.ui.chat.ChatUiState
 import xyz.rycerz.apofis.ui.chat.ComposerMode
+import xyz.rycerz.apofis.ui.chat.LiveMerger
 import xyz.rycerz.apofis.ui.chat.StatusLine
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
 /**
  * The cost of the backdrop blur, measured on a device with hardware rendering (tools/emulator/run-e2e.sh --app-test
- * BlurCostTest): the chat with a fixed 300 item transcript, a live reply growing by 40 characters every frame and a
- * scripted scroll up and down, for 600 frames with blur on and then off. Writes blur-cost.txt and one screenshot per
- * mode while text is behind the composer and the glass button, and one after the keyboard was shown and hidden.
- * No server, no key, no model run. Real time is unavoidable here: it measures real frames.
+ * BlurCostTest). The chat shows a fixed 300 item stored head merged with a live reply through the production
+ * [LiveMerger] (the incremental path), the reply grows by 40 characters every frame, and one held drag scrolls up and
+ * down on a schedule counted in drawn frames. Growth and the drag start at a frame-counted measurement start. Four
+ * phases of 600 frames in balanced order (on, off, off, on); screenshots are taken outside the measured window.
+ * Writes blur-cost.txt, a screenshot per mode while the list moves under the glass button, and one per mode after the
+ * keyboard was shown (asserted from the window insets and the composer's position) and hidden again (asserted restored).
+ * No server, no key, no model run. Real time is unavoidable: it measures real frames.
  */
 @RunWith(AndroidJUnit4::class)
 class BlurCostTest {
@@ -63,110 +76,219 @@ class BlurCostTest {
         mkdirs()
     }
 
-    private val history: List<ChatItem> = (1..150).flatMap {
+    // One fixed stored head, reused as the same list: the merger then builds only the live tail per update.
+    private val head: List<ChatItem> = (1..150).flatMap {
         listOf(
             UserMessage("u$it", "Question $it: how do the garden beds drain after a long rain?", steered = false, timestamp = NOW),
             AssistantReply("r$it", emptyList(), "Answer $it. Raised beds drain better and warm up sooner in spring, so seedlings can go in earlier.", NOW),
         )
-    } // 300 items
+    } + UserMessage("u151", "Write a long answer", steered = false, timestamp = NOW, runId = RUN)
 
-    private data class Result(val frames: Int, val p50: Double, val p95: Double, val allocsPerFrame: Double)
+    private class Phase(val durations: List<Long>, val allocs: Long, val positions: Int, val glassSeen: Boolean)
+
+    private val compositions = AtomicInteger()
+    private val draws = AtomicInteger()
 
     @Test
     fun measure() {
         ActivityScenario.launch(ComponentActivity::class.java).use { scenario ->
-            SystemClock.sleep(3000) // a configuration change right after boot recreates the activity: let it settle
-            lateinit var first: ComponentActivity
-            scenario.onActivity { first = it }
-            val hardware = first.window.decorView.isHardwareAccelerated
-            val on = phase(scenario, blur = true)
-            val off = phase(scenario, blur = false)
-            val p95Delta = on.p95 - off.p95
-            val allocDelta = on.allocsPerFrame - off.allocsPerFrame
-            val accepted = p95Delta <= 4.0 && allocDelta <= 10.0
+            val order = listOf(true, false, false, true) // balanced: drift over the run affects both modes alike
+            val phases = order.mapIndexed { i, blur -> blur to phase(scenario, blur, shots = i < 2) }
+            fun summary(blur: Boolean): Triple<Double, Double, Double> {
+                val mine = phases.filter { it.first == blur }.map { it.second }
+                val sorted = mine.flatMap { it.durations }.sorted()
+                fun pct(p: Double) = if (sorted.isEmpty()) 0.0 else sorted[((sorted.size - 1) * p).toInt()] / 1e6
+                val frames = sorted.size.coerceAtLeast(1)
+                return Triple(pct(0.5), pct(0.95), mine.sumOf { it.allocs }.toDouble() / frames)
+            }
+            val (onP50, onP95, onAlloc) = summary(true)
+            val (offP50, offP95, offAlloc) = summary(false)
+            var hardware = false
+            scenario.onActivity { hardware = it.window.decorView.isHardwareAccelerated }
+            val accepted = onP95 - offP95 <= 4.0 && onAlloc - offAlloc <= 10.0
             val report = listOf(
                 "hardware=$hardware",
-                "blur=on frames=${on.frames} p50_ms=%.2f p95_ms=%.2f allocs_per_frame=%.1f".format(on.p50, on.p95, on.allocsPerFrame),
-                "blur=off frames=${off.frames} p50_ms=%.2f p95_ms=%.2f allocs_per_frame=%.1f".format(off.p50, off.p95, off.allocsPerFrame),
-                "p95_delta_ms=%.2f allocs_delta=%.1f accepted=%s (p95 at most 4 ms worse, at most 10 more allocations per frame)"
-                    .format(p95Delta, allocDelta, if (accepted) "yes" else "no"),
+                "blur=on frames=${phases.filter { it.first }.sumOf { it.second.durations.size }} p50_ms=%.2f p95_ms=%.2f allocs_per_frame=%.1f".format(onP50, onP95, onAlloc),
+                "blur=off frames=${phases.filter { !it.first }.sumOf { it.second.durations.size }} p50_ms=%.2f p95_ms=%.2f allocs_per_frame=%.1f".format(offP50, offP95, offAlloc),
+                "p95_delta_ms=%.2f allocs_delta=%.1f accepted=%s (p95 at most 4 ms worse, at most 10 more allocations per frame; order on off off on)"
+                    .format(onP95 - offP95, onAlloc - offAlloc, if (accepted) "yes" else "no"),
             )
             report.forEach { Log.i(TAG, it) }
             File(out, "blur-cost.txt").writeText(report.joinToString("\n", postfix = "\n"))
             assertTrue("software rendering: blur cannot be measured", hardware)
-            assertTrue("frames: ${on.frames} / ${off.frames}", on.frames >= FRAMES && off.frames >= FRAMES)
+            for ((blur, p) in phases) {
+                assertTrue("blur=$blur: ${p.durations.size} frames", p.durations.size >= FRAMES)
+                assertTrue("blur=$blur: the list did not move (${p.positions} positions)", p.positions >= 10)
+                assertTrue("blur=$blur: the glass button was not shown during the measurement", p.glassSeen)
+            }
         }
     }
 
-    private fun phase(scenario: ActivityScenario<ComponentActivity>, blur: Boolean): Result {
+    private fun current(scenario: ActivityScenario<ComponentActivity>): ComponentActivity {
+        lateinit var a: ComponentActivity
+        scenario.onActivity { a = it }
+        return a
+    }
+
+    /** Waits until the same activity instance stayed resumed for 3 s (a configuration change after boot recreates it). */
+    private fun settled(scenario: ActivityScenario<ComponentActivity>) {
+        var last = current(scenario)
+        var since = SystemClock.uptimeMillis()
+        val until = since + 60_000
+        while (SystemClock.uptimeMillis() - since < 3000 && SystemClock.uptimeMillis() < until) {
+            SystemClock.sleep(200)
+            val now = current(scenario)
+            if (now !== last || !now.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                last = now
+                since = SystemClock.uptimeMillis()
+            }
+        }
+    }
+
+    /** Waits, bounded, for [condition] (checked every 10 ms); fails with [what] when it does not come. */
+    private fun await(what: String, timeoutMs: Long = 20_000, condition: () -> Boolean) {
+        val until = SystemClock.uptimeMillis() + timeoutMs
+        while (!condition()) {
+            check(SystemClock.uptimeMillis() < until) { "timed out waiting for $what" }
+            SystemClock.sleep(10)
+        }
+    }
+
+    private fun phase(scenario: ActivityScenario<ComponentActivity>, blur: Boolean, shots: Boolean): Phase {
         val name = if (blur) "blur-on" else "blur-off"
-        val text = mutableStateOf("")
+        val growing = mutableStateOf(false)
+        lateinit var list: LazyListState
         lateinit var activity: ComponentActivity
-        for (attempt in 1..3) { // the current instance; set again if it was recreated meanwhile
+        for (attempt in 1..3) { // the current instance; set again if a configuration change recreated it meanwhile
+            settled(scenario)
+            val drawsBefore = draws.get()
+            val listener = ViewTreeObserver.OnDrawListener { draws.incrementAndGet() }
             scenario.onActivity {
                 activity = it
-                it.setContent { key(blur) { Bench(blur, text) } } // a new composition per mode
+                it.enableEdgeToEdge() // as MainActivity: the chat itself handles the system bars and the keyboard
+                @Suppress("DEPRECATION")
+                it.window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE) // as MainActivity's manifest entry
+                it.window.decorView.viewTreeObserver.addOnDrawListener(listener) // before the content: its first frame counts
+                it.setContent { key(blur, attempt) { Bench(blur, growing) { l -> list = l } } }
             }
-            SystemClock.sleep(3000) // first composition and layout of the transcript
-            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) break
-            Log.i(TAG, "$name: the activity was recreated (attempt $attempt)")
+            runCatching { await("the first frame of $name", 10_000) { compositions.get() > 0 && draws.get() > drawsBefore } }
+            instrumentation.runOnMainSync { activity.window.decorView.viewTreeObserver.removeOnDrawListener(listener) }
+            if (current(scenario) === activity && activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && draws.get() > drawsBefore) break
+            Log.i(TAG, "$name: no frames or the activity was recreated (attempt $attempt)")
         }
-        diagnose(activity, name)
-
         val view = activity.window.decorView
         val x = view.width / 2f
-        val top = view.height * 0.3f
-        val amplitude = view.height * 0.3f
+        val top = view.height * 0.35f
+        val amplitude = view.height * 0.25f
         // A real slow drag away from the bottom releases following (no fling: the finger rests before lifting).
         Finger(x, top).apply {
-            for (i in 1..30) move(top + amplitude * i / 30)
+            for (i in 1..30) {
+                move(top + amplitude * i / 30)
+                SystemClock.sleep(16)
+            }
             SystemClock.sleep(150)
-            move(top + amplitude)
             up()
         }
-        SystemClock.sleep(1500)
+        await("the drag to settle") { !list.isScrollInProgress }
 
+        // Measurement start, counted in drawn frames: growth and the drag schedule begin here.
         val durations = ArrayList<Long>()
-        val half = CountDownLatch(FRAMES / 2)
-        val done = CountDownLatch(FRAMES)
+        val frames = AtomicInteger()
         val thread = HandlerThread("frames").apply { start() }
-        val listener = Window.OnFrameMetricsAvailableListener { _, metrics, _ ->
-            synchronized(durations) { if (durations.size < FRAMES) durations += metrics.getMetric(FrameMetrics.TOTAL_DURATION) }
-            half.countDown()
-            done.countDown()
+        val metrics = Window.OnFrameMetricsAvailableListener { _, m, _ ->
+            synchronized(durations) { if (durations.size < FRAMES) durations += m.getMetric(FrameMetrics.TOTAL_DURATION) }
+            frames.incrementAndGet()
+        }
+        val positions = HashSet<Pair<Int, Int>>()
+        var glassSeen = false
+        instrumentation.runOnMainSync {
+            activity.window.addOnFrameMetricsAvailableListener(metrics, Handler(thread.looper))
+            growing.value = true
         }
         @Suppress("DEPRECATION")
         Debug.startAllocCounting()
         val allocsBefore = Debug.getGlobalAllocCount()
-        instrumentation.runOnMainSync { activity.window.addOnFrameMetricsAvailableListener(listener, Handler(thread.looper)) }
-        // The scripted scroll: one held drag, down and up again over about a second, until 600 frames were drawn.
         val finger = Finger(x, top)
-        val until = SystemClock.uptimeMillis() + 120_000
-        var step = 0
-        var shot = false
-        while (done.count > 0 && SystemClock.uptimeMillis() < until) {
-            step++
-            finger.move(top + amplitude * (1 - cos(step * 2 * PI / 60)).toFloat() / 2)
-            if (!shot && half.count == 0L) {
-                screenshot("$name.png") // text behind the composer and the glass button while it scrolls
-                shot = true
+        var seen = 0
+        val until = SystemClock.uptimeMillis() + 180_000
+        while (frames.get() < FRAMES && SystemClock.uptimeMillis() < until) {
+            val f = frames.get()
+            if (f == seen) {
+                SystemClock.sleep(2)
+                continue
             }
-            SystemClock.sleep(16)
+            seen = f
+            finger.move(top + amplitude * (1 - cos(f * 2 * PI / 60)).toFloat() / 2) // one period every 60 drawn frames
+            instrumentation.runOnMainSync {
+                positions += list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset
+                if (list.canScrollBackward && list.isScrollInProgress) glassSeen = true // the button's condition
+            }
         }
-        finger.up()
-        val allocs = Debug.getGlobalAllocCount() - allocsBefore
-        instrumentation.runOnMainSync { activity.window.removeOnFrameMetricsAvailableListener(listener) }
+        val allocs = (Debug.getGlobalAllocCount() - allocsBefore).toLong()
         @Suppress("DEPRECATION")
         Debug.stopAllocCounting()
+        instrumentation.runOnMainSync {
+            activity.window.removeOnFrameMetricsAvailableListener(metrics)
+            growing.value = false
+        }
         thread.quitSafely()
-        if (!shot) diagnose(activity, "$name-stalled")
+        if (shots) {
+            SystemClock.sleep(300) // outside the measured window; the finger still holds the list under the glass
+            screenshot("$name.png")
+        }
+        finger.up()
+        await("the list to settle") { !list.isScrollInProgress }
+        if (shots) keyboard(activity, name, x, top, amplitude)
+        return Phase(synchronized(durations) { durations.toList() }, allocs, positions.size, glassSeen)
+    }
 
-        // The keyboard shown and hidden again (a resize of the bottom area), then the glass button once more.
-        SystemClock.sleep(1000)
-        tap(view.width / 2f, view.height - 60 * view.resources.displayMetrics.density) // the composer's text field
-        SystemClock.sleep(2500)
+    /** Shows the keyboard on the real composer field, checks the resize, hides it, checks the restoration, then a screenshot. */
+    private fun keyboard(activity: ComponentActivity, name: String, x: Float, top: Float, amplitude: Float) {
+        val view = activity.window.decorView
+        fun field(): AccessibilityNodeInfo? = instrumentation.uiAutomation.rootInActiveWindow?.let { root ->
+            fun find(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+                if (n == null) return null
+                if (n.viewIdResourceName == "composer.field") return n
+                for (i in 0 until n.childCount) find(n.getChild(i))?.let { return it }
+                return null
+            }
+            find(root)
+        }
+        fun fieldTop(): Int = Rect().also { r -> field()?.apply { refresh() }?.getBoundsInScreen(r) }.top // fresh, not cached
+        fun imeShown(): Boolean {
+            var shown = false
+            instrumentation.runOnMainSync { shown = ViewCompat.getRootWindowInsets(view)?.isVisible(WindowInsetsCompat.Type.ime()) == true }
+            return shown
+        }
+        // The emulator emulates a hardware keyboard and would show no on-screen keyboard (a 0 px inset): ask for it
+        // (a setting of this throwaway AVD, deleted with it after the run).
+        instrumentation.uiAutomation.executeShellCommand("settings put secure show_ime_with_hard_keyboard 1").close()
+        await("the composer field") { field() != null }
+        val restTop = fieldTop()
+        check(field()!!.performAction(AccessibilityNodeInfo.ACTION_CLICK)) { "could not click the composer field" }
+        await("the keyboard to show") { imeShown() }
+        fun bottoms(): Pair<Int, Int> {
+            var r = 0 to 0
+            instrumentation.runOnMainSync {
+                val insets = ViewCompat.getRootWindowInsets(view)!!
+                r = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom to insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+            }
+            return r
+        }
+        runCatching { await("the keyboard to open (taller than the navigation bar)") { bottoms().let { it.first > it.second } } }
+            .onFailure { throw IllegalStateException("the keyboard has no height: ${bottoms()} (keyboard, navigation bar px)", it) }
+        // The app applies max(keyboard, navigation bar) once: the composer moves up by exactly what the keyboard adds.
+        SystemClock.sleep(500) // the keyboard's opening animation ends
+        val (ime, nav) = bottoms()
+        val shift = maxOf(ime, nav) - nav
+        Log.i(TAG, "$name: keyboard inset $ime px, navigation bar $nav px")
+        runCatching { await("the composer to move up by $shift px") { kotlin.math.abs(restTop - fieldTop() - shift) <= 4 } }
+            .onFailure { throw IllegalStateException("composer top ${fieldTop()} (was $restTop), expected a shift of $shift px", it) }
+        Log.i(TAG, "$name: keyboard shown, composer top $restTop -> ${fieldTop()}")
         instrumentation.runOnMainSync { activity.window.insetsController?.hide(WindowInsets.Type.ime()) }
-        SystemClock.sleep(2000)
+        await("the keyboard to hide") { !imeShown() }
+        await("the composer to return") { kotlin.math.abs(fieldTop() - restTop) <= 2 }
+        Log.i(TAG, "$name: keyboard hidden, composer top back at ${fieldTop()}")
         Finger(x, top).apply {
             for (i in 1..20) {
                 move(top + amplitude * i / 20)
@@ -176,49 +298,19 @@ class BlurCostTest {
             screenshot("$name-keyboard.png")
             up()
         }
-
-        val sorted = synchronized(durations) { durations.sorted() }
-        fun percentile(p: Double) = if (sorted.isEmpty()) 0.0 else sorted[((sorted.size - 1) * p).toInt()] / 1e6
-        return Result(sorted.size, percentile(0.5), percentile(0.95), allocs.toDouble() / sorted.size.coerceAtLeast(1))
     }
 
-    private val compositions = AtomicInteger()
-
-    /** What the device is doing, in logcat (kept by the harness): drawing, frames, compositions, the main thread. */
-    private fun diagnose(activity: ComponentActivity, label: String) {
-        val draws = AtomicInteger()
-        val frames = AtomicInteger()
-        val view = activity.window.decorView
-        val onDraw = ViewTreeObserver.OnDrawListener { draws.incrementAndGet() }
-        val callback = object : Choreographer.FrameCallback {
-            override fun doFrame(frameTimeNanos: Long) {
-                frames.incrementAndGet()
-                Choreographer.getInstance().postFrameCallback(this)
-            }
-        }
-        val before = compositions.get()
-        instrumentation.runOnMainSync {
-            view.viewTreeObserver.addOnDrawListener(onDraw)
-            Choreographer.getInstance().postFrameCallback(callback)
-        }
-        SystemClock.sleep(2000)
-        val stack = Looper.getMainLooper().thread.stackTrace.take(30).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" }
-        instrumentation.runOnMainSync {
-            view.viewTreeObserver.removeOnDrawListener(onDraw)
-            Choreographer.getInstance().removeFrameCallback(callback)
-        }
-        Log.i(TAG, "diag $label: draws=${draws.get()} choreographer=${frames.get()} compositions=${compositions.get() - before} " +
-            "state=${activity.lifecycle.currentState} focus=${activity.hasWindowFocus()} shown=${view.isShown} size=${view.width}x${view.height} " +
-            "children=${(view as? android.view.ViewGroup)?.childCount}")
-        Log.i(TAG, "diag $label main: $stack")
-    }
-
-    @androidx.compose.runtime.Composable
-    private fun Bench(blur: Boolean, text: MutableState<String>) {
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Composable
+    private fun Bench(blur: Boolean, growing: MutableState<Boolean>, onList: (LazyListState) -> Unit) {
         ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = false, blur = blur) {
             val list = rememberLazyListState()
+            onList(list)
+            val text = remember { mutableStateOf("") }
+            val merger = remember { LiveMerger { NOW } }
             SideEffect { compositions.incrementAndGet() }
-            LaunchedEffect(Unit) {
+            LaunchedEffect(growing.value) {
+                if (!growing.value) return@LaunchedEffect
                 var n = 0
                 while (true) {
                     withFrameNanos {}
@@ -226,21 +318,17 @@ class BlurCostTest {
                     text.value += if (++n % 10 == 0) "words go here\n\n" + "x".repeat(25) else "growing reply text, forty characters ok "
                 }
             }
-            val live = LiveReply("run_bench", "running", text.value, emptyList(), null, Connection.LIVE)
-            val state = ChatUiState(
-                "apofis-bench", "Blur cost", StatusLine.WORKING,
-                history + UserMessage("u151", "Write a long answer", steered = false, timestamp = NOW) +
-                    AssistantReply("live", emptyList(), text.value, NOW, live = true),
-                ComposerMode.STOP, "", "emulator", live,
-            )
-            ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, listState = list)
+            val live = LiveReply(RUN, "running", text.value, emptyList(), null, Connection.LIVE)
+            val state = ChatUiState("apofis-bench", "Blur cost", StatusLine.WORKING, merger.merge(head, live), ComposerMode.STOP, "", "emulator", live)
+            Box(Modifier.semantics { testTagsAsResourceId = true }) {
+                ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, listState = list)
+            }
         }
     }
 
     /** A finger on the screen: injected events, each delivered before the next. */
-    private inner class Finger(private val x: Float, y: Float) {
+    private inner class Finger(private val x: Float, private var y: Float) {
         private val downTime = SystemClock.uptimeMillis()
-        private var y = y
 
         init {
             send(MotionEvent.ACTION_DOWN)
@@ -260,15 +348,6 @@ class BlurCostTest {
         }
     }
 
-    private fun tap(x: Float, y: Float) {
-        val t = SystemClock.uptimeMillis()
-        listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP).forEach {
-            val e = MotionEvent.obtain(t, t + if (it == MotionEvent.ACTION_UP) 50 else 0, it, x, y, 0)
-            instrumentation.sendPointerSync(e)
-            e.recycle()
-        }
-    }
-
     private fun screenshot(name: String) {
         val bitmap = instrumentation.uiAutomation.takeScreenshot() ?: return
         File(out, name).outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
@@ -278,6 +357,7 @@ class BlurCostTest {
     private companion object {
         const val TAG = "ApofisE2e" // the harness keeps this tag's logcat lines
         const val FRAMES = 600
+        const val RUN = "run_bench"
         const val NOW = 1773140400.0 // 2026-03-10T11:00Z
     }
 }
