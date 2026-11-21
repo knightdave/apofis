@@ -64,6 +64,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.UriHandler
+import xyz.rycerz.apofis.ui.theme.BackdropState
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -133,6 +135,9 @@ fun ChatScreen(
     )
     val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
     val callbacks = rememberUpdatedState(Callbacks(actions, onRetryLoad, zone, today))
+    // The objects the slots use, read through a holder too: replacing the list state (and with it the follower), the
+    // backdrop (the blur setting) or the link handler reaches the screen; equal identities notify nothing.
+    val objects = rememberUpdatedState(Objects(listState, follow, backdrop, uriHandler))
 
     val barSlot = remember {
         @Composable {
@@ -167,10 +172,11 @@ fun ChatScreen(
                     input.mode,
                     { actions.onDraftChange(it, input.draftRevision) },
                     onSend = {
+                        val o = objects.value // the current list and follower, at tap time
                         linkFailed = false
                         actions.onSendClick()
-                        follow.onSend()
-                        scope.launch { listState.scrollToItem(0) }
+                        o.follow.onSend()
+                        scope.launch { o.list.scrollToItem(0) }
                     },
                     onStop = { input.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
                     busy = input.sending,
@@ -186,6 +192,11 @@ fun ChatScreen(
             @Composable {
                 val state = latest.value
                 val c = callbacks.value
+                val o = objects.value
+                val listState = o.list
+                val follow = o.follow
+                val backdrop = o.backdrop
+                SideEffect { ChromeProbe.bodyBackdrop = backdrop }
                 val surface = MaterialTheme.colorScheme.surface
                 if (state.status == StatusLine.LOAD_FAILED) {
                     Uncovered(barHeight, bottomArea, fullScreen = false) {
@@ -241,7 +252,7 @@ fun ChatScreen(
                                     }
                                     drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
                                 },
-                            onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
+                            onLink = { url -> linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure },
                         )
                     }
                     ScrollToBottomButton(
@@ -445,6 +456,8 @@ private data class BarCallbacks(
     val appBarActions: @Composable RowScope.() -> Unit,
 )
 
+private data class Objects(val list: LazyListState, val follow: Follower, val backdrop: BackdropState, val uri: UriHandler)
+
 private data class Callbacks(val actions: ChatActions, val onRetryLoad: () -> Unit, val zone: ZoneId, val today: LocalDate)
 
 /** The body lambda for the last pair of bar heights. */
@@ -468,6 +481,7 @@ internal object ChromeProbe {
     var bottomCompositions = 0
     var rootMeasures = 0
     var pins = 0 // requests the follow rules made to move the list to the bottom
+    var bodyBackdrop: xyz.rycerz.apofis.ui.theme.BackdropState? = null // the backdrop the transcript was last composed with
 }
 
 /**
