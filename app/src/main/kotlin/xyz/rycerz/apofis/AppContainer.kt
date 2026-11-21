@@ -3,9 +3,9 @@ package xyz.rycerz.apofis
 import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.util.Log
-import androidx.room.Room
 import androidx.work.WorkManager
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -30,7 +31,10 @@ import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
-import xyz.rycerz.apofis.db.MIGRATION_1_2
+import xyz.rycerz.apofis.db.openAppDatabase
+import xyz.rycerz.apofis.notify.NOTIFY_PREFS
+import xyz.rycerz.apofis.notify.Notifier
+import xyz.rycerz.apofis.notify.chatUri
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
@@ -60,6 +64,8 @@ class Connected internal constructor(
     private val scope: CoroutineScope,
     /** The composer of the cached chats: the container's one, shared by its connections. */
     val composer: Composer = Composer(scope),
+    /** The connection epoch this graph was built under. */
+    val generation: Long = 0,
 ) {
     private val liveApi = api
     private val liveRepo = repo
@@ -95,6 +101,7 @@ private const val TAG = "Apofis"
 internal const val CACHE_PREFS = "cache"
 private const val CACHE_URL = "cache_base_url" // the server the cached rows came from
 internal const val SWITCH_MARKER = "switch_in_progress" // present from the first write of a switch until its last
+private const val CONNECTION_EPOCH = "connection_epoch" // +1 with every switch's marker; notices and taps carry it
 
 private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity")
 private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
@@ -119,7 +126,7 @@ private val logOnly = CoroutineExceptionHandler { _, e -> logFailure(e) }
 class AppContainer(
     private val app: Application,
     val credentials: CredentialStore = CredentialStore(app),
-    openDatabase: () -> AppDatabase = { Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").addMigrations(MIGRATION_1_2).build() },
+    openDatabase: () -> AppDatabase = { openAppDatabase(app) },
 ) {
     val preferences = Preferences(app)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + logOnly)
@@ -141,6 +148,70 @@ class AppContainer(
     private var switchFailedBefore = false
     private val published = MutableStateFlow<Connected?>(null)
     private val switchLock = Mutex()
+
+    /** The current connection's generation: persisted, so a restart keeps it; every switch moves it on. */
+    fun epoch(): Long = cachePrefs.getLong(CONNECTION_EPOCH, 0)
+
+    val notifyPrefs: SharedPreferences = app.getSharedPreferences(NOTIFY_PREFS, Context.MODE_PRIVATE)
+    private val visibleChat = MutableStateFlow<Pair<Long, String>?>(null) // (epoch of its graph, key)
+    val notifier by lazy { Notifier(app, notifyPrefs, db, ::epoch, { visibleChat.value?.takeIf { it.first == epoch() }?.second }, scope) }
+
+    /**
+     * From the UI: [key]'s chat screen of the graph built under [generation] is shown in a started activity ([shown])
+     * or no longer is. Showing it cancels its notification, in the notifier's lane: nothing here waits for disk or the
+     * notification service. A late callback of an old graph never touches the new one's chat of the same key.
+     */
+    fun chatShown(generation: Long, key: String, shown: Boolean) {
+        if (shown) {
+            if (generation != epoch()) return // an old graph's chat starting late
+            visibleChat.value = generation to key
+            notifier.cancel(key, generation)
+        } else {
+            visibleChat.compareAndSet(generation to key, null)
+        }
+    }
+
+    private val chatRequest = MutableStateFlow<Pair<Long, String>?>(null)
+
+    /** A tapped chat as (epoch, key); the chat route of the connection with that epoch selects it, then [chatOpened]. */
+    val chatToOpen: StateFlow<Pair<Long, String>?> = chatRequest.asStateFlow()
+
+    fun chatOpened(request: Pair<Long, String>) {
+        chatRequest.compareAndSet(request, null)
+    }
+
+    /**
+     * The one consumer of taps for [conn]: each request is selected through [select] (checked against this live graph
+     * in the same step), and only then acknowledged, in one step; [opened] runs when a selection happened.
+     */
+    suspend fun consumeTaps(conn: Connected, select: suspend (key: String, current: () -> Boolean) -> Boolean, opened: () -> Unit) {
+        chatRequest.filterNotNull().collect { request ->
+            if (request.first != conn.generation) {
+                // Another connection's tap: left for that connection's drawer, unless this is the current connection,
+                // which proves it stale (an older epoch) and drops it.
+                if (conn.generation == epoch() && conn.isOpen) chatOpened(request)
+                return@collect
+            }
+            val selected = select(request.second) { tapTarget(request, conn) != null }
+            chatOpened(request)
+            if (selected) opened()
+        }
+    }
+
+    /** The key a tap [request] may open in [conn], checked at the moment of navigation; null: stale, ignore it. */
+    fun tapTarget(request: Pair<Long, String>, conn: Connected?): String? =
+        request.second.takeIf { conn != null && conn.isOpen && request.first == conn.generation && request.first == epoch() }
+
+    /** A notification tap: only `apofis://chat/<current epoch>/<chat on this phone>` opens it; anything else is ignored. */
+    suspend fun openChat(intent: Intent?): Boolean {
+        val epoch = epoch()
+        val key = chatKey(intent, epoch) ?: return false
+        if (db.sessionDao().get(key)?.hidden != false) return false
+        notifier.cancel(key, epoch)
+        if (epoch() != epoch) return false // switched during the lookup; the route compares the epoch again anyway
+        chatRequest.value = epoch to key
+        return true
+    }
 
     /**
      * Drafts, sends being stored and unsent text of the cached chats: shared by every connection, emptied only in the
@@ -220,7 +291,11 @@ class AppContainer(
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
-                commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
+                // The generation moves with the marker: from here on no notice, clear or tap of the old one is accepted.
+                // The epoch moves with the marker, inside the notifier's lane: no notice, clear or tap of the old one
+                // is accepted afterwards, and its notifications and rows go. A death here is finished by the start sweep.
+                notifier.switchEpoch { commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true).putLong(CONNECTION_EPOCH, epoch() + 1)) }
+                chatRequest.value = null
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
                     commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
                     withRepositoryLock {
@@ -276,8 +351,13 @@ class AppContainer(
             disconnect()
             null
         } else {
-            credentials.load()?.let(::build)?.also { scope.launch { scheduleQueuedSends() } }
+            credentials.load()?.let(::build)?.also {
+                scope.launch { scheduleQueuedSends() }
+                scope.launch { notifier.replayOutbox() } // notices a process death left between the commit and the post
+            }
         }
+        // Another epoch's leftovers (a switch a death interrupted); reads nothing about chats, posts nothing.
+        scope.launch { notifier.cleanup() }
     }
 
     /** Erases the credentials; the switch mark is removed only once that reached the disk, so a restart stays disconnected. */
@@ -330,12 +410,22 @@ class AppContainer(
             settle = { if (open.get()) follower.settle(it) },
         )
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
+        val generation = epoch()
         follower = RunFollower(api, db, repo, runScope, onRunFinished = {
             if (open.get()) {
                 queue.drain()
                 runScope.launch { refreshQuietly(repo, composer) } // not on the follower's own, non-cancellable path
             }
-        }, active = open::get)
-        return Connected(c, api, db, repo, queue, follower, open, runScope, composer)
+        }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, ended ->
+            notifier.clearNeedsAnswer(key, run, generation, ended)
+        }, generation = { generation })
+        return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation)
     }
+}
+
+/** The chat key of a notification's tap intent for [generation], or null for anything else (checked by round trip). */
+internal fun chatKey(intent: Intent?, generation: Long): String? {
+    val uri = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data ?: return null
+    val key = uri.pathSegments.takeIf { it.size == 2 }?.get(1) ?: return null
+    return key.takeIf { uri.toString() == chatUri(generation, it).toString() }
 }

@@ -434,6 +434,28 @@ class DrawerViewModelTest {
     }
 
     @Test
+    fun notificationTapSelectsOnlyWhileItsGraphIsCurrent() = runTest {
+        addSession("apofis-a", "Open one")
+        addSession("apofis-b", "Tapped")
+        addSession("apofis-h", "Hidden")
+        db.sessionDao().upsert(db.sessionDao().get("apofis-h")!!.copy(hidden = true))
+        val vm = vm()
+        val open = vm.selected.await { it != null }!!
+        saved.clear()
+
+        assertFalse(vm.selectTapped("apofis-b") { false }) // switched away before the selection
+        assertFalse(vm.selectTapped("apofis-h") { true }) // hidden after the tap
+        assertEquals(open, vm.selected.value)
+        // Nothing stored for the next drawer to restore (the initial selection's own write may land late, so only the
+        // tapped keys are checked).
+        assertTrue(saved.none { it == "apofis-b" || it == "apofis-h" })
+
+        assertTrue(vm.selectTapped("apofis-b") { true })
+        assertEquals("apofis-b", vm.selected.value)
+        assertEquals("apofis-b", saved.last())
+    }
+
+    @Test
     fun tappingTheOpenChatOpensItAgain() = runTest {
         addSession("apofis-a", "Open one")
         val vm = vm()

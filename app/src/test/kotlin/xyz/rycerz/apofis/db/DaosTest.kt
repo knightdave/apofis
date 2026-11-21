@@ -83,7 +83,7 @@ class DaosTest {
             v1.version = 1
         }
 
-        val migrated = Room.databaseBuilder(app, AppDatabase::class.java, "v1.db").addMigrations(MIGRATION_1_2).allowMainThreadQueries().build()
+        val migrated = Room.databaseBuilder(app, AppDatabase::class.java, "v1.db").addMigrations(*ALL_MIGRATIONS).allowMainThreadQueries().build()
         try {
             assertTrue(migrated.messageDao().rows("apofis-a").isEmpty()) // readable again: fetched anew when opened
             assertTrue(migrated.sessionDao().get("apofis-a")!!.stale)

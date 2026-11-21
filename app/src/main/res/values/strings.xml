@@ -193,4 +193,10 @@
     <string name="drawer_error_closed">The connection was closed</string>
     <string name="archived_title">Archived chats</string>
     <string name="drawer_more_actions">More actions</string>
+    <string name="notif_channel_replies">Replies</string>
+    <string name="notif_channel_answers">Needs your answer</string>
+    <string name="notif_reply_finished">Reply finished</string>
+    <string name="notif_reply_failed">Reply did not finish</string>
+    <string name="notif_needs_answer">Hermes needs your answer</string>
+    <string name="notif_public">New activity in a chat</string>
 </resources>
