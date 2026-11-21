@@ -59,7 +59,7 @@ class FollowerNoticeTest {
     private lateinit var repo: ChatRepository
     private val routes = ConcurrentHashMap<String, (RecordedRequest) -> MockResponse>()
     private val sent = CopyOnWriteArrayList<Sent>()
-    private val cleared = CopyOnWriteArrayList<List<Any?>>() // key, run, retired request, ended
+    private val cleared = CopyOnWriteArrayList<List<Any?>>() // key, run, ended
     private val lockedAtHandOver = CopyOnWriteArrayList<Boolean>()
     private var follower: RunFollower? = null
     private val sink = NoticeSink { k, r, s, n, e, g, replay ->
@@ -88,7 +88,7 @@ class FollowerNoticeTest {
 
     private fun TestScope.follower(done: CompletableDeferred<Unit>? = null) = RunFollower(
         api, db, repo, backgroundScope, delayMs = {}, onRunFinished = { done?.complete(Unit) },
-        onNotice = sink, onControlsCleared = { k, r, q, ended -> cleared += listOf(k, r, q, ended) }, generation = { GEN },
+        onNotice = sink, onControlsCleared = { k, r, ended -> cleared += listOf(k, r, ended) }, generation = { GEN },
     ).also { follower = it }
 
     private fun on(path: String, vararg responses: () -> MockResponse) {
@@ -223,7 +223,7 @@ class FollowerNoticeTest {
         f.settle(RUN)
 
         assertEquals(listOf(true), lockedAtHandOver) // a newer read cannot overtake: it waits for the lock
-        assertEquals(listOf(listOf(KEY, RUN, "p1", false)), cleared) // the read began after p1 was handed over
+        assertEquals(listOf(listOf(KEY, RUN, false)), cleared) // the read began after p1 was handed over
     }
 
     @Test
@@ -242,7 +242,7 @@ class FollowerNoticeTest {
         f.settle(RUN) // the older read, showing the approval, is not applied
 
         assertTrue(sent.isEmpty())
-        assertEquals(listOf(listOf(KEY, RUN, null, false)), cleared) // only the newer read's (no control)
+        assertEquals(listOf(listOf(KEY, RUN, false)), cleared) // only the newer read's (no control)
     }
 
     /** A sink that hands each notice's receipt ([outcome]) to the check it belongs to, as the notifier does. */
@@ -318,7 +318,7 @@ class FollowerNoticeTest {
         h!!.join()
 
         assertEquals(listOf("req:$RUN:pA:$GEN", "req:$RUN:pB:$GEN"), sent.map { it.eventId })
-        assertEquals(listOf(listOf(KEY, RUN, "pA", false)), cleared) // it retires A, the request current when it began, never B
+        assertTrue(cleared.isEmpty()) // it began before B was handed over: an older snapshot, never handed on to retire B
     }
 
     @Test
@@ -328,7 +328,7 @@ class FollowerNoticeTest {
         on(STATUS, status("running"))
         f.settle(RUN)
 
-        assertEquals(listOf(listOf(KEY, RUN, null, false)), cleared)
+        assertEquals(listOf(listOf(KEY, RUN, false)), cleared)
     }
 
     @Test
@@ -342,7 +342,7 @@ class FollowerNoticeTest {
         on(STATUS, json("""{"error":{"code":"run_not_found"}}""", 404))
         f.settle(RUN)
 
-        assertEquals(listOf(listOf(KEY, RUN, null, true), listOf(KEY, RUN, null, true)), cleared)
+        assertEquals(listOf(listOf(KEY, RUN, true), listOf(KEY, RUN, true)), cleared)
         assertTrue(sent.isEmpty())
         assertTrue(outbox().isEmpty())
     }
@@ -360,7 +360,7 @@ class FollowerNoticeTest {
         assertNull(db.activeRunDao().get("bad/id")) // still cleaned up
         assertTrue(outbox().none { it.runId == "bad/id" })
         assertTrue(sent.none { it.runId == "bad/id" })
-        assertTrue(listOf(KEY, "bad/id", null, true) in cleared)
+        assertTrue(listOf(KEY, "bad/id", true) in cleared)
     }
 
     @Test

@@ -186,6 +186,12 @@ class AppContainer(
      */
     suspend fun consumeTaps(conn: Connected, select: suspend (key: String, current: () -> Boolean) -> Boolean, opened: () -> Unit) {
         chatRequest.filterNotNull().collect { request ->
+            if (request.first != conn.generation) {
+                // Another connection's tap: left for that connection's drawer, unless this is the current connection,
+                // which proves it stale (an older epoch) and drops it.
+                if (conn.generation == epoch() && conn.isOpen) chatOpened(request)
+                return@collect
+            }
             val selected = select(request.second) { tapTarget(request, conn) != null }
             chatOpened(request)
             if (selected) opened()
@@ -410,8 +416,8 @@ class AppContainer(
                 queue.drain()
                 runScope.launch { refreshQuietly(repo, composer) } // not on the follower's own, non-cancellable path
             }
-        }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, request, ended ->
-            notifier.clearNeedsAnswer(key, run, request, generation, ended)
+        }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, ended ->
+            notifier.clearNeedsAnswer(key, run, generation, ended)
         }, generation = { generation })
         return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation)
     }

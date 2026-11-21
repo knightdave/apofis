@@ -93,9 +93,8 @@ class RunFollower(
     private val onRunFinished: suspend (sessionKey: String) -> Unit = {},
     private val active: () -> Boolean = { true }, // false once this follower's connection is closed
     private val onNotice: NoticeSink = NoticeSink { _, _, _, _, _, _, _ -> },
-    // No answer pending for the run any more: [requestId] is the request this read retires (pending when it started);
-    // [ended]: the run ended without a finish notice.
-    private val onControlsCleared: suspend (key: String, runId: String, requestId: String?, ended: Boolean) -> Unit = { _, _, _, _ -> },
+    // No answer pending for the run any more ([ended]: the run ended without a finish notice).
+    private val onControlsCleared: suspend (key: String, runId: String, ended: Boolean) -> Unit = { _, _, _ -> },
     private val generation: () -> Long = { 0 }, // this follower's connection, captured into every notice it hands on
 ) : RunStarter {
     private val lives = ConcurrentHashMap<String, MutableStateFlow<LiveReply?>>()
@@ -338,10 +337,11 @@ class RunFollower(
                         handedRequest = request
                         onNotice.notice(run.sessionKey, run.runId, run.startedAt, Notice.NEEDS_ANSWER, "req:${run.runId}:$request:$gen", gen, false)
                     }
-                    pending == null -> {
-                        // A read that began before a request was handed over cannot retire it; the next one will.
-                        if (retiring == handedRequest) handedRequest = null
-                        onControlsCleared(run.sessionKey, run.runId, retiring, false)
+                    // Only a read that began after the last request was handed over proves it is no longer pending; an
+                    // older snapshot is not handed on at all, so it can never retire a newer request.
+                    pending == null && retiring == handedRequest -> {
+                        handedRequest = null
+                        onControlsCleared(run.sessionKey, run.runId, false)
                     }
                 }
             } catch (e: CancellationException) {
@@ -787,7 +787,7 @@ class RunFollower(
             try {
                 // A finish replaces the run's request; a stop, a gone run or a local failure only retires it.
                 if (row != null) onNotice.notice(key, id, row.runStartedAt, Notice.valueOf(row.notice), row.eventId, row.generation, false)
-                else onControlsCleared(key, id, null, true)
+                else onControlsCleared(key, id, true)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {

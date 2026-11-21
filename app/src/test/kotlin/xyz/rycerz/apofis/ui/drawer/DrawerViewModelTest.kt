@@ -432,7 +432,9 @@ class DrawerViewModelTest {
         assertFalse(vm.selectTapped("apofis-b") { false }) // switched away before the selection
         assertFalse(vm.selectTapped("apofis-h") { true }) // hidden after the tap
         assertEquals(open, vm.selected.value)
-        assertTrue(saved.isEmpty()) // nothing stored for the next drawer to restore
+        // Nothing stored for the next drawer to restore (the initial selection's own write may land late, so only the
+        // tapped keys are checked).
+        assertTrue(saved.none { it == "apofis-b" || it == "apofis-h" })
 
         assertTrue(vm.selectTapped("apofis-b") { true })
         assertEquals("apofis-b", vm.selected.value)

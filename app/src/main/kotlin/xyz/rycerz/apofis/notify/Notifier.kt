@@ -100,14 +100,15 @@ fun ensureChannels(context: Context) {
 private class Item(val op: suspend () -> Unit, val done: CompletableDeferred<Unit>?)
 
 /**
- * The accepted control state of one run, as handed over (in the writer's order): the request now pending, the request
- * ids an accepted read has since retired, and whether the run ended. The lane decides from it when it acts.
+ * The latest accepted control state of one run, as handed over (in the writer's order): the request now pending (null:
+ * none), and whether the run ended. The lane decides from it, and from what the chat displays, when it acts.
  */
 private class RunControls(val sessionKey: String, val runId: String, val generation: Long) {
     var pending: NoticeStateEntity? = null
-    val retired = LinkedHashSet<String>()
     var ended = false
 }
+
+private val TERMINAL = setOf("completed", "failed", "cancelled", "interrupted")
 
 /**
  * Posts one generic notification per chat from verified run state, never from a push.
@@ -116,9 +117,10 @@ private class RunControls(val sessionKey: String, val runId: String, val generat
  * current connection epoch when it acts and does nothing on a mismatch but remove its own stale row or notification;
  * a switch bumps the epoch inside the lane, so no delivery can pass the check and post after it. Per chat, an event of
  * an older run (start time, then id) is dropped, a finish replaces its own run's request, and nothing of a run follows
- * its finish; a request alerts once. Approvals and clears are decided when the lane acts, against the latest accepted
- * control state: a request is posted only while it is still the pending one, a clear removes only the exact request it
- * retired. The lane holds at most one sweep and one control step per chat.
+ * its finish; a request alerts once. Approvals and clears are decided when the lane acts, from what the chat displays and
+ * the latest accepted control state: a displayed request that is not the pending one goes, and the pending one is
+ * posted only while it is still pending and its run is stored and not ended. The lane holds at most one sweep and one
+ * control step per chat.
  */
 class Notifier(
     private val context: Context,
@@ -209,21 +211,15 @@ class Notifier(
     override suspend fun notice(sessionKey: String, runId: String, runStartedAt: Long, notice: Notice, eventId: String, generation: Long, replay: Boolean) {
         val e = NoticeStateEntity(sessionKey, generation, runStartedAt, runId, notice.name, eventId)
         if (notice != Notice.NEEDS_ANSWER) return enqueue({ finish(e, replay) })
-        control(sessionKey, runId, generation) {
-            it.retired.remove(eventId)
-            it.pending = e
-        }
+        control(sessionKey, runId, generation) { it.pending = e }
     }
 
     /**
-     * An accepted read shows no request pending for [runId]: nothing of it is posted any more, and [requestId] (the
-     * request this read retires, the one pending when it started) is removed if it is what the chat shows. [ended]: the
-     * run ended without a finish notice (stopped, gone, refused); its displayed request goes, whatever it is.
+     * An accepted read shows no request pending for [runId] (the writer hands over only reads that began after its last
+     * request): its displayed request goes and nothing of it is posted. [ended]: the run ended without a finish notice.
      */
-    suspend fun clearNeedsAnswer(sessionKey: String, runId: String, requestId: String?, generation: Long, ended: Boolean = false) =
+    suspend fun clearNeedsAnswer(sessionKey: String, runId: String, generation: Long, ended: Boolean = false) =
         control(sessionKey, runId, generation) {
-            if (requestId != null) it.retired += "req:$runId:$requestId:$generation"
-            while (it.retired.size > MAX_ALERTED) it.retired.remove(it.retired.first())
             it.pending = null
             if (ended) it.ended = true
         }
@@ -240,21 +236,35 @@ class Notifier(
         currentCoroutineContext()[NoticeReceipts]?.add(receipt)
     }
 
-    /** The chat's control step: applies the latest accepted state of each of its runs. */
+    /**
+     * The chat's control step, a function of what it displays and the latest state of each of its runs: a displayed
+     * request of the run that is not the pending one goes first (coalescing may skip states, never this cancel); then
+     * the pending one, if any, is delivered.
+     */
     private suspend fun settleControls(sessionKey: String) {
         val runs = synchronized(controls) {
             steps.remove(sessionKey)
-            controls.values.filter { it.sessionKey == sessionKey }.map { c ->
-                Triple(c, c.pending, c.retired.toSet())
-            }.also { taken -> taken.forEach { controls.values.remove(it.first) } } // a later hand-over starts afresh
+            controls.values.filter { it.sessionKey == sessionKey }.map { c -> Triple(c, c.pending, c.ended) }
+                .also { taken -> taken.forEach { controls.values.remove(it.first) } } // a later hand-over starts afresh
         }
         val current = generation()
-        for ((c, pending, retired) in runs) {
+        for ((c, pending, ended) in runs) {
             if (c.generation != current) continue
             val shown = shownIn(sessionKey).filter { it.extra(EXTRA_KIND) == Notice.NEEDS_ANSWER.name && it.extra(EXTRA_RUN) == c.runId && it.epoch() == current }
-            shown.filter { c.ended || it.extra(EXTRA_EVENT) in retired }.forEach { nm.cancel(sessionKey, it.id) }
-            if (pending != null && !c.ended) request(pending)
+            shown.filter { ended || it.extra(EXTRA_EVENT) != pending?.eventId }.forEach { nm.cancel(sessionKey, it.id) }
+            if (pending != null && !ended) request(pending)
         }
+    }
+
+    /**
+     * Right before an approval's post: still the run's pending request (no later hand-over changed it) and its run is
+     * still stored and not ended in Room (a stored terminal status means no answer is possible any more).
+     */
+    private suspend fun stillPending(e: NoticeStateEntity): Boolean {
+        val later = synchronized(controls) { controls["${e.generation}|${e.sessionKey}|${e.runId}"] }
+        if (later != null && (later.ended || later.pending?.eventId != e.eventId)) return false
+        val status = db.activeRunDao().get(e.runId)?.status ?: return false
+        return status !in TERMINAL
     }
 
     /** Cleanup that reads nothing about chats: rows and notifications of another epoch. Safe while disconnected. */
@@ -368,7 +378,7 @@ class Notifier(
      */
     private suspend fun request(e: NoticeStateEntity) {
         if (e.generation != generation()) return
-        if (db.activeRunDao().get(e.runId) == null) return // settled meanwhile: its clear came first
+        if (!stillPending(e)) return // settled, ended or replaced meanwhile
         val (s, sameRun) = order(e) ?: return
         // Each entry is an event id, prefixed with SUPPRESSED when it was deliberately not shown.
         val alerted = if (sameRun) Json.decodeFromString<List<String>>(s!!.alerted) else emptyList()
@@ -386,7 +396,11 @@ class Notifier(
         val show = showable(e, title)
         val entry = if (show) e.eventId else SUPPRESSED + e.eventId
         val kept = alerted.filter { it.removePrefix(SUPPRESSED) != e.eventId } + entry
-        if (show) post(e, title!!, silent) else nm.cancel(e.sessionKey, ID)
+        if (show) {
+            if (!post(e, title!!, silent)) return // superseded during the preparation: nothing posted, nothing recorded
+        } else {
+            nm.cancel(e.sessionKey, ID)
+        }
         db.noticeStateDao().upsert(e.copy(alerted = Json.encodeToString(kept.takeLast(MAX_ALERTED))))
         reconciled[e.sessionKey] = run // only once its effect is done
     }
@@ -398,7 +412,8 @@ class Notifier(
     }
 
     @SuppressLint("MissingPermission") // checked in [allowed], in the same lane step
-    private suspend fun post(e: NoticeStateEntity, title: String, silent: Boolean) {
+    /** Posts [e]; false (nothing posted) for an approval that stopped being pending while it was prepared. */
+    private suspend fun post(e: NoticeStateEntity, title: String, silent: Boolean): Boolean {
         val notice = Notice.valueOf(e.notice)
         val channel = if (notice == Notice.NEEDS_ANSWER) CHANNEL_ANSWERS else CHANNEL_REPLIES
         val text = context.getString(
@@ -433,8 +448,10 @@ class Notifier(
         // Silent as NotificationCompat.setSilent does it: a group child that defers alerting to a summary that never exists.
         if (silent) n.setGroup(SILENT_GROUP).setGroupAlertBehavior(Notification.GROUP_ALERT_SUMMARY)
         beforePost()
+        if (notice == Notice.NEEDS_ANSWER && !stillPending(e)) return false
         nm.notify(e.sessionKey, ID, n.build())
         // A chat hidden or deleted after the title read: take it back at once (the instant before is a known limit).
         if (!usable(e.sessionKey)) nm.cancel(e.sessionKey, ID)
+        return true
     }
 }

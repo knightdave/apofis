@@ -159,6 +159,28 @@ class OpenChatIntentTest {
     }
 
     @Test
+    fun oldDrawerLeavesANewEpochTap() = runTest {
+        container.connect(Credentials("https://a.example/", "key-a"))
+        session("apofis-a")
+        val old = container.connected()!!
+        var oldOpened = 0
+        backgroundScope.launch { container.consumeTaps(old, { _, current -> current() }) { oldOpened++ } } // not yet replaced
+        container.connect(Credentials("https://a.example/", "key-b")) // same server: the chat stays
+        val new = container.connected()!!
+
+        assertTrue(container.openChat(view(chatUri(container.epoch(), "apofis-a")))) // a tap for the new connection
+        testScheduler.runCurrent() // the old drawer's collector runs first
+        assertEquals(container.epoch() to "apofis-a", container.chatToOpen.value) // left for the new drawer
+        assertEquals(0, oldOpened)
+
+        var newOpened = 0
+        backgroundScope.launch { container.consumeTaps(new, { _, current -> current() }) { newOpened++ } }
+        testScheduler.runCurrent()
+        assertEquals(1, newOpened)
+        assertNull(container.chatToOpen.value)
+    }
+
+    @Test
     fun disconnectedStartPostsNothing() = runTest {
         db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:r", "apofis-a", "r", 1, "FINISHED", container.epoch(), 0))
 
