@@ -69,6 +69,8 @@ internal const val GRAPHEME_SLACK = 1024
  * The window ends on a code point boundary; its end counts as a boundary only at the end of [text]. Shortcut: when no
  * boundary is found in the window (a grapheme longer than [GRAPHEME_SLACK]), the cut is at the cap, on a code point
  * boundary.
+ * Known limit: a grapheme spanning more than one window may also be cut at code point boundaries that are not
+ * grapheme boundaries.
  */
 internal fun pieceEnd(text: CharSequence, start: Int, cap: Int = PAGE_CHARS): Int {
     if (text.length - start <= cap) return text.length
@@ -89,39 +91,29 @@ private fun hasText(text: String) = text.length > PAGE_CHARS || text.isNotBlank(
 /**
  * The one eligibility rule, at draw time and at action time, from the transcript as it is now: the raw text of item
  * [key] in [items] if it is a sent user message (any user message when [fullMessage]: the reader opened by Show full
- * message), or a reply that is finished (not live), has text, and is not in a turn whose run is still pending. A run
- * is pending while its user message carries a run id: the pending send that gives it one is settled in the same
- * transaction that stores the run's final transcript, so until that transcript is published the turn's stored
- * replies may be partial. Else null. One reverse pass per call: there is no key index, and this runs once per tap or
- * per transcript change, never per frame.
+ * message), or a reply with text while the chat has no live or unsettled run ([running] or [unsettled]); else null.
+ * One reverse pass per call: there is no key index, and this runs once per tap or per transcript change.
  */
-internal fun actionable(items: List<ChatItem>, key: String, fullMessage: Boolean = false): String? {
-    var found: AssistantReply? = null
-    for (i in items.indices.reversed()) {
-        val item = items[i]
-        if (found == null) {
-            if (item.key != key) continue
-            when (item) {
-                is UserMessage -> return item.text.takeIf { fullMessage || item.state == SendState.SENT }
-                is AssistantReply -> if (item.live || !hasText(item.text)) return null else found = item
-                else -> return null
-            }
-        } else if (item is UserMessage && item.runId != null) {
-            return null // in a turn whose run is still pending
-        }
+internal fun actionable(items: List<ChatItem>, key: String, fullMessage: Boolean = false, running: Boolean = false): String? {
+    val item = items.lastOrNull { it.key == key } ?: return null
+    return when (item) {
+        is UserMessage -> item.text.takeIf { fullMessage || item.state == SendState.SENT }
+        is AssistantReply -> item.text.takeIf { !item.live && hasText(it) && !running && !unsettled(items) }
+        else -> null
     }
-    return found?.text
 }
+
+/**
+ * Whether the chat has a run that is live (a live reply is shown) or not yet settled (a user message still carries the
+ * run id its pending send gives it; the follower settles that send in the same transaction that stores the run's final
+ * transcript). While it does, no reply has actions: which stored rows belong to that run cannot be told reliably, and
+ * one check over the whole chat cannot misattribute. One pass, once per transcript change or tap.
+ */
+internal fun unsettled(items: List<ChatItem>): Boolean =
+    items.any { (it is AssistantReply && it.live) || (it is UserMessage && it.runId != null) }
 
 /** The Select key prefix of the full-message reader (Show full message); item keys never contain a colon. */
 internal const val FULL = "full:"
-
-/** The row's form of [actionable]'s turn rule: the replies after the first user message that carries a run id. */
-internal fun pendingReplies(items: List<ChatItem>): Set<String> {
-    val turn = items.indexOfFirst { it is UserMessage && it.runId != null }
-    if (turn < 0) return emptySet()
-    return (turn + 1 until items.size).mapNotNullTo(HashSet()) { (items[it] as? AssistantReply)?.key }
-}
 
 /** What Copy does with [current] (the text now, by [actionable]) for a press on [drawn]: length first, then content. */
 internal sealed interface CopyPlan {

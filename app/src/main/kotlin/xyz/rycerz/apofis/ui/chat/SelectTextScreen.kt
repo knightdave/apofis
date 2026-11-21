@@ -44,8 +44,15 @@ import xyz.rycerz.apofis.ui.theme.scaled
  * concatenate to the text exactly. Nothing is saved: a reopened or recreated view starts at the top.
  */
 @Composable
-fun SelectTextScreen(text: String, onBack: () -> Unit) {
+fun SelectTextScreen(text: CharSequence, onBack: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
+    // Another text (by identity, never by content: comparing or hashing a long body would read all of it) is a new
+    // list from its top.
+    val source = remember { Source() }
+    if (source.text !== text) {
+        source.text = text
+        source.version++
+    }
     Column(Modifier.fillMaxSize().background(scheme.surface)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(start = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             ApofisIconButton(onClick = onBack, contentDescription = stringResource(R.string.back)) {
@@ -53,12 +60,12 @@ fun SelectTextScreen(text: String, onBack: () -> Unit) {
             }
             Text(stringResource(R.string.select_title), Modifier.padding(start = 8.dp), style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Medium), color = scheme.onSurface)
         }
-        key(text) { Pieces(text) } // another text is a new list from its top
+        key(source.version) { Pieces(text) }
     }
 }
 
 @Composable
-private fun Pieces(text: String) {
+private fun Pieces(text: CharSequence) {
     val ends = remember { ArrayList<Int>() } // a cache of piece ends, filled in order as pieces are shown
     var found by remember { mutableIntStateOf(1) }
     val listState = remember { LazyListState() } // not saved: see above
@@ -72,10 +79,16 @@ private fun Pieces(text: String) {
     LazyColumn(Modifier.fillMaxSize(), listState, contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 20.dp)) {
         items(found, key = { it }) { i ->
             val e = end(i)
-            val piece = remember { lf(text.substring(if (i == 0) 0 else end(i - 1), e)) }
+            val piece = remember { lf(text.subSequence(if (i == 0) 0 else end(i - 1), e).toString()) }
             SelectionContainer {
                 Text(piece, Modifier.fillMaxWidth().testTag("select.piece:$i"), style = scaled(ChatText.assistant), color = MaterialTheme.colorScheme.onSurface)
             }
         }
     }
+}
+
+/** The text shown and a counter that changes whenever another text object arrives. */
+private class Source {
+    var text: CharSequence? = null
+    var version = 0
 }

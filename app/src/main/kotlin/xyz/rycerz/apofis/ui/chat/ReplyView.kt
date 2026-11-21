@@ -127,10 +127,9 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
 }
 
 /**
- * Under a reply: the live indicators, the pending request, the outcome notice and, once its run is over (not live,
- * not [active], see [pendingReplies]), Copy and Select ([MessageActionRow]). A CHANGED note shows
- * inside the block of the request that replaced the answered one, and only while that request is drawn (GONE notes:
- * [GoneRow]).
+ * Under a reply: the live indicators, the pending request, the outcome notice and Copy and Select ([MessageActionRow]),
+ * shown only while the chat has no live or unsettled run ([active], see [unsettled]). A CHANGED note shows inside the
+ * block of the request that replaced the answered one, and only while that request is drawn (GONE notes: [GoneRow]).
  */
 @Composable
 internal fun ReplyFooter(

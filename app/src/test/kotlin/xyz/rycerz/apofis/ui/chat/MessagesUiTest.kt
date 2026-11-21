@@ -55,6 +55,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.run.Connection
@@ -376,6 +377,9 @@ class MessagesUiTest {
         override fun get(index: Int): Char = s[index].also { reads++ }
         override fun subSequence(startIndex: Int, endIndex: Int) = s.subSequence(startIndex, endIndex).also { reads += it.length }
         override fun toString() = s.also { reads += it.length }
+        // As a String does: hashing or comparing by content reads it all.
+        override fun hashCode() = s.hashCode().also { reads += s.length }
+        override fun equals(other: Any?) = (other is Counting && other.s == s).also { reads += s.length }
     }
 
     @Test
@@ -537,6 +541,53 @@ class MessagesUiTest {
     }
 
     @Test
+    fun aSelectViewSavedDeepAndRestoredOntoAShorterBodyWithoutLoadingShowsItWhole() {
+        val tester = StateRestorationTester(rule)
+        val long = (0 until 12).joinToString("") { "piece$it ".padEnd(PAGE_CHARS, '.') }
+        var state by mutableStateOf(state(listOf(reply("r1", long))))
+        tester.setContent { Themed { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
+        rule.onNodeWithContentDescription("Select text").performClick()
+        val list = rule.onNode(hasScrollToIndexAction() and hasAnyAncestor(isDialog()))
+        for (i in 0..7) {
+            list.performScrollToIndex(i)
+            rule.waitForIdle()
+        }
+        // Saved while the deep view is still mounted; the retained owner already holds the shorter body on restore.
+        state = state(listOf(reply("r1", "word")))
+        tester.emulateSavedInstanceStateRestore()
+        rule.waitForIdle()
+        rule.onNode(hasText("word") and hasAnyAncestor(isDialog())).assertIsDisplayed()
+        assertEquals(1, rule.onNode(hasScrollToIndexAction() and hasAnyAncestor(isDialog())).fetchSemanticsNode().config[SemanticsProperties.CollectionInfo].rowCount)
+    }
+
+    @Test
+    fun theReaderSavedDeepAndRecreatedOntoAShorterBodyShowsItWhole() {
+        // The screen itself, outside a dialog window (whose content state is not restored), so saved state would reach it.
+        val tester = StateRestorationTester(rule)
+        var text by mutableStateOf((0 until 12).joinToString("") { "piece$it ".padEnd(PAGE_CHARS, '.') })
+        tester.setContent { Themed { SelectTextScreen(text) {} } }
+        val list = rule.onNode(hasScrollToIndexAction())
+        for (i in 0..7) {
+            list.performScrollToIndex(i)
+            rule.waitForIdle()
+        }
+        text = "word" // saved while deep; the shorter body is there at the restored composition
+        tester.emulateSavedInstanceStateRestore()
+        rule.waitForIdle()
+        rule.onNode(hasText("word")).assertIsDisplayed()
+        assertEquals(1, rule.onNode(hasScrollToIndexAction()).fetchSemanticsNode().config[SemanticsProperties.CollectionInfo].rowCount)
+    }
+
+    @Test
+    fun openingSelectReadsOnePieceOfAFreshBody() {
+        val body = Counting("y".repeat(1_000_000))
+        rule.setContent { Themed { SelectTextScreen(body) {} } }
+        rule.waitForIdle()
+        rule.onNodeWithTag("select.piece:0").assertIsDisplayed()
+        assertTrue("read ${body.reads} characters before the first piece", body.reads <= 2 * (PAGE_CHARS + GRAPHEME_SLACK + 1))
+    }
+
+    @Test
     fun aWordSelectedAtAPieceEdgeCopiesExactly() {
         val clipboard = FakeClipboard()
         val text = "x".repeat(PAGE_CHARS) + "\nomega tail"
@@ -569,7 +620,7 @@ class MessagesUiTest {
     }
 
     @Test
-    fun aRunsTurnHasNoActionsUntilItsFinalTranscriptIsPublished() {
+    fun noReplyHasActionsWhileARunIsLiveOrUnsettled() {
         val r1 = reply("r1", "Earlier answer")
         val asked = UserMessage("u2", "Next?", false, FIXED_NOW, runId = "A") // its pending send is not settled yet
         val partial = reply("r3", "Half of the")
@@ -577,18 +628,60 @@ class MessagesUiTest {
         var state by mutableStateOf(state(listOf(r1, asked, partial), polling))
         rule.setContent { Themed { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
         rule.waitForIdle()
-        assertEquals("only the history reply r1", 1, replyRows().size)
-        // The run's end reaches the screen before the transcript that settled it: the turn is still pending.
+        assertEquals("live: no reply row", 0, replyRows().size)
+        // The run's end reaches the screen before the transcript that settled it: still unsettled.
         state = state(listOf(r1, asked, partial))
         rule.waitForIdle()
-        assertEquals(1, replyRows().size)
-        assertNull(actionable(listOf(r1, asked, partial), "r3"))
+        assertEquals(0, replyRows().size)
         // The final transcript: the send settled (no run id) and the final body stored.
-        val settled = listOf(r1, asked.copy(runId = null), reply("r3", "Half of the answer, now whole."))
-        state = state(settled)
+        state = state(listOf(r1, asked.copy(runId = null), reply("r3", "Half of the answer, now whole.")))
         rule.waitForIdle()
         assertEquals(2, replyRows().size)
-        assertEquals("Half of the answer, now whole.", actionable(settled, "r3"))
+    }
+
+    @Test
+    fun theRuleCannotMisattributeAReplyToARun() {
+        // Clock skew: the phone's send did not match its server row, so the marked bubble comes after the partial reply.
+        val skew = listOf<ChatItem>(UserMessage("u1", "ask", false, FIXED_NOW - 70), reply("r2", "partial"), UserMessage("p123", "ask", false, FIXED_NOW, SendState.SENT, "k", runId = "A"))
+        assertNull(actionable(skew, "r2"))
+        assertNull(actionable(Joined(skew, listOf<ChatItem>(AssistantReply("live", emptyList(), "", FIXED_NOW, live = true))), "r2"))
+        // A marker on an earlier turn: everything waits until that run settles, then nothing waits.
+        val misplaced = listOf<ChatItem>(UserMessage("uA", "a", false, FIXED_NOW, runId = "A"), reply("rA", "A"), UserMessage("uB", "b", false, FIXED_NOW), reply("rB", "B"))
+        assertNull(actionable(misplaced, "rB"))
+        val settledA = misplaced.map { if (it is UserMessage) it.copy(runId = null) else it }
+        assertEquals("B", actionable(settledA, "rB"))
+        assertEquals("A", actionable(settledA, "rA"))
+        // A steer inside the running turn carries no run id; the turn's first message does.
+        val steered = listOf<ChatItem>(UserMessage("u1", "go", false, FIXED_NOW, runId = "A"), reply("r1", "part one"), UserMessage("s2", "also", true, FIXED_NOW), reply("r2", "part two"))
+        assertNull(actionable(steered, "r1"))
+        assertNull(actionable(steered, "r2"))
+        // Stopped or failed runs settle like any other: their transcript has outcomes and no run id.
+        val stopped = listOf<ChatItem>(UserMessage("u1", "go", false, FIXED_NOW), AssistantReply("r1", emptyList(), "half", FIXED_NOW, outcome = ReplyOutcome.STOPPED))
+        assertEquals("half", actionable(stopped, "r1"))
+        val failed = listOf<ChatItem>(UserMessage("u1", "go", false, FIXED_NOW), AssistantReply("r1", emptyList(), "err", FIXED_NOW, outcome = ReplyOutcome.FAILED))
+        assertEquals("err", actionable(failed, "r1"))
+        // A transcript loaded with no local runs: every stored reply is actionable.
+        val history = listOf<ChatItem>(reply("r0", "leading"), UserMessage("u1", "q", false, FIXED_NOW), reply("r1", "a"), UserMessage("u2", "q2", false, FIXED_NOW), reply("r2", "b"))
+        for (key in listOf("r0", "r1", "r2")) assertTrue(actionable(history, key) != null)
+        assertNull("a live run blocks it too", actionable(history, "r2", running = true))
+    }
+
+    @Test
+    fun aMismatchedSendKeepsTheFooterCopyAndSelectOff() {
+        rule.mainClock.autoAdvance = false
+        val clipboard = FakeClipboard()
+        val selected = ArrayList<String>()
+        val shown = listOf<ChatItem>(UserMessage("u1", "ask", false, FIXED_NOW - 70), reply("r2", "partial"))
+        val skew = shown + UserMessage("p123", "ask", false, FIXED_NOW, SendState.SENT, "k", runId = "A")
+        var now = shown
+        rule.setContent { Themed(clipboard = clipboard) { List(shown, onSelect = { selected += it }, current = { now }) } }
+        rule.mainClock.advanceTimeByFrame()
+        now = skew // the marked bubble arrives before the next frame
+        val replyCopy = rule.onAllNodes(hasContentDescription("Copy")).let { all -> all[all.fetchSemanticsNodes().withIndex().first { it.value.boundsInRoot.left < 100f }.index] }
+        replyCopy.performClick()
+        rule.mainClock.advanceTimeBy(5 * frame)
+        assertTrue(clipboard.writes.isEmpty())
+        assertNull(actionable(skew, "r2"))
     }
 
     /** The action button of the last message on screen. */
@@ -614,7 +707,7 @@ class MessagesUiTest {
         rule.mainClock.advanceTimeBy(5 * frame)
         assertTrue(clipboard.writes.isEmpty())
         assertTrue(selected.isEmpty())
-        assertEquals("history stays actionable", "Earlier answer", actionable(now, "r1"))
+        assertNull("while a run is unsettled no reply qualifies", actionable(now, "r1"))
     }
 
     @Test

@@ -943,9 +943,9 @@ internal fun MessageList(
     val onSelectNow by rememberUpdatedState(onSelect)
     val currentNow by rememberUpdatedState(current)
     val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
-    // Replies of a turn whose run is still pending are not history yet: once per transcript, not per token.
+    // No reply has actions while a run is live or unsettled: once per transcript, not per token.
     @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
-    val active = remember(stored) { pendingReplies(stored) }
+    val active = live != null || remember(stored) { unsettled(stored) }
     LazyColumn(modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
         items(
             count = rows.size,
@@ -972,7 +972,7 @@ internal fun MessageList(
                         }
                         is FooterRow -> ReplyFooter(
                             row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
-                            rowActions, active = row.reply.key in active,
+                            rowActions, active = active,
                         )
                         is NoticeRow -> NoticeLine(row.notice.text)
                         GoneRow -> Notice(R.string.chat_answer_gone)

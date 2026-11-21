@@ -237,7 +237,8 @@ fun ChatScreen(
         // Only the stored part is searched (a live merge appends just the live reply, which has no Select), once per
         // transcript change, not per streamed token. Closes once the key no longer resolves.
         @Suppress("UNCHECKED_CAST") val stored = (state.items as? Joined<ChatItem>)?.head ?: state.items
-        val text = remember(stored, key) { actionable(stored, key.removePrefix(FULL), fullMessage = key.startsWith(FULL)) } // as Copy and Select do
+        val running = state.live != null
+        val text = remember(stored, key, running) { actionable(stored, key.removePrefix(FULL), fullMessage = key.startsWith(FULL), running = running) } // as Copy and Select do
         // A restored view waits for the transcript to load; once loaded, a miss closes it for good.
         LaunchedEffect(text == null, state.loaded) { if (text == null && state.loaded) selectKey = null }
         if (text != null) {
