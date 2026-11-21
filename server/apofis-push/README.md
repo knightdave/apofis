@@ -26,26 +26,24 @@ check of the replies it started.
   also wake that topic, and many such records can crowd out real phones. ntfy does not tie a topic
   to one phone: whoever subscribes to the topic receives the session ids, event kinds and timing.
   The origin allowlist still stops a record from sending anywhere but `https://ntfy.sh`.
-- **Never blocks Hermes.** The hook returns at once. It hands the work to at most two background
-  children per Hermes home and drops the wake when both are busy. A child stops waiting for requests
-  after 20 s and is ended by the kernel at 25 s whatever it is doing (except I/O the kernel itself
-  cannot interrupt). Each request gets 5 s. Errors are swallowed and the hook prints nothing.
-- **Read-only, enforced.** The database is read by a short-lived reader process that first gives up
-  every right to write, create, delete or truncate files (Linux Landlock), then opens `state.db`
-  read-only, reads the phone registrations (hidden `apofis-push-*` sessions) and exits; it is killed
-  after 3 s. Without Landlock, or when Hermes is not running (no `-wal`/`-shm` files), the hook sends
-  nothing. Its own files (two slot locks and the log) live in `~/.hermes/agent-hooks/`, never next to
-  the database. It never writes or deletes records and ignores records older than 90 days. It sends
-  only to an allowed https origin (here `https://ntfy.sh`), never follows redirects and ignores proxy
-  settings.
+- **Never blocks Hermes.** The hook returns at once and does no work on the database. It hands the
+  work to at most two background children per Hermes home and drops the wake when both are busy (the
+  app's 15 minute check covers it). A child starts no new request after 20 s and is ended by the
+  kernel at 25 s whatever it is doing (except I/O the kernel itself cannot interrupt). Each request gets 5 s. Errors are swallowed and the hook prints nothing.
+- **Read-only.** The child opens `state.db` with a read-only SQLite connection, reads the phone
+  registrations (hidden `apofis-push-*` sessions), closes it before any network, and never writes or
+  deletes records; records older than 90 days are ignored. Like any SQLite reader of a WAL database,
+  SQLite may create or reuse the `-wal` and `-shm` files next to it; that never changes the
+  database's content. Its own files (two slot locks and the log) live in `~/.hermes/agent-hooks/`.
+  It sends only to an allowed https origin (here `https://ntfy.sh`), never follows redirects and
+  ignores proxy settings.
 - **Limits.** At most 32 phones are served; `regs=32+` in the log means more than 32 were found and
   only the newest 32 were woken. If Hermes holds more than 4096 push records from the last 90 days,
   only the newest 4096 are considered.
 
 ## Requirements
 
-- `python3` 3.9 or newer on the gateway's `PATH` (standard library only), Linux with Landlock
-  enabled (`cat /sys/kernel/security/lsm` lists `landlock`).
+- `python3` 3.9 or newer on the gateway's `PATH` (standard library only), Linux.
 - Tested against Hermes Agent `a8fed44bbe`.
 
 ## Install (owner only)
@@ -53,23 +51,22 @@ check of the replies it started.
 **Install only after the agent reports the emulator pass done.** On c3po, from an up-to-date
 `main`:
 
-1. Copy the script:
+1. Back up everything this installation replaces or edits, under one unique stamp, before
+   changing anything. If any backup fails, stop here:
 
    ```sh
-   install -D -m 0755 server/apofis-push/apofis_push.py /home/hermes/.hermes/agent-hooks/apofis_push.py
+   stamp=$(date +%Y%m%d%H%M%S); h=~/.hermes; note=$h/apofis-push.install-$stamp
+   mkdir -p $h/agent-hooks && : > $note || exit 1
+   for f in agent-hooks/apofis_push.py config.yaml shell-hooks-allowlist.json; do
+     if [ -e $h/$f ]; then cp -p --no-clobber $h/$f $h/$f.bak-apofis-$stamp && echo "backup $f" >> $note || exit 1
+     else echo "absent $f" >> $note; fi
+   done
    ```
 
-2. Back up both files you are about to edit, with a unique name, and note whether the allowlist
-   existed:
+2. Copy the script:
 
    ```sh
-   stamp=$(date +%Y%m%d%H%M%S)
-   cp -p --no-clobber ~/.hermes/config.yaml ~/.hermes/config.yaml.bak-apofis-$stamp
-   if [ -e ~/.hermes/shell-hooks-allowlist.json ]; then
-     cp -p --no-clobber ~/.hermes/shell-hooks-allowlist.json ~/.hermes/shell-hooks-allowlist.json.bak-apofis-$stamp
-   else
-     echo "allowlist did not exist before apofis-push" > ~/.hermes/agent-hooks/apofis-push.install-note
-   fi
+   install -m 0755 server/apofis-push/apofis_push.py /home/hermes/.hermes/agent-hooks/apofis_push.py
    ```
 
 3. Merge into `~/.hermes/config.yaml` (keep any other `hooks:` entries):
@@ -128,18 +125,19 @@ The gateway picks up hook changes within about 30 seconds.
 
 Log outcomes: `matched` (with one `<origin>=<HTTP status or error>` per phone, or
 `refused:<reason>=skipped` for a record that fails the endpoint rule), `skipped db` (database not
-readable, not in WAL mode, or Hermes not running), `skipped sandbox` (Landlock unavailable),
-`skipped slot` (the child could not verify or publish its slot), `skipped db-budget` (the read took over 1.5 s), `skipped session`
+readable), `skipped db-busy` (locked past the busy timeout), `skipped slot` (the child could not verify or publish its slot), `skipped db-budget` (the read took over 1.5 s), `skipped session`
 (not a chat the app started), `deadline regs=<n>` (requests still running at 20 s).
 
 ## Rollback
 
-Remove exactly the two `apofis_push.py` entries from `config.yaml` and the two from the allowlist
-(if `agent-hooks/apofis-push.install-note` says the allowlist did not exist and it now holds only
-those two entries, delete it). Then delete `/home/hermes/.hermes/agent-hooks/apofis_push.py` and the
-`apofis-push.*` files next to it. Restore a whole `.bak-apofis-<stamp>` copy only if nothing else changed
-in that file since, because a restore also undoes later, unrelated edits and approvals. If the hooks
-do not register or unregister within a few minutes, restart the gateway when convenient.
+Use the newest `~/.hermes/apofis-push.install-<stamp>` note. Remove exactly the two `apofis_push.py`
+entries from `config.yaml` and the two from the allowlist (if the note says the allowlist was
+`absent` and it now holds only those two entries, delete it). For the script: if the note says
+`backup agent-hooks/apofis_push.py`, restore `apofis_push.py.bak-apofis-<stamp>` over it; if it says
+`absent`, delete it and the `apofis-push.*` files next to it. Restore a whole config or allowlist
+backup only if nothing else changed in that file since, because a restore also undoes later,
+unrelated edits and approvals. If the hooks do not register or unregister within a few minutes,
+restart the gateway when convenient.
 
 ## Development
 

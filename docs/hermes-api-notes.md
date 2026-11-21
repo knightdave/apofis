@@ -346,7 +346,8 @@ Source-derived at `a8fed44bbe`, not observed live (the owner's handoff checks it
   `O_RDWR|O_CREAT` and `-wal` with READWRITE|CREATE before falling back to read-only (sqlite3.c
   3.53: `unixOpenSharedMemory`, `sqlite3WalOpen`, `unixOpen`). On a WAL database whose last writer
   has closed (sidecars deleted), such a reader creates both files in a writable directory (checked on
-  a private fixture). The hook's reader therefore runs under Landlock with no write rights.
+  a private fixture). The hook accepts this as SQLite's normal reader behaviour; it never changes
+  the database content.
 - **Stdin.** `{hook_event_name, tool_name, tool_input, session_id, cwd, profile, extra}`;
   `session_id` is top level, every other keyword argument is under `extra` (`shell_hooks.py:49,87-102`).
 - **`on_session_end`** (`agent/turn_finalizer.py:794-812`): `extra` has `task_id, turn_id, completed,

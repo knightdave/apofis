@@ -10,19 +10,18 @@ It checks, by stat only, that no file changed under the Hermes install tree
 (/home/hermes/.hermes/hermes-agent, recursively), under /home/hermes/.hermes/agent-hooks
 (recursively) and the two hook configuration files (config.yaml, shell-hooks-allowlist.json). It does
 not cover the rest of /home/hermes/.hermes, which the running gateway writes to. Every hook child is
-accounted for before the throwaway home is removed (kept only with --keep).
+accounted for by the suite's own `account` routine; the throwaway home is removed afterwards, whatever
+the outcome, unless accounting fails (then it is kept and reported) or --keep is given.
 """
 import sys
 
 sys.dont_write_bytecode = True
 
-import fcntl  # noqa: E402
 import http.server  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
-import signal  # noqa: E402
 import sqlite3  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
@@ -36,6 +35,8 @@ PY = AGENT + "/venv/bin/python"
 GATEWAY_PATH = ("/home/hermes/.local/bin:/home/hermes/.nix-profile/bin:/etc/profiles/per-user/hermes/bin:"
                 "/run/wrappers/bin:/run/current-system/sw/bin")
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from test_apofis_push import Quarantine, account  # noqa: E402  (one cleanup routine for suite and check)
 INSTALLED = "/home/hermes/.hermes/agent-hooks/apofis_push.py"
 RELEASE_OPTS = "--allow-origin https://ntfy.sh"
 APP = "apofis-1b4e28ba-2fa1-11d2-883f-0016d3cca427"
@@ -115,45 +116,6 @@ class Fake:
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
 
-def free(path):
-    try:
-        fd = os.open(path, os.O_RDWR)
-    except FileNotFoundError:
-        return True
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-
-
-def account(slots, script):
-    """Wait until both slots are free; on the watchdog kill only a verified child (its cmdline names
-    the throwaway script and it holds the slot), then confirm the slot is released."""
-    end = time.monotonic() + WATCHDOG
-    while time.monotonic() < end:
-        if all(free(p) for p in slots):
-            return "ended"
-        time.sleep(0.02)
-    for path in slots:
-        try:
-            pid = int(open(path).read().strip())
-            cmd = open("/proc/%d/cmdline" % pid, "rb").read().split(b"\0")
-            fds = [os.readlink("/proc/%d/fd/%s" % (pid, n)) for n in os.listdir("/proc/%d/fd" % pid)]
-        except (OSError, ValueError):
-            continue
-        if script.encode() in cmd and path in fds:
-            os.killpg(pid, signal.SIGKILL)
-    end = time.monotonic() + WATCHDOG
-    while time.monotonic() < end:
-        if all(free(p) for p in slots):
-            return "killed"
-        time.sleep(0.02)
-    raise SystemExit("FAIL: a hook child could not be accounted for")
-
-
 def wait(cond, what):
     end = time.monotonic() + WATCHDOG
     while time.monotonic() < end:
@@ -179,8 +141,8 @@ def main():
     os.chmod(script, 0o755)
     fake = Fake()
     origin = "http://127.0.0.1:%d" % fake.port
-    db = sqlite3.connect(os.path.join(home, "state.db"), isolation_level=None)  # held open: -wal and -shm exist
-    ok = False
+    db = sqlite3.connect(os.path.join(home, "state.db"), isolation_level=None)
+    quarantined = False
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript("""
@@ -240,13 +202,18 @@ def main():
 
         with open(os.path.join(state, "apofis-push.log")) as f:
             print("hook log:\n" + f.read().replace(origin, "http://127.0.0.1:<port>"), end="")
-        ok = True
     finally:
-        account(slots, script)
+        try:
+            account(slots, script)
+        except Quarantine as e:
+            quarantined = True
+            print("FAIL: %s; throwaway home kept: %s" % (e, t))
         db.close()
         fake.httpd.shutdown()
-        if ok and not keep:
+        if not quarantined and not keep:
             shutil.rmtree(t)
+    if quarantined:
+        raise SystemExit(1)
     after = tree_state()
     changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
     assert not changed, "Hermes install tree changed: %s" % changed[:20]

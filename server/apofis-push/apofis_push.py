@@ -2,31 +2,42 @@
 """Apofis push hook for Hermes: a contentless UnifiedPush wake through ntfy. See README.md.
 
 `hook` (run by Hermes from its hooks: block) reserves one of two slots, spawns one detached `send`
-child and returns at once. The child forks a reader that drops every filesystem write right
-(Landlock) before it opens Hermes' state database read-only; the reader returns the registrations
-and exits (killed at a hard limit). The child then POSTs {"session_id","kind"} to each validated
-endpoint. `check` reports configuration and records without any network. Python 3.9+ stdlib, Linux.
+child and returns at once; it does no work on the database. The child reads the app's registration
+records with a read-only SQLite connection, closes it, and POSTs {"session_id","kind"} to each
+validated endpoint; the kernel ends it at CHILD_HARD seconds whatever it is doing. `check` reports
+configuration and records without any network. Python 3.9+ standard library, Linux.
 """
 from __future__ import annotations
 
-import fcntl
-import json
-import os
-import re
-import resource
-import select
 import signal
-import socket
-import sqlite3
-import ssl
-import stat
-import subprocess
 import sys
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+
+CHILD_HARD = 25  # seconds; the kernel ends a `send` child here (default SIGALRM action, no Python code)
+
+
+def arm_hard_deadline() -> None:
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(CHILD_HARD)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})  # an inherited blocked mask must not defeat it
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["send"]:
+    arm_hard_deadline()  # first, before any other import or work
+
+import fcntl  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import socket  # noqa: E402
+import sqlite3  # noqa: E402
+import ssl  # noqa: E402
+import stat  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.parse  # noqa: E402
+import urllib.request  # noqa: E402
 
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 UUID_RE = re.compile(UUID)
@@ -46,11 +57,9 @@ MAX_PROMPT = 1024
 MAX_MODEL_CONFIG = 65536
 MAX_SESSION_ID = 256
 STDIN_MAX = 1 << 20
-CHILD_HARD = 25  # default-action SIGALRM: the kernel ends the child, no Python code has to run
-SOFT_DEADLINE = 20  # the child stops waiting for requests and reports "deadline"
-DB_BUDGET = 1.5  # SQLite progress budget inside the reader
-DB_HARD = 3.0  # the reader is SIGKILLed after this, whatever a single operation does
-READER_MEM = 256 << 20
+SOFT_DEADLINE = 20  # after this the child starts no new POST and reports "deadline"
+DB_BUDGET = 1.5  # SQLite progress-handler budget for the whole read
+DB_BUSY = 0.5  # SQLite busy timeout
 LOG_MAX = 256 * 1024
 LOG_KEEP = 128 * 1024
 LOG_LOCK_WAIT = 1.0
@@ -136,24 +145,26 @@ def parse_args(argv: list[str]) -> dict:
     return o
 
 
-# --- Paths: nothing is ever written in the database's directory -----------------------------------
+# --- Our own files: $HERMES_HOME/agent-hooks, opened relative to one directory descriptor ----------
+
+SLOTS = ("apofis-push.slot0.lock", "apofis-push.slot1.lock")
+
 
 def db_path(o: dict, home: str) -> str:
     return os.path.abspath(o.get("--state-db") or os.path.join(home, "state.db"))
 
 
 def state_dir(home: str) -> str:
-    """Slots and log live in $HERMES_HOME/agent-hooks (created by the owner's install), never next to
-    the database."""
-    return os.path.join(home, "agent-hooks")
+    return os.path.join(home, "agent-hooks")  # created by the owner's install
 
 
 def log_path(o: dict, home: str) -> str:
-    return o.get("--log") or os.path.join(state_dir(home), "apofis-push.log")
+    path = o.get("--log") or os.path.join(state_dir(home), "apofis-push.log")
+    return path if path == "-" else os.path.abspath(path)
 
 
-def forbidden(db: str) -> dict:
-    """The database directory and the identities of the database and its sidecars (hard links too)."""
+def db_ids(db: str) -> set:
+    """(device, inode) of the database and its sidecars; only the child looks at the database."""
     ids = set()
     for p in (db, db + "-wal", db + "-shm", db + "-journal"):
         try:
@@ -161,28 +172,30 @@ def forbidden(db: str) -> dict:
             ids.add((st.st_dev, st.st_ino))
         except OSError:
             pass
-    return {"dir": os.path.realpath(os.path.dirname(db)), "ids": ids}
+    return ids
 
 
-def usable_dir(path: str, bad: dict) -> bool:
-    return os.path.isdir(path) and os.path.realpath(path) != bad["dir"]
+def open_dir(path: str) -> int:
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 
 
-def open_private(path: str, flags: int, bad: dict) -> int:
-    """Open a private regular file without following symlinks or blocking on a FIFO; refuse anything in
-    the database directory, any non-regular or hard-linked file and any database identity."""
-    if not usable_dir(os.path.dirname(os.path.abspath(path)), bad):
-        raise OSError("refused directory")
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (st.st_dev, st.st_ino) in bad["ids"]:
+def private_ok(st, bad) -> bool:
+    return (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.geteuid()
+            and (st.st_dev, st.st_ino) not in bad)
+
+
+def open_private(dfd: int, name: str, flags: int, bad=frozenset()) -> int:
+    """`name` in the directory `dfd`: a regular file we own with one link and no database identity;
+    never follows a symlink, never truncates on open, never blocks on a FIFO; mode 0600."""
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        if not private_ok(os.fstat(fd), bad):
+            raise OSError("refused file")
+        os.fchmod(fd, 0o600)
+    except BaseException:
         os.close(fd)
-        raise OSError("refused file")
+        raise
     return fd
-
-
-def slot_paths(home: str) -> list[str]:
-    return [os.path.join(state_dir(home), "apofis-push.slot%d.lock" % i) for i in (0, 1)]
 
 
 # --- Parent: Hermes' hook -------------------------------------------------------------------------
@@ -198,9 +211,7 @@ def hook_target(event: dict) -> tuple[str, str] | None:
     platform = platform if isinstance(platform, str) else ""
     if platform and platform != "api_server":
         return None
-    sid = event.get("session_id")
-    if sid is None:
-        sid = ""
+    sid = event.get("session_id", "")  # missing is anonymous; a present null is invalid
     if not isinstance(sid, str) or len(sid) > MAX_SESSION_ID or "\x00" in sid:
         return None
     name = event.get("hook_event_name")
@@ -216,17 +227,21 @@ def hook_target(event: dict) -> tuple[str, str] | None:
     return None
 
 
-def reserve_slot(home: str, lock, bad: dict) -> int | None:
-    for path in slot_paths(home):
-        fd = open_private(path, os.O_RDWR | os.O_CREAT, bad)
-        try:
-            lock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            continue
-        os.ftruncate(fd, 0)  # no stale pid survives into the new child's slot
-        return fd
-    return None
+def reserve_slot(home: str, lock) -> int | None:
+    dfd = open_dir(state_dir(home))
+    try:
+        for name in SLOTS:
+            fd = open_private(dfd, name, os.O_RDWR | os.O_CREAT)
+            try:
+                lock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                continue
+            os.ftruncate(fd, 0)  # no stale pid survives into the new child's slot
+            return fd
+        return None
+    finally:
+        os.close(dfd)
 
 
 def run_hook(o: dict, home: str, stdin, env, spawn, lock) -> int:
@@ -237,7 +252,7 @@ def run_hook(o: dict, home: str, stdin, env, spawn, lock) -> int:
         target = hook_target(json.loads(data))
         if target is None:
             return 0
-        fd = reserve_slot(home, lock, forbidden(db_path(o, home)))
+        fd = reserve_slot(home, lock)
         if fd is None:
             return 0
         try:
@@ -254,51 +269,23 @@ def run_hook(o: dict, home: str, stdin, env, spawn, lock) -> int:
     return 0
 
 
-# --- Database: a sandboxed, hard-limited reader ---------------------------------------------------
-
-def sandbox() -> None:
-    """Drop every filesystem write, create, remove, rename and truncate right of this process for good
-    (Landlock); reads stay allowed. Raises when Landlock is unavailable."""
-    import ctypes
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.syscall.restype = ctypes.c_long
-    abi = libc.syscall(ctypes.c_long(444), None, ctypes.c_size_t(0), ctypes.c_uint32(1))
-    if abi < 1:
-        raise OSError("landlock unavailable")
-    access = 0x1FF2  # WRITE_FILE, REMOVE_DIR, REMOVE_FILE, MAKE_CHAR..MAKE_SYM
-    access |= (1 << 13 if abi >= 2 else 0) | (1 << 14 if abi >= 3 else 0)  # REFER, TRUNCATE
-    attr = ctypes.c_uint64(access)
-    fd = libc.syscall(ctypes.c_long(444), ctypes.byref(attr), ctypes.c_size_t(8), ctypes.c_uint32(0))
-    if fd < 0:
-        raise OSError(ctypes.get_errno(), "landlock ruleset")
-    try:
-        if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
-            raise OSError(ctypes.get_errno(), "no_new_privs")
-        if libc.syscall(ctypes.c_long(446), ctypes.c_int(fd), ctypes.c_uint32(0)) != 0:
-            raise OSError(ctypes.get_errno(), "landlock restrict")
-    finally:
-        os.close(fd)
-
+# --- Database (child only) ------------------------------------------------------------------------
 
 def snapshot(db: str, work, monotonic, on_progress=None):
-    """One read transaction on a WAL database, read-only, query_only, in-memory temp store, inside a
-    monotonic budget checked by SQLite's progress handler and again before the result is accepted."""
-    with open(db, "rb") as f:
-        header = f.read(100)
-    if len(header) < 100 or header[18] != 2 or header[19] != 2:
-        raise OSError("not a WAL database")
+    """One read transaction with a plain read-only connection (`mode=ro`, query_only, short busy
+    timeout) inside a monotonic budget, checked by SQLite's progress handler and before the result is
+    accepted."""
     end = monotonic() + DB_BUDGET
 
     def progress():
         if on_progress:
             on_progress()
         return 1 if monotonic() > end else 0
-    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db), uri=True, timeout=DB_BUDGET,
+    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db), uri=True, timeout=DB_BUSY,
                            isolation_level=None)
     try:
         conn.set_progress_handler(progress, 1000)
         conn.execute("PRAGMA query_only=1")
-        conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("BEGIN")
         result = work(conn)
         conn.execute("COMMIT")
@@ -313,64 +300,16 @@ def snapshot(db: str, work, monotonic, on_progress=None):
     return result
 
 
-def read_db(db: str, work, monotonic) -> tuple[str, object]:
-    """Run `work` in a forked reader under the sandbox. ("ok", result) or (reason, None) with reason
-    "budget", "db" or "sandbox". The reader is SIGKILLed after DB_HARD seconds."""
-    r, w = os.pipe()
-    pid = os.fork()
-    if pid == 0:  # reader
-        out = {"err": "db"}
-        try:
-            os.close(r)
-            signal.signal(signal.SIGALRM, signal.SIG_DFL)
-            signal.alarm(int(DB_HARD) + 2)
-            try:
-                sandbox()
-            except Exception:
-                out = {"err": "sandbox"}
-                raise
-            with open("/proc/self/statm") as f:  # cap growth: current size plus READER_MEM
-                cap = int(f.read().split()[0]) * resource.getpagesize() + READER_MEM
-            resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
-            out = {"ok": snapshot(db, work, monotonic)}
-        except Budget:
-            out = {"err": "budget"}
-        except BaseException:
-            pass
-        try:
-            data = json.dumps(out).encode()
-            while data:
-                data = data[os.write(w, data):]
-        finally:
-            os._exit(0)
-    os.close(w)
-    chunks: list = []
-    end = time.monotonic() + DB_HARD
-    done = False
+def read(db: str, work, monotonic) -> tuple[str, object]:
+    """("ok", result) or (reason, None): db-budget, db-busy (busy timeout) or db."""
     try:
-        while not done:
-            left = end - time.monotonic()
-            if left <= 0:
-                break
-            if select.select([r], [], [], left)[0]:
-                b = os.read(r, 65536)
-                chunks.append(b)
-                done = not b
-    finally:
-        os.close(r)
-        if not done:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-        os.waitpid(pid, 0)
-    if not done:
-        return "budget", None
-    try:
-        out = json.loads(b"".join(chunks))
-    except ValueError:
+        return "ok", snapshot(db, work, monotonic)
+    except Budget:
+        return "db-budget", None
+    except sqlite3.OperationalError as e:
+        return ("db-busy" if "locked" in str(e) else "db"), None
+    except Exception:
         return "db", None
-    return ("ok", out["ok"]) if "ok" in out else (out.get("err", "db"), None)
 
 
 def _markers(model_config) -> tuple | None:
@@ -513,17 +452,22 @@ def post(url: str, body: bytes, timeout: float, opener) -> str:
 
 # --- Log ------------------------------------------------------------------------------------------
 
-def write_log(path: str, line: str, bad: dict, lock=fcntl.flock, monotonic=time.monotonic, sleep=time.sleep) -> None:
+def write_log(path: str, line: str, bad=frozenset(), lock=fcntl.flock, monotonic=time.monotonic,
+              sleep=time.sleep) -> None:
     """Append one line under <log>.lock (non-blocking polls, 1 s cap: skipped on timeout); rotate over
-    LOG_MAX keeping the last LOG_KEEP bytes. Private regular files only (see open_private). Never raises."""
+    LOG_MAX keeping the last LOG_KEEP bytes. Private files only (open_private). Never raises."""
     if path == "-":
         sys.stdout.write(line + "\n")
+        sys.stdout.flush()  # the CLI ends with os._exit, which does not flush
         return
     try:
-        lfd = open_private(path + ".lock", os.O_RDWR | os.O_CREAT, bad)
+        dfd = open_dir(os.path.dirname(path))
     except OSError:
         return
+    lfd = fd = -1
     try:
+        name = os.path.basename(path)
+        lfd = open_private(dfd, name + ".lock", os.O_RDWR | os.O_CREAT, bad)
         end = monotonic() + LOG_LOCK_WAIT
         while True:
             try:
@@ -533,56 +477,52 @@ def write_log(path: str, line: str, bad: dict, lock=fcntl.flock, monotonic=time.
                 if monotonic() >= end:
                     return
                 sleep(0.01)
-        fd = open_private(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, bad)
-        try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, (line + "\n").encode())
-            size = os.fstat(fd).st_size
-            if size > LOG_MAX:
-                os.lseek(fd, size - LOG_KEEP, os.SEEK_SET)
-                tail = os.read(fd, LOG_KEEP)
-                tail = tail[tail.find(b"\n") + 1:]
-                os.ftruncate(fd, 0)
-                os.write(fd, tail)
-        finally:
-            os.close(fd)
+        fd = open_private(dfd, name, os.O_RDWR | os.O_CREAT | os.O_APPEND, bad)
+        os.write(fd, (line + "\n").encode())
+        size = os.fstat(fd).st_size
+        if size > LOG_MAX:
+            os.lseek(fd, size - LOG_KEEP, os.SEEK_SET)
+            tail = os.read(fd, LOG_KEEP)
+            tail = tail[tail.find(b"\n") + 1:]
+            os.ftruncate(fd, 0)
+            os.write(fd, tail)
     except OSError:
         pass
     finally:
-        os.close(lfd)
+        for d in (fd, lfd, dfd):
+            if d >= 0:
+                os.close(d)
 
 
 def utc(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
-def arm_hard_deadline() -> None:
-    signal.signal(signal.SIGALRM, signal.SIG_DFL)
-    signal.alarm(CHILD_HARD)
-
-
 # --- Child: send ----------------------------------------------------------------------------------
 
-def own_slot(fd: int, home: str) -> bool:
-    """The inherited descriptor is one of this home's slot files (regular, single link, no symlink)."""
+def own_slot(fd: int, home: str, bad) -> bool:
+    """The inherited descriptor is one of this home's slot files, private and not a database identity."""
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        if not private_ok(st, bad):
             return False
-        for path in slot_paths(home):
-            try:
-                lst = os.lstat(path)
-            except OSError:
-                continue
-            if stat.S_ISREG(lst.st_mode) and (lst.st_dev, lst.st_ino) == (st.st_dev, st.st_ino):
-                return True
+        dfd = open_dir(state_dir(home))
+        try:
+            for name in SLOTS:
+                try:
+                    lst = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if (lst.st_dev, lst.st_ino) == (st.st_dev, st.st_ino):
+                    return True
+        finally:
+            os.close(dfd)
     except OSError:
         pass
     return False
 
 
 def deliver(o: dict, home: str, now, monotonic, sleep, opener, soft_end: float) -> str:
-    db = db_path(o, home)
     session = o["--session"] or None
     install = o.get("--only-install")
     now_s = now()
@@ -590,10 +530,10 @@ def deliver(o: dict, home: str, now, monotonic, sleep, opener, soft_end: float) 
     def work(conn):
         app = resolve_app_session(conn, session) if session else None
         rows, more = registration_rows(conn, now_s, install) if app or not session else ([], False)
-        return [app, rows, more]
-    status, result = read_db(db, work, monotonic)
+        return app, rows, more
+    status, result = read(db_path(o, home), work, monotonic)
     if status != "ok":
-        return "skipped " + {"budget": "db-budget", "sandbox": "sandbox"}.get(status, "db")
+        return "skipped " + status
     app, rows, more = result
     if session and not app:
         return "skipped session"
@@ -606,11 +546,15 @@ def deliver(o: dict, home: str, now, monotonic, sleep, opener, soft_end: float) 
     body = push_body(app, o["--kind"])
     results: list = [None] * len(rows)
     threads = []
+    late = False
     for i, (_rid, _started, endpoint) in enumerate(rows):
         v = validate_endpoint(endpoint, o["origins"], o["http_origins"]) if endpoint is not None else "prompt"
         if isinstance(v, str):
             results[i] = "refused:%s=skipped" % v
             continue
+        if monotonic() >= soft_end:  # no new POST after the soft deadline
+            late = True
+            break
 
         def work_send(i=i, label=v[0], url=v[1]):
             results[i] = "%s=%s" % (label, post(url, body, o["timeout"], opener))
@@ -619,21 +563,20 @@ def deliver(o: dict, home: str, now, monotonic, sleep, opener, soft_end: float) 
         threads.append(t)
     for t in threads:
         t.join(max(0.0, soft_end - monotonic()))
-    if any(t.is_alive() for t in threads):
+    if late or any(t.is_alive() for t in threads):
         return "deadline regs=%d" % len(rows)
     return " ".join(["matched regs=%d%s" % (len(rows), "+" if more else "")] + [r or "error" for r in results])
 
 
-def run_send(o: dict, home: str, now, monotonic, sleep, opener, arm) -> int:
-    arm()  # hard stop first, so nothing below can outlive CHILD_HARD
+def run_send(o: dict, home: str, now, monotonic, sleep, opener) -> int:
     soft_end = monotonic() + SOFT_DEADLINE
     hook = HOOKS[o["--kind"]]
     fd = o["slot_fd"]
-    bad = forbidden(db_path(o, home))
+    bad = db_ids(db_path(o, home))
     try:
         if fd is None:
             line = deliver(o, home, now, monotonic, sleep, opener, soft_end)
-        elif not own_slot(fd, home):
+        elif not own_slot(fd, home, bad):
             line = "skipped slot"
         else:
             try:
@@ -674,10 +617,10 @@ def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
                 (prefix, prefix[:-1] + ".")).fetchall()]
     else:
         def work(conn):
-            return list(registration_rows(conn, now_s, o.get("--only-install")))
-    status, result = read_db(db_path(o, home), work, monotonic)
+            return registration_rows(conn, now_s, o.get("--only-install"))
+    status, result = read(db_path(o, home), work, monotonic)
     if status != "ok":
-        out.write("\n".join(lines + ["skipped " + {"budget": "db-budget", "sandbox": "sandbox"}.get(status, "db")]) + "\n")
+        out.write("\n".join(lines + ["skipped " + status]) + "\n")
         return 3
     lines.append("db opened read-only")
     if o["--ids"]:
@@ -699,7 +642,8 @@ def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
 
 
 def main(argv, stdin, env, now=time.time, spawn=subprocess.Popen, opener=None, lock=fcntl.flock,
-         monotonic=time.monotonic, sleep=time.sleep, stdout=None, arm=arm_hard_deadline) -> int:
+         monotonic=time.monotonic, sleep=time.sleep, stdout=None) -> int:
+    """Never touches the process alarm: the hard deadline belongs to the CLI process only."""
     try:
         o = parse_args(list(argv))
     except Exception:
@@ -708,7 +652,7 @@ def main(argv, stdin, env, now=time.time, spawn=subprocess.Popen, opener=None, l
     if o["cmd"] == "hook":
         return run_hook(o, home, stdin, env, spawn, lock)
     if o["cmd"] == "send":
-        return run_send(o, home, now, monotonic, sleep, opener, arm)
+        return run_send(o, home, now, monotonic, sleep, opener)
     try:
         return run_check(o, home, env, now, monotonic, stdout or sys.stdout)
     except BaseException:  # interruption or output failure: never a status that reads as complete
