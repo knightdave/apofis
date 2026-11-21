@@ -1,0 +1,37 @@
+{
+  "comment": "Endpoint rule vectors shared by apofis_push.py tests and the app's EndpointTest. Keep byte-identical across tasks.",
+  "origin": "https://ntfy.sh",
+  "valid": [
+    "https://ntfy.sh/upAbC123xyz_-9?up=1",
+    "https://ntfy.sh/upAbC123xyz_-9"
+  ],
+  "negatives": [
+    {"url": "http://ntfy.sh/upAbC123xyz_-9?up=1", "reason": "scheme"},
+    {"url": "https://evil.example/upAbC123xyz_-9?up=1", "reason": "origin"},
+    {"url": "https://ntfy.sh.evil.example/upAbC123xyz_-9?up=1", "reason": "origin"},
+    {"url": "https://u:p@ntfy.sh/upAbC123xyz_-9?up=1", "reason": "userinfo"},
+    {"url": "https://ntfy.sh:8443/upAbC123xyz_-9?up=1", "reason": "origin"},
+    {"url": "https://ntfy.sh/upAbC123xyz_-9?up=1#x", "reason": "fragment"},
+    {"url": "https://ntfy.sh/upAbC123xyz_-?up=1", "reason": "path"},
+    {"url": "https://ntfy.sh/upAbC123xyz_-9X?up=1", "reason": "path"},
+    {"url": "https://ntfy.sh/upAbC123xyz_-9/json?up=1", "reason": "path"},
+    {"url": "https://ntfy.sh/%2e%2e/upAbC123xyz_-9?up=1", "reason": "path"},
+    {"url": "https://ntfy.sh/upAbC123xyz_-9?up=1&x=2", "reason": "query"},
+    {"url": "https://ntfy.sh./upAbC123xyz_-9?up=1", "reason": "origin"},
+    {"url": "https://ntfy.sh\\@evil/upAbC123xyz_-9?up=1", "reason": "parse"},
+    {"url": "https://127.0.0.1/upAbC123xyz_-9?up=1", "reason": "origin"},
+    {"url": "file:///upAbC123xyz_-9", "reason": "scheme"}
+  ],
+  "tooLong": {"prefix": "https://ntfy.sh/upAbC123xyz_-9?up=1", "pad": "a", "length": 513, "reason": "length"},
+  "maxLength": 512,
+  "loopback": {
+    "comment": "Replace {port} with the test port and {port1} with port + 1.",
+    "httpOrigin": "http://127.0.0.1:{port}",
+    "valid": "http://127.0.0.1:{port}/upWIRECHECK012?up=1",
+    "negatives": [
+      {"url": "http://127.0.0.1:{port}/upWIRECHECK012?up=1", "httpOrigin": null, "reason": "scheme"},
+      {"url": "http://127.0.0.1:{port1}/upWIRECHECK012?up=1", "httpOrigin": "http://127.0.0.1:{port}", "reason": "origin"},
+      {"url": "http://localhost:{port}/upWIRECHECK012?up=1", "httpOrigin": "http://127.0.0.1:{port}", "reason": "origin"}
+    ]
+  }
+}

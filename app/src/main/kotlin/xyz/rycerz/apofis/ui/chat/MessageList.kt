@@ -15,6 +15,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.referentialEqualityPolicy
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -457,6 +459,7 @@ internal object Work {
     var largestHighlight = 0 // the longest code handed to the highlighter
     var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
     var timelineRows = 0L // timeline step rows composed
+    var pageEnds = 0L // text pages measured
 }
 
 /**
@@ -932,7 +935,10 @@ internal fun MessageList(
     current: (() -> List<ChatItem>)? = null,
 ) {
     val builder = remember(zone) { ChatRows(zone) }
-    val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
+    // Copy reads the reply as it is when tapped. Referential: comparing the items would compare a live reply's steps.
+    val latestHolder = remember { mutableStateOf(items, referentialEqualityPolicy()) }
+    latestHolder.value = items
+    val latest by latestHolder
     // One sideways scroll per table, shared by its slices (separate list items), by "<reply>/b<index>".
     val tableScrolls = remember { HashMap<String, ScrollState>() }
     val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }

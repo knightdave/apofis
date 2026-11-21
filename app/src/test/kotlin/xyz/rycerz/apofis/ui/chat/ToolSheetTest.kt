@@ -3,7 +3,15 @@ package xyz.rycerz.apofis.ui.chat
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.performScrollTo
+import org.junit.Assert.assertTrue
+import xyz.rycerz.apofis.chat.TOOL_RESULT_DISPLAY_LIMIT
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -93,5 +101,41 @@ class ToolSheetTest {
         rule.onNodeWithTag("step:r2:0:terminal").performClick() // and it opens again
         rule.waitForIdle()
         assertEquals(1, sheetShown())
+    }
+
+    // ---- fix round 1: live previews are bounded, also when they change in an open sheet ----
+
+    private fun longestText() = rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.Text), useUnmergedTree = true)
+        .fetchSemanticsNodes().maxOfOrNull { n -> n.config[SemanticsProperties.Text].maxOf { it.length } } ?: 0
+
+    private fun pageText(tag: String) =
+        rule.onNodeWithTag("$tag.page", useUnmergedTree = true).fetchSemanticsNode().config[SemanticsProperties.Text].joinToString("")
+
+    @Test
+    fun hugeLivePreviewsAreCappedAndPaged() {
+        val huge = "y".repeat(1_000_000)
+        var step by mutableStateOf(ToolStep("c1", "n".repeat(1_000_000), huge, null, false, error = false, running = true))
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                ToolDetailSheet(step, live = true, onDismiss = {})
+            }
+        }
+        rule.waitForIdle()
+        assertTrue("longest ${longestText()}", longestText() <= TEXT_PAGE_CHARS)
+        rule.onNodeWithText("The arguments are shortened here.").assertExists()
+
+        val result = (1..30_000).joinToString("\n") { "row $it" }
+        step = step.copy(result = result, running = false) // the result arrives while the sheet is open
+        rule.waitForIdle()
+        assertTrue("longest ${longestText()}", longestText() <= TEXT_PAGE_CHARS)
+        rule.onNodeWithText("The result is shortened here. The full result is on the server.").assertExists()
+
+        val shown = StringBuilder(pageText("sheet.result"))
+        val next = rule.onNode(hasContentDescription("Next part") and hasAnyAncestor(hasTestTag("sheet.result")))
+        while (SemanticsProperties.Disabled !in next.fetchSemanticsNode().config) {
+            next.performScrollTo().performClick()
+            shown.append(pageText("sheet.result"))
+        }
+        assertEquals("every shown page together is the capped result", result.take(TOOL_RESULT_DISPLAY_LIMIT), shown.toString())
     }
 }

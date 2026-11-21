@@ -1,6 +1,17 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.annotation.StringRes
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.heightIn
@@ -58,9 +69,9 @@ import xyz.rycerz.apofis.ui.theme.wash
  * so only Deny is offered.
  */
 @Composable
-internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, onChoice: (String, Long, ApprovalChoice) -> Unit) {
+internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onChoice: (String, Long, ApprovalChoice) -> Unit) {
     val command = control.command?.takeIf { it.isNotBlank() }
-    val choose = { choice: ApprovalChoice -> onChoice(control.requestId, control.executionGeneration, choice) }
+    val choose = { press: Press, choice: ApprovalChoice -> if (gate.accepts(press)) onChoice(control.requestId, control.executionGeneration, choice) }
     ControlCard(R.string.chat_approval_title, changed, R.drawable.lucide_triangle_exclamation_point, ApofisTheme.colors.warning) {
         if (command != null) {
             CodeSurface {
@@ -75,10 +86,14 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
         } else {
             Text(stringResource(R.string.chat_approval_no_command), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
-            Pill(stringResource(R.string.chat_approval_deny), filled = false, enabled = !answering) { choose(ApprovalChoice.DENY) }
+        Row(
+            Modifier.fillMaxWidth().padding(top = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Pill(stringResource(R.string.chat_approval_deny), filled = false, enabled = !answering, gate) { choose(it, ApprovalChoice.DENY) }
             if (command != null) {
-                Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering) { choose(ApprovalChoice.ONCE) }
+                Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering, gate) { choose(it, ApprovalChoice.ONCE) }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
                     ApofisIconButton(onClick = { menu = true }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
@@ -86,15 +101,17 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                     }
                     DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
                         val session = remember { MutableInteractionSource() }
+                        val sessionPress = remember { Press() }
                         DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_session)) }, onClick = {
                             menu = false
-                            choose(ApprovalChoice.SESSION)
-                        }, Modifier.wash(session), interactionSource = session)
+                            choose(sessionPress, ApprovalChoice.SESSION)
+                        }, Modifier.pressStart(sessionPress, gate).wash(session), interactionSource = session)
                         val always = remember { MutableInteractionSource() }
+                        val alwaysPress = remember { Press() }
                         DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_always)) }, onClick = {
                             menu = false
-                            choose(ApprovalChoice.ALWAYS)
-                        }, Modifier.wash(always), interactionSource = always)
+                            choose(alwaysPress, ApprovalChoice.ALWAYS)
+                        }, Modifier.pressStart(alwaysPress, gate).wash(always), interactionSource = always)
                     }
                 }
             }
@@ -104,10 +121,11 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
 
 /** A question from Hermes, answered right here, by this block's own request id and generation. */
 @Composable
-internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, onAnswer: (String, Long, String) -> Unit) {
+internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onAnswer: (String, Long, String) -> Unit) {
     ControlCard(R.string.chat_clarify_title, changed) {
         control.question?.let { Text(it, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface) }
         var answer by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf("") }
+        val sendPress = remember { Press() }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 answer,
@@ -118,8 +136,9 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
                 enabled = !answering,
             )
             ApofisIconButton(
-                onClick = { onAnswer(control.requestId, control.executionGeneration, answer) },
+                onClick = { if (gate.accepts(sendPress)) onAnswer(control.requestId, control.executionGeneration, answer) },
                 contentDescription = stringResource(R.string.chat_clarify_send),
+                Modifier.pressStart(sendPress, gate),
                 enabled = !answering && answer.isNotBlank(),
             ) {
                 Icon(painterResource(R.drawable.lucide_arrow_up), null, Modifier.size(20.dp))
@@ -181,13 +200,15 @@ private fun ControlCard(
  * the wash and focus ring on the pill itself.
  */
 @Composable
-private fun Pill(label: String, filled: Boolean, enabled: Boolean, onClick: () -> Unit) {
+private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerGate, onClick: (Press) -> Unit) {
     val source = remember { MutableInteractionSource() }
+    val press = remember { Press() }
     val scheme = MaterialTheme.colorScheme
     Box(
         Modifier
             .heightIn(min = 48.dp)
-            .clickable(source, indication = null, enabled = enabled, role = Role.Button, onClick = onClick),
+            .pressStart(press, gate)
+            .clickable(source, indication = null, enabled = enabled, role = Role.Button) { onClick(press) },
         contentAlignment = Alignment.Center,
     ) {
         Box(
@@ -203,3 +224,84 @@ private fun Pill(label: String, filled: Boolean, enabled: Boolean, onClick: () -
         }
     }
 }
+
+/**
+ * Double-tap protection for one request (the block is keyed by its id and generation, so a changed request gets a
+ * new gate). [shownAt] is when this block first showed the request, on the uptime clock. An answer is accepted only
+ * from a press that began at least the double-tap interval ([settle]) after that, on this request. A press is timed
+ * by its own down event (the pointer's or the key's own uptime), so one handled late never looks later than it was.
+ * Each activation uses exactly the press that produced it, on its own control: a click from a pointer release uses
+ * that pointer's down, one from a key release uses that key's down; an activation with no press of its own (an
+ * accessibility action) uses none and is judged when it arrives. Nothing else blocks an answer.
+ */
+internal class AnswerGate(private val clock: () -> Long, private val settle: Long) {
+    private val shownAt = clock()
+
+    /** Called by an answer control's click with that control's press record: consumes the press it came from. */
+    fun accepts(press: Press): Boolean {
+        val begun: Pair<Long, AnswerGate>? = when {
+            press.pointerReleasing -> press.pointerDown.also { press.pointerDown = null; press.pointerReleasing = false } ?: return false
+            press.keyReleasing -> press.keyReleased.also { press.keyReleased = null; press.keyReleasing = false } ?: return false
+            else -> null // no press of its own
+        }
+        if (begun != null && begun.second !== this) return false // begun on another request
+        return (begun?.first ?: clock()) - shownAt >= settle
+    }
+}
+
+/**
+ * One answer control's presses: the pointer gesture in progress (its down's own uptime and request) and the
+ * activation keys held on it (each key's own down time), plus which release is being dispatched right now.
+ */
+internal class Press {
+    var pointerDown: Pair<Long, AnswerGate>? = null
+    var pointerReleasing = false // the release of that pointer gesture is being dispatched
+    val keyDowns = HashMap<Key, Pair<Long, AnswerGate>>()
+    var keyReleased: Pair<Long, AnswerGate>? = null // the down of the key whose release is being dispatched
+    var keyReleasing = false
+}
+
+private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
+
+/**
+ * Records this answer control's presses before its own click handling sees them: pointer downs and releases (cleared
+ * once the gesture ends, cancelled or not) and activation key downs (not repeats) and releases (cleared once the
+ * release has been handled without a click, and all of them when the control loses focus).
+ */
+private fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
+    .pointerInput(press, gate) {
+        awaitEachGesture {
+            try {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                press.pointerDown = down.uptimeMillis to gate
+                do {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                } while (event.changes.any { it.pressed })
+                press.pointerReleasing = true // the click, if any, comes from this release (Main pass)
+                awaitPointerEvent(PointerEventPass.Final) // the same release, after the click
+            } finally {
+                press.pointerDown = null
+                press.pointerReleasing = false
+            }
+        }
+    }
+    .onFocusChanged { if (!it.hasFocus) press.keyDowns.clear() }
+    .onPreviewKeyEvent {
+        if (it.key in activationKeys) {
+            if (it.type == KeyEventType.KeyDown && it.nativeKeyEvent.repeatCount == 0) {
+                press.keyDowns[it.key] = it.nativeKeyEvent.eventTime to gate
+            } else if (it.type == KeyEventType.KeyUp) {
+                press.keyReleased = press.keyDowns.remove(it.key)
+                press.keyReleasing = true
+            }
+        }
+        false
+    }
+    .onKeyEvent {
+        // Reached only when the control did not take the release as a click: drop what that release recorded.
+        if (it.type == KeyEventType.KeyUp) {
+            press.keyReleased = null
+            press.keyReleasing = false
+        }
+        false
+    }

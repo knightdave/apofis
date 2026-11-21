@@ -104,6 +104,11 @@
     <string name="state_expanded">Rozwinięte</string>
     <string name="state_collapsed">Zwinięte</string>
     <string name="sheet_handle">Uchwyt przeciągania</string>
+    <string name="steps_earlier">Wcześniejsze kroki (%d)</string>
+    <string name="steps_later">Późniejsze kroki (%d)</string>
+    <string name="page_previous">Poprzednia część</string>
+    <string name="page_next">Następna część</string>
+    <string name="page_part">Część %1$d</string>
     <string name="chat_tool_running">W toku</string>
     <string name="chat_tool_failed">Błąd</string>
     <string name="tool_arguments">Argumenty</string>
