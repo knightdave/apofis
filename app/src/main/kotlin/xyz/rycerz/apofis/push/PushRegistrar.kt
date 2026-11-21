@@ -207,7 +207,7 @@ class PushRegistrar(
     /**
      * First half of a server switch, called by AppContainer.connect before its switch marker: commits the revocation of
      * the current registration and a fresh instance (a new ntfy topic). Throws when that cannot be committed; the switch
-     * must not go on without it. [finishSwitch] or any later start performs it.
+     * must not go on without it. The local revocation job (or any later start) performs it; the switch never sends it.
      */
     suspend fun prepareSwitch() {
         withContext(Dispatchers.IO) {
@@ -222,12 +222,6 @@ class PushRegistrar(
                 }
             }
         }
-    }
-
-    /** Second half of a switch, after the marker: unregisters the old registration and, only if push is on, registers anew. */
-    suspend fun finishSwitch() {
-        op { _ -> reconcile(null) }
-        afterUserOp()
     }
 
     /** The local half of recovery (no network): revocations, receiver events, registration. True when no revocation is left. */
@@ -270,7 +264,7 @@ class PushRegistrar(
     private var live: () -> Boolean = { true }
 
     private fun afterUserOp() {
-        if (needsWork(prefs, policy.distributors(context))) scheduleWork()
+        if (needsWork(prefs, policy.distributors(context), epoch())) scheduleWork()
     }
 
     private fun enabled() = prefs.getBoolean(Keys.ENABLED, false)
@@ -279,7 +273,7 @@ class PushRegistrar(
     /** The policy's distributors that are installed, in policy order; read at every use, never from storage. */
     private fun allowed(): List<String> = port.distributors(context).let { installed -> policy.distributors(context).filter { it in installed } }
 
-    private fun confirmed() = confirmedEndpoint(prefs, policy.distributors(context))
+    private fun confirmed() = confirmedEndpoint(prefs, policy.distributors(context), epoch())
 
     private fun needsServer() = prefs.contains(Keys.PENDING_ID) || (enabled() && confirmed().let { it != null && it != prefs.getString(Keys.ENDPOINT, null) })
 

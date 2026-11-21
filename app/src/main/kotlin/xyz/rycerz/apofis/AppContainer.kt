@@ -137,7 +137,7 @@ class AppContainer(
     private val app: Application,
     val credentials: CredentialStore = CredentialStore(app),
     pushPort: UnifiedPushPort = RealUnifiedPush,
-    pushStore: SharedPreferences = pushPrefs(app),
+    private val pushStore: SharedPreferences = pushPrefs(app),
     openDatabase: () -> AppDatabase = { Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").addMigrations(MIGRATION_1_2).build() },
 ) {
     val preferences = Preferences(app)
@@ -259,7 +259,9 @@ class AppContainer(
                     commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true).putLong(CONNECTION_EPOCH, cachePrefs.getLong(CONNECTION_EPOCH, 0) + 1))
                 }
                 afterSwitchMarker()
-                push.finishSwitch()
+                // The old registration is unregistered by the local revocation job, never here: the switch does not
+                // claim a revocation it has not done, and the job keeps it until the UNREGISTER was sent.
+                runCatching { PublishWorker.recover(app, pushStore) }.onFailure(::logFailure)
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {

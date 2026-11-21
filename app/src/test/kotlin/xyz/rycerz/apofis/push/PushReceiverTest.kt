@@ -210,7 +210,7 @@ class PushReceiverTest {
         runCatching { deliver(intent("UNREGISTERED", token2)) }
         log.killAt = 0
         assertEquals(instanceOf(prefs), prefs.disk[Keys.UNREGISTERED_INSTANCE])
-        assertTrue(needsWork(prefs.restart(), setOf(NTFY_PACKAGE)))
+        assertTrue(needsWork(prefs.restart(), setOf(NTFY_PACKAGE), 0))
     }
 
     @Test
@@ -263,17 +263,24 @@ class PushReceiverTest {
         val deadline = mutableListOf<Runnable>()
         var finishes = 0
         var worked = 0
-        admit({ lane += it }, { deadline += it }, { finishes++ }) { worked++ }
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { _, _ -> worked++ }
         deadline.single().run() // the budget runs out while the event still waits for the lane
         assertEquals(1, finishes)
         lane.single().run() // the lane frees up: the abandoned event is not handled (no commit, no ACK)
         assertEquals(0, worked)
         assertEquals(1, finishes)
-        // An event the lane started is finished on time; its work goes on and finishes it no second time.
+        // Started, but the deadline comes before its first durable commit: its claim fails, it commits nothing.
         lane.clear(); deadline.clear(); finishes = 0
-        admit({ lane += it }, { deadline += it }, { finishes++ }) { finish -> deadline.single().run(); worked++; finish() }
+        var committed = false
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { finish, claim -> deadline.single().run(); if (claim()) committed = true; finish() }
         lane.single().run()
-        assertEquals(1, worked)
+        assertFalse(committed)
+        assertEquals(1, finishes)
+        // Claimed first: the deadline finishes the broadcast on time, the hand-off completes, no second finish.
+        lane.clear(); deadline.clear(); finishes = 0
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { finish, claim -> if (claim()) { deadline.single().run(); committed = true }; finish() }
+        lane.single().run()
+        assertTrue(committed)
         assertEquals(1, finishes)
     }
 
@@ -433,6 +440,33 @@ class PushReceiverTest {
             val found = app.packageManager.queryBroadcastReceivers(Intent(ACTION + action).setPackage(app.packageName), 0)
             assertEquals(action, listOf(PushReceiver::class.java.name), found.map { it.activityInfo.name })
         }
+    }
+
+    // Fix round 4.
+
+    @Test
+    fun aRevocationPastTheDeadlineIsLeftForRedelivery() = runTest {
+        val (r, token) = enabled()
+        log.events.clear(); ctx.sent.clear()
+        PushReceiver().receive(ctx, intent("UNREGISTERED", token), finish = { log.step("finish") }, schedule = schedule, claim = { false })
+        assertNull(prefs.disk[Keys.UNREGISTERED_INSTANCE])
+        assertEquals("not handed to the connector: the registration is intact", listOf("finish"), log.events)
+        deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID) })
+        assertEquals(VALID, prefs.getString(Keys.ENDPOINT_NEW, null))
+        assertEquals(PushState.Registering, r.ui.value.state)
+    }
+
+    @Test
+    fun startupNeverRegistersARevokedInstance() = runTest {
+        val (_, token) = enabled()
+        log.killAt = log.count() + 2 // the revocation commit, then death before the connector's UNREGISTER broadcast
+        runCatching { deliver(intent("UNREGISTERED", token)) }
+        log.killAt = 0
+        ctx.sent.clear()
+        val restarted = PushRegistrar(ctx, prefs.restart(), { FakeRecordApi(server) }, { 0L }, { 0L }, backgroundScope, TestPolicy(), RealUnifiedPush)
+        restarted.publishPending()
+        assertTrue("no REGISTER for the revoked instance", ctx.sent.none { it.action == "org.unifiedpush.android.distributor.REGISTER" })
+        assertEquals(PushState.Off, restarted.ui.value.state)
     }
 }
 

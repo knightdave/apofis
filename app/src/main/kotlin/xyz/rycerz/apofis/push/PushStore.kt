@@ -43,13 +43,16 @@ internal fun instanceOf(prefs: SharedPreferences) = "g" + prefs.getLong(Keys.GEN
 internal fun registrationOf(prefs: SharedPreferences) = Registration.decode(prefs.getString(Keys.REGISTRATION, null))
 internal fun revocationsOf(prefs: SharedPreferences) = prefs.getString(Keys.REVOKE, null)?.lines()?.mapNotNull(Registration::decode).orEmpty()
 
-/** The current registration, if it is journaled for the current instance with a distributor in [allowed]. */
-internal fun currentRegistration(prefs: SharedPreferences, allowed: Set<String>) =
-    registrationOf(prefs)?.takeIf { it.instance == instanceOf(prefs) && it.distributor in allowed && it.token != null }
+/**
+ * The current registration: journaled for the current instance, with a distributor in [allowed], under the current
+ * connection [epoch]. One of an older epoch counts as not registered.
+ */
+internal fun currentRegistration(prefs: SharedPreferences, allowed: Set<String>, epoch: Long) = registrationOf(prefs)
+    ?.takeIf { it.instance == instanceOf(prefs) && it.distributor in allowed && it.token != null && it.epoch == epoch }
 
 /** The endpoint the distributor gave the current registration's token; anything else is not confirmed. */
-internal fun confirmedEndpoint(prefs: SharedPreferences, allowed: Set<String>): String? {
-    val token = currentRegistration(prefs, allowed)?.token ?: return null
+internal fun confirmedEndpoint(prefs: SharedPreferences, allowed: Set<String>, epoch: Long): String? {
+    val token = currentRegistration(prefs, allowed, epoch)?.token ?: return null
     return prefs.getString(Keys.ENDPOINT_NEW, null)?.takeIf { prefs.getString(Keys.ENDPOINT_NEW_TOKEN, null) == token }
 }
 
@@ -57,10 +60,10 @@ internal fun confirmedEndpoint(prefs: SharedPreferences, allowed: Set<String>): 
  * True while PushRegistrar has persisted work left: a revocation, an event from the receiver, a pending id, or push on
  * without a confirmed endpoint that the record holds.
  */
-internal fun needsWork(prefs: SharedPreferences, allowed: Set<String>): Boolean {
+internal fun needsWork(prefs: SharedPreferences, allowed: Set<String>, epoch: Long): Boolean {
     if (prefs.contains(Keys.REVOKE) || prefs.contains(Keys.UNREGISTERED_INSTANCE) || prefs.contains(Keys.PENDING_ID)) return true
     if (!prefs.getBoolean(Keys.ENABLED, false)) return false
-    val confirmed = confirmedEndpoint(prefs, allowed)
+    val confirmed = confirmedEndpoint(prefs, allowed, epoch)
     return confirmed == null || confirmed != prefs.getString(Keys.ENDPOINT, null)
 }
 

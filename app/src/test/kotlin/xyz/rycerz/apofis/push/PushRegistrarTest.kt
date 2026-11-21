@@ -36,6 +36,7 @@ class PushRegistrarTest {
         var now = 1_000_000_000L
         val port = FakePort(log)
         var scheduled = 0
+        var epoch = 0L // the persisted connection epoch
         var prefs = FakePrefs(mutableMapOf(Keys.INSTALL_ID to install)) { log.step("commit ${it.sorted()}"); true }
 
         /** A new process: memory is read back from disk. */
@@ -44,7 +45,7 @@ class PushRegistrarTest {
         }
 
         fun TestScope.registrar(policy: PushPolicy = TestPolicy()) =
-            PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, policy, port) { scheduled++ }
+            PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, policy, port, { epoch }) { scheduled++ }
 
         /** What PushReceiver commits for a NEW_ENDPOINT of the current registration (or of [token]). */
         fun endpointFor(url: String = VALID, token: String? = registrationOf(prefs)?.token) {
@@ -63,7 +64,7 @@ class PushRegistrarTest {
 
     private suspend fun PushRegistrar.switch() {
         prepareSwitch()
-        finishSwitch()
+        reconcileLocal() // what the local revocation job does
     }
 
     @Test
@@ -580,7 +581,7 @@ class PushRegistrarTest {
             prefs.onCommit = { true }
             restart()
             port.calls.clear()
-            assertTrue(needsWork(prefs, NTFY_ONLY) || prefs.getBoolean(Keys.ENABLED, false))
+            assertTrue(needsWork(prefs, NTFY_ONLY, epoch) || prefs.getBoolean(Keys.ENABLED, false))
             registrar().publishPending()
             assertTrue(port.calls.contains("register g1"))
         }
@@ -610,7 +611,7 @@ class PushRegistrarTest {
             runCatching { r.enableNow() }.onSuccess { error("no death") }
             log.killAt = 0
             restart()
-            assertTrue(needsWork(prefs, NTFY_ONLY))
+            assertTrue(needsWork(prefs, NTFY_ONLY, epoch))
             registrar().publishPending()
             assertEquals(setOf("g1"), port.registered)
         }
@@ -622,7 +623,7 @@ class PushRegistrarTest {
             log.killAt = 0
             assertTrue("the distributor never heard of it", port.subscribed.isEmpty())
             restart()
-            assertTrue(needsWork(prefs, NTFY_ONLY))
+            assertTrue(needsWork(prefs, NTFY_ONLY, epoch))
             registrar().publishPending()
             assertEquals(setOf("tok-g1"), port.subscribed)
         }
@@ -635,10 +636,10 @@ class PushRegistrarTest {
             runCatching { r.verify(force = true) }.onSuccess { error("no death") }
             log.killAt = 0
             restart()
-            assertTrue(needsWork(prefs, NTFY_ONLY))
+            assertTrue(needsWork(prefs, NTFY_ONLY, epoch))
             registrar().publishPending()
             assertEquals(id(2), prefs.getString(Keys.RECORD, null))
-            assertFalse(needsWork(prefs, NTFY_ONLY))
+            assertFalse(needsWork(prefs, NTFY_ONLY, epoch))
         }
     }
 
@@ -827,6 +828,36 @@ class PushRegistrarTest {
             assertTrue(scheduled > 0)
             registrar().publishPending()
             assertEquals(PushUi(PushState.Off), registrar().ui.value)
+        }
+    }
+
+    // Fix round 4.
+
+    @Test
+    fun aRegistrationMadeBeforeTheEpochAdvancedIsNotOn() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            connection++
+            r.prepareSwitch()
+            current = null
+            // A queued worker runs while connect waits before the marker: it registers g2 under the old epoch, and
+            // ntfy's NEW_ENDPOINT for that token arrives.
+            r.publishPending()
+            assertEquals(0L, registrationOf(prefs)?.epoch)
+            endpointFor(VALID2)
+            epoch++ // the marker commit advances the epoch
+            current = apiB
+            r.publishPending()
+            assertEquals(1L, registrationOf(prefs)?.epoch) // registered again under the new epoch
+            assertTrue("the receiver now accepts its token", currentRegistration(prefs, NTFY_ONLY, epoch) != null)
+            assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        }
+        with(World()) { // without re-registration it would never show On
+            val r = registrar()
+            turnedOn(r)
+            epoch++
+            assertEquals(PushState.Registering, registrar().ui.value.state)
         }
     }
 }

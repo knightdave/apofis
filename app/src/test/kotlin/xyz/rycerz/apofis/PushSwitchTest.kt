@@ -35,6 +35,7 @@ class PushSwitchTest {
     private val push = pushPrefs(app)
     private val markerAtPushEffect = mutableListOf<Boolean>()
     private var dieAtUnregister = false
+    private var throwAtUnregister = false
 
     // Records whether the switch marker was on disk at every connector call.
     private val fake = FakePort()
@@ -48,57 +49,69 @@ class PushSwitchTest {
         }
         override fun unregister(c: Context, r: Registration, connector: Boolean) {
             if (dieAtUnregister) throw xyz.rycerz.apofis.push.Death()
+            if (throwAtUnregister) throw IllegalStateException("broadcast failed")
             fake.unregister(c, r, connector).also { markerAtPushEffect += cache.contains(SWITCH_MARKER) }
         }
     }
 
+    // WorkManager holds its work: in these tests nothing runs it in the background (it would use the app's own
+    // container); each test runs what the jobs run, on its own container.
     @Before
-    fun setUp() = WorkManagerTestInitHelper.initializeTestWorkManager(app)
+    fun setUp() {
+        val held = java.util.concurrent.Executor { } // workers never run; WorkManager's own bookkeeping does
+        WorkManagerTestInitHelper.initializeTestWorkManager(app, androidx.work.Configuration.Builder()
+            .setTaskExecutor(androidx.work.testing.SynchronousExecutor()).setExecutor(held).build())
+    }
 
     @After
-    fun tearDown() = db.close()
+    fun tearDown() {
+        WorkManager.getInstance(app).cancelAllWork().result.get() // no WorkManager task outlives the test
+        db.close()
+    }
 
     @Test
-    fun pushEffectsHappenUnderTheSwitchMarkerAndPublishFollows() = runTest {
+    fun theSwitchSendsNoUnregisterTheLocalJobDoes() = runTest {
         val container = AppContainer(app, store, port) { db }
         container.connect(Credentials("https://a.example/", "key-a"))
         // Push on, with a journaled registration for the current instance.
         assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
-            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1").encode()).commit())
+            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1", connectionEpoch(app)).encode()).commit())
         markerAtPushEffect.clear()
 
         container.connect(Credentials("https://b.example/", "key-b"))
 
-        assertEquals(listOf(true, true, true), markerAtPushEffect) // unregister g1, save, register g2
-        assertEquals(2L, push.getLong(Keys.GENERATION, 0))
-        // The endpoint that arrived during the switch is published by work scheduled after it.
-        val work = WorkManager.getInstance(app).getWorkInfosForUniqueWork(PublishWorker.NAME).get()
-        assertEquals(1, work.size)
-    }
-
-    @Test
-    fun theRevocationSurvivesADeathInTheSwitch() = runTest {
-        val container = AppContainer(app, store, port) { db }
-        container.connect(Credentials("https://a.example/", "key-a"))
-        assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
-            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1").encode()).commit())
-        dieAtUnregister = true // the process dies at the first push side effect, after the marker
-        runCatching { container.connect(Credentials("https://b.example/", "key-b")) }
-        dieAtUnregister = false
+        assertEquals("connect sends nothing to the distributor", emptyList<String>(), fake.calls)
         assertTrue(push.contains(Keys.REVOKE))
-        // Next process: starts disconnected (the marker), and the push work alone finishes the revocation.
-        val restarted = AppContainer(app, store, port) { db }
-        assertEquals(null, restarted.connected())
-        restarted.push.publishPending()
-        assertTrue(fake.calls.contains("unregister g1 tok-g1"))
+        assertEquals(1, WorkManager.getInstance(app).getWorkInfosForUniqueWork(PublishWorker.LOCAL_NAME).get().size)
+        assertEquals(1, WorkManager.getInstance(app).getWorkInfosForUniqueWork(PublishWorker.NAME).get().size)
+        assertEquals(xyz.rycerz.apofis.push.PushState.Registering, container.push.ui.value.state)
+        // The local job: the only place that sends it, after the marker.
+        assertTrue(container.push.reconcileLocal())
+        assertEquals(listOf("unregister g1 tok-g1", "save io.heckel.ntfy", "register g2"), fake.calls)
+        assertEquals("registered under the epoch the switch advanced", connectionEpoch(app), xyz.rycerz.apofis.push.registrationOf(push)?.epoch)
         assertTrue(!push.contains(Keys.REVOKE))
     }
 
     @Test
+    fun aThrowingUnregisterKeepsTheRevocationUntilSent() = runTest {
+        val container = AppContainer(app, store, port) { db }
+        container.connect(Credentials("https://a.example/", "key-a"))
+        assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
+            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1", connectionEpoch(app)).encode()).commit())
+        fake.subscribed += "tok-g1"
+        throwAtUnregister = true
+        container.connect(Credentials("https://b.example/", "key-b")) // the switch claims no revocation
+        assertTrue(!container.push.reconcileLocal()) // the local job fails: the entry stays, the job retries
+        assertTrue(push.contains(Keys.REVOKE))
+        assertEquals(xyz.rycerz.apofis.push.PushState.Registering, container.push.ui.value.state)
+        throwAtUnregister = false
+        assertTrue(container.push.reconcileLocal())
+        assertTrue(!push.contains(Keys.REVOKE))
+        assertTrue("the old subscription is gone", "tok-g1" !in fake.subscribed)
+    }
+
+    @Test
     fun theRevocationIsOnDiskBeforeTheMarker() = runTest {
-        // WorkManager holds its work (no process of this test runs it): the next start below finishes the revocation.
-        val held = java.util.concurrent.Executor { }
-        WorkManagerTestInitHelper.initializeTestWorkManager(app, androidx.work.Configuration.Builder().setTaskExecutor(held).setExecutor(held).build())
         val container = AppContainer(app, store, port) { db }
         container.connect(Credentials("https://a.example/", "key-a"))
         assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
@@ -155,7 +168,7 @@ class PushSwitchTest {
         val ctx = xyz.rycerz.apofis.push.LogContext(app, xyz.rycerz.apofis.push.EventLog(), null, sink)
         container.beforeSwitch = { // the switch has begun (its generation already advanced): a MESSAGE for the old token
             xyz.rycerz.apofis.push.PushReceiver().receive(ctx, android.content.Intent("org.unifiedpush.android.connector.MESSAGE")
-                .setPackage(app.packageName).putExtra("token", "tok-g1").putExtra("bytesMessage", byteArrayOf(1)), {}) { }
+                .setPackage(app.packageName).putExtra("token", "tok-g1").putExtra("bytesMessage", byteArrayOf(1)), {}, schedule = {})
         }
         container.connect(Credentials("https://b.example/", "key-b"))
         assertEquals(0, wakes)
