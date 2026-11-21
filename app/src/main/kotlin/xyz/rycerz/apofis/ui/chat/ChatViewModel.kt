@@ -8,6 +8,9 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -127,8 +130,12 @@ class ChatViewModel(
     private val sessionKey: String,
     private val connected: Connected,
     online: Flow<Boolean> = flowOf(true),
-    private val onSendAccepted: () -> Unit = {}, // the composer took a send (the first one asks for notifications)
 ) : ViewModel(), ChatActions {
+    private val accepted = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /** Emits when the composer took a send; the screen asks for notifications on the first (the view model holds no UI). */
+    val sendAccepted: SharedFlow<Unit> = accepted.asSharedFlow()
+
     private val repo = connected.repo
     private val follower = connected.follower
     private val composer = connected.composer // draft, send in flight and send failure: outlive this view model
@@ -225,7 +232,7 @@ class ChatViewModel(
         }
         if (started != null) {
             local.update { it.copy(composerNote = null) }
-            onSendAccepted()
+            accepted.tryEmit(Unit)
         }
     }
 

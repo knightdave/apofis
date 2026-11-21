@@ -13,6 +13,11 @@ import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
@@ -609,13 +614,132 @@ class NotifierTest {
         val release = CountDownLatch(1)
         notifier.beforeAck = { release.await(10, TimeUnit.SECONDS) }
         notifier.notice(B, "run_b", 1, Notice.FINISHED, "run:run_b", gen, replay = false) // holds the lane
-        repeat(100) {
-            notifier.clearNeedsAnswer(A, "run_a", gen)
-            notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p$it:$gen", gen, replay = false)
-        }
-        assertTrue("pending ${notifier.pending}", notifier.pending <= 2)
+        repeat(100) { notifier.clearNeedsAnswer(A, "run_a", gen) } // the same state read again and again
+        repeat(100) { notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) }
+        assertTrue("pending ${notifier.pending}", notifier.pending <= 3) // the held finish, one clear, one request
         release.countDown()
         notifier.idle()
+    }
+
+    @Test
+    fun deliveredReportsAFailedDecision() = runTest {
+        start()
+        val since = notifier.mark()
+        notifier.beforePost = { error("the post failed") }
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", A, null, "waiting_for_approval", 1))
+        notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false)
+
+        try {
+            notifier.delivered(since)
+            fail("a failed hand-off was reported as delivered")
+        } catch (_: NoticeNotDelivered) {
+        }
+        notifier.beforePost = {}
+        notifier.delivered(notifier.mark()) // later work is judged on its own
+    }
+
+    @Test
+    fun stoppedLaneFailsWaitersInsteadOfHanging() = runTest {
+        val lane = CoroutineScope(Job())
+        notifier = Notifier(app, prefs, db, { gen }, { visible }, lane)
+        val hold = CompletableDeferred<Unit>()
+        notifier.beforeAck = { hold.await() }
+        val since = notifier.mark()
+        notifier.notice(A, "run_a", 1, Notice.FINISHED, "run:run_a", gen, replay = false)
+        val waiter = async(Dispatchers.IO) { runCatching { notifier.delivered(since) } }
+        awaitUntilPending(1)
+
+        lane.cancel() // the lane's scope ends while the item is held
+
+        val outcome = withContext(Dispatchers.IO) { withTimeout(10_000) { waiter.await() } } // a watchdog
+        assertTrue(outcome.exceptionOrNull() is NoticeNotDelivered)
+        assertTrue(runCatching { notifier.delivered(notifier.mark()) }.exceptionOrNull() is NoticeNotDelivered) // and later ones
+    }
+
+    private suspend fun awaitUntilPending(n: Int) = withContext(Dispatchers.IO) {
+        repeat(2000) {
+            if (notifier.pending >= n) return@withContext
+            Thread.sleep(5)
+        }
+        fail("not pending")
+    }
+
+    /** Holds the lane on a finish of chat B until the returned gate opens. */
+    private suspend fun holdLane(): CompletableDeferred<Unit> {
+        val hold = CompletableDeferred<Unit>()
+        var once = true
+        notifier.beforeAck = { if (once) { once = false; hold.await() } }
+        notifier.notice(B, "run_hold", 1, Notice.FINISHED, "run:run_hold", gen, replay = false)
+        awaitUntilPending(1)
+        return hold
+    }
+
+    @Test
+    fun staleClearNeverErasesANewerRequest() = runTest {
+        start()
+        db.activeRunDao().upsert(ActiveRunEntity("run_new", A, null, "waiting_for_approval", 2))
+        val hold = holdLane()
+        notifier.notice(A, "run_new", 2, Notice.NEEDS_ANSWER, "req:run_new:p1:$gen", gen, replay = false)
+        notifier.clearNeedsAnswer(A, "run_old", gen) // a late retirement of the previous run
+        hold.complete(Unit)
+        notifier.idle()
+
+        assertEquals("req:run_new:p1:$gen", shown(A)?.extras?.getString("xyz.rycerz.apofis.event"))
+    }
+
+    @Test
+    fun retirementSurvivesALateHandOver() = runTest {
+        start()
+        ask(A, "run_a", 1, "p1")
+        val hold = holdLane()
+        notifier.clearNeedsAnswer(A, "run_a", gen) // a 404 settled the run
+        db.activeRunDao().delete("run_a")
+        notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) // accepted earlier, handed over late
+        hold.complete(Unit)
+        notifier.idle()
+
+        assertNull(shown(A))
+    }
+
+    @Test
+    fun startupRetiresARequestSupersededBySuppression() = runTest {
+        start()
+        ask(A, "run_a", 1, "pA")
+        // B of the same run was decided as not shown; the process died before A was cancelled.
+        db.noticeStateDao().upsert(
+            xyz.rycerz.apofis.db.NoticeStateEntity(A, gen, 1, "run_a", "NEEDS_ANSWER", "req:run_a:pB:$gen", """["req:run_a:pA:$gen","!req:run_a:pB:$gen"]"""),
+        )
+
+        start().replayOutbox()
+
+        assertNull(shown(A))
+    }
+
+    @Test
+    fun overflowShowsAnAmbiguousRequestSilently() = runTest {
+        start()
+        for (i in 1..8) ask(A, "run_a", 1, "p$i")
+        assertTrue(loud(A))
+        ask(A, "run_a", 1, "p9") // the set is full: shown, without an alert
+        assertEquals("req:run_a:p9:$gen", shown(A)!!.extras.getString("xyz.rycerz.apofis.event"))
+        assertTrue(!loud(A))
+
+        ask(A, "run_a", 1, "p1") // evicted from the eight ids: maybe new, maybe not
+
+        assertEquals("req:run_a:p1:$gen", shown(A)!!.extras.getString("xyz.rycerz.apofis.event"))
+        assertTrue(!loud(A))
+    }
+
+    @Test
+    fun dismissalSurvivesUnrelatedTraffic() = runTest {
+        start()
+        ask(A, "run_a", 1, "p1")
+        nm.cancel(A, active().single().id) // dismissed
+        for (i in 1..70) ask(B, "run_b$i", i.toLong(), "q$i")
+
+        ask(A, "run_a", 1, "p1") // the next ordinary read of the same request
+
+        assertNull(shown(A))
     }
 
     @Test

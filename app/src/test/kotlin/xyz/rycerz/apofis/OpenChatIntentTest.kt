@@ -138,6 +138,20 @@ class OpenChatIntentTest {
     }
 
     @Test
+    fun disconnectedStartCancelsOtherEpochNotifications() = runTest {
+        post("apofis-a") // posted under the current epoch
+        app.getSharedPreferences(CACHE_PREFS, android.content.Context.MODE_PRIVATE).edit()
+            .putLong("connection_epoch", container.epoch() + 1).commit() // a switch moved on, then the process died
+
+        val next = AppContainer(app, CredentialStore(app) { key }) { db } // no usable credentials
+        assertNull(next.load())
+        next.notifier.idle()
+        next.notifier.idle()
+
+        assertTrue(nm.activeNotifications.isEmpty())
+    }
+
+    @Test
     fun everythingElseIgnored() = runTest {
         val g = container.epoch()
         post("apofis-a")

@@ -165,6 +165,7 @@ class RunFollower(
      */
     suspend fun settle(runId: String): String? {
         if (foreground) return null // a follower owns it
+        val since = onNotice.mark()
         val run = db.activeRunDao().get(runId) ?: return null
         val status = try {
             refresher(run).read().status
@@ -172,8 +173,9 @@ class RunFollower(
             null
         }
         if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
-        // Outside every lock: a background check reports done only once its notices are posted or durably decided.
-        onNotice.delivered()
+        // Outside every lock: a background check reports done only once its notices are posted or durably decided;
+        // NoticeNotDelivered otherwise, so its caller retries.
+        onNotice.delivered(since)
         return status
     }
 

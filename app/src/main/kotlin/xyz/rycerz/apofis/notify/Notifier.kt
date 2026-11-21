@@ -12,15 +12,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.service.notification.StatusBarNotification
 import androidx.room.withTransaction
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.completeWith
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import xyz.rycerz.apofis.MainActivity
@@ -46,9 +46,18 @@ enum class Notice { FINISHED, FAILED, NEEDS_ANSWER }
 fun interface NoticeSink {
     suspend fun notice(sessionKey: String, runId: String, runStartedAt: Long, notice: Notice, eventId: String, generation: Long, replay: Boolean)
 
-    /** Returns once everything handed over before is delivered (posted, or durably decided). */
-    suspend fun delivered() {}
+    /** A position before the events a caller is about to hand over; pass it to [delivered]. */
+    fun mark(): Long = 0
+
+    /**
+     * Returns once every event handed over after [since] (and before this call) is posted or durably decided; throws
+     * [NoticeNotDelivered] when one of them failed or the notifier stopped. Never waits forever.
+     */
+    suspend fun delivered(since: Long) {}
 }
+
+/** A handed-over notice was not delivered: the background caller should retry. */
+class NoticeNotDelivered : Exception("notice not delivered")
 
 /** The tap target of a chat's notification; also the PendingIntent's identity, so each chat has its own. */
 @SuppressLint("UseKtx") // androidx.core is not a direct dependency
@@ -67,8 +76,13 @@ fun ensureChannels(context: Context) {
     )
 }
 
-/** A control transition of one chat waiting in the lane; a later one replaces it (the latest accepted state wins). */
-private class Control(@Volatile var op: suspend () -> Unit)
+/** One lane operation: [seq] orders it for receipts, [done] (if any) learns its outcome. */
+private class Item(val seq: Long, val op: suspend () -> Unit, val done: CompletableDeferred<Unit>?)
+
+/** The last control transition queued for a chat, while not yet taken by the lane; an identical one is not queued again. */
+private class Control(val id: String) {
+    var taken = false // guarded by the notifier's control lock
+}
 
 /**
  * Posts one generic notification per chat from verified run state, never from a push.
@@ -77,7 +91,8 @@ private class Control(@Volatile var op: suspend () -> Unit)
  * current connection epoch when it acts and does nothing on a mismatch but remove its own stale row or notification;
  * a switch bumps the epoch inside the lane, so no delivery can pass the check and post after it. Per chat, an event of
  * an older run (start time, then id) is dropped, a finish replaces its own run's request, and nothing of a run follows
- * its finish; a request alerts once. The lane holds at most one sweep and one control transition per chat.
+ * its finish; a request alerts once. The lane holds at most one sweep, and never two identical control transitions of
+ * one chat in a row.
  */
 class Notifier(
     private val context: Context,
@@ -88,11 +103,15 @@ class Notifier(
     scope: CoroutineScope,
 ) : NoticeSink {
     private val nm = context.getSystemService(NotificationManager::class.java)
-    private val lane = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+    private val lane = Channel<Item>(Channel.UNLIMITED)
+    private val seq = AtomicLong()
+    private val failed = ConcurrentSkipListSet<Long>() // seqs of operations that failed, the last 64
     private val sweepQueued = AtomicBoolean()
     private val queued = AtomicInteger()
-    private val controls = ConcurrentHashMap<String, Control>()
-    private val postedHere = LinkedHashSet<String>() // request events posted by this process; lane only
+    private val controls = HashMap<String, Control>() // guarded by itself
+    // Chats whose current run's requests this process has already reconciled ("<epoch>:<run>"); lane only. Per chat,
+    // so unrelated traffic never evicts it: after the first look, an already decided request is never shown again.
+    private val reconciled = HashMap<String, String>()
 
     /** Test-only: runs in the lane before a delivery's final transaction, to fail or hold it there. */
     internal var beforeAck: suspend () -> Unit = {}
@@ -101,70 +120,111 @@ class Notifier(
     internal var beforePost: suspend () -> Unit = {}
 
     init {
+        // The only consumer, for the scope's life: each item's failure goes to that item's waiter and to the receipts;
+        // when the scope ends, the mailbox closes and every waiting or later item fails instead of hanging.
         scope.launch(Dispatchers.IO) {
-            for (op in lane) {
-                try {
-                    op()
-                    queued.decrementAndGet()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    queued.decrementAndGet() // an outbox row whose delivery failed stays for the next replay
-                }
+            try {
+                for (item in lane) run(item)
+            } finally {
+                lane.close()
+                while (true) fail(lane.tryReceive().getOrNull() ?: break)
             }
         }
         // A chat hidden, deleted or evicted takes its notification and order with it, after any delivery in flight.
         scope.launch { db.invalidationTracker.createFlow("SessionEntity", emitInitialState = false).collect { requestSweep() } }
     }
 
-    private fun enqueue(op: suspend () -> Unit) {
+    private suspend fun run(item: Item) {
+        try {
+            item.op()
+            item.done?.complete(Unit)
+        } catch (e: CancellationException) {
+            fail(item, e)
+            throw e
+        } catch (e: Exception) {
+            fail(item, e) // an outbox row whose delivery failed stays for the next replay
+        } finally {
+            queued.decrementAndGet()
+        }
+    }
+
+    private fun fail(item: Item, cause: Throwable? = null) {
+        failed += item.seq
+        while (failed.size > 64) failed.pollFirst()
+        item.done?.completeExceptionally(cause ?: NoticeNotDelivered())
+    }
+
+    private fun enqueue(op: suspend () -> Unit, done: CompletableDeferred<Unit>? = null) {
+        val item = Item(seq.incrementAndGet(), op, done)
         queued.incrementAndGet()
-        lane.trySend(op)
+        if (lane.trySend(item).isFailure) {
+            queued.decrementAndGet()
+            fail(item)
+        }
     }
 
     /** Operations handed over and not yet finished; for tests. */
     internal val pending: Int get() = queued.get()
 
     private suspend fun <T> inLane(op: suspend () -> T): T {
-        val done = CompletableDeferred<T>()
-        enqueue { done.completeWith(runCatching { op() }) }
-        return done.await()
+        val result = CompletableDeferred<T>()
+        val done = CompletableDeferred<Unit>()
+        enqueue({ result.complete(op()) }, done)
+        done.await() // throws the operation's failure, or the lane's stop
+        return result.await()
     }
 
-    /** Returns once every operation handed over before has run. */
+    /** Returns once every operation handed over before has run (or throws if the lane stopped). */
     internal suspend fun idle() = inLane {}
 
-    override suspend fun delivered() = idle()
+    override fun mark(): Long = seq.get()
+
+    override suspend fun delivered(since: Long) {
+        val upTo = seq.get()
+        try {
+            idle()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            throw NoticeNotDelivered()
+        }
+        if (failed.subSet(since, false, upTo, true).isNotEmpty()) throw NoticeNotDelivered()
+    }
 
     fun ensureChannels() = ensureChannels(context)
 
     /** Hands the event to the lane and returns. A finish is queued as is; a request takes the chat's control slot. */
     override suspend fun notice(sessionKey: String, runId: String, runStartedAt: Long, notice: Notice, eventId: String, generation: Long, replay: Boolean) {
         val e = NoticeStateEntity(sessionKey, generation, runStartedAt, runId, notice.name, eventId)
-        if (notice == Notice.NEEDS_ANSWER) control(sessionKey) { request(e) } else enqueue { finish(e, replay) }
+        if (notice == Notice.NEEDS_ANSWER) control(sessionKey, eventId) { request(e) } else enqueue({ finish(e, replay) })
     }
 
-    /** No answer is pending any more for [runId]: its request notification goes, never another run's notice. */
-    fun clearNeedsAnswer(sessionKey: String, runId: String, generation: Long) = control(sessionKey) {
+    /**
+     * No answer is pending any more for [runId] of [generation]: the request notification it was issued for goes (the
+     * displayed run and epoch must match), never another run's notice. Queued in order with every request, so a newer
+     * request handed over later still follows it.
+     */
+    fun clearNeedsAnswer(sessionKey: String, runId: String, generation: Long) = control(sessionKey, "clear:$generation:$runId") {
         if (generation == generation()) {
             shownIn(sessionKey).filter { it.extra(EXTRA_KIND) == Notice.NEEDS_ANSWER.name && it.extra(EXTRA_RUN) == runId && it.epoch() == generation }
                 .forEach { nm.cancel(sessionKey, it.id) }
         }
     }
 
-    private fun control(key: String, op: suspend () -> Unit) {
-        val slot = Control(op)
-        val queued = controls.putIfAbsent(key, slot)
-        if (queued != null) {
-            queued.op = op
-            // Taken by the lane meanwhile: this transition needs its own place.
-            if (controls[key] === queued) return
-            controls[key] = slot
+    /** Queues [op] unless the chat's last queued, not yet taken transition is the same one ([id]); never reorders. */
+    private fun control(key: String, id: String, op: suspend () -> Unit) {
+        val c = synchronized(controls) {
+            val last = controls[key]
+            if (last != null && !last.taken && last.id == id) return
+            Control(id).also { controls[key] = it }
         }
-        enqueue {
-            controls.remove(key, slot)
-            slot.op()
-        }
+        enqueue({
+            synchronized(controls) {
+                c.taken = true
+                if (controls[key] === c) controls.remove(key)
+            }
+            op()
+        })
     }
 
     /** Cleanup that reads nothing about chats: rows and notifications of another epoch. Safe while disconnected. */
@@ -187,7 +247,7 @@ class Notifier(
             val s = db.noticeStateDao().get(key)?.takeIf { it.generation == current }
             val request = sbn.extra(EXTRA_KIND) == Notice.NEEDS_ANSWER.name
             val runGone = request && db.activeRunDao().get(sbn.extra(EXTRA_RUN).orEmpty()) == null
-            val decided = s != null && (s.eventId == sbn.extra(EXTRA_EVENT) || (request && s.notice == Notice.NEEDS_ANSWER.name && s.runId == sbn.extra(EXTRA_RUN)))
+            val decided = s != null && s.eventId == sbn.extra(EXTRA_EVENT) // exactly the chat's latest decision
             if (runGone || !decided) nm.cancel(key, sbn.id)
         }
         for (row in db.noticeOutboxDao().all(current)) {
@@ -196,7 +256,7 @@ class Notifier(
     }
 
     /** The chat ([generation], [sessionKey]) was opened: its notification goes. */
-    fun cancel(sessionKey: String, generation: Long) = enqueue { if (generation == generation()) nm.cancel(sessionKey, ID) }
+    fun cancel(sessionKey: String, generation: Long) = enqueue({ if (generation == generation()) nm.cancel(sessionKey, ID) })
 
     /** A server switch: [bump] commits the new epoch inside the lane, then every notification, row and order goes. */
     suspend fun switchEpoch(bump: () -> Unit) = inLane {
@@ -204,14 +264,14 @@ class Notifier(
         nm.cancelAll()
         db.noticeOutboxDao().clear()
         db.noticeStateDao().clear()
-        postedHere.clear()
+        reconciled.clear()
     }
 
     private fun requestSweep() {
-        if (sweepQueued.compareAndSet(false, true)) enqueue {
+        if (sweepQueued.compareAndSet(false, true)) enqueue({
             sweepQueued.set(false) // a change during this sweep queues the next one
             sweep()
-        }
+        })
     }
 
     /** Notifications of another epoch or of a chat that is gone or hidden go, with the order of such chats. */
@@ -270,7 +330,8 @@ class Notifier(
 
     /**
      * A request: alerts once per request id. Its order is written before the post, so a death after it never alerts
-     * again; after a death before or after the post, a request already decided but not in the tray is re-posted silently.
+     * again. The first look at an already decided request in a process is the process-death path: re-posted silently
+     * if it is not in the tray. Any later look in the same process never shows it again (a dismissal stays).
      */
     private suspend fun request(e: NoticeStateEntity) {
         if (e.generation != generation()) return
@@ -279,10 +340,15 @@ class Notifier(
         // Each entry is an event id, prefixed with SUPPRESSED when it was deliberately not shown.
         val alerted = if (sameRun) Json.decodeFromString<List<String>>(s!!.alerted) else emptyList()
         var silent = false
+        val run = "${e.generation}:${e.runId}"
+        val firstLook = reconciled[e.sessionKey] != run
+        reconciled[e.sessionKey] = run
         if (alerted.any { it.removePrefix(SUPPRESSED) == e.eventId }) {
             if (SUPPRESSED + e.eventId in alerted) return // consumed: never shown later
-            if (e.eventId in postedHere || shownIn(e.sessionKey).any { it.extra(EXTRA_EVENT) == e.eventId }) return
+            if (!firstLook || shownIn(e.sessionKey).any { it.extra(EXTRA_EVENT) == e.eventId }) return
             silent = true // decided before a death: posted or not, it comes back without a second alert
+        } else if (alerted.size >= MAX_ALERTED) {
+            silent = true // the set overflowed: this may be an evicted request, so it is shown without an alert
         }
         val title = title(e.sessionKey)
         val show = showable(e, title)
@@ -291,8 +357,6 @@ class Notifier(
         db.noticeStateDao().upsert(e.copy(alerted = Json.encodeToString(kept.takeLast(MAX_ALERTED))))
         if (!show) return nm.cancel(e.sessionKey, ID)
         post(e, title!!, silent)
-        postedHere += e.eventId
-        if (postedHere.size > 64) postedHere.remove(postedHere.first())
     }
 
     private fun allowed(notice: Notice): Boolean {

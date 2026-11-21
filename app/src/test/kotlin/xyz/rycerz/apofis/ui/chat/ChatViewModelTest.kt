@@ -152,9 +152,7 @@ class ChatViewModelTest {
 
     private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
-    private var accepted = 0
-
-    private fun vm(): ChatViewModel = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected, online) { accepted++ } } })
+    private fun vm(): ChatViewModel = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected, online) } })
         .get("vm${created++}", ChatViewModel::class).also { vms += it }
 
     private fun json(body: String, code: Int = 200) =
@@ -268,6 +266,8 @@ class ChatViewModelTest {
     fun onlyAnAcceptedSendIsReported() = runTest {
         addSession()
         val vm = vm()
+        var accepted = 0
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.sendAccepted.collect { accepted++ } }
         vm.onSendClick() // a stale enabled button with nothing to send: the composer takes nothing
         assertEquals(0, accepted)
 

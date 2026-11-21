@@ -16,6 +16,7 @@ import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -29,7 +30,9 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.NoticeOutboxEntity
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.notify.Notice
+import xyz.rycerz.apofis.notify.NoticeNotDelivered
 import xyz.rycerz.apofis.notify.NoticeSink
+import xyz.rycerz.apofis.sync.SendQueue
 import xyz.rycerz.apofis.sync.ChatRepository
 
 private const val KEY = "apofis-a"
@@ -245,8 +248,10 @@ class FollowerNoticeTest {
                     log += "handed over"
                 }
 
-                override suspend fun delivered() {
-                    log += "delivered"
+                override fun mark(): Long = 41
+
+                override suspend fun delivered(since: Long) {
+                    log += "delivered after $since"
                 }
             },
             generation = { GEN },
@@ -256,7 +261,32 @@ class FollowerNoticeTest {
         f.settle(RUN)
         log += "returned"
 
-        assertEquals(listOf("handed over", "delivered", "returned"), log)
+        assertEquals(listOf("handed over", "delivered after 41", "returned"), log)
+    }
+
+    @Test
+    fun undeliveredNoticeMakesTheWorkerRetry() = runTest {
+        lateinit var f: RunFollower
+        f = RunFollower(
+            api, db, repo, backgroundScope, delayMs = {},
+            onNotice = object : NoticeSink {
+                override suspend fun notice(sessionKey: String, runId: String, runStartedAt: Long, notice: Notice, eventId: String, generation: Long, replay: Boolean) = Unit
+
+                override suspend fun delivered(since: Long) = throw NoticeNotDelivered()
+            },
+            generation = { GEN },
+        )
+        messages()
+        on(STATUS, status("completed"))
+        on("/v1/runs", json("""{"run_id":"run_2","status":"started","replayed":false}""", 202))
+        stored()
+        val queue = SendQueue(api, db, f, System::currentTimeMillis, settle = { f.settle(it) })
+        queue.enqueue(KEY, "second")
+
+        assertFalse(queue.drainSettlingRuns()) // the run settled and the next message went out, yet the notice did not
+
+        assertNull(db.activeRunDao().get(RUN))
+        assertEquals("run_2", db.activeRunDao().forSession(KEY)!!.runId)
     }
 
     @Test

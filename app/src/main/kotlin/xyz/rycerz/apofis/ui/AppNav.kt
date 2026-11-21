@@ -63,7 +63,7 @@ import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_MIN_SDK
 import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_PERMISSION
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
 import androidx.lifecycle.compose.LifecycleStartEffect
-import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.mutableIntStateOf
 import xyz.rycerz.apofis.notify.rememberAskNotificationsOnce
 
 enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT, LICENSES }
@@ -84,14 +84,7 @@ fun AppNav(container: AppContainer) {
     }
     val conn = connection
     val toOpen by container.chatToOpen.collectAsState()
-    var tapped by remember(conn) { mutableStateOf<String?>(null) } // a checked tap of this graph, for the chat route
-    // The one consumer of a tap: checked against the live graph now; a stale one is dropped and changes no screen.
-    LaunchedEffect(toOpen, conn) {
-        val request = toOpen ?: return@LaunchedEffect
-        container.chatOpened(request)
-        tapped = container.tapTarget(request, conn) ?: return@LaunchedEffect
-        chosen = Screen.CHAT
-    }
+    var taps by remember(conn) { mutableIntStateOf(0) } // taps this graph selected, for the chat route to show
     // Without a connection only Connect makes sense; a failed reconnect that ended disconnected stays on its screen.
     val screen = when {
         conn == null && chosen != Screen.RECONNECT -> Screen.CONNECT
@@ -100,6 +93,20 @@ fun AppNav(container: AppContainer) {
 
     // Holds the drawer (open chat, drafts): outlives the chat screen (Settings, Connection), not the connection.
     val chatOwner = key(conn) { rememberViewModelStoreOwner() }
+
+    // The one consumer of a tap. Its epoch is checked where the drawer selects and stores the chat, in the same step;
+    // only a selection that happened changes the screen, so a stale tap changes nothing.
+    if (conn != null) {
+        val drawer = drawerOf(container, conn, chatOwner)
+        LaunchedEffect(toOpen, drawer) {
+            val request = toOpen ?: return@LaunchedEffect
+            container.chatOpened(request)
+            if (drawer.selectTapped(request.second) { container.tapTarget(request, conn) != null }) {
+                taps++
+                chosen = Screen.CHAT
+            }
+        }
+    }
 
     when (screen) {
         Screen.CONNECT, Screen.RECONNECT -> key(screen) {
@@ -128,7 +135,7 @@ fun AppNav(container: AppContainer) {
             BackHandler(enabled = canGoBack, onBack = leave)
             ConnectScreen(vm, onBack = if (canGoBack) leave else null)
         }
-        Screen.CHAT -> if (conn != null) ChatRoute(container, conn, chatOwner, tapped, onTapped = { tapped = null }, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })
+        Screen.CHAT -> if (conn != null) ChatRoute(container, conn, chatOwner, taps, onSettings = { chosen = Screen.SETTINGS }, onConnection = { chosen = Screen.RECONNECT })
         Screen.SETTINGS -> {
             BackHandler { chosen = Screen.CHAT }
             val scope = rememberCoroutineScope()
@@ -162,9 +169,9 @@ fun AppNav(container: AppContainer) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner, tapped: String?, onTapped: () -> Unit, onSettings: () -> Unit, onConnection: () -> Unit) {
+private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner, taps: Int, onSettings: () -> Unit, onConnection: () -> Unit) {
     val prefs = container.preferences
-    val drawer = viewModel(viewModelStoreOwner = owner) { DrawerViewModel(conn, lastChat = prefs.lastChat, onSelected = { prefs.lastChat = it }) }
+    val drawer = drawerOf(container, conn, owner)
     val selected by drawer.selected.collectAsState()
     val loadFailed by drawer.loadFailed.collectAsState()
     val rows by drawer.rows.collectAsState()
@@ -189,14 +196,12 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     }
     BackHandler(drawerState.isOpen) { scope.launch { drawerState.close() } }
     LaunchedEffect(showArchived, archived.isEmpty()) { if (showArchived && archived.isEmpty()) showArchived = false }
-    LaunchedEffect(tapped) {
-        val key = tapped ?: return@LaunchedEffect
-        onTapped()
-        drawer.onSelect(key) // the drawer checks the row again
-        showArchived = false
+    LaunchedEffect(taps) {
+        if (taps == 0) return@LaunchedEffect
+        showArchived = false // a tapped chat is shown, not the archive or the drawer over it
         drawerState.close()
     }
-    val askNotifications by rememberUpdatedState(rememberAskNotificationsOnce(container.notifyPrefs))
+    val askNotifications = rememberAskNotificationsOnce(container.notifyPrefs) // this activity's launcher
 
     val open = object : DrawerActions by drawer {
         override fun onSelect(key: String) {
@@ -258,12 +263,14 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                     // Scoped to this chat being on screen: leaving clears the view model, its collectors and its
                     // connectivity subscription. Its draft lives in the connection's holder, not here.
                     val chatOwner = rememberViewModelStoreOwner()
-                    // The first send the composer accepts asks for the notification permission, once ever.
-                    val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) { askNotifications() } }
+                    val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
+                    // The first send the composer accepts asks for the notification permission, once ever, through the
+                    // launcher of the composition that is collecting (the view model holds none).
+                    LaunchedEffect(vm, askNotifications) { vm.sendAccepted.collect { askNotifications() } }
                     LaunchedEffect(vm) { drawer.reopened.drop(1).filterNotNull().filter { it.key == sessionKey }.collect { vm.onOpened() } }
                     val state by vm.state.collectAsState()
                     // Its notification is never posted while it is on screen in a started activity.
-                    LifecycleStartEffect(sessionKey) {
+                    LifecycleStartEffect(conn, sessionKey) {
                         container.chatShown(conn.generation, sessionKey, true)
                         onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
                     }
@@ -273,4 +280,11 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         }
     }
     prompt?.let { PromptHost(it, drawer) }
+}
+
+/** The drawer of [conn], held by [owner]; the same instance wherever it is asked for. */
+@Composable
+private fun drawerOf(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner): DrawerViewModel {
+    val prefs = container.preferences
+    return viewModel(viewModelStoreOwner = owner) { DrawerViewModel(conn, lastChat = prefs.lastChat, onSelected = { prefs.lastChat = it }) }
 }

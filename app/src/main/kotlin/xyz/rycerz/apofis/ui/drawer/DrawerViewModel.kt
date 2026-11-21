@@ -203,6 +203,23 @@ class DrawerViewModel(
         }
     }
 
+    /**
+     * A notification tap: under the same lock as every selection, selects and stores [key] only if the row is usable
+     * and [current] (the tap still belongs to this live graph) holds, checked in the same step. True when it did.
+     */
+    suspend fun selectTapped(key: String, current: () -> Boolean): Boolean = try {
+        ops.withLock {
+            if (!usable(key) || !current()) return@withLock false
+            if (selectedFlow.value == key) reopenedFlow.value = Reopen(key, tokens.incrementAndGet()) else selectedFlow.value = key
+            onSelected(key) // stored now, not later by the collector of a graph that may be closing
+            true
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        false // closed by a server switch
+    }
+
     /** A chat that can be shown: its row exists here and is not hidden. */
     private suspend fun usable(key: String) = db.sessionDao().get(key)?.hidden == false
 

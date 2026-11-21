@@ -30,7 +30,7 @@ class NotificationAccessTest {
     }
 
     private fun access() = notificationAccess(app, prefs)
-    private fun ask() = askNotificationsOnce(app, prefs) { asks += it }
+    private fun ask() = askNotificationsOnce(app, prefs).also { if (it) asks += Manifest.permission.POST_NOTIFICATIONS }
 
     @Test
     @Config(sdk = [31])
