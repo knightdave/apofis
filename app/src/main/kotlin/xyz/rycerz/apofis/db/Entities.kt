@@ -68,3 +68,18 @@ data class ReplyOutcomeEntity(
     val outcome: String,
     val detail: String?,
 )
+
+/**
+ * A finish notice written in the same transaction that settles its run ([eventId] `run:<runId>`), so a process death
+ * before the notification is posted cannot lose it. [notice] is a Notice name; [generation] the connection it came from.
+ */
+@Entity
+data class NoticeOutboxEntity(
+    @PrimaryKey val eventId: String,
+    val sessionKey: String,
+    val runId: String,
+    val runStartedAt: Long,
+    val notice: String,
+    val generation: Long,
+    val createdAt: Long,
+)

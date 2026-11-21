@@ -238,3 +238,24 @@ interface ReplyOutcomeDao {
     @Upsert
     suspend fun upsert(o: ReplyOutcomeEntity)
 }
+
+@Dao
+interface NoticeOutboxDao {
+    @Query("SELECT * FROM NoticeOutboxEntity ORDER BY runStartedAt, runId")
+    suspend fun all(): List<NoticeOutboxEntity>
+
+    @Query("SELECT * FROM NoticeOutboxEntity WHERE eventId = :eventId")
+    suspend fun get(eventId: String): NoticeOutboxEntity?
+
+    @Upsert
+    suspend fun upsert(row: NoticeOutboxEntity)
+
+    @Query("DELETE FROM NoticeOutboxEntity WHERE eventId = :eventId")
+    suspend fun delete(eventId: String)
+
+    @Query("DELETE FROM NoticeOutboxEntity WHERE generation != :generation")
+    suspend fun deleteOtherGenerations(generation: Long)
+
+    @Query("DELETE FROM NoticeOutboxEntity")
+    suspend fun clear()
+}

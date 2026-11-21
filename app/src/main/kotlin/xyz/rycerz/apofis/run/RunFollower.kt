@@ -35,7 +35,10 @@ import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.chat.buildTranscript
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
+import xyz.rycerz.apofis.db.NoticeOutboxEntity
 import xyz.rycerz.apofis.db.ReplyOutcomeEntity
+import xyz.rycerz.apofis.notify.Notice
+import xyz.rycerz.apofis.notify.NoticeSink
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.PendingState
 import xyz.rycerz.apofis.sync.RunStarter
@@ -88,6 +91,9 @@ class RunFollower(
     private val delayMs: suspend (Long) -> Unit = { delay(it) },
     private val onRunFinished: suspend (sessionKey: String) -> Unit = {},
     private val active: () -> Boolean = { true }, // false once this follower's connection is closed
+    private val onNotice: NoticeSink = NoticeSink { _, _, _, _, _, _, _ -> },
+    private val onControlsCleared: (key: String, runId: String, requestId: String) -> Unit = { _, _, _ -> },
+    private val generation: () -> Long = { 0 }, // this follower's connection, captured into every notice it hands on
 ) : RunStarter {
     private val lives = ConcurrentHashMap<String, MutableStateFlow<LiveReply?>>()
     private val jobs = HashMap<String, Job>() // by run id; it also guards [foreground] and [stopping]
@@ -102,6 +108,9 @@ class RunFollower(
 
     /** Test-only: runs at the start of Finish's database phase, to cancel or fail it there. */
     internal var beforeFinishWrite: suspend RunFollower.() -> Unit = {}
+
+    /** Test-only: runs in Finish's transaction right after the outbox row is written, to fail it there. */
+    internal var afterOutboxWrite: suspend RunFollower.() -> Unit = {}
 
     /** Test-only: runs after a status read has returned and been recorded, before its result is applied. */
     internal var beforeStatusApply: suspend RunFollower.() -> Unit = {}
@@ -149,16 +158,18 @@ class RunFollower(
      * For the send worker while the app is in the background, where no follower runs: one status read of [runId]. A run
      * that ended, or that the server no longer knows, is finished by the same transcript transaction as a follower's
      * Finish, whose hand-off drains the queue. No stream is opened; a run still going is left for a later check.
+     * Returns the status read (null: nothing was read, or the server no longer knows the run).
      */
-    suspend fun settle(runId: String) {
-        if (foreground) return // a follower owns it
-        val run = db.activeRunDao().get(runId) ?: return
+    suspend fun settle(runId: String): String? {
+        if (foreground) return null // a follower owns it
+        val run = db.activeRunDao().get(runId) ?: return null
         val status = try {
             refresher(run).read().status
         } catch (_: ApiError.NotFound) {
             null
         }
         if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
+        return status
     }
 
     /** Stops the run the user saw ([runId] of [sessionKey]); nothing when it is gone, never the run that followed it. */
@@ -245,6 +256,7 @@ class RunFollower(
         private val tickets = AtomicLong()
         private val applying = Mutex()
         private var applied = 0L // guarded by [applying]
+        private var asked: String? = null // the approval or clarify request last handed on as a notice; guarded by [applying]
         private val stopping = Mutex() // guards the two fields below and orders the stop intent's writes
         private var stopsInFlight = 0
         private var stopAccepted = false // by the server, for this run; also true for an intent stored before a restart
@@ -274,6 +286,7 @@ class RunFollower(
          * stream event passes no ticket. False when the database failed: nothing was shown and the caller retries.
          */
         suspend fun publish(status: String, pending: PendingControl?, ticket: Long? = null): Boolean = withContext(NonCancellable) {
+            var notice: (suspend () -> Unit)? = null
             try {
                 beforeStatusStore(status)
                 applying.withLock {
@@ -286,11 +299,41 @@ class RunFollower(
                     } else {
                         val accepted = held == stored(status)
                         edit(run) { it.copy(status = held, pending = if (accepted) pending else null) }
+                        if (accepted && status !in TERMINAL) notice = noticeFor(pending)
                     }
                 }
-                true
             } catch (_: SQLException) {
-                false
+                return@withContext false
+            }
+            try {
+                notice?.invoke() // outside the lock: it reads the database and talks to the OS
+            } catch (_: Exception) {
+                // the status is stored and shown; a failing notification must not undo that
+            }
+            true
+        }
+
+        /**
+         * Under [applying], for an accepted non-terminal status: a newly pending approval or clarify request becomes a
+         * NEEDS_ANSWER notice (not stored: the next accepted read derives it again); no pending control any more
+         * clears the request last handed on.
+         */
+        private fun noticeFor(pending: PendingControl?): (suspend () -> Unit)? {
+            val request = pending?.takeIf { it.kind == "approval" || it.kind == "clarify" }?.requestId
+            val last = asked
+            val key = run.sessionKey
+            val id = run.runId
+            val gen = generation()
+            return when {
+                request != null && request != last -> {
+                    asked = request
+                    { onNotice.notice(key, id, run.startedAt, Notice.NEEDS_ANSWER, "req:$id:$request:$gen", gen, false) }
+                }
+                pending == null && last != null -> {
+                    asked = null
+                    { onControlsCleared(key, id, last) }
+                }
+                else -> null
             }
         }
 
@@ -453,6 +496,7 @@ class RunFollower(
         private var unsaved = 0
         private var savedAt = System.nanoTime()
         private val toolStarts = HashMap<String, Double>()
+        private var outboxRow: NoticeOutboxEntity? = null // written by the last write(); handed on only once it committed
 
         suspend fun run() {
             state(key).update { if (it?.runId == id) it else LiveReply(id, run.status, "", emptyList(), null, Connection.LIVE) }
@@ -680,8 +724,21 @@ class RunFollower(
             // Still owned, checked under the repository lock that a switch, a cache clear and a delete also take: a closed
             // connection's follower settles nothing (a same-server switch keeps the row for the new one), and a deleted
             // or cleared run never comes back. There is no foreign key to refuse an orphan outcome.
+            outboxRow = null
             if (!active()) return false
             val owned = db.activeRunDao().get(id)?.takeIf { it.sessionKey == key && db.sessionDao().get(key) != null } ?: return false
+            val notice = when (status) {
+                "completed" -> Notice.FINISHED
+                "failed", "interrupted" -> Notice.FAILED // interrupted also ends a resolved unknown run
+                else -> null // cancelled (a stop), or gone from the server: nothing verified to tell
+            }
+            if (notice != null) {
+                // In this transaction: a process death after the commit still leaves the notice to replay.
+                val row = NoticeOutboxEntity("run:$id", key, id, owned.startedAt, notice.name, generation(), System.currentTimeMillis())
+                db.noticeOutboxDao().upsert(row)
+                afterOutboxWrite()
+                outboxRow = row
+            }
             val stopped = owned.stopRequested
             val outcome = when (status) {
                 "failed" -> ReplyOutcome.FAILED
@@ -712,6 +769,15 @@ class RunFollower(
             refreshers -= id
             state(key).update { if (it?.runId == id) null else it }
             if (!settled) return
+            outboxRow?.let { row ->
+                try {
+                    onNotice.notice(key, id, row.runStartedAt, Notice.valueOf(row.notice), row.eventId, row.generation, false)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // the row stays in the outbox for the next replay
+                }
+            }
             try {
                 onRunFinished(key)
             } catch (e: CancellationException) {

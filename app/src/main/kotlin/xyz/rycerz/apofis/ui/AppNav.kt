@@ -62,6 +62,8 @@ import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_MIN_SDK
 import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_PERMISSION
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
+import androidx.lifecycle.compose.LifecycleStartEffect
+import xyz.rycerz.apofis.notify.rememberAskNotificationsOnce
 
 enum class Screen { CONNECT, CHAT, SETTINGS, RECONNECT, LICENSES }
 
@@ -80,6 +82,8 @@ fun AppNav(container: AppContainer) {
         return
     }
     val conn = connection
+    val toOpen by container.chatToOpen.collectAsState()
+    LaunchedEffect(toOpen) { if (toOpen != null) chosen = Screen.CHAT } // a notification tap: the chat route selects it
     // Without a connection only Connect makes sense; a failed reconnect that ended disconnected stays on its screen.
     val screen = when {
         conn == null && chosen != Screen.RECONNECT -> Screen.CONNECT
@@ -177,6 +181,15 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     }
     BackHandler(drawerState.isOpen) { scope.launch { drawerState.close() } }
     LaunchedEffect(showArchived, archived.isEmpty()) { if (showArchived && archived.isEmpty()) showArchived = false }
+    LaunchedEffect(drawer) {
+        container.chatToOpen.filterNotNull().collect {
+            drawer.onSelect(it)
+            showArchived = false
+            drawerState.close()
+            container.chatOpened(it)
+        }
+    }
+    val askNotifications = rememberAskNotificationsOnce(container.notifyPrefs)
 
     val open = object : DrawerActions by drawer {
         override fun onSelect(key: String) {
@@ -241,7 +254,14 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                     val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
                     LaunchedEffect(vm) { drawer.reopened.drop(1).filterNotNull().filter { it.key == sessionKey }.collect { vm.onOpened() } }
                     val state by vm.state.collectAsState()
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton)
+                    // Its notification is never posted while it is on screen in a started activity.
+                    LifecycleStartEffect(sessionKey) {
+                        container.chatShown(sessionKey, true)
+                        onStopOrDispose { container.chatShown(sessionKey, false) }
+                    }
+                    // The first send asks for the notification permission, once ever.
+                    val actions = remember(vm) { object : ChatActions by vm { override fun onSendClick() { askNotifications(); vm.onSendClick() } } }
+                    ChatScreen(state, actions, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton)
                 }
             }
         }
