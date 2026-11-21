@@ -36,7 +36,7 @@ GATEWAY_PATH = ("/home/hermes/.local/bin:/home/hermes/.nix-profile/bin:/etc/prof
                 "/run/wrappers/bin:/run/current-system/sw/bin")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_apofis_push import Quarantine, account  # noqa: E402  (one cleanup routine for suite and check)
+from test_apofis_push import Quarantine, account, slots_free  # noqa: E402  (one cleanup routine for suite and check)
 INSTALLED = "/home/hermes/.hermes/agent-hooks/apofis_push.py"
 RELEASE_OPTS = "--allow-origin https://ntfy.sh"
 APP = "apofis-1b4e28ba-2fa1-11d2-883f-0016d3cca427"
@@ -125,6 +125,28 @@ def wait(cond, what):
     raise SystemExit("FAIL: timed out waiting for " + what)
 
 
+def teardown(slots, script, stop, home, keep, wait=WATCHDOG + 30):
+    """Account for every child first (an interrupt is held until accounting finishes); only then stop the
+    fake (`stop`) and remove the home. If accounting fails, keep both until the slots are free (the
+    child's hard deadline bounds that), say what was kept, and fail."""
+    interrupted = None
+    while True:
+        try:
+            account(slots, script, wait)
+            break
+        except KeyboardInterrupt as e:
+            interrupted = e
+        except Quarantine as e:
+            print("FAIL: %s; kept the throwaway home %s and the fake's port until the slots are free" % (e, home))
+            slots_free(slots, wait)
+            raise SystemExit(1)
+    stop()
+    if not keep:
+        shutil.rmtree(home)
+    if interrupted:
+        raise interrupted
+
+
 def main():
     keep = "--keep" in sys.argv[1:]
     readme = readme_command()
@@ -142,7 +164,6 @@ def main():
     fake = Fake()
     origin = "http://127.0.0.1:%d" % fake.port
     db = sqlite3.connect(os.path.join(home, "state.db"), isolation_level=None)
-    quarantined = False
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript("""
@@ -203,17 +224,8 @@ def main():
         with open(os.path.join(state, "apofis-push.log")) as f:
             print("hook log:\n" + f.read().replace(origin, "http://127.0.0.1:<port>"), end="")
     finally:
-        try:
-            account(slots, script)
-        except Quarantine as e:
-            quarantined = True
-            print("FAIL: %s; throwaway home kept: %s" % (e, t))
         db.close()
-        fake.httpd.shutdown()
-        if not quarantined and not keep:
-            shutil.rmtree(t)
-    if quarantined:
-        raise SystemExit(1)
+        teardown(slots, script, fake.httpd.shutdown, t, keep)
     after = tree_state()
     changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
     assert not changed, "Hermes install tree changed: %s" % changed[:20]

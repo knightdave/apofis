@@ -605,8 +605,8 @@ def run_send(o: dict, home: str, now, monotonic, sleep, opener) -> int:
 # --- check ----------------------------------------------------------------------------------------
 
 def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
-    """The summary prints nothing until it is built; --ids streams a capped listing. Any failure or
-    interruption exits 3."""
+    """Reads everything, closes the database, and only then prints. Exit 0 complete, 4 incomplete
+    (--ids capped or a field shortened), 3 failed or interrupted."""
     lines = ["python %s" % sys.version.split()[0],
              "SSL_CERT_FILE %s" % ("set" if env.get("SSL_CERT_FILE") else "unset"),
              "origins %s" % (" ".join(o["origins"] + o["http_origins"]) or "none")]
@@ -614,18 +614,13 @@ def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
     if o["--ids"]:
         prefix = "apofis-push-%s-" % o["--only-install"]
 
-        def work(conn):  # streamed, at most MAX_REGS rows, every field bounded in SQL
-            out.write("\n".join(lines + ["db opened read-only"]) + "\n")
-            n = 0
-            for row in conn.execute("SELECT substr(id, 1, 64), substr(title, 1, 200), substr(source, 1, 32), hidden "
-                                    "FROM sessions WHERE id >= ? AND id < ? ORDER BY id LIMIT ?",
-                                    (prefix, prefix[:-1] + ".", MAX_REGS + 1)):
-                n += 1
-                if n > MAX_REGS:
-                    out.write("truncated after %d rows\n" % MAX_REGS)
-                    break
-                out.write("\t".join(re.sub(r"[\x00-\x1f\x7f]", "?", str(c)) for c in row) + "\n")
-            out.flush()
+        def work(conn):  # at most MAX_REGS + 1 rows, every field bounded in SQL, with shortening flags
+            return conn.execute(
+                "SELECT substr(id, 1, 64), substr(title, 1, 200), substr(source, 1, 32), "
+                "CASE WHEN typeof(hidden) = 'integer' AND hidden IN (0, 1) THEN hidden END, "
+                "length(id) > 64 OR length(title) > 200 OR length(source) > 32 "
+                "FROM sessions WHERE id >= ? AND id < ? ORDER BY id LIMIT ?",
+                (prefix, prefix[:-1] + ".", MAX_REGS + 1)).fetchall()
     else:
         def work(conn):
             return registration_rows(conn, now_s, o.get("--only-install"))
@@ -633,22 +628,29 @@ def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
     if status != "ok":
         out.write("\n".join(lines + ["skipped " + status]) + "\n")
         return 3
-    if o["--ids"]:
-        return 0
     lines.append("db opened read-only")
-    rows, more = result
-    for rid, started, endpoint in rows:
-        m = RECORD_RE.fullmatch(rid)
-        if not m:
-            continue
-        v = validate_endpoint(endpoint, o["origins"], o["http_origins"]) if endpoint is not None else "prompt"
-        state = "refused %s" % v if isinstance(v, str) else "valid %s" % v[0]
-        lines.append("apofis-push-%s...-%s %s age=%dd" % (m.group(1)[:8], m.group(2), state,
-                                                          max(0, now_s - started) // 86400))
-    lines.append("regs=%d%s" % (len(rows), "+" if more else ""))
+    code = 0
+    if o["--ids"]:
+        rows = result[:MAX_REGS]
+        for row in rows:
+            lines.append("\t".join(re.sub(r"[\x00-\x1f\x7f]", "?", "?" if c is None else str(c)) for c in row[:4]))
+        if len(result) > MAX_REGS or any(r[3] is None or r[4] for r in rows):
+            lines.append("incomplete: capped at %d rows or a field shortened" % MAX_REGS)
+            code = 4
+    else:
+        rows, more = result
+        for rid, started, endpoint in rows:
+            m = RECORD_RE.fullmatch(rid)
+            if not m:
+                continue
+            v = validate_endpoint(endpoint, o["origins"], o["http_origins"]) if endpoint is not None else "prompt"
+            state = "refused %s" % v if isinstance(v, str) else "valid %s" % v[0]
+            lines.append("apofis-push-%s...-%s %s age=%dd" % (m.group(1)[:8], m.group(2), state,
+                                                              max(0, now_s - started) // 86400))
+        lines.append("regs=%d%s" % (len(rows), "+" if more else ""))
     out.write("\n".join(lines) + "\n")
     out.flush()
-    return 0
+    return code
 
 
 def main(argv, stdin, env, now=time.time, spawn=subprocess.Popen, opener=None, lock=fcntl.flock,

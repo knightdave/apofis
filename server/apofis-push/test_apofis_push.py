@@ -454,6 +454,46 @@ class Counting:
 # ---------------------------------------------------------------------------
 
 
+class WireTeardownTest(unittest.TestCase):
+    """hermes_wire_check.teardown: the fake and the throwaway home are released only after every child is
+    accounted for; an interruption waits for accounting; a failure keeps both and fails."""
+
+    def test_failed_accounting_keeps_home_and_port(self):
+        import hermes_wire_check as w
+        fx = Fixture(self)
+        held = fx.hold(fx.slot_path(0))  # a holder that is not a verified hook child
+        self.addCleanup(os.close, held)
+        with open(fx.slot_path(0), "w") as f:
+            f.write(str(os.getpid()))
+        stop = mock.Mock()
+        out = io.StringIO()
+        with mock.patch.object(signal, "pidfd_send_signal") as send, contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                w.teardown([fx.slot_path(0), fx.slot_path(1)], SCRIPT, stop, fx.dir, keep=False, wait=0.2)
+        send.assert_not_called()
+        stop.assert_not_called()
+        self.assertTrue(os.path.isdir(fx.dir))
+        self.assertIn(fx.dir, out.getvalue())
+
+    def test_interrupt_waits_for_accounting(self):
+        import hermes_wire_check as w
+        fx = Fixture(self)
+        stop = mock.Mock()
+        calls = []
+
+        def account(slots, script, watchdog):
+            calls.append(stop.called)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return "ended"
+        with mock.patch.object(w, "account", account):
+            with self.assertRaises(KeyboardInterrupt):
+                w.teardown([fx.slot_path(0)], SCRIPT, stop, fx.dir, keep=False)
+        self.assertEqual(calls, [False, False], "accounting finished before anything was released")
+        stop.assert_called_once()
+        self.assertFalse(os.path.isdir(fx.dir))
+
+
 class StartupTest(unittest.TestCase):
     def test_bad_options_exit_2_without_side_effects(self):
         for i, opt in enumerate((["--allow-origin", "http://ntfy.sh"], ["--allow-http-origin", "http://localhost:1"],
@@ -1122,6 +1162,21 @@ class SnapshotTest(unittest.TestCase):
         code, opener = fx.send()
         self.assertEqual(len(opener.calls), 1)
 
+    def test_check_prints_only_after_the_connection_closed(self):
+        fx = Fixture(self)
+        fx.record()
+        conns = self.tracked()
+        test = self
+
+        class Out(io.StringIO):
+            def write(self, text):
+                test.assertTrue(conns and all(c.closed for c in conns), "output while the database is open")
+                return super().write(text)
+        for i, argv in enumerate((["check", "--state-db", fx.db],
+                                  ["check", "--only-install", INSTALL, "--ids", "--state-db", fx.db])):
+            with self.subTest(case=i):
+                self.assertEqual(ap.main(argv, io.BytesIO(b""), fx.env(), now=lambda: NOW, stdout=Out()), 0)
+
     def test_busy_timeout_logged_as_busy(self):
         fx = Fixture(self)
         fx.app()
@@ -1361,20 +1416,22 @@ class SendTest(unittest.TestCase):
 
 
 class DeadlineTest(unittest.TestCase):
-    def test_hard_deadline_from_production_entry_point(self):
-        """The real CLI, from a copy whose only change is a shorter CHILD_HARD, under an inherited blocked
-        SIGALRM mask; the test arms no alarm. A request held forever ends in death by SIGALRM with the slot
-        released; without the production arm the child would run to the soft deadline and exit 0."""
+    def run_copy(self, replace):
+        """The real CLI from a disposable copy of the script with `replace` applied, a held request, a
+        slot passed in and SIGALRM blocked by inheritance; the test arms no alarm. Returns (fx, server,
+        returncode, elapsed)."""
         fx = Fixture(self)
         server = Server(self, hold=True)
         fx.app(started=time.time())
         fx.record(endpoint=server.endpoint, started=time.time())
         with open(SCRIPT) as f:
             text = f.read()
-        self.assertEqual(text.count("\nCHILD_HARD = 25 "), 1)
+        for a, b in replace:
+            self.assertEqual(text.count(a), 1)
+            text = text.replace(a, b)
         copy = os.path.join(fx.state, "apofis_push.py")
         with open(copy, "w") as f:
-            f.write(text.replace("\nCHILD_HARD = 25 ", "\nCHILD_HARD = 2 "))
+            f.write(text)
         fd = fx.hold(fx.slot_path(0))
         old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})  # inherited by the child
         try:
@@ -1388,8 +1445,26 @@ class DeadlineTest(unittest.TestCase):
             signal.pthread_sigmask(signal.SIG_SETMASK, old)
             os.close(fd)
         self.addCleanup(lambda: p.poll() is None and (os.killpg(p.pid, signal.SIGKILL), p.wait(WATCHDOG)))
-        self.assertEqual(p.wait(WATCHDOG), -signal.SIGALRM)
-        self.assertLess(time.monotonic() - start, ap.SOFT_DEADLINE)
+        rc = p.wait(WATCHDOG)
+        return fx, server, rc, time.monotonic() - start
+
+    def test_request_in_flight_at_soft_deadline(self):
+        """The held request is abandoned at the soft deadline: a 'deadline' line, a normal exit and a free
+        slot, long before the hard deadline (an unbounded join would wait for SIGALRM instead)."""
+        fx, server, rc, elapsed = self.run_copy([("\nCHILD_HARD = 25 ", "\nCHILD_HARD = 20 "),
+                                                 ("\nSOFT_DEADLINE = 20 ", "\nSOFT_DEADLINE = 1 ")])
+        self.assertEqual(rc, 0)
+        self.assertLess(elapsed, 20)
+        self.assertEqual(len(server.requests), 1, "no new POST after the soft deadline")
+        self.assertRegex(fx.log_text(), r"on_session_end deadline regs=1\n$")
+        self.assertTrue(slot_free(fx.slot_path(0)))
+
+    def test_hard_deadline_from_production_entry_point(self):
+        """Only CHILD_HARD shortened: a request held forever ends in death by SIGALRM with the slot released;
+        without the production arm the child would run until its request times out and exit 0."""
+        fx, server, rc, elapsed = self.run_copy([("\nCHILD_HARD = 25 ", "\nCHILD_HARD = 2 ")])
+        self.assertEqual(rc, -signal.SIGALRM)
+        self.assertLess(elapsed, ap.SOFT_DEADLINE)
         self.assertTrue(server.entered.is_set())
         self.assertTrue(slot_free(fx.slot_path(0)))
 
@@ -1625,17 +1700,24 @@ class CheckTest(unittest.TestCase):
             ["apofis-push-%s-2" % INSTALL, "t?x?y", "cli", "0"],
         ])
 
-    def test_ids_listing_capped(self):
+    def test_ids_incomplete_listing_exits_4(self):
         fx = Fixture(self)
         for s in range(1, 41):
             fx.record(seq=str(s))
-        fx.w.execute("UPDATE sessions SET title = ? WHERE id = ?", ("t" * 10000, "apofis-push-%s-1" % INSTALL))
-        code, out = fx.run(["check", "--only-install", INSTALL, "--ids", "--state-db", fx.db])
-        self.assertEqual(code, 0)
-        rows = [line for line in out.splitlines() if line.startswith("apofis-push-")]
-        self.assertEqual(len(rows), 32)
-        self.assertTrue(out.endswith("truncated after 32 rows\n"))
-        self.assertLessEqual(max(len(r) for r in rows), 64 + 200 + 32 + 10)
+        argv = ["check", "--only-install", INSTALL, "--ids", "--state-db", fx.db]
+        code, out = fx.run(argv)  # more rows than the cap
+        self.assertEqual(code, 4)
+        self.assertEqual(len([line for line in out.splitlines() if line.startswith("apofis-push-")]), 32)
+        self.assertTrue(out.endswith("incomplete: capped at 32 rows or a field shortened\n"))
+        for i, (column, value) in enumerate((("title", "t" * 10000), ("hidden", 7), ("hidden", "x"))):
+            with self.subTest(case=i):  # one row, one oversized or unrepresentable field
+                fx = Fixture(self)
+                rid = fx.record()
+                fx.w.execute("UPDATE sessions SET %s = ? WHERE id = ?" % column, (value, rid))
+                code, out = fx.run(argv[:-1] + [fx.db])
+                self.assertEqual(code, 4)
+                self.assertIn("incomplete:", out)
+                self.assertLessEqual(max(len(line) for line in out.splitlines()), 64 + 200 + 32 + 10)
 
     def test_ids_requires_install(self):
         fx = Fixture(self)
