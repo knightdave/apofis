@@ -67,6 +67,11 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
  * Writes blur-cost.txt, a screenshot per mode while the list moves under the glass button, and one per mode after the
  * keyboard was shown (asserted from the window insets and the composer's position) and hidden again (asserted restored).
  * No server, no key, no model run. Real time is unavoidable: it measures real frames.
+ *
+ * Limits, kept on purpose (blur ships off; this measures, it does not gate): the drag samples delivered frame metrics
+ * and may skip frame indices; "glass seen" is the button's visibility condition, not a check that its pixels were
+ * drawn; allocation counts are process-wide; the list's endpoint padding is not measured with the keyboard open (the
+ * composer and the scroll button are). Software GL on the emulator is not a phone GPU.
  */
 @RunWith(AndroidJUnit4::class)
 class BlurCostTest {
@@ -93,7 +98,7 @@ class BlurCostTest {
     fun measure() {
         ActivityScenario.launch(ComponentActivity::class.java).use { scenario ->
             val order = listOf(true, false, false, true) // balanced: drift over the run affects both modes alike
-            val phases = order.mapIndexed { i, blur -> blur to phase(scenario, blur, shots = i < 2) }
+            val phases = order.mapIndexed { i, blur -> blur to phase(scenario, blur, shots = i < 2, index = i) }
             fun summary(blur: Boolean): Triple<Double, Double, Double> {
                 val mine = phases.filter { it.first == blur }.map { it.second }
                 val sorted = mine.flatMap { it.durations }.sorted()
@@ -154,9 +159,10 @@ class BlurCostTest {
         }
     }
 
-    private fun phase(scenario: ActivityScenario<ComponentActivity>, blur: Boolean, shots: Boolean): Phase {
+    private fun phase(scenario: ActivityScenario<ComponentActivity>, blur: Boolean, shots: Boolean, index: Int): Phase {
         val name = if (blur) "blur-on" else "blur-off"
         val growing = mutableStateOf(false)
+        val text = mutableStateOf("") // this phase's own reply text
         lateinit var list: LazyListState
         lateinit var activity: ComponentActivity
         for (attempt in 1..3) { // the current instance; set again if a configuration change recreated it meanwhile
@@ -169,13 +175,18 @@ class BlurCostTest {
                 @Suppress("DEPRECATION")
                 it.window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE) // as MainActivity's manifest entry
                 it.window.decorView.viewTreeObserver.addOnDrawListener(listener) // before the content: its first frame counts
-                it.setContent { key(blur, attempt) { Bench(blur, growing) { l -> list = l } } }
+                it.setContent { key(index, attempt) { Bench(blur, growing, text) { l -> list = l } } } // a new composition per phase
             }
             runCatching { await("the first frame of $name", 10_000) { compositions.get() > 0 && draws.get() > drawsBefore } }
             instrumentation.runOnMainSync { activity.window.decorView.viewTreeObserver.removeOnDrawListener(listener) }
             if (current(scenario) === activity && activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && draws.get() > drawsBefore) break
             Log.i(TAG, "$name: no frames or the activity was recreated (attempt $attempt)")
+            check(attempt < 3) { "$name: no frame of this phase's content after 3 attempts" }
         }
+        // Each phase starts alike: no reply text yet, the list at the bottom.
+        var start = Triple(-1, -1, -1)
+        instrumentation.runOnMainSync { start = Triple(text.value.length, list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset) }
+        check(start == Triple(0, 0, 0)) { "$name (phase $index) did not start reset: text, index, offset = $start" }
         val view = activity.window.decorView
         val x = view.width / 2f
         val top = view.height * 0.35f
@@ -285,6 +296,23 @@ class BlurCostTest {
         runCatching { await("the composer to move up by $shift px") { kotlin.math.abs(restTop - fieldTop() - shift) <= 4 } }
             .onFailure { throw IllegalStateException("composer top ${fieldTop()} (was $restTop), expected a shift of $shift px", it) }
         Log.i(TAG, "$name: keyboard shown, composer top $restTop -> ${fieldTop()}")
+        // With the keyboard open the scroll button follows the composer up: shown by a held drag, it lies above it.
+        Finger(x, top).apply {
+            for (i in 1..10) {
+                move(top + amplitude * i / 20)
+                SystemClock.sleep(16)
+            }
+            var button = Rect()
+            await("the scroll button with the keyboard open") {
+                instrumentation.uiAutomation.rootInActiveWindow?.findAccessibilityNodeInfosByText("Scroll to the latest message")?.firstOrNull()?.let {
+                    it.refresh()
+                    button = Rect().also(it::getBoundsInScreen)
+                    true
+                } ?: false
+            }
+            check(button.bottom <= fieldTop()) { "the scroll button $button is not above the composer (top ${fieldTop()}) with the keyboard open" }
+            up()
+        }
         instrumentation.runOnMainSync { activity.window.insetsController?.hide(WindowInsets.Type.ime()) }
         await("the keyboard to hide") { !imeShown() }
         await("the composer to return") { kotlin.math.abs(fieldTop() - restTop) <= 2 }
@@ -302,11 +330,10 @@ class BlurCostTest {
 
     @OptIn(ExperimentalComposeUiApi::class)
     @Composable
-    private fun Bench(blur: Boolean, growing: MutableState<Boolean>, onList: (LazyListState) -> Unit) {
+    private fun Bench(blur: Boolean, growing: MutableState<Boolean>, text: MutableState<String>, onList: (LazyListState) -> Unit) {
         ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = false, blur = blur) {
             val list = rememberLazyListState()
             onList(list)
-            val text = remember { mutableStateOf("") }
             val merger = remember { LiveMerger { NOW } }
             SideEffect { compositions.incrementAndGet() }
             LaunchedEffect(growing.value) {

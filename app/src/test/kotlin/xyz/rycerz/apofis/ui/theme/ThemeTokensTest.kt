@@ -85,6 +85,8 @@ class ThemeTokensTest {
             floor("actionIcon", c.actionIcon, page, 3.0)
             floor("warning", c.warning, page, 3.0)
             floor("warning on cardFill", c.warning, c.cardFill, 3.0)
+            // The scroll button without blur: its glass fill over its own page backplate, whatever content lies under it.
+            floor("scroll arrow on its fill-only button", scheme.onSurface, c.glassButtonFill.compositeOver(page), 3.0)
         }
         assertEquals(emptyList<String>(), failures)
     }

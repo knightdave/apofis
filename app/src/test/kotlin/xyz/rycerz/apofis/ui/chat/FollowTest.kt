@@ -54,6 +54,9 @@ class FollowTest {
         assertTrue(onScrollSettled(released, 56 * density, threshold).following) // the boundary is inside
         assertFalse(onScrollSettled(released, 57 * density, threshold).following)
         assertFalse(onScrollSettled(following, 57 * density, threshold).following)
+        // A reader released outside the zone loses any hold: an external scroll cancels the handoff.
+        assertEquals(FollowState(false, 0), onScrollSettled(onRunEnded(following, 1000), 57 * density, threshold))
+        assertEquals(1000L + Motion.FOLLOW_HOLD, onScrollSettled(onRunEnded(following, 1000), 55 * density, threshold).holdUntilMs)
 
         assertFalse(shouldPin(released, contentGrew = true, atBottom = false, nowMs = 1000))
         assertTrue(shouldPin(following, contentGrew = true, atBottom = false, nowMs = 1000))
@@ -105,10 +108,11 @@ class FollowTest {
     private fun show(initial: ChatUiState, index: Int = 0, offset: Int = 0): (ChatUiState) -> Unit {
         rule.mainClock.autoAdvance = false
         var ui by mutableStateOf(initial)
+        val actions = object : ChatActions {} // stable, as the view model is in the app
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                 list = androidx.compose.foundation.lazy.rememberLazyListState(index, offset)
-                ChatScreen(ui, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list)
+                ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list)
             }
         }
         frames(10)
@@ -243,31 +247,61 @@ class FollowTest {
         assertTrue("distance ${distanceFromBottom()}", distanceFromBottom() > 112)
     }
 
-    /** I2: tapping the scroll button animates down; growth during the animation does not turn it into a jump. */
+    /** I2: the button's animation owns the scroll: growth during it requests no pin, even for a follower within 56 dp. */
     @Test
-    fun buttonAnimationIsNotTurnedIntoAJump() {
+    fun noPinDuringTheButtonAnimation() {
         val set = show(state(live(text(400))))
-        drag(1200f)
-        assertTrue(distanceFromBottom() > 112)
-        frames(10)
-        // Shown again by a scroll: a small drag away.
-        rule.onNode(hasScrollToIndexAction()).performTouchInput {
-            down(center)
-            moveBy(Offset(0f, 60f))
-            moveBy(Offset(0f, 60f))
-            up()
-        }
-        frames(2)
+        nudge(100f) // 50 dp up: still following, and the scroll shows the button
+        assertTrue(list.canScrollBackward)
         rule.onNodeWithContentDescription("Scroll to the latest message").performClick()
-        frames(3)
-        set(state(live(text(2000))))
-        frames(1)
-        assertFalse("jumped to the bottom", atBottom())
+        frames(2)
+        assertTrue("the animation runs", list.isScrollInProgress)
+        val pins = ChromeProbe.pins
+        for (i in 1..5) {
+            set(state(live(text(400 + i * 100))))
+            frames()
+        }
+        assertEquals("a pin was requested during the button's animation", pins, ChromeProbe.pins)
         frames(120)
-        assertTrue("${list.firstVisibleItemIndex}/${list.firstVisibleItemScrollOffset}", atBottom())
-        set(state(live(text(2400)))) // following again after the animation settled at the bottom
-        frames()
         assertTrue(atBottom())
+    }
+
+    /** I2: a handoff hold ends when the reader scrolls (without a drag) more than 56 dp away before it expires. */
+    @Test
+    fun externalScrollCancelsTheHandoffHold() {
+        val set = show(state(live(text(1200))))
+        assertTrue(atBottom())
+        set(state(null, history + AssistantReply("r99", emptyList(), text(1600), FIXED_NOW)))
+        frames(6) // the hold has started; still inside its 450 ms
+        rule.runOnUiThread { runBlocking { list.scrollBy(600f) } } // a keyboard or wheel scroll: 300 dp away
+        val held = anchor() // right after it: the next frames must not pull it back
+        assertFalse(atBottom())
+        for (f in 0..(Motion.FOLLOW_HOLD / 16 + 4)) {
+            frames()
+            assertEquals("frame $f: pulled back", held, anchor())
+        }
+    }
+
+    /** I1: restored with a saved position while the transcript is still empty, the reader stays a reader once it loads. */
+    @Test
+    fun restoredOverAnEmptyFirstLayoutStaysAReader() {
+        val set = show(ChatUiState("apofis-1", "Follow", StatusLine.IDLE, emptyList(), ComposerMode.SEND, "", "hermes.example"), index = 12, offset = 40)
+        frames(5)
+        set(state(live(text(400))))
+        frames(5)
+        assertFalse(atBottom())
+        val held = anchor()
+        for (i in 1..20) {
+            set(state(live(text(400 + i * 100))))
+            frames()
+            assertEquals("growth frame $i", held, anchor())
+        }
+        val position = list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset
+        set(state(null, history + AssistantReply("r99", emptyList(), text(2400), FIXED_NOW)))
+        for (f in 0..(Motion.FOLLOW_HOLD / 16 + 4)) {
+            frames()
+            assertTrue("hold frame $f: moved to the bottom", !atBottom())
+        }
     }
 
     /** The drag itself releases following: with the finger still down, growth and the run end move nothing. */
@@ -314,5 +348,27 @@ class FollowTest {
             frames()
             assertTrue("frame $i: pulled to ${distanceFromBottom()}", distanceFromBottom() > 112)
         }
+    }
+
+    /** I11: a streamed token recomposes only the transcript: not the header, not the composer, and no root measure. */
+    @Test
+    fun streamedTokensLeaveTheChromeAlone() {
+        val set = show(state(live(text(100))))
+        frames(5)
+        val bar = ChromeProbe.barCompositions
+        val bottom = ChromeProbe.bottomCompositions
+        val root = ChromeProbe.rootMeasures
+        for (i in 1..100) {
+            set(state(live(text(100 + i * 40))))
+            frames()
+        }
+        assertEquals("header recomposed by tokens", bar, ChromeProbe.barCompositions)
+        assertEquals("composer recomposed by tokens", bottom, ChromeProbe.bottomCompositions)
+        assertEquals("root measured by tokens", root, ChromeProbe.rootMeasures)
+        // Control: real chrome changes still reach them.
+        set(state(live(text(4200))).copy(title = "Renamed", draft = "typed"))
+        frames(2)
+        assertTrue(ChromeProbe.barCompositions > bar)
+        assertTrue(ChromeProbe.bottomCompositions > bottom)
     }
 }

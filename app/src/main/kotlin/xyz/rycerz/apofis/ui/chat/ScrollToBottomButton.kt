@@ -6,6 +6,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
@@ -46,7 +47,11 @@ internal fun ScrollToBottomButton(visible: Boolean, backdrop: BackdropState?, on
     ) {
         val colors = ApofisTheme.colors
         ApofisIconButton(onClick, stringResource(R.string.chat_scroll_to_bottom), visualSize = 28.dp) {
-            Box(Modifier.fillMaxSize().frostedGlass(backdrop, CircleShape, colors.glassButtonFill, colors.glassButtonBorder), contentAlignment = Alignment.Center) {
+            // Without blur the glass shows the content under it, which can be as light as the arrow (dark theme over a light
+            // patch): a page backplate keeps the arrow at its contrast against the fill whatever lies under the button.
+            val fillOnly = backdrop?.layer == null || !ApofisTheme.blur
+            val backplate = if (fillOnly) Modifier.background(MaterialTheme.colorScheme.surface, CircleShape) else Modifier
+            Box(Modifier.fillMaxSize().then(backplate).frostedGlass(backdrop, CircleShape, colors.glassButtonFill, colors.glassButtonBorder), contentAlignment = Alignment.Center) {
                 Icon(painterResource(R.drawable.lucide_arrow_down), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
             }
         }

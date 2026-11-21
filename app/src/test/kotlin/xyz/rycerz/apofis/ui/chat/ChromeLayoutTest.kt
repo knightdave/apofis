@@ -87,12 +87,13 @@ class ChromeLayoutTest {
     fun edgeToEdge() = rule.runOnUiThread { WindowCompat.setDecorFitsSystemWindows(rule.activity.window, false) }
 
     /** Window insets in px, as the system would dispatch them. */
-    private fun insets(ime: Int = 0, left: Int = 0, right: Int = 0) {
+    private fun insets(ime: Int = 0, left: Int = 0, right: Int = 0, top: Int = 0) {
         rule.runOnUiThread {
             val i = WindowInsetsCompat.Builder()
                 .setInsets(WindowInsetsCompat.Type.ime(), Insets.of(0, 0, 0, ime)).setVisible(WindowInsetsCompat.Type.ime(), ime > 0)
                 .setInsets(WindowInsetsCompat.Type.navigationBars(), Insets.of(left, 0, 0, 0))
                 .setInsets(WindowInsetsCompat.Type.displayCutout(), Insets.of(0, 0, right, 0))
+                .setInsets(WindowInsetsCompat.Type.statusBars(), Insets.of(0, top, 0, 0))
                 .build()
             ViewCompat.dispatchApplyWindowInsets(rule.activity.window.decorView, i)
         }
@@ -235,6 +236,10 @@ class ChromeLayoutTest {
         fun index(tag: String) = rule.onNode(hasTestTag(tag), useUnmergedTree = true).fetchSemanticsNode().config[SemanticsProperties.TraversalIndex]
         assertTrue(rule.onNode(hasTestTag("chat.key:apofis-1"), useUnmergedTree = true).fetchSemanticsNode().config[SemanticsProperties.IsTraversalGroup])
         assertTrue("bar ${index("chat.topbar")} < 0 < bottom ${index("chat.bottom")}", index("chat.topbar") < 0f && index("chat.bottom") > 0f)
+        // An index orders a container's descendants as a unit only when the container is a traversal group itself.
+        for (tag in listOf("chat.topbar", "chat.bottom")) {
+            assertTrue("$tag is a traversal group", rule.onNode(hasTestTag(tag), useUnmergedTree = true).fetchSemanticsNode().config[SemanticsProperties.IsTraversalGroup])
+        }
     }
 
     @Test
@@ -314,23 +319,27 @@ class ChromeLayoutTest {
     // ---- I6: horizontal insets ----
 
     private fun checkSideInsets(rtl: Boolean) {
-        val inset = 96f // px each side (48 dp)
-        insets(left = 96, right = 96)
+        val left = 96f // px: a side navigation bar
+        val right = 40f // px: a cutout on the other side
+        insets(left = 96, right = 40)
         show(chat(failed), rtl = rtl)
-        insets(left = 96, right = 96)
+        insets(left = 96, right = 40)
         val width = rule.onRoot().fetchSemanticsNode().size.width
         val drawer = bounds(hasContentDescription("Open chat list"))
         val newChat = bounds(hasContentDescription("New chat"))
-        for (r in listOf(drawer, newChat)) assertTrue("$r inside the insets", r.left >= inset - 1f && r.right <= width - inset + 1f)
+        for (r in listOf(drawer, newChat)) assertTrue("$r inside the insets", r.left >= left - 1f && r.right <= width - right + 1f)
         val rows = rule.onAllNodes(tagged("user:") or tagged("reply:"), useUnmergedTree = true).fetchSemanticsNodes().map { it.unclipped() }
-        for (r in rows) assertTrue("row $r inside the insets", r.left >= inset - 1f && r.right <= width - inset + 1f)
+        for (r in rows) assertTrue("row $r inside the insets", r.left >= left - 1f && r.right <= width - right + 1f)
         rule.mainClock.autoAdvance = false // the button hides 2 s after scrolling: look while it is shown
         rule.onNode(androidx.compose.ui.test.hasScrollToIndexAction()).performTouchInput { swipeDown(startY = top + height / 4, endY = bottom - height / 4) } // inside the uncovered area
         repeat(10) { rule.mainClock.advanceTimeByFrame() }
         val button = rule.onAllNodes(hasContentDescription("Scroll to the latest message"), useUnmergedTree = true).fetchSemanticsNodes()
         assertEquals(1, button.size)
         val b = button.single().boundsInRoot
-        assertTrue("scroll button $b inside the insets", b.left >= inset - 1f && b.right <= width - inset + 1f)
+        // At the end edge: its inset plus the 2 dp end gap of the 48 dp target (12 dp to the 28 dp circle).
+        val gap = px(2)
+        if (rtl) assertEquals("RTL: the button's distance to the left (end) edge", left + gap, b.left, 1.5f)
+        else assertEquals("the button's distance to the right (end) edge", right + gap, width - b.right, 1.5f)
     }
 
     @Test
@@ -343,11 +352,24 @@ class ChromeLayoutTest {
 
     // ---- I7: the load failure lies in the uncovered area and its Retry can be tapped ----
 
+    /** I7: with no room left for it (landscape, status bar, keyboard), no second, unreachable Retry is shown; the title's is. */
+    @Test
+    @Config(qualifiers = "w760dp-h360dp-land-xhdpi")
+    fun loadFailureWithoutRoomOffersOnlyTheTitleRetry() {
+        insets(top = 48, ime = 480)
+        show(ChatUiState("", "", StatusLine.LOAD_FAILED, emptyList(), ComposerMode.SEND_DISABLED, ""))
+        insets(top = 48, ime = 480) // 24 dp status bar, 240 dp keyboard in a 360 dp window
+        assertEquals(0, rule.onAllNodes(hasText("Try again") and androidx.compose.ui.test.hasClickAction()).fetchSemanticsNodes().size)
+        val titleRetry = rule.onAllNodes(SemanticsMatcher("retry from the title") { it.config.getOrNull(SemanticsActions.OnClick)?.label == "Try again" })
+            .fetchSemanticsNodes()
+        assertEquals(1, titleRetry.size)
+    }
+
     @Test
     @Config(qualifiers = "w360dp-h400dp-xhdpi")
     fun loadFailureRetryIsReachableWithTheKeyboard() {
         show(ChatUiState("", "", StatusLine.LOAD_FAILED, emptyList(), ComposerMode.SEND_DISABLED, ""))
-        insets(ime = 480) // 240 dp keyboard in a 400 dp window
+        insets(ime = 320) // 160 dp keyboard in a 400 dp window: a small region, still room for a Retry (scrolled to)
         val retry = hasText("Try again") and androidx.compose.ui.test.hasClickAction()
         rule.onNode(retry).performScrollTo()
         rule.waitForIdle()

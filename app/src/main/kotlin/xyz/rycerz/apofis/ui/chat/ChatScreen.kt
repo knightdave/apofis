@@ -3,6 +3,7 @@ package xyz.rycerz.apofis.ui.chat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -24,6 +25,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.layout.SubcomposeMeasureScope
+import androidx.compose.ui.layout.MeasureResult
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.foundation.layout.asPaddingValues
@@ -74,6 +78,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.key
+import androidx.compose.runtime.SideEffect
 import xyz.rycerz.apofis.chat.SendState
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
@@ -115,14 +120,32 @@ fun ChatScreen(
     val backdrop = rememberBackdropState()
     val density = LocalDensity.current
     var bottomContent by remember { mutableIntStateOf(0) } // the bottom area without the larger of keyboard and navigation bar, px
-    val surface = MaterialTheme.colorScheme.surface
-    val sides = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)
 
-    // Like a scaffold: the bottom area and the bar are measured first, then the body is composed with their heights,
-    // so the list's padding and the uncovered region never lag a frame behind (keyboard, notes, large text).
-    SubcomposeLayout(modifier.fillMaxSize().background(surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }) { constraints -> // the end-to-end tests read the open chat's key here
-        val loose = constraints.copy(minWidth = 0, minHeight = 0)
-        val bottom = subcompose(ChromeSlot.BOTTOM) {
+    // The slots read their inputs through these holders, so each recomposes only when its own inputs change: a streamed
+    // token changes the transcript, never the header's or the composer's inputs (equal values notify nothing).
+    val latest = rememberUpdatedState(state)
+    val barInput = rememberUpdatedState(ChatUiState("", state.title, state.status, emptyList(), ComposerMode.SEND_DISABLED, "", state.host))
+    val bottomInput = rememberUpdatedState(
+        BottomInput(
+            state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
+            state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed,
+        ),
+    )
+    val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
+    val callbacks = rememberUpdatedState(Callbacks(actions, onRetryLoad, zone, today))
+
+    val barSlot = remember {
+        @Composable {
+            SideEffect { ChromeProbe.barCompositions++ }
+            val c = barCallbacks.value
+            ChatTopBar(barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions, Modifier.blockTouchesBelow().coverForAccessibility(order = -1f))
+        }
+    }
+    val bottomSlot = remember {
+        @Composable {
+            SideEffect { ChromeProbe.bottomCompositions++ }
+            val input = bottomInput.value
+            val actions = callbacks.value.actions
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -134,99 +157,132 @@ fun ChatScreen(
                     .imePadding() // max(keyboard, navigation bar), applied once
                     .onSizeChanged { bottomContent = it.height },
             ) {
-                Column(Modifier.background(surface)) { // notes keep a backing of their own over scrolled text
-                    state.composerNote?.let { ComposerNoteLine(it) }
-                    if (linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
-                    state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
+                Column(Modifier.background(MaterialTheme.colorScheme.surface)) { // notes keep a backing of their own over scrolled text
+                    input.note?.let { ComposerNoteLine(it) }
+                    if (input.linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
+                    input.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                 }
                 Composer(
-                    state.draft,
-                    if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
-                    { actions.onDraftChange(it, state.draftRevision) },
+                    input.draft,
+                    input.mode,
+                    { actions.onDraftChange(it, input.draftRevision) },
                     onSend = {
                         linkFailed = false
                         actions.onSendClick()
                         follow.onSend()
                         scope.launch { listState.scrollToItem(0) }
                     },
-                    onStop = { state.live?.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
-                    busy = state.sending,
+                    onStop = { input.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
+                    busy = input.sending,
                 )
             }
-        }.single().measure(loose)
-        val bar = subcompose(ChromeSlot.BAR) {
-            ChatTopBar(state, onOpenConnection, onRetryLoad, navigationIcon, appBarActions, Modifier.blockTouchesBelow().coverForAccessibility(order = -1f))
-        }.single().measure(loose)
-        val barHeight = bar.height
-        val bottomArea = bottom.height
-        val body = subcompose(ChromeSlot.BODY) {
-            if (state.status == StatusLine.LOAD_FAILED) {
-                Uncovered(barHeight, bottomArea, fullScreen = false) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-                            WashTextButton(R.string.chat_load_retry, onRetryLoad)
-                        }
-                    }
-                }
-            } else {
-                val padding = PaddingValues(
-                    start = sides.asPaddingValues().calculateStartPadding(LocalLayoutDirection.current),
-                    end = sides.asPaddingValues().calculateEndPadding(LocalLayoutDirection.current),
-                    top = barHeight.toDp() + 8.dp,
-                    bottom = bottomArea.toDp() + 8.dp,
-                )
-                Uncovered(barHeight, bottomArea, fullScreen = true) {
-                    MessageList(
-                        state.items,
-                        state.live,
-                        state.notes,
-                        state.answering,
-                        actions,
-                        onCancel = { it.idempotencyKey?.let(actions::onCancel) },
-                        onStep = { detail = it },
-                        listState = listState,
-                        contentPadding = padding,
-                        zone = zone,
-                        today = today,
-                        modifier = Modifier
-                            .backdropSource(backdrop, surface)
-                            .drawWithContent {
-                                drawContent()
-                                // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
-                                // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom edge
-                                // (above the insets and the card's 8 dp outer margin, Composer.kt) and below it: text and
-                                // controls at the bottom are never washed out, text passing behind the composer fades.
-                                val gap = 8.dp.toPx()
-                                val rest = size.height - bottomArea - gap
-                                val edge = size.height - (bottomArea - bottomContent) - gap
-                                if (edge > rest) {
-                                    drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
-                                }
-                                drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
-                            },
-                        onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
-                    )
-                }
-                ScrollToBottomButton(
-                    visible = follow.buttonVisible,
-                    backdrop = backdrop,
-                    onClick = {
-                        follow.onButton()
-                        scope.launch { listState.animateScrollToItem(0) }
-                    },
-                    // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
-                    Modifier.windowInsetsPadding(sides).padding(end = 2.dp, bottom = 2.dp),
-                )
-            }
-        }.map { it.measure(loose) }
-        layout(constraints.maxWidth, constraints.maxHeight) {
-            body.first().place(0, barHeight) // the uncovered region
-            body.getOrNull(1)?.let { it.place(constraints.maxWidth - it.width, constraints.maxHeight - bottomArea - it.height) } // the scroll button
-            bottom.place(0, constraints.maxHeight - bottomArea, zIndex = 1f)
-            bar.place(0, 0, zIndex = 1f)
         }
     }
+    // The body for a pair of bar heights: the same lambda while they hold, so a token recomposes the body only through
+    // the state it reads; new heights compose it at once with the new padding (same pass, no stale frame).
+    val bodies = remember { BodyCache() }
+    val bodyFor = { barHeight: Int, bottomArea: Int ->
+        bodies.get(barHeight, bottomArea) {
+            @Composable {
+                val state = latest.value
+                val c = callbacks.value
+                val surface = MaterialTheme.colorScheme.surface
+                if (state.status == StatusLine.LOAD_FAILED) {
+                    Uncovered(barHeight, bottomArea, fullScreen = false) {
+                        BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            // Too little room (landscape with the keyboard): the title's own retry stays; a second Retry
+                            // in a viewport too small to reach would only promise a control that cannot be tapped.
+                            if (maxHeight >= 96.dp) {
+                                Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                                    WashTextButton(R.string.chat_load_retry, c.onRetryLoad)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    val sides = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal).asPaddingValues()
+                    val direction = LocalLayoutDirection.current
+                    val density = LocalDensity.current
+                    val padding = with(density) {
+                        PaddingValues(
+                            start = sides.calculateStartPadding(direction),
+                            end = sides.calculateEndPadding(direction),
+                            top = barHeight.toDp() + 8.dp,
+                            bottom = bottomArea.toDp() + 8.dp,
+                        )
+                    }
+                    Uncovered(barHeight, bottomArea, fullScreen = true) {
+                        MessageList(
+                            state.items,
+                            state.live,
+                            state.notes,
+                            state.answering,
+                            c.actions,
+                            onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
+                            onStep = { detail = it },
+                            listState = listState,
+                            contentPadding = padding,
+                            zone = c.zone,
+                            today = c.today,
+                            modifier = Modifier
+                                .backdropSource(backdrop, surface)
+                                .drawWithContent {
+                                    drawContent()
+                                    // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
+                                    // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom
+                                    // edge (above the insets and the card's 8 dp outer margin, Composer.kt) and below it: text
+                                    // and controls at the bottom are never washed out, text passing behind the composer fades.
+                                    val gap = 8.dp.toPx()
+                                    val rest = size.height - bottomArea - gap
+                                    val edge = size.height - (bottomArea - bottomContent) - gap
+                                    if (edge > rest) {
+                                        drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
+                                    }
+                                    drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
+                                },
+                            onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
+                        )
+                    }
+                    ScrollToBottomButton(
+                        visible = follow.buttonVisible,
+                        backdrop = backdrop,
+                        onClick = {
+                            follow.onButton()
+                            scope.launch { listState.animateScrollToItem(0) }
+                        },
+                        // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
+                        Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)).padding(end = 2.dp, bottom = 2.dp),
+                    )
+                }
+            }
+        }
+    }
+
+    // Like a scaffold: the bottom area and the bar are measured first, then the body is composed with their heights, so
+    // the list's padding and the uncovered region never lag a frame behind (keyboard, notes, large text). The policy is
+    // remembered and reads no per-token state, so streaming never measures the root again.
+    val policy = remember {
+        val measure: SubcomposeMeasureScope.(Constraints) -> MeasureResult = { constraints ->
+            ChromeProbe.rootMeasures++
+            val loose = constraints.copy(minWidth = 0, minHeight = 0)
+            val bottom = subcompose(ChromeSlot.BOTTOM, bottomSlot).single().measure(loose)
+            val bar = subcompose(ChromeSlot.BAR, barSlot).single().measure(loose)
+            val body = subcompose(ChromeSlot.BODY, bodyFor(bar.height, bottom.height)).map { it.measure(loose) }
+            layout(constraints.maxWidth, constraints.maxHeight) {
+                body.first().place(0, bar.height) // the uncovered region
+                // The scroll button, at the end edge (mirrored in right-to-left layouts).
+                body.getOrNull(1)?.let { it.placeRelative(constraints.maxWidth - it.width, constraints.maxHeight - bottom.height - it.height) }
+                bottom.place(0, constraints.maxHeight - bottom.height, zIndex = 1f)
+                bar.place(0, 0, zIndex = 1f)
+            }
+        }
+        measure
+    }
+    SubcomposeLayout(
+        modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
+        policy,
+    )
 
     state.confirmCancel?.let { id ->
         // The dialog follows its own row: it rewords once a request may have gone out, and closes once the row is
@@ -370,6 +426,50 @@ private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, content: @Comp
 
 private enum class ChromeSlot { BOTTOM, BAR, BODY }
 
+/** What the composer slot shows: equal values notify nothing, so tokens do not recompose it. */
+private data class BottomInput(
+    val draft: String,
+    val draftRevision: Long,
+    val mode: ComposerMode,
+    val sending: Boolean,
+    val note: ComposerNote?,
+    val unsent: UnsentText?,
+    val runId: String?,
+    val linkFailed: Boolean,
+)
+
+private data class BarCallbacks(
+    val onOpenConnection: () -> Unit,
+    val onRetryLoad: () -> Unit,
+    val navigationIcon: @Composable () -> Unit,
+    val appBarActions: @Composable RowScope.() -> Unit,
+)
+
+private data class Callbacks(val actions: ChatActions, val onRetryLoad: () -> Unit, val zone: ZoneId, val today: LocalDate)
+
+/** The body lambda for the last pair of bar heights. */
+private class BodyCache {
+    private var key = -1L
+    private var body: (@Composable () -> Unit)? = null
+
+    fun get(top: Int, bottom: Int, make: () -> @Composable () -> Unit): @Composable () -> Unit {
+        val k = top.toLong() shl 32 or (bottom.toLong() and 0xffffffffL)
+        if (k != key || body == null) {
+            key = k
+            body = make()
+        }
+        return body!!
+    }
+}
+
+/** Counters the tests read to prove that streamed tokens leave the chrome alone; a few increments, no other cost. */
+internal object ChromeProbe {
+    var barCompositions = 0
+    var bottomCompositions = 0
+    var rootMeasures = 0
+    var pins = 0 // requests the follow rules made to move the list to the bottom
+}
+
 /**
  * An opaque overlay hides from accessibility what lies under it: Compose leaves out of the tree the parts of nodes
  * covered by an "important" node drawn above them. A blank pane title makes this container important without making it
@@ -377,6 +477,7 @@ private enum class ChromeSlot { BOTTOM, BAR, BODY }
  */
 private fun Modifier.coverForAccessibility(order: Float) = semantics {
     paneTitle = ""
+    isTraversalGroup = true // so the index orders the container's controls as one unit, not one by one by position
     traversalIndex = order // read top to bottom: the bar (-1), the list (0), the bottom area (1), whatever the drawing order
 }
 

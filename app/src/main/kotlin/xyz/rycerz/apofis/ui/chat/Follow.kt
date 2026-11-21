@@ -30,9 +30,12 @@ internal data class FollowState(val following: Boolean, val holdUntilMs: Long)
 /** A user drag releases the bottom at once, also during a hold. */
 internal fun onUserDrag(state: FollowState): FollowState = FollowState(following = false, holdUntilMs = 0)
 
-/** When scrolling settles within [thresholdPx] (56 dp) of the bottom, following resumes; farther away it stops. */
+/**
+ * When scrolling settles within [thresholdPx] (56 dp) of the bottom, following resumes; farther away it stops and any
+ * hold ends with it: a reader who scrolled away during a handoff is not pulled back when the hold would run out.
+ */
 internal fun onScrollSettled(state: FollowState, distanceFromBottomPx: Float, thresholdPx: Float): FollowState =
-    state.copy(following = distanceFromBottomPx <= thresholdPx)
+    if (distanceFromBottomPx <= thresholdPx) state.copy(following = true) else FollowState(following = false, holdUntilMs = 0)
 
 /** The run ended: a follower stays pinned for [Motion.FOLLOW_HOLD] ms across the live-to-stored swap; a reader is left alone. */
 internal fun onRunEnded(state: FollowState, nowMs: Long): FollowState =
@@ -67,9 +70,10 @@ internal class Follower(private val list: LazyListState, internal var wasLive: B
         dismissed = true
     }
 
-    /** A send scrolls to the bottom and follows its reply. */
+    /** A send scrolls to the bottom and follows its reply (also in a chat that was empty, so never measured with data). */
     fun onSend() {
         state = state.copy(following = true)
+        measured = true
     }
 
     /** A pin may move the list only when no one else scrolls it: a drag owns it through [state], any other scroll (TalkBack, keyboard, the button's animation) by being in progress. */
@@ -77,10 +81,9 @@ internal class Follower(private val list: LazyListState, internal var wasLive: B
 
     internal fun atBottom() = list.firstVisibleItemIndex == 0 && list.firstVisibleItemScrollOffset == 0
 
-    /** The bottom row's shift from its resting place (a few visible rows: bounded); 0 for an empty list. */
+    /** The bottom row's shift from its resting place (a few visible rows: bounded). */
     internal fun distance(): Float =
-        if (list.layoutInfo.totalItemsCount == 0) 0f
-        else list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.toFloat() } ?: Float.POSITIVE_INFINITY
+        list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.toFloat() } ?: Float.POSITIVE_INFINITY
 }
 
 @Composable
@@ -89,7 +92,9 @@ internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
     val follower = remember(list) { Follower(list, live != null) }
     val threshold = with(LocalDensity.current) { 56.dp.toPx() }
     LaunchedEffect(list, follower, threshold) {
-        snapshotFlow { list.layoutInfo.viewportSize.height }.first { it > 0 }
+        // The first layout that shows data: an empty first layout (the transcript still loading) decides nothing, and a
+        // saved position takes effect only once items exist.
+        snapshotFlow { list.layoutInfo.viewportSize.height > 0 && list.layoutInfo.totalItemsCount > 0 }.first { it }
         follower.state = onScrollSettled(follower.state, follower.distance(), threshold)
         follower.measured = true
     }
@@ -124,7 +129,10 @@ internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
         follower.tail = tail
         if (grew && follower.measured && follower.free() &&
             shouldPin(follower.state, contentGrew = true, atBottom = follower.atBottom(), nowMs = follower.frameMs)
-        ) list.requestScrollToItem(0)
+        ) {
+            ChromeProbe.pins++
+            list.requestScrollToItem(0)
+        }
     }
     LaunchedEffect(live != null) {
         val ended = follower.wasLive && live == null
@@ -134,7 +142,10 @@ internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
         follower.state = onRunEnded(follower.state, now)
         while (now < follower.state.holdUntilMs) {
             follower.frameMs = now
-            if (follower.free() && shouldPin(follower.state, contentGrew = false, atBottom = follower.atBottom(), nowMs = now)) list.scrollToItem(0)
+            if (follower.free() && shouldPin(follower.state, contentGrew = false, atBottom = follower.atBottom(), nowMs = now)) {
+                ChromeProbe.pins++
+                list.scrollToItem(0)
+            }
             now = withFrameMillis { it }
         }
         follower.frameMs = now

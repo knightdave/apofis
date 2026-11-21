@@ -32,8 +32,8 @@ class ChromeScreenshotTest {
     private fun ButtonOverText() {
         Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(16.dp)) {
             Text(
-                "The scroll button floats over the conversation. Its glass fill keeps the arrow readable over any text " +
-                    "behind it, and the text stays faintly visible through it.",
+                "The scroll button floats over the conversation. Without blur it keeps a page backplate under its " +
+                    "glass fill, so the arrow stays readable over any text behind it.",
                 color = MaterialTheme.colorScheme.onSurface,
             )
             ScrollToBottomButton(visible = true, backdrop = null, onClick = {}, Modifier.align(Alignment.CenterEnd))

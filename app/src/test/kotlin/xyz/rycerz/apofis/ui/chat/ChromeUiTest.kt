@@ -230,4 +230,39 @@ class ChromeUiTest {
         rule.waitForIdle()
         assertEquals("no sample once blur is off at the consumer", before, backdrop.samples)
     }
+
+    /** M3: the fill-only button's arrow keeps 3:1 against what is around it inside the circle, over light and dark content. */
+    @Test
+    fun fillOnlyArrowKeepsItsContrast() {
+        var case by mutableStateOf(0)
+        val cases = listOf(
+            Triple(ThemeMode.DARK, null, Color.White), Triple(ThemeMode.LIGHT, null, Color.Black),
+            Triple(ThemeMode.DARK, xyz.rycerz.apofis.ui.PurpleSeed, Color.White), Triple(ThemeMode.LIGHT, xyz.rycerz.apofis.ui.PurpleSeed, Color.Black),
+            Triple(ThemeMode.DARK, xyz.rycerz.apofis.ui.GreenSeed, Color.White), Triple(ThemeMode.LIGHT, xyz.rycerz.apofis.ui.GreenSeed, Color.Black),
+        )
+        rule.setContent {
+            val (mode, seed, content) = cases[case]
+            ApofisTheme(mode, dynamicColor = seed != null, pureBlack = false, reduceMotion = true, blur = false, seed = seed) {
+                // The worst content right under the circle: a solid block of the text color that contrasts most with the page.
+                Box(Modifier.testTag("probe").size(64.dp).background(content)) {
+                    ScrollToBottomButton(visible = true, backdrop = null, onClick = {}, Modifier.align(Alignment.Center))
+                }
+            }
+        }
+        for (i in cases.indices) {
+            case = i
+            rule.waitForIdle()
+            val px = pixels("probe")
+            // The 28 dp circle (56 px) centred in 128 px: sample inside it, away from its 1 dp border.
+            var lo = 1f
+            var hi = 0f
+            for (y in 44 until 84) for (x in 44 until 84) {
+                val l = px[x, y].luminance()
+                lo = minOf(lo, l)
+                hi = maxOf(hi, l)
+            }
+            val ratio = (hi + 0.05f) / (lo + 0.05f)
+            assertTrue("case ${cases[i]}: arrow contrast %.2f".format(ratio), ratio >= 3f)
+        }
+    }
 }
