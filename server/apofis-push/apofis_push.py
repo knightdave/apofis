@@ -618,7 +618,8 @@ def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
             return conn.execute(
                 "SELECT substr(id, 1, 64), substr(title, 1, 200), substr(source, 1, 32), "
                 "CASE WHEN typeof(hidden) = 'integer' AND hidden IN (0, 1) THEN hidden END, "
-                "length(id) > 64 OR length(title) > 200 OR length(source) > 32 "
+                "length(id) > 64 OR length(title) > 200 OR length(source) > 32 OR instr(CAST(id AS BLOB), x'00') "
+                "OR instr(CAST(title AS BLOB), x'00') OR instr(CAST(source AS BLOB), x'00') "  # TEXT stops at NUL
                 "FROM sessions WHERE id >= ? AND id < ? ORDER BY id LIMIT ?",
                 (prefix, prefix[:-1] + ".", MAX_REGS + 1)).fetchall()
     else:

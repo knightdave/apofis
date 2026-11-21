@@ -14,6 +14,7 @@ import http.server
 import io
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -454,26 +455,157 @@ class Counting:
 # ---------------------------------------------------------------------------
 
 
+class ReadmeProcedureTest(unittest.TestCase):
+    """Runs the README's own helper block and Verify: commands (bash, HOME in a temporary directory)
+    against each install and rollback state; each must print ok exactly when the state is done."""
+    C = "python3 -I /home/hermes/.hermes/agent-hooks/apofis_push.py hook --allow-origin https://ntfy.sh"
+    OTHER = 'model: x\nhooks:\n  on_session_start:\n    - command: "other"\n      timeout: 5\n'
+    OURS = ('  on_session_end:\n    - command: "%s"\n      timeout: 5\n'
+            '  on_human_input_request:\n    - command: "%s"\n      timeout: 5\n') % (C, C)
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(HERE, "README.md"), encoding="utf-8") as f:
+            text = f.read()
+        cls.helpers = next(b for b in re.findall(r"```sh\n(.*?)```", text, re.S) if "cfg() {" in b)
+        cls.verify = re.findall(r"Verify: `([^`]+)`", text)
+        assert len(cls.verify) == 9, cls.verify
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="apofis-push-readme-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.h = os.path.join(self.home, ".hermes")
+        self.b = os.path.join(self.h, "apofis-push-backup-1")
+        os.makedirs(os.path.join(self.h, "agent-hooks"))
+        os.makedirs(self.b)
+        open(os.path.join(self.b, "COMPLETE"), "w").close()
+
+    def put(self, rel, text):
+        path = os.path.join(self.h, rel)
+        if text is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        with open(path, "w") as f:
+            f.write(text)
+
+    def allowlist(self, ours=True, other=False):
+        a = [{"event": "pre_tool_call", "command": "other"}] if other else []
+        a += [{"event": e, "command": self.C} for e in ("on_session_end", "on_human_input_request")] if ours else []
+        return json.dumps({"approvals": a}, indent=2, sort_keys=True)
+
+    def ok(self, i):
+        """The same answer from bash and, where installed, zsh (the owner's shell)."""
+        answers = {subprocess.run([sh, "-c",  # PATH again: NixOS /etc/zshenv rebuilds it from HOME
+                                   "PATH=%s\n%s\nb=%s\n%s" % (os.environ["PATH"], self.helpers, self.b, self.verify[i])],
+                                  cwd=os.path.dirname(os.path.dirname(HERE)), capture_output=True, text=True,
+                                  env={"HOME": self.home, "PATH": os.environ["PATH"]}, timeout=WATCHDOG).stdout == "ok\n"
+                   for sh in ("bash", "zsh") if shutil.which(sh)}
+        self.assertEqual(len(answers), 1, "bash and zsh disagree on Verify %d" % i)
+        return answers.pop()
+
+    def check(self, want):
+        self.assertEqual({i: self.ok(i) for i in want}, want)
+
+    def install_script(self):
+        shutil.copy(SCRIPT, os.path.join(self.h, "agent-hooks", "apofis_push.py"))
+
+    def test_fresh_install_and_rollback(self):
+        self.put("apofis-push-backup-1/config.yaml", self.OTHER)
+        self.put("config.yaml", self.OTHER + self.OURS)
+        self.put("shell-hooks-allowlist.json", self.allowlist())
+        self.install_script()
+        self.check({0: True, 1: True, 2: True, 3: True, 4: False, 5: False, 7: False})
+        self.put("config.yaml", self.OTHER)
+        self.check({4: True, 5: False})
+        self.put("shell-hooks-allowlist.json", None)  # the backup had none: deleted
+        self.check({4: True, 5: True, 7: True, 8: False})
+        self.put("agent-hooks/apofis_push.py", None)
+        self.check({8: True})
+
+    def test_reinstall_and_rollback(self):
+        self.put("apofis-push-backup-1/config.yaml", self.OTHER + self.OURS)
+        self.put("apofis-push-backup-1/shell-hooks-allowlist.json", self.allowlist(other=True))
+        self.put("apofis-push-backup-1/apofis_push.py", "# the earlier script\n")
+        self.put("config.yaml", self.OTHER + self.OURS)
+        self.put("shell-hooks-allowlist.json", self.allowlist(other=True))
+        self.install_script()
+        self.check({1: True, 2: True, 3: True, 4: True, 5: True, 6: False, 7: False})
+        self.put("agent-hooks/apofis_push.py", "# the earlier script\n")
+        self.check({6: True})
+
+    def test_interrupted_install_rolls_back(self):
+        self.put("apofis-push-backup-1/config.yaml", self.OTHER)
+        self.put("config.yaml", self.OTHER + self.OURS)  # interrupted before the approvals
+        self.install_script()
+        self.check({2: True, 3: False, 4: False, 5: True, 7: False})
+        self.put("config.yaml", self.OTHER)
+        self.check({4: True, 5: True, 7: True})
+        self.put("agent-hooks/apofis_push.py", None)
+        self.check({8: True})
+
+    def test_interrupted_rollback_and_unreadable_file(self):
+        self.put("apofis-push-backup-1/config.yaml", self.OTHER)
+        self.put("config.yaml", self.OTHER)  # interrupted after step 1
+        self.put("shell-hooks-allowlist.json", self.allowlist(other=True))
+        self.check({4: True, 5: False, 7: False})
+        self.put("shell-hooks-allowlist.json", self.allowlist(ours=False, other=True))
+        self.check({5: True, 7: True})
+        os.chmod(os.path.join(self.h, "config.yaml"), 0)
+        self.check({4: False, 7: False})
+
+
 class WireTeardownTest(unittest.TestCase):
     """hermes_wire_check.teardown: the fake and the throwaway home are released only after every child is
     accounted for; an interruption waits for accounting; a failure keeps both and fails."""
 
+    def unverified_holder(self, fx):
+        held = fx.hold(fx.slot_path(0))  # a holder that is not a verified hook child
+        with open(fx.slot_path(0), "w") as f:
+            f.write(str(os.getpid()))
+        return held
+
     def test_failed_accounting_keeps_home_and_port(self):
         import hermes_wire_check as w
         fx = Fixture(self)
-        held = fx.hold(fx.slot_path(0))  # a holder that is not a verified hook child
-        self.addCleanup(os.close, held)
-        with open(fx.slot_path(0), "w") as f:
-            f.write(str(os.getpid()))
+        self.addCleanup(os.close, self.unverified_holder(fx))
         stop = mock.Mock()
         out = io.StringIO()
         with mock.patch.object(signal, "pidfd_send_signal") as send, contextlib.redirect_stdout(out):
             with self.assertRaises(SystemExit):
-                w.teardown([fx.slot_path(0), fx.slot_path(1)], SCRIPT, stop, fx.dir, keep=False, wait=0.2)
+                w.teardown([fx.slot_path(0), fx.slot_path(1)], SCRIPT, stop, fx.dir, keep=False, settle=0.1, hold=0.2)
         send.assert_not_called()
         stop.assert_not_called()
         self.assertTrue(os.path.isdir(fx.dir))
         self.assertIn(fx.dir, out.getvalue())
+        self.assertIn("still held", out.getvalue())
+
+    def test_quarantine_waits_for_release_despite_interrupt(self):
+        import hermes_wire_check as w
+        fx = Fixture(self)
+        held = self.unverified_holder(fx)
+        released = threading.Event()
+
+        def release():
+            os.close(held)
+            released.set()
+        timer = threading.Timer(0.5, release)
+        timer.start()
+        self.addCleanup(timer.join)
+        real, calls = w.slots_free, []
+
+        def slots_free(slots, watchdog):
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyboardInterrupt  # an interrupt while waiting in quarantine
+            return real(slots, watchdog)
+        stop = mock.Mock(side_effect=lambda: self.assertTrue(released.is_set(), "fake stopped before release"))
+        with mock.patch.object(w, "slots_free", slots_free), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                w.teardown([fx.slot_path(0), fx.slot_path(1)], SCRIPT, stop, fx.dir, keep=False, settle=0.1, hold=10)
+            self.assertTrue(released.is_set(), "teardown exited before the slot was released")
+        stop.assert_called_once()
+        self.assertTrue(os.path.isdir(fx.dir))
 
     def test_interrupt_waits_for_accounting(self):
         import hermes_wire_check as w
@@ -1709,7 +1841,8 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertEqual(len([line for line in out.splitlines() if line.startswith("apofis-push-")]), 32)
         self.assertTrue(out.endswith("incomplete: capped at 32 rows or a field shortened\n"))
-        for i, (column, value) in enumerate((("title", "t" * 10000), ("hidden", 7), ("hidden", "x"))):
+        for i, (column, value) in enumerate((("title", "t" * 10000), ("hidden", 7), ("hidden", "x"),
+                                                ("title", "visible\x00suffix"), ("source", "api_server\x00x"))):
             with self.subTest(case=i):  # one row, one oversized or unrepresentable field
                 fx = Fixture(self)
                 rid = fx.record()

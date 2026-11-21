@@ -53,14 +53,24 @@ check of the replies it started.
 
 Order: the script is in place and verified before any hook entry exists, so no hook can point at a
 missing script. Every step only adds what is missing, so re-running an interrupted install from the
-step that failed (with the same `$b`) converges. In each verification `c` is the exact hook command.
+step that failed converges. Each `Verify:` command prints `ok` exactly when the step is done.
 
-1. Make a backup set for this installation. `mkdir` without `-p` fails if the name exists, so a
+1. In the shell you use for this, define the hook command and two helpers (also used by Rollback).
+   `cfg FILE` prints each config entry for the command with the event line above it; `apr FILE`
+   prints the events approved for the command. Both print nothing for an absent file and fail for an
+   unreadable or malformed one:
+
+   ```sh
+   c='python3 -I /home/hermes/.hermes/agent-hooks/apofis_push.py hook --allow-origin https://ntfy.sh'
+   cfg() { [ ! -e "$1" ] || { grep -B1 -F "$c" "$1"; [ $? -le 1 ]; }; }
+   apr() { [ ! -e "$1" ] || python3 -I -c 'import json, sys; a = json.load(open(sys.argv[1]))["approvals"]; print("\n".join(sorted(e["event"] for e in a if e.get("command") == sys.argv[2])))' "$1" "$c"; }
+   ```
+
+2. Make a backup set for this installation. `mkdir` without `-p` fails if the name exists, so a
    retry never overwrites an earlier set; the set counts only once `COMPLETE` exists. Stop on any error:
 
    ```sh
    h=~/.hermes; b=$h/apofis-push-backup-$(date +%Y%m%d%H%M%S)
-   c='python3 -I /home/hermes/.hermes/agent-hooks/apofis_push.py hook --allow-origin https://ntfy.sh'
    mkdir "$b" || exit 1
    for f in agent-hooks/apofis_push.py config.yaml shell-hooks-allowlist.json; do
      if [ -e "$h/$f" ]; then cp -p "$h/$f" "$b/$(basename "$f")" || exit 1; fi
@@ -68,18 +78,18 @@ step that failed (with the same `$b`) converges. In each verification `c` is the
    touch "$b/COMPLETE"
    ```
 
-   Verify: `ls "$b"` lists `COMPLETE`.
+   Verify: `[ -e "$b/COMPLETE" ] && echo ok`
 
-2. Put the script in place:
+3. Put the script in place:
 
    ```sh
    mkdir -p ~/.hermes/agent-hooks
    install -m 0755 server/apofis-push/apofis_push.py /home/hermes/.hermes/agent-hooks/apofis_push.py
    ```
 
-   Verify: `cmp server/apofis-push/apofis_push.py ~/.hermes/agent-hooks/apofis_push.py && echo ok`.
+   Verify: `cmp server/apofis-push/apofis_push.py ~/.hermes/agent-hooks/apofis_push.py && echo ok`
 
-3. Add to `~/.hermes/config.yaml` whichever of these two entries is not there yet (keep every other
+4. Add to `~/.hermes/config.yaml` whichever of these two entries is not there yet (keep every other
    `hooks:` entry):
 
    ```yaml
@@ -94,12 +104,12 @@ step that failed (with the same `$b`) converges. In each verification `c` is the
 
    Use the absolute path exactly as shown: Hermes expands `~` only at the very start of a command,
    so `python3 -I ~/.hermes/...` would not find the script.
-   Verify: `grep -cF "$c" ~/.hermes/config.yaml` prints `2`.
 
-4. Approve both hooks in `~/.hermes/shell-hooks-allowlist.json` (mode 0600). Create the file if it
+   Verify: `x=$(cfg ~/.hermes/config.yaml) && [ "$(echo "$x" | grep -cE '^ *(on_session_end|on_human_input_request):$')" = 2 ] && echo ok`
+
+5. Approve both hooks in `~/.hermes/shell-hooks-allowlist.json` (mode 0600). Create the file if it
    does not exist; otherwise add whichever of the two entries is missing to `approvals` and keep the
-   others. The command must
-   be byte-identical to the one in `config.yaml`:
+   others. The command must be byte-identical to the one in `config.yaml`:
 
    ```json
    {
@@ -114,7 +124,7 @@ step that failed (with the same `$b`) converges. In each verification `c` is the
    chmod 600 ~/.hermes/shell-hooks-allowlist.json
    ```
 
-   Verify: `grep -cF "$c" ~/.hermes/shell-hooks-allowlist.json` prints `2`.
+   Verify: `x=$(apr ~/.hermes/shell-hooks-allowlist.json) && [ "$x" = "$(printf 'on_human_input_request\non_session_end')" ] && echo ok`
 
 The gateway picks up hook changes within about 30 seconds.
 
@@ -145,25 +155,26 @@ readable), `skipped db-busy` (locked past the busy timeout), `skipped slot` (the
 
 ## Rollback
 
-Use the backup set of the installation you undo: `b=~/.hermes/apofis-push-backup-<stamp>` (with
-`COMPLETE`), and `c` as in install step 1. Hook entries go first and are verified gone before the
-script is touched, so no hook can point at a missing script. An entry counts as added by that
-installation only if the backed-up file did not contain it. Every step is safe to re-run.
+Use the backup set of the installation you undo, `b=~/.hermes/apofis-push-backup-<stamp>` (one with
+`COMPLETE`), and the helpers from install step 1. Hook entries go first and are verified gone before
+the script is touched, so no hook can point at a missing script. An entry counts as added by that
+installation only if the backed-up file did not have it. Every step is safe to re-run, so an
+interrupted rollback converges.
 
-1. In `~/.hermes/config.yaml`, remove each of the two `apofis_push.py` entries that the backup
-   (`$b/config.yaml`) did not contain; keep everything else.
-   Verify: `grep -cF "$c" ~/.hermes/config.yaml` prints the same number as
-   `grep -cF "$c" "$b/config.yaml" 2>/dev/null || echo 0`.
+1. In `~/.hermes/config.yaml`, remove each `apofis_push.py` entry that `$b/config.yaml` did not have;
+   keep everything else.
+   Verify: `x=$(cfg ~/.hermes/config.yaml) && y=$(cfg "$b/config.yaml") && [ "$x" = "$y" ] && echo ok`
 2. The same for `~/.hermes/shell-hooks-allowlist.json` against `$b/shell-hooks-allowlist.json`. If the
-   backup has no allowlist and the file now holds only those two entries, delete it.
-   Verify: the same two counts for the allowlist are equal.
-3. Only when 1 and 2 verify: if `$b/apofis_push.py` exists, put it back with
-   `install -m 0755 "$b/apofis_push.py" ~/.hermes/agent-hooks/apofis_push.py`
-   (verify: `cmp "$b/apofis_push.py" ~/.hermes/agent-hooks/apofis_push.py && echo ok`). Otherwise, and
-   only if no hook entry remains (both counts in step 1 are 0), delete
-   `~/.hermes/agent-hooks/apofis_push.py` and the script's own files there: `apofis-push.slot0.lock`,
-   `apofis-push.slot1.lock`, `apofis-push.log`, `apofis-push.log.lock`
-   (verify: `ls ~/.hermes/agent-hooks` shows none of them).
+   backup has no allowlist and the file now approves nothing else, delete it.
+   Verify: `x=$(apr ~/.hermes/shell-hooks-allowlist.json) && y=$(apr "$b/shell-hooks-allowlist.json") && [ "$x" = "$y" ] && echo ok`
+3. Only when 1 and 2 print `ok`, the script. If `$b/apofis_push.py` exists, put it back:
+   `install -m 0755 "$b/apofis_push.py" ~/.hermes/agent-hooks/apofis_push.py`.
+   Verify: `cmp "$b/apofis_push.py" ~/.hermes/agent-hooks/apofis_push.py && echo ok`
+   Otherwise, only if no hook entry for the command remains:
+   Verify: `x=$(cfg ~/.hermes/config.yaml) && y=$(apr ~/.hermes/shell-hooks-allowlist.json) && [ -z "$x$y" ] && echo ok`
+   then delete `~/.hermes/agent-hooks/apofis_push.py` and the script's own files there:
+   `apofis-push.slot0.lock`, `apofis-push.slot1.lock`, `apofis-push.log`, `apofis-push.log.lock`.
+   Verify: `cd ~/.hermes/agent-hooks && [ ! -e apofis_push.py ] && [ ! -e apofis-push.slot0.lock ] && [ ! -e apofis-push.slot1.lock ] && [ ! -e apofis-push.log ] && [ ! -e apofis-push.log.lock ] && echo ok`
 4. Restore `$b/config.yaml` or `$b/shell-hooks-allowlist.json` whole only if nothing else changed in
    that file since, because a restore also undoes later, unrelated edits and approvals.
 
