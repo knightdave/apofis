@@ -350,10 +350,13 @@ class Quarantine(AssertionError):
 
 
 def slot_free(path):
+    """True only on positive evidence: a missing file or a lock we could take. Any probe error is "held"."""
     try:
         fd = os.open(path, os.O_RDWR)
     except FileNotFoundError:
         return True
+    except Exception:
+        return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
@@ -469,7 +472,7 @@ class ReadmeProcedureTest(unittest.TestCase):
             text = f.read()
         cls.helpers = next(b for b in re.findall(r"```sh\n(.*?)```", text, re.S) if "cfg() {" in b)
         cls.verify = re.findall(r"Verify: `([^`]+)`", text)
-        assert len(cls.verify) == 9, cls.verify
+        assert len(cls.verify) == 7, cls.verify
 
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="apofis-push-readme-")
@@ -515,13 +518,11 @@ class ReadmeProcedureTest(unittest.TestCase):
         self.put("config.yaml", self.OTHER + self.OURS)
         self.put("shell-hooks-allowlist.json", self.allowlist())
         self.install_script()
-        self.check({0: True, 1: True, 2: True, 3: True, 4: False, 5: False, 7: False})
+        self.check({0: True, 1: True, 2: True, 3: True, 4: False, 5: False})
         self.put("config.yaml", self.OTHER)
         self.check({4: True, 5: False})
         self.put("shell-hooks-allowlist.json", None)  # the backup had none: deleted
-        self.check({4: True, 5: True, 7: True, 8: False})
-        self.put("agent-hooks/apofis_push.py", None)
-        self.check({8: True})
+        self.check({4: True, 5: True})
 
     def test_reinstall_and_rollback(self):
         self.put("apofis-push-backup-1/config.yaml", self.OTHER + self.OURS)
@@ -530,7 +531,7 @@ class ReadmeProcedureTest(unittest.TestCase):
         self.put("config.yaml", self.OTHER + self.OURS)
         self.put("shell-hooks-allowlist.json", self.allowlist(other=True))
         self.install_script()
-        self.check({1: True, 2: True, 3: True, 4: True, 5: True, 6: False, 7: False})
+        self.check({1: True, 2: True, 3: True, 4: True, 5: True, 6: False})
         self.put("agent-hooks/apofis_push.py", "# the earlier script\n")
         self.check({6: True})
 
@@ -538,21 +539,19 @@ class ReadmeProcedureTest(unittest.TestCase):
         self.put("apofis-push-backup-1/config.yaml", self.OTHER)
         self.put("config.yaml", self.OTHER + self.OURS)  # interrupted before the approvals
         self.install_script()
-        self.check({2: True, 3: False, 4: False, 5: True, 7: False})
+        self.check({2: True, 3: False, 4: False, 5: True})
         self.put("config.yaml", self.OTHER)
-        self.check({4: True, 5: True, 7: True})
-        self.put("agent-hooks/apofis_push.py", None)
-        self.check({8: True})
+        self.check({4: True, 5: True})
 
     def test_interrupted_rollback_and_unreadable_file(self):
         self.put("apofis-push-backup-1/config.yaml", self.OTHER)
         self.put("config.yaml", self.OTHER)  # interrupted after step 1
         self.put("shell-hooks-allowlist.json", self.allowlist(other=True))
-        self.check({4: True, 5: False, 7: False})
+        self.check({4: True, 5: False})
         self.put("shell-hooks-allowlist.json", self.allowlist(ours=False, other=True))
-        self.check({5: True, 7: True})
+        self.check({5: True})
         os.chmod(os.path.join(self.h, "config.yaml"), 0)
-        self.check({4: False, 7: False})
+        self.check({4: False})
 
 
 class WireTeardownTest(unittest.TestCase):
@@ -578,6 +577,29 @@ class WireTeardownTest(unittest.TestCase):
         stop.assert_not_called()
         self.assertTrue(os.path.isdir(fx.dir))
         self.assertIn(fx.dir, out.getvalue())
+        self.assertIn("still held", out.getvalue())
+
+    def test_probe_error_takes_the_quarantine_wait(self):
+        """The reviewer's case: EMFILE when opening a slot must not fall through to releasing anything."""
+        import errno
+        import hermes_wire_check as w
+        fx = Fixture(self)
+        slots = [fx.slot_path(0), fx.slot_path(1)]
+        real = os.open
+
+        def emfile(path, *a, **k):
+            if path in slots:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(path, *a, **k)
+        stop = mock.Mock()
+        out = io.StringIO()
+        start = time.monotonic()
+        with mock.patch.object(os, "open", emfile), contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                w.teardown(slots, SCRIPT, stop, fx.dir, keep=False, settle=0.1, hold=0.3)
+        self.assertGreaterEqual(time.monotonic() - start, 0.3, "the quarantine wait was skipped")
+        stop.assert_not_called()
+        self.assertTrue(os.path.isdir(fx.dir))
         self.assertIn("still held", out.getvalue())
 
     def test_quarantine_waits_for_release_despite_interrupt(self):

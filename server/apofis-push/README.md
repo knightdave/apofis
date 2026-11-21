@@ -157,7 +157,7 @@ readable), `skipped db-busy` (locked past the busy timeout), `skipped slot` (the
 
 Use the backup set of the installation you undo, `b=~/.hermes/apofis-push-backup-<stamp>` (one with
 `COMPLETE`), and the helpers from install step 1. Hook entries go first and are verified gone before
-the script is touched, so no hook can point at a missing script. An entry counts as added by that
+the script is touched; rollback never deletes the script, so no hook can point at a missing script. An entry counts as added by that
 installation only if the backed-up file did not have it. Every step is safe to re-run, so an
 interrupted rollback converges.
 
@@ -167,14 +167,11 @@ interrupted rollback converges.
 2. The same for `~/.hermes/shell-hooks-allowlist.json` against `$b/shell-hooks-allowlist.json`. If the
    backup has no allowlist and the file now approves nothing else, delete it.
    Verify: `x=$(apr ~/.hermes/shell-hooks-allowlist.json) && y=$(apr "$b/shell-hooks-allowlist.json") && [ "$x" = "$y" ] && echo ok`
-3. Only when 1 and 2 print `ok`, the script. If `$b/apofis_push.py` exists, put it back:
+3. Only when 1 and 2 print `ok`, and only if `$b/apofis_push.py` exists, put the earlier script back:
    `install -m 0755 "$b/apofis_push.py" ~/.hermes/agent-hooks/apofis_push.py`.
    Verify: `cmp "$b/apofis_push.py" ~/.hermes/agent-hooks/apofis_push.py && echo ok`
-   Otherwise, only if no hook entry for the command remains:
-   Verify: `x=$(cfg ~/.hermes/config.yaml) && y=$(apr ~/.hermes/shell-hooks-allowlist.json) && [ -z "$x$y" ] && echo ok`
-   then delete `~/.hermes/agent-hooks/apofis_push.py` and the script's own files there:
-   `apofis-push.slot0.lock`, `apofis-push.slot1.lock`, `apofis-push.log`, `apofis-push.log.lock`.
-   Verify: `cd ~/.hermes/agent-hooks && [ ! -e apofis_push.py ] && [ ! -e apofis-push.slot0.lock ] && [ ! -e apofis-push.slot1.lock ] && [ ! -e apofis-push.log ] && [ ! -e apofis-push.log.lock ] && echo ok`
+   Otherwise leave the script in place: a script no hook refers to is inert, and you may delete it
+   (with its `apofis-push.*` files) by hand once `hooks:` in `config.yaml` no longer mentions it in any form.
 4. Restore `$b/config.yaml` or `$b/shell-hooks-allowlist.json` whole only if nothing else changed in
    that file since, because a restore also undoes later, unrelated edits and approvals.
 

@@ -37,7 +37,7 @@ GATEWAY_PATH = ("/home/hermes/.local/bin:/home/hermes/.nix-profile/bin:/etc/prof
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from apofis_push import CHILD_HARD  # noqa: E402
-from test_apofis_push import Quarantine, account, slots_free  # noqa: E402  (one cleanup routine for suite and check)
+from test_apofis_push import account, slots_free  # noqa: E402  (one cleanup routine for suite and check)
 INSTALLED = "/home/hermes/.hermes/agent-hooks/apofis_push.py"
 RELEASE_OPTS = "--allow-origin https://ntfy.sh"
 APP = "apofis-1b4e28ba-2fa1-11d2-883f-0016d3cca427"
@@ -142,7 +142,7 @@ def teardown(slots, script, stop, home, keep, settle=WATCHDOG, hold=CHILD_HARD +
             break
         except KeyboardInterrupt as e:
             interrupted = e
-        except Quarantine as e:
+        except Exception as e:  # Quarantine or any probe error: unresolved, never a release
             quarantine = e
     if quarantine is None:
         stop()
