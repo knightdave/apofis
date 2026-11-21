@@ -21,11 +21,12 @@ private val BODY = """{"kind":"test"}""".toByteArray()
 enum class TestPushResult { SENT, SEND_FAILED, WAKE_ARRIVED, NO_WAKE }
 
 /**
- * The Settings test push, body-blind: the app POSTs `{"kind":"test"}` to its own endpoint, and the next wake delivered
- * within [TEST_WINDOW_MS] counts as "a push arrived". Nothing here reads a push or posts a notification.
- * [validate] is the endpoint rule with the build's origins.
+ * The Settings test push, body-blind: the app POSTs `{"kind":"test"}` to its own endpoint, and a wake delivered within
+ * [TEST_WINDOW_MS] after a 2xx answer counts as "a push arrived". Accepted limit: a wake delivered before that answer is
+ * not counted (the user sends again). Nothing here reads a push or posts a notification. [elapsed] is a monotonic clock;
+ * [validate] is the endpoint rule with the build's origins; [client] should be dedicated to this.
  */
-class TestPush(private val clock: () -> Long, client: OkHttpClient, private val validate: (String) -> String?) {
+class TestPush(private val elapsed: () -> Long, client: OkHttpClient, private val validate: (String) -> String?) {
     private val client = client.newBuilder()
         .followRedirects(false).followSslRedirects(false).proxy(Proxy.NO_PROXY).cookieJar(CookieJar.NO_COOKIES)
         .callTimeout(10, TimeUnit.SECONDS)
@@ -33,18 +34,19 @@ class TestPush(private val clock: () -> Long, client: OkHttpClient, private val 
     private val result = MutableStateFlow<TestPushResult?>(null)
     val lastResult: StateFlow<TestPushResult?> = result.asStateFlow()
 
-    // Guarded by this. The window opens when the send starts: ntfy can deliver before its HTTP answer arrives.
+    // Guarded by this.
+    private var sending = false
     private var sentAt: Long? = null
     private var windowFrom: Long? = null
-    private var wokeWhileSending = false
 
+    /** False without sending when a send is in flight or the last one started under 10 s ago. */
     suspend fun send(endpoint: String): Boolean {
         synchronized(this) {
-            val now = clock()
-            if (sentAt?.let { now - it in 0 until SEND_EVERY_MS } == true) return false
+            val now = elapsed()
+            if (sending || sentAt?.let { now - it < SEND_EVERY_MS } == true) return false
+            sending = true
             sentAt = now
-            windowFrom = now
-            wokeWhileSending = false
+            windowFrom = null
             result.value = null
         }
         val url = validate(endpoint)
@@ -55,12 +57,9 @@ class TestPush(private val clock: () -> Long, client: OkHttpClient, private val 
             false
         }
         synchronized(this) {
-            result.value = when {
-                !ok -> TestPushResult.SEND_FAILED
-                wokeWhileSending -> TestPushResult.WAKE_ARRIVED
-                else -> TestPushResult.SENT
-            }
-            if (result.value != TestPushResult.SENT) windowFrom = null
+            sending = false
+            if (ok) windowFrom = elapsed()
+            result.value = if (ok) TestPushResult.SENT else TestPushResult.SEND_FAILED
         }
         return ok
     }
@@ -68,21 +67,18 @@ class TestPush(private val clock: () -> Long, client: OkHttpClient, private val 
     /** Called by PushReceiver for every delivered message of the current registration. */
     fun onWake() = synchronized(this) {
         tick()
-        if (windowFrom == null) return@synchronized
-        if (result.value == TestPushResult.SENT) {
-            result.value = TestPushResult.WAKE_ARRIVED
+        if (windowFrom != null) {
             windowFrom = null
-        } else {
-            wokeWhileSending = true
+            result.value = TestPushResult.WAKE_ARRIVED
         }
     }
 
     /** Closes an expired window as [TestPushResult.NO_WAKE]; the Settings sheet calls it while open. */
     fun tick() = synchronized(this) {
         val from = windowFrom ?: return@synchronized
-        if (clock() - from >= TEST_WINDOW_MS) {
+        if (elapsed() - from >= TEST_WINDOW_MS) {
             windowFrom = null
-            if (result.value == TestPushResult.SENT) result.value = TestPushResult.NO_WAKE
+            result.value = TestPushResult.NO_WAKE
         }
     }
 }

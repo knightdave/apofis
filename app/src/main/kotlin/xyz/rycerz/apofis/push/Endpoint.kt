@@ -14,7 +14,7 @@ internal data class EndpointCheck(val url: String?, val reason: String?)
  */
 internal fun checkEndpoint(url: String, origins: Set<String>, loopback: String?): EndpointCheck {
     fun refuse(reason: String) = EndpointCheck(null, reason)
-    if (url.length > MAX_URL) return refuse("length")
+    if (url.length > 4 * MAX_URL || url.codePointCount(0, url.length) > MAX_URL) return refuse("length") // code points, as Python counts
     if (!URL_CHARS.matches(url)) return refuse("parse")
     val sep = url.indexOf("://")
     val scheme = if (sep < 0) "" else url.substring(0, sep)

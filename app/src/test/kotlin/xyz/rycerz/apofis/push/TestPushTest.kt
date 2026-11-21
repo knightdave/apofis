@@ -9,6 +9,10 @@ import kotlinx.coroutines.test.runTest
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -72,10 +76,53 @@ class TestPushTest {
         assertFalse(t2.send(endpoint))
         assertEquals(TestPushResult.SEND_FAILED, t2.lastResult.value)
 
-        val t3 = push()
-        assertFalse(t3.send("https://evil.example/upAbC123xyz_-9?up=1"))
-        assertEquals(TestPushResult.SEND_FAILED, t3.lastResult.value)
-        assertEquals(1, server.requestCount)
+    }
+
+    /** No network: answers [code] after running [during] (as if it happened while the POST was in flight). */
+    private fun answering(code: Int = 200, during: () -> Unit = {}) = OkHttpClient.Builder().addInterceptor { chain ->
+        calls++
+        during()
+        Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(code).message("x").body("".toResponseBody()).build()
+    }.build()
+    private var calls = 0
+
+    @Test
+    fun rejectedEndpointsMakeNoCall() = runTest {
+        for (bad in listOf("https://evil.example/upAbC123xyz_-9?up=1", "http://127.0.0.1:1/upWIRECHECK012?up=1", "file:///upAbC123xyz_-9")) {
+            val t = push(answering())
+            assertFalse(t.send(bad))
+            assertEquals(TestPushResult.SEND_FAILED, t.lastResult.value)
+        }
+        assertEquals("no request attempted", 0, calls)
+    }
+
+    @Test
+    fun wakeBeforeTheAnswerIsNotCounted() = runTest {
+        lateinit var t: TestPush
+        t = push(answering { t.onWake() })
+        assertTrue(t.send(endpoint))
+        assertEquals("known limit: the user sends again", TestPushResult.SENT, t.lastResult.value)
+    }
+
+    @Test
+    fun windowStartsAtTheAnswer() = runTest {
+        val t = push(answering { now += 9_000 }) // a slow POST
+        t.send(endpoint)
+        now += TEST_WINDOW_MS - 1
+        t.tick()
+        assertEquals(TestPushResult.SENT, t.lastResult.value)
+        t.onWake()
+        assertEquals(TestPushResult.WAKE_ARRIVED, t.lastResult.value)
+    }
+
+    @Test
+    fun oneSendAtATime() = runTest {
+        lateinit var t: TestPush
+        var second: Boolean? = null
+        t = push(answering { if (calls == 1) { now += 10_000; second = runBlocking { t.send(endpoint) } } }) // past the 10 s throttle, still in flight
+        assertTrue(t.send(endpoint))
+        assertEquals(false, second)
+        assertEquals(1, calls)
     }
 
     @Test

@@ -9,6 +9,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** The shared vectors of the hook script, read as Task 1 wrote them; the app must give the same verdicts and reasons. */
@@ -19,12 +20,14 @@ class EndpointTest {
     @Test
     fun releaseVerdicts() {
         assertEquals(NTFY_ORIGIN, vectors.getValue("origin").jsonPrimitive.content)
-        for (v in vectors.getValue("valid").jsonArray.map { it.jsonPrimitive.content }) {
-            assertEquals(v, validateEndpoint(v, release, null))
+        vectors.getValue("valid").jsonArray.map { it.jsonPrimitive.content }.forEachIndexed { i, v ->
+            assertTrue("valid $i", validateEndpoint(v, release, null) == v) // compared, never printed
         }
         vectors.getValue("negatives").jsonArray.forEachIndexed { i, n ->
             val url = n.jsonObject.getValue("url").jsonPrimitive.content
-            assertEquals("negative $i", EndpointCheck(null, n.jsonObject.getValue("reason").jsonPrimitive.content), checkEndpoint(url, release, null))
+            val got = checkEndpoint(url, release, null)
+            assertTrue("negative $i", got.url == null)
+            assertEquals("negative $i", n.jsonObject.getValue("reason").jsonPrimitive.content, got.reason)
         }
         val tooLong = vectors.getValue("tooLong").jsonObject
         val prefix = tooLong.getValue("prefix").jsonPrimitive.content
@@ -44,7 +47,7 @@ class EndpointTest {
         val lb = vectors.getValue("loopback").jsonObject
         val origin = fill(lb.getValue("httpOrigin").jsonPrimitive.content)
         val valid = fill(lb.getValue("valid").jsonPrimitive.content)
-        assertEquals(valid, validateEndpoint(valid, release, origin))
+        assertTrue("loopback valid", validateEndpoint(valid, release, origin) == valid)
         assertEquals("scheme", checkEndpoint(valid, release, null).reason) // the release policy has no loopback origin
         assertNull(validateEndpoint(valid, release, fill("http://127.0.0.1:{port1}")))
         lb.getValue("negatives").jsonArray.forEachIndexed { i, n ->
@@ -52,5 +55,12 @@ class EndpointTest {
             val reason = n.jsonObject.getValue("reason").jsonPrimitive.content
             assertEquals("loopback negative $i", reason, checkEndpoint(fill(n.jsonObject.getValue("url").jsonPrimitive.content), release, o).reason)
         }
+    }
+
+    @Test
+    fun lengthCountsCodePointsLikeTheScript() {
+        val nonBmp = String(Character.toChars(0x1F600))
+        assertEquals("parse", checkEndpoint(nonBmp.repeat(257), release, null).reason) // 257 code points, 514 UTF-16 units
+        assertEquals("length", checkEndpoint(nonBmp.repeat(513), release, null).reason)
     }
 }

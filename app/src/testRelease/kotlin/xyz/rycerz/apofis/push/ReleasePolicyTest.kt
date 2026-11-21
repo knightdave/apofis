@@ -9,6 +9,7 @@ import android.content.pm.PackageInfo
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
 import java.util.Properties
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -64,5 +65,19 @@ class ReleasePolicyTest {
         for (absent in listOf("xyz.rycerz.apofis.e2e", "ComponentActivity", "MessagingReceiverImpl", "RaiseToForegroundService", "LinkActivity", "FOREGROUND_SERVICE")) {
             assertFalse(absent, absent in manifest)
         }
+    }
+
+    @Test
+    fun registrationLeftByADebugBuildIsReplaced() = runTest {
+        // Same app id and key: a debug install journaled an e2e registration and a loopback endpoint, then release was installed over it.
+        val prefs = FakePrefs(mutableMapOf(Keys.ENABLED to true, Keys.GENERATION to 1L, Keys.REGISTRATION to "g1\txyz.rycerz.apofis.e2e\ttok-e2e",
+            Keys.ENDPOINT_NEW to "http://127.0.0.1:41234/upWIRECHECK012?up=1", Keys.ENDPOINT_NEW_INSTANCE to "g1"))
+        val port = FakePort().apply { installed += "xyz.rycerz.apofis.e2e" }
+        val server = FakeServer("https://a.example/")
+        val r = PushRegistrar(app, prefs, { FakeRecordApi(server) }, { 0L }, { 0L }, backgroundScope, pushPolicy, port)
+        r.publishPending()
+        assertEquals(listOf("unregister g1 tok-e2e", "save $NTFY_PACKAGE", "register g2"), port.calls)
+        assertTrue("no record for the loopback endpoint", server.created.isEmpty())
+        assertEquals(NTFY_PACKAGE, registrationOf(prefs)?.distributor)
     }
 }

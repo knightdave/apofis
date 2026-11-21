@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.SystemClock
 import android.util.Log
 import androidx.room.Room
 import androidx.work.WorkManager
@@ -34,7 +35,10 @@ import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.MIGRATION_1_2
 import xyz.rycerz.apofis.push.HermesRecordApi
+import xyz.rycerz.apofis.push.PublishWorker
 import xyz.rycerz.apofis.push.PushRegistrar
+import xyz.rycerz.apofis.push.RealUnifiedPush
+import xyz.rycerz.apofis.push.UnifiedPushPort
 import xyz.rycerz.apofis.push.TestPush
 import xyz.rycerz.apofis.push.pushPolicy
 import xyz.rycerz.apofis.push.pushPrefs
@@ -127,6 +131,7 @@ private val logOnly = CoroutineExceptionHandler { _, e -> logFailure(e) }
 class AppContainer(
     private val app: Application,
     val credentials: CredentialStore = CredentialStore(app),
+    pushPort: UnifiedPushPort = RealUnifiedPush,
     openDatabase: () -> AppDatabase = { Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").addMigrations(MIGRATION_1_2).build() },
 ) {
     val preferences = Preferences(app)
@@ -156,9 +161,10 @@ class AppContainer(
     /** Push registration on the current server; its records live there, revocation debt per server. */
     val push by lazy {
         PushRegistrar(app, pushPrefs(app), api = { connected()?.let { HermesRecordApi(it.credentials.baseUrl, it.api) } },
-            connectionGeneration = connectionGeneration::get, clock = System::currentTimeMillis, scope = scope)
+            connectionGeneration = connectionGeneration::get, clock = System::currentTimeMillis, scope = scope, port = pushPort,
+            scheduleWork = { PublishWorker.schedule(app) })
     }
-    val testPush by lazy { TestPush(System::currentTimeMillis, OkHttpClient()) { validateEndpoint(it, pushPolicy.origins(app), pushPolicy.loopbackOrigin(app)) } }
+    val testPush by lazy { TestPush(SystemClock::elapsedRealtime, OkHttpClient()) { validateEndpoint(it, pushPolicy.origins(app), pushPolicy.loopbackOrigin(app)) } }
 
     /**
      * Drafts, sends being stored and unsent text of the cached chats: shared by every connection, emptied only in the
@@ -236,12 +242,13 @@ class AppContainer(
                 }
                 connectionGeneration.incrementAndGet()
                 beforeSwitch()
-                // Before the old client closes: its record becomes debt there, the registration instance rotates.
-                runCatching { push.forgetServer(old?.let { HermesRecordApi(it.credentials.baseUrl, it.api) }) }.onFailure(::logFailure)
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
+                // The marker comes before any push side effect, so a death after one restarts disconnected, never on the
+                // old credentials. Push must persist the old registration's revocation, or the switch fails.
+                commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
+                push.forgetServer(old?.let { HermesRecordApi(it.credentials.baseUrl, it.api) })
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
-                commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
                     commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
                     withRepositoryLock {
@@ -319,6 +326,7 @@ class AppContainer(
 
     /** Durable send work was cancelled for the switch: schedule it again for what is still queued, then resume. */
     private suspend fun afterSwitch() {
+        runCatching { PublishWorker.recover(app) }.onFailure(::logFailure) // push work skipped while the switch ran
         if (current != null) scheduleQueuedSends()
         foreground.refresh()
     }

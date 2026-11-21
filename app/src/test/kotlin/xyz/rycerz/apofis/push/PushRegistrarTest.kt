@@ -24,7 +24,7 @@ class PushRegistrarTest {
     private val app = ApplicationProvider.getApplicationContext<Application>()
 
     /** Everything that survives a process death (prefs, servers, the connector); registrars are rebuilt from it. */
-    private inner class World(prefsName: String = PUSH_PREFS, install: String? = INSTALL) {
+    private inner class World(install: String = INSTALL) {
         val log = EventLog()
         val a = FakeServer("https://a.example/")
         val b = FakeServer("https://b.example/")
@@ -34,13 +34,16 @@ class PushRegistrarTest {
         var connection = 0L
         var now = 1_000_000_000L
         val port = FakePort(log)
-        val commits = mutableListOf<Set<String>>()
-        val prefs = HookedPrefs(app.getSharedPreferences(prefsName, 0).also { p ->
-            p.edit().clear().apply { if (install != null) putString(Keys.INSTALL_ID, install) }.commit()
-        }) { log.step("commit ${it.sorted()}"); commits += it; true }
+        var scheduled = 0
+        var prefs = FakePrefs(mutableMapOf(Keys.INSTALL_ID to install)) { log.step("commit ${it.sorted()}"); true }
+
+        /** A new process: memory is read back from disk. */
+        fun restart() {
+            prefs = prefs.restart()
+        }
 
         fun TestScope.registrar(policy: PushPolicy = TestPolicy()) =
-            PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, policy, port)
+            PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, policy, port) { scheduled++ }
 
         /** What PushReceiver commits for a NEW_ENDPOINT of the current instance. */
         fun endpointFor(r: PushRegistrar, url: String = VALID, instance: String = r.currentInstance()) {
@@ -126,7 +129,7 @@ class PushRegistrarTest {
             r.verify(force = true)
             assertEquals(listOf(id(2), id(3)), ours(a)) // the retitled row is no longer provably ours: never deleted
             assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
-            assertFalse(r.ui.value.cleanupPending)
+            assertTrue("and never forgotten: it may still hold the endpoint", r.ui.value.cleanupPending)
         }
     }
 
@@ -169,6 +172,10 @@ class PushRegistrarTest {
             r.publishPending()
             assertEquals(listOf("create ${id(3)}", "hide ${id(3)}", "read ${id(2)}", "read ${id(1)}", "delete ${id(1)}"), apiA.calls)
             assertEquals(listOf(id(3)), ours(a))
+            // id 2's create may still land on the server: its 404 is not final until SETTLE_MS have passed.
+            assertTrue(r.ui.value.cleanupPending)
+            now += SETTLE_MS
+            r.publishPending()
             assertFalse(r.ui.value.cleanupPending)
         }
     }
@@ -405,7 +412,7 @@ class PushRegistrarTest {
             connection++
             r.forgetServer(apiA)
             current = apiB
-            assertEquals(listOf("unregister g1", "save $NTFY_PACKAGE", "register g2"), port.calls)
+            assertEquals(listOf("unregister g1 tok-g1", "save $NTFY_PACKAGE", "register g2"), port.calls)
             assertEquals(listOf(id(1)), a.deleted)
             // The new instance is not assumed to have a new endpoint, and the old one's endpoint is never reused.
             r.publishPending()
@@ -465,7 +472,7 @@ class PushRegistrarTest {
             r.enableNow()
             r.verify(force = true)
             assertEquals(PushState.Registering, r.ui.value.state)
-            assertEquals(listOf("save $NTFY_PACKAGE", "register g1", "register g1"), port.calls)
+            assertEquals(listOf("save $NTFY_PACKAGE", "register g1", "save $NTFY_PACKAGE", "register g1"), port.calls)
             // ntfy uninstalled: the saved distributor is gone, so push turns itself off.
             port.installed.clear()
             r.verify(force = true)
@@ -497,7 +504,7 @@ class PushRegistrarTest {
     @Test
     fun twoInstalls() = runTest {
         val one = World()
-        val two = World("push-two", install = "9f8e7d6c-5b4a-4321-8fed-cba987654321")
+        val two = World(install = "9f8e7d6c-5b4a-4321-8fed-cba987654321")
         two.apiA = FakeRecordApi(one.a, two.log)
         two.current = two.apiA
         val r1 = with(one) { registrar() }
@@ -527,7 +534,7 @@ class PushRegistrarTest {
         }
         val logged = ShadowLog.getLogs().joinToString("\n") { "${it.msg} ${it.throwable}" }
         assertTrue(logged.isNotEmpty())
-        for (secret in listOf("upAbC123xyz", "upZyX987abc", "ntfy.sh/", "evil.example")) assertFalse(logged, secret in logged)
+        listOf("upAbC123xyz", "upZyX987abc", "ntfy.sh/", "evil.example").forEachIndexed { i, secret -> assertFalse("secret $i logged", secret in logged) }
     }
 
     // Step 2b (gate I4).
@@ -543,6 +550,7 @@ class PushRegistrarTest {
             runCatching { r.publishPending() }.onSuccess { error("no death") }
             assertEquals(id(1), prefs.getString(Keys.PENDING_ID, null))
             log.killAt = 0
+            restart()
             val restarted = registrar()
             restarted.disable()
             assertEquals(Row("someone else", "api_server"), a.rows[id(1)])
@@ -560,10 +568,11 @@ class PushRegistrarTest {
             endpointFor(r)
             log.killAt = log.count() + 3 // reservation commit, attempted commit, death before the create request
             runCatching { r.publishPending() }.onSuccess { error("no death") }
-            assertTrue(prefs.getBoolean(Keys.PENDING_ATTEMPTED, false))
+            assertTrue(prefs.contains(Keys.PENDING_ATTEMPTED_AT))
             assertEquals(emptyList<String>(), apiA.calls)
             a.rows[id(1)] = Row("someone else", "api_server")
             log.killAt = 0
+            restart()
             val restarted = registrar()
             restarted.publishPending()
             assertEquals(listOf("create ${id(1)}", "read ${id(1)}", "create ${id(2)}", "hide ${id(2)}"), apiA.calls)
@@ -582,6 +591,7 @@ class PushRegistrarTest {
             w.log.killAt = w.log.count() + k
             val died = runCatching { r.disable() }.isFailure
             w.log.killAt = 0
+            w.restart()
             val restarted = with(w) { registrar() }
             if (w.prefs.getBoolean(Keys.ENABLED, false)) {
                 // Death before the first commit: nothing was revoked yet and push is still on; the user turns it off again.
@@ -616,6 +626,7 @@ class PushRegistrarTest {
                 w.log.killAt = 0
                 val r2 = if (died) {
                     // AppContainer starts disconnected after a death during a switch; the user then connects again.
+                    w.restart()
                     with(w) { registrar() }.also { w.current = null; w.connection++; it.forgetServer(null) }
                 } else r
                 w.current = target
@@ -643,6 +654,272 @@ class PushRegistrarTest {
                 k++
             }
             assertTrue("side effects in the switch: $k", k > 4)
+        }
+    }
+
+    // Fix round 1.
+
+    @Test
+    fun deleteOnlyAfterFreshProof() = runTest {
+        // A turn ran in it, it gained a parent, or it ended: a DELETE could cascade to rows this app never created.
+        for (change in listOf<(Row) -> Unit>({ it.messageCount = 1 }, { it.parent = "apofis-x" }, { it.endReason = "compression" })) {
+            with(World()) {
+                val r = registrar()
+                turnedOn(r)
+                change(a.rows.getValue(id(1)))
+                r.disable()
+                assertEquals(emptyList<String>(), a.deleted)
+                assertTrue(id(1) in debt())
+                assertEquals(PushUi(PushState.Off, true), r.ui.value)
+            }
+        }
+        // Ours and empty but no longer hidden: hidden again, read again, then deleted.
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            a.rows.getValue(id(1)).hidden = false
+            apiA.calls.clear()
+            r.disable()
+            assertEquals(listOf("read ${id(1)}", "hide ${id(1)}", "read ${id(1)}", "delete ${id(1)}"), apiA.calls)
+            assertEquals(PushUi(PushState.Off, false), r.ui.value)
+        }
+    }
+
+    @Test
+    fun retitledRecordStaysDebt() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            a.rows.getValue(id(1)).let { a.rows[id(1)] = it.copy(title = "renamed elsewhere") }
+            r.disable()
+            assertEquals(listOf(id(1)), ours(a))
+            assertTrue("kept, so the cleanup line stays", id(1) in debt())
+            assertEquals(PushUi(PushState.Off, true), r.ui.value)
+        }
+    }
+
+    @Test
+    fun attemptedCreateMayStillLand() = runTest {
+        with(World()) {
+            val r = registrar()
+            r.enableNow()
+            endpointFor(r)
+            apiA.sendFails = true // the answer never came: the create may still be executing on Hermes
+            r.publishPending()
+            val title = prefs.getString(Keys.PENDING_TITLE, null)
+            apiA.sendFails = false
+            r.disable()
+            assertTrue("a 404 is not final yet", id(1) in debt())
+            // The late create commits on the server.
+            a.rows[id(1)] = Row(title, "api_server")
+            now += 60_000
+            r.publishPending()
+            assertEquals(listOf(id(1)), a.deleted)
+            assertFalse(r.ui.value.cleanupPending)
+        }
+        with(World()) {
+            val r = registrar()
+            r.enableNow()
+            endpointFor(r)
+            apiA.sendFails = true
+            r.publishPending()
+            apiA.sendFails = false
+            r.disable()
+            now += SETTLE_MS - 1
+            r.publishPending()
+            assertTrue(r.ui.value.cleanupPending)
+            now += 1
+            r.publishPending()
+            assertFalse("never landed: settled after SETTLE_MS", r.ui.value.cleanupPending)
+        }
+    }
+
+    @Test
+    fun connectionChangeStopsBeforeTheNextRequest() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            apiA.beforeCall = { if (it.startsWith("read")) connection++ } // a switch starts while the read is in flight
+            apiA.calls.clear()
+            r.disable()
+            assertEquals("no DELETE after the read", listOf("read ${id(1)}"), apiA.calls)
+            assertEquals(listOf(id(1)), ours(a))
+            assertTrue(id(1) in debt())
+            assertEquals("DELETE", prefs.getString(Keys.REVOKE_PHASE, null))
+        }
+    }
+
+    @Test
+    fun failedCommitFencesUntilWritten() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            port.calls.clear()
+            prefs.onCommit = { false } // the disk stops taking writes
+            r.disable()
+            assertEquals("UNREGISTER", prefs.getString(Keys.REVOKE_PHASE, null)) // in memory, as on Android
+            assertNull(prefs.disk[Keys.REVOKE_PHASE])
+            r.publishPending()
+            r.verify(force = true)
+            assertEquals("no side effect from a state that is not on disk", emptyList<String>(), port.calls)
+            assertEquals(listOf(id(1)), ours(a))
+            // The disk recovers: the next operation writes the whole intent first, then acts on it.
+            prefs.onCommit = { true }
+            r.publishPending()
+            assertEquals("unregister g1 tok-g1", port.calls.first())
+            assertEquals(emptyList<String>(), ours(a))
+            assertEquals(PushUi(PushState.Off, false), r.ui.value)
+        }
+        // A restart instead reads the disk, where nothing was revoked.
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            prefs.onCommit = { false }
+            r.disable()
+            prefs.onCommit = { true }
+            restart()
+            val restarted = registrar()
+            restarted.publishPending()
+            assertEquals(PushState.On(NTFY_PACKAGE), restarted.ui.value.state)
+        }
+    }
+
+    @Test
+    fun startupFindsEveryIntent() = runTest {
+        // Enable committed, death before the distributor was saved.
+        with(World()) {
+            val r = registrar()
+            log.killAt = log.count() + 2 // the enable commit, then death before save
+            runCatching { r.enableNow() }.onSuccess { error("no death") }
+            log.killAt = 0
+            restart()
+            assertTrue(needsWork(prefs, setOf(NTFY_PACKAGE)))
+            val restarted = registrar()
+            restarted.publishPending()
+            assertEquals(PushState.Registering, restarted.ui.value.state)
+            assertEquals(setOf("g1"), port.registered)
+            assertFalse(needsWork(prefs, setOf(NTFY_PACKAGE)))
+        }
+        // A 30-day renewal of the same endpoint, death before its create.
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            now += ROTATE_AFTER_MS
+            log.killAt = log.count() + 4 // read, reservation, attempted, death before the create
+            runCatching { r.verify(force = true) }.onSuccess { error("no death") }
+            log.killAt = 0
+            restart()
+            assertTrue(needsWork(prefs, setOf(NTFY_PACKAGE)))
+            registrar().publishPending()
+            assertEquals(listOf(id(2)), ours(a))
+            assertFalse(needsWork(prefs, setOf(NTFY_PACKAGE)))
+        }
+    }
+
+    @Test
+    fun withoutConnectionTheWorkerRetries() = runTest {
+        with(World()) {
+            val r = registrar()
+            r.enableNow()
+            endpointFor(r)
+            current = null // a switch is running
+            assertFalse(r.publishPending())
+            current = apiA
+            assertTrue(r.publishPending())
+            assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        }
+    }
+
+    @Test
+    fun failedCleanupIsScheduledAndNotStarvedByPublish() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            apiA.failWith = ApiError.Network(java.io.IOException("down"))
+            scheduled = 0
+            r.disable()
+            assertTrue(scheduled > 0)
+        }
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            a.rows[id(9)] = Row("t9", "api_server", hidden = true)
+            assertTrue(prefs.edit().putString(Keys.DEBT, """{"${a.url}":[{"id":"${id(9)}","title":"t9"}]}""").commit())
+            endpointFor(r, VALID2)
+            apiA.sendFails = true
+            assertFalse(r.publishPending())
+            assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+            assertEquals(listOf(id(9)), a.deleted)
+        }
+    }
+
+    @Test
+    fun verifyDerivesItsOutcomeAfresh() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            apiA.failWith = ApiError.Network(java.io.IOException("down"))
+            r.verify(force = true)
+            assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+            apiA.failWith = null
+            r.verify(force = true)
+            assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+            // A failed publish of a new endpoint is resumed by verify, not only by the worker.
+            endpointFor(r, VALID2)
+            apiA.sendFails = true
+            r.publishPending()
+            apiA.sendFails = false
+            r.verify(force = true)
+            assertEquals(id(2) to """{"v":1,"endpoint":"$VALID2"}""", a.created.last())
+            assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        }
+    }
+
+    @Test
+    fun registrationOfAnotherPolicyIsReplaced() = runTest {
+        with(World()) {
+            port.installed += "xyz.rycerz.apofis.e2e"
+            assertTrue(prefs.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
+                .putString(Keys.REGISTRATION, "g1\txyz.rycerz.apofis.e2e\ttok-e2e").commit())
+            val r = registrar() // release-shaped policy: ntfy only
+            r.publishPending()
+            assertEquals(listOf("unregister g1 tok-e2e", "save $NTFY_PACKAGE", "register g2"), port.calls)
+            assertEquals(NTFY_PACKAGE, registrationOf(prefs)?.distributor)
+        }
+        // The connector would send REGISTER to a package outside the policy: nothing is journaled or sent.
+        with(World()) {
+            port.journalAs = "com.example.other"
+            val r = registrar()
+            r.enableNow()
+            assertNull(registrationOf(prefs))
+            assertTrue(port.registered.isEmpty())
+        }
+    }
+
+    @Test
+    fun switchHonoursACommittedRevocation() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            assertTrue(prefs.edit().putString(Keys.UNREGISTERED_INSTANCE, "g1").commit())
+            port.calls.clear()
+            connection++
+            r.forgetServer(apiA)
+            assertTrue(port.calls.none { it.startsWith("register") })
+            assertEquals(PushUi(PushState.Off, false), r.ui.value)
+        }
+    }
+
+    @Test
+    fun switchFailsWithoutDurableIntent() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            port.calls.clear()
+            prefs.onCommit = { false }
+            connection++
+            assertTrue(runCatching { r.forgetServer(apiA) }.exceptionOrNull() is java.io.IOException)
+            assertEquals(emptyList<String>(), port.calls)
         }
     }
 }

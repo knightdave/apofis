@@ -30,6 +30,8 @@ data class SessionDto(
     val preview: String?, // list rows only
     @SerialName("_lineage_root_id") val lineageRootId: String?,
     @SerialName("_lineage_ids") val lineageIds: List<String> = emptyList(),
+    @SerialName("parent_session_id") val parentSessionId: String? = null,
+    @SerialName("end_reason") val endReason: String? = null,
 )
 
 @Serializable
