@@ -7,6 +7,8 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -225,54 +227,81 @@ private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerG
 
 /**
  * Double-tap protection for one request (the block is keyed by its id and generation, so a changed request gets a
- * new gate). [shownAt] is when this block first showed the request. An answer is accepted only from a press that
- * began at least the double-tap interval ([settle]) after that, on this request. Each control tracks its own press
- * ([Press]), so one control's early press never validates another's answer; an activation without a press (an
- * accessibility action) is judged when it arrives. Nothing else blocks an answer.
+ * new gate). [shownAt] is when this block first showed the request, on the uptime clock. An answer is accepted only
+ * from a press that began at least the double-tap interval ([settle]) after that, on this request. A press is timed
+ * by its own down event (the pointer's or the key's own uptime), so one handled late never looks later than it was.
+ * Each activation uses exactly the press that produced it, on its own control: a click from a pointer release uses
+ * that pointer's down, one from a key release uses that key's down; an activation with no press of its own (an
+ * accessibility action) uses none and is judged when it arrives. Nothing else blocks an answer.
  */
 internal class AnswerGate(private val clock: () -> Long, private val settle: Long) {
     private val shownAt = clock()
 
-    fun now() = clock()
-
-    /** Called by an answer control's click with that control's press: consumes it. */
+    /** Called by an answer control's click with that control's press record: consumes the press it came from. */
     fun accepts(press: Press): Boolean {
-        val start = press.startedAt
-        val on = press.on
-        press.startedAt = null
-        press.on = null
-        if (on != null && on !== this) return false // begun on another request
-        return (start ?: clock()) - shownAt >= settle
+        val begun: Pair<Long, AnswerGate>? = when {
+            press.pointerReleasing -> press.pointerDown.also { press.pointerDown = null; press.pointerReleasing = false } ?: return false
+            press.keyReleasing -> press.keyReleased.also { press.keyReleased = null; press.keyReleasing = false } ?: return false
+            else -> null // no press of its own
+        }
+        if (begun != null && begun.second !== this) return false // begun on another request
+        return (begun?.first ?: clock()) - shownAt >= settle
     }
 }
 
-/** One answer control's press in progress: when it began and on which request. */
+/**
+ * One answer control's presses: the pointer gesture in progress (its down's own uptime and request) and the
+ * activation keys held on it (each key's own down time), plus which release is being dispatched right now.
+ */
 internal class Press {
-    var startedAt: Long? = null
-    var on: AnswerGate? = null
+    var pointerDown: Pair<Long, AnswerGate>? = null
+    var pointerReleasing = false // the release of that pointer gesture is being dispatched
+    val keyDowns = HashMap<Key, Pair<Long, AnswerGate>>()
+    var keyReleased: Pair<Long, AnswerGate>? = null // the down of the key whose release is being dispatched
+    var keyReleasing = false
 }
 
 private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
 
-/** Records when a press on this answer control begins: first, before the control's own click handling sees it. */
+/**
+ * Records this answer control's presses before its own click handling sees them: pointer downs and releases (cleared
+ * once the gesture ends, cancelled or not) and activation key downs (not repeats) and releases (cleared once the
+ * release has been handled without a click, and all of them when the control loses focus).
+ */
 private fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
     .pointerInput(press, gate) {
         awaitEachGesture {
-            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-            press.startedAt = gate.now()
-            press.on = gate
-            // Once the gesture is over (after the click, if there was one), no press is in progress.
-            do {
-                val event = awaitPointerEvent(PointerEventPass.Final)
-            } while (event.changes.any { it.pressed })
-            press.startedAt = null
-            press.on = null
+            try {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                press.pointerDown = down.uptimeMillis to gate
+                do {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                } while (event.changes.any { it.pressed })
+                press.pointerReleasing = true // the click, if any, comes from this release (Main pass)
+                awaitPointerEvent(PointerEventPass.Final) // the same release, after the click
+            } finally {
+                press.pointerDown = null
+                press.pointerReleasing = false
+            }
         }
     }
+    .onFocusChanged { if (!it.hasFocus) press.keyDowns.clear() }
     .onPreviewKeyEvent {
-        if (it.type == KeyEventType.KeyDown && it.key in activationKeys && press.startedAt == null) {
-            press.startedAt = gate.now()
-            press.on = gate
+        if (it.key in activationKeys) {
+            if (it.type == KeyEventType.KeyDown && it.nativeKeyEvent.repeatCount == 0) {
+                press.keyDowns[it.key] = it.nativeKeyEvent.eventTime to gate
+            } else if (it.type == KeyEventType.KeyUp) {
+                press.keyReleased = press.keyDowns.remove(it.key)
+                press.keyReleasing = true
+            }
+        }
+        false
+    }
+    .onKeyEvent {
+        // Reached only when the control did not take the release as a click: drop what that release recorded.
+        if (it.type == KeyEventType.KeyUp) {
+            press.keyReleased = null
+            press.keyReleasing = false
         }
         false
     }
