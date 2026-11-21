@@ -128,18 +128,21 @@ instrument_target() {
   esac
 }
 
-# Names of credential-like variables: any word KEY, TOKEN, SECRET, PASSWORD, PASS, CREDENTIAL(S) or AUTH, and canaries.
-CREDENTIAL_RE='(^|_)(KEYS?|TOKENS?|SECRETS?|PASSWORDS?|PASSWD|PASS|CREDENTIALS?|AUTH)(_|$)|CANARY'
+# --app-test needs no credential. At mode entry the script runs itself again with an environment built from nothing
+# plus this fixed list, so no child it starts (the local build, ssh, rsync, the remote stage) can inherit anything else:
+# not a credential under any name, not the test canary. SSH_AUTH_SOCK lets ssh log in here; forwarding it is off.
+APP_ENV=(PATH HOME USER LOGNAME LANG LC_ALL TERM TMPDIR XDG_RUNTIME_DIR SSH_AUTH_SOCK
+  APOFIS_E2E_HOST APOFIS_HERMES_PORT APOFIS_BUILD_TIMEOUT APOFIS_BOOT_TIMEOUT APOFIS_TEST_TIMEOUT)
 
-# --app-test needs no credential. At mode entry, once, every credential-like variable leaves this shell, so nothing
-# started from here on (ssh, rsync, the remote stage, any helper) can inherit one; the test canary goes too. The ssh
-# agent socket stays: it is how ssh logs in, not a secret value.
-scrub_credentials() {
-  local v
-  for v in $(compgen -e); do
-    [ "$v" != SSH_AUTH_SOCK ] && [[ ${v^^} =~ $CREDENTIAL_RE ]] && unset "$v"
-  done
-  APOFIS_E2E_CANARY=''
+# Every ssh (rsync's too): no agent forwarding and no X11 forwarding, whatever the ssh configuration says; in app
+# mode no port forwarding at all (it needs no tunnel).
+SSH_OPTS=(-o BatchMode=yes -a -x -o ForwardAgent=no -o ForwardX11=no)
+
+# The only files --app-test uploads: the APKs it installs, built here, and the remote stage's own files (tracked): its
+# script, and the flake with the version catalog it reads to make the emulator shell. Never a directory walk.
+app_upload_list() {
+  printf '%s\n' tools/emulator/run-e2e.sh flake.nix flake.lock gradle/libs.versions.toml \
+    app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 }
 
 # The credential in $key. --app-test needs none, so the real key is never read in that mode: a disposable per-run
@@ -334,10 +337,13 @@ remote() {
   export ANDROID_TMP=$state/tmp GRADLE_USER_HOME=$state/gradle TMPDIR=$state/tmp TMP=$state/tmp TEMP=$state/tmp
   # -XX:-UsePerfData: the JVM would otherwise write /tmp/hsperfdata_<user> whatever java.io.tmpdir says.
   export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$state/tmp -XX:-UsePerfData"
-  cd "$root"
-  exec nix develop .#emulator -c env HOME="$state/home" XDG_CONFIG_HOME="$state/xdg/config" XDG_CACHE_HOME="$state/xdg/cache" \
+  # App mode runs from the uploaded list alone (a path flake: no git, nothing else of the tree).
+  local src=$root flake=.#emulator
+  if [[ $tests == app:* ]]; then src=$root/app-src flake=path:$root/app-src#emulator; fi
+  cd "$src"
+  exec nix develop "$flake" -c env HOME="$state/home" XDG_CONFIG_HOME="$state/xdg/config" XDG_CACHE_HOME="$state/xdg/cache" \
     XDG_DATA_HOME="$state/xdg/data" XDG_STATE_HOME="$state/xdg/state" XDG_RUNTIME_DIR="$state/xdg/runtime" \
-    "$root/tools/emulator/run-e2e.sh" --in-shell "$tests" "$tunnel_port" "$out" "$nonce"
+    "$src/tools/emulator/run-e2e.sh" --in-shell "$tests" "$tunnel_port" "$out" "$nonce"
 }
 
 # Writes a heartbeat to the build host every 5 s; when the connection is gone the write fails and the run is stopped.
@@ -369,10 +375,12 @@ in_shell() {
   local test_apk=e2e/build/outputs/apk/debug/e2e-debug.apk test_task=:e2e:assembleDebug
   if [[ $tests == app:* ]]; then test_apk=app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk test_task=:app:assembleDebugAndroidTest; fi
 
-  rmsg build
-  bg bounded "$BUILD_TIMEOUT" ./gradlew --no-daemon --no-configuration-cache --console=plain \
-    -Pkotlin.compiler.execution.strategy=in-process :app:assembleDebug "$test_task" >"$out/gradle.log" 2>&1 ||
-    rdie build-failed
+  if [[ $tests != app:* ]]; then # app mode: the APKs were built on the build host and uploaded
+    rmsg build
+    bg bounded "$BUILD_TIMEOUT" ./gradlew --no-daemon --no-configuration-cache --console=plain \
+      -Pkotlin.compiler.execution.strategy=in-process :app:assembleDebug "$test_task" >"$out/gradle.log" 2>&1 ||
+      rdie build-failed
+  fi
 
   # adb's default server port must be free: never share a server.
   free_port 5037 || rdie adb-port
@@ -627,7 +635,7 @@ sessions_state='' journal=() published='' export_files=() export_state='' lock_t
 incoming='' wd_pid='' orig_out='' orig_err=''
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
-rsh() { bounded "${RSH_TIMEOUT:-60}" ssh -o BatchMode=yes "$HOST" "$@"; }
+rsh() { bounded "${RSH_TIMEOUT:-60}" ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
 # Runs one of the shared functions on the emulator host: rsh_fn <function> <args...>.
 rsh_fn() { { declare -f "${SHARED_FNS[@]}"; printf '%q ' "$@"; echo; } | rsh bash -s; }
 
@@ -648,7 +656,7 @@ key_patterns() {
     p+=("$b" "$(printf '%s' "$b" | tr '+/' '-_')")
   done
   # For testing the leak path with a disposable canary instead of the key (see the README).
-  [ "$mode" = app ] || [ "${#APOFIS_E2E_CANARY}" -lt 16 ] || p+=("$APOFIS_E2E_CANARY") # never in app mode
+  [ "$mode" = app ] || [ "${#APOFIS_E2E_CANARY}" -lt 16 ] || p+=("$APOFIS_E2E_CANARY") # never in app mode (not even set there)
   printf '%s\n' "${#p[@]}" "${p[@]}"
 }
 
@@ -978,8 +986,10 @@ run_remote() {
   local tests=$1 line='' partial='' r deadline='' n
   mkfifo -m 600 "$tmp/in" "$tmp/out"
   # shellcheck disable=SC2029 # the arguments are meant to expand here
-  bounded "$REMOTE_TIMEOUT" ssh -o BatchMode=yes -o ServerAliveInterval=15 \
-    -o ServerAliveCountMax=4 "$HOST" "cd ~/$REMOTE_DIR && exec tools/emulator/run-e2e.sh --remote $tests $tunnel_port $run_id $nonce" \
+  local dir=$REMOTE_DIR
+  [[ $tests != app:* ]] || dir=$REMOTE_DIR/app-src # app mode: only the uploaded list lives there
+  bounded "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 "$HOST" "cd ~/$dir && exec tools/emulator/run-e2e.sh --remote $tests $tunnel_port $run_id $nonce" \
     <"$tmp/in" >"$tmp/out" 2>/dev/null &
   remote_pid=$!
   exec {rin}>"$tmp/in" {rout}<"$tmp/out"
@@ -1108,7 +1118,7 @@ import_export() {
     return 1
   fi
   for e in "${export_files[@]}"; do printf '%s\n' "${e#* }"; done >"$tmp/files"
-  bounded 600 rsync --times --chmod=Fu+rw --temp-dir="$(cd "$incoming" && pwd)" --files-from="$tmp/files" "$src" "$incoming/" >/dev/null 2>&1 || fail="copy"
+  bounded 600 rsync -e "ssh ${SSH_OPTS[*]}" --times --chmod=Fu+rw --temp-dir="$(cd "$incoming" && pwd)" --files-from="$tmp/files" "$src" "$incoming/" >/dev/null 2>&1 || fail="copy"
   if [ -z "$fail" ]; then
     for e in "${export_files[@]}"; do
       h=${e%% *} f=${e#* }
@@ -1209,7 +1219,14 @@ main() {
     --in-shell) shift; in_shell "$@"; return ;;
     *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]> | --app-test <Class>" >&2; exit 2 ;;
   esac
-  [ "$mode" != app ] || scrub_credentials # first, before anything is started
+  if [ "$mode" = app ]; then # first, before anything is started: a clean environment, then no forwarding of any kind
+    if [ -z "${APOFIS_E2E_CLEAN_ENV:-}" ]; then
+      local keep=() v
+      for v in "${APP_ENV[@]}"; do [ -z "${!v+x}" ] || keep+=("$v=${!v}"); done
+      exec env -i "${keep[@]}" APOFIS_E2E_CLEAN_ENV=1 bash "$0" "$@"
+    fi
+    SSH_OPTS+=(-o ClearAllForwardings=yes)
+  fi
   [[ $tests =~ ^[A-Za-z0-9_#]+$ || ($mode == app && $tests =~ ^app:[A-Za-z0-9_]+$) ]] || die "bad test name: $tests"
   no_core_dumps || die "could not disable core dumps"
   # The first action: this host's lock, before anything else is touched here or on the emulator host.
@@ -1235,14 +1252,27 @@ main() {
   [[ $r =~ ^LISTENERS=(none|[0-9]+(,[0-9]+)*)$ ]] || die "could not list the emulator host's listeners"
   ports_before=${r#LISTENERS=}
 
-  log "stage 1: rsync to $HOST:~/$REMOTE_DIR"
-  # shellcheck disable=SC2029
-  rsh "cd ~/$REMOTE_DIR && { [ -d .git ] || git init -q; } && echo /.state/ > .git/info/exclude" >/dev/null 2>&1 || die "could not prepare $HOST"
-  bounded 600 rsync -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/.state/ ./ "$HOST:$REMOTE_DIR/" >/dev/null 2>&1 ||
-    die "rsync failed"
-  # The flake only sees files git knows about; .gitignore keeps build output out of the Nix store copy.
-  # shellcheck disable=SC2029
-  RSH_TIMEOUT=120 rsh "cd ~/$REMOTE_DIR && git add -A" >/dev/null 2>&1 || die "git add failed on $HOST"
+  if [ "$mode" = app ]; then
+    log "stage 1: building the APKs here; uploading only them and the remote stage's own files to $HOST:~/$REMOTE_DIR/app-src"
+    bounded "$BUILD_TIMEOUT" nix develop -c ./gradlew --console=plain :app:assembleDebug :app:assembleDebugAndroidTest \
+      >"$tmp/gradle.log" 2>&1 || die "the local build failed"
+    app_upload_list >"$tmp/upload"
+    while IFS= read -r f; do [ -f "$f" ] && [ ! -L "$f" ] || die "missing upload file $f"; done <"$tmp/upload"
+    git ls-files --error-unmatch tools/emulator/run-e2e.sh flake.nix flake.lock gradle/libs.versions.toml >/dev/null 2>&1 ||
+      die "the remote stage's files must be tracked"
+    rsh_fn remove_tree "$REMOTE_DIR/app-src" >/dev/null 2>&1 || die "could not clear $HOST:~/$REMOTE_DIR/app-src"
+    bounded 600 rsync -e "ssh ${SSH_OPTS[*]}" --times --files-from="$tmp/upload" ./ "$HOST:$REMOTE_DIR/app-src/" >/dev/null 2>&1 ||
+      die "upload failed"
+  else
+    log "stage 1: rsync to $HOST:~/$REMOTE_DIR"
+    # shellcheck disable=SC2029
+    rsh "cd ~/$REMOTE_DIR && { [ -d .git ] || git init -q; } && printf \"/.state/\\n/app-src/\\n\" > .git/info/exclude" >/dev/null 2>&1 || die "could not prepare $HOST"
+    bounded 600 rsync -e "ssh ${SSH_OPTS[*]}" -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/.state/ --exclude=/app-src/ ./ "$HOST:$REMOTE_DIR/" >/dev/null 2>&1 ||
+      die "rsync failed"
+    # The flake only sees files git knows about; .gitignore keeps build output out of the Nix store copy.
+    # shellcheck disable=SC2029
+    RSH_TIMEOUT=120 rsh "cd ~/$REMOTE_DIR && git add -A" >/dev/null 2>&1 || die "git add failed on $HOST"
+  fi
 
   if [ "$mode" = app ]; then
     tunnel_port=0 # the app's own test needs no server: no tunnel
@@ -1254,7 +1284,7 @@ main() {
       tunnel_port=''
     [[ $tunnel_port =~ ^18[0-9]{3}$ ]] || die "no free tunnel port on $HOST"
     # Its stdin is held by this script: when this script dies for any reason, the remote cat ends and the tunnel closes.
-    exec {tun_fd}> >(exec ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
+    exec {tun_fd}> >(exec ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
       -R "127.0.0.1:$tunnel_port:127.0.0.1:$HERMES_PORT" "$HOST" 'exec cat >/dev/null' >/dev/null 2>&1)
     tunnel_pid=$!
     local listen=''

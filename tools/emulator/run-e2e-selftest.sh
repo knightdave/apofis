@@ -10,6 +10,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 APOFIS_E2E_LIB=1 source "$here/run-e2e.sh"
 
 t=$(mktemp -d "${TMPDIR:-/tmp}/apofis-e2e-selftest.XXXXXX")
+trap 'chmod -R u+w "$t" 2>/dev/null; find "$t" -delete 2>/dev/null' EXIT # also when interrupted: no fixture is left behind
 tmp=$t/tmp
 mkdir "$tmp"
 E2E_ROOT=$t
@@ -625,49 +626,87 @@ check "authenticated mode (control): the same peer does receive the real key, so
 check "app test: runs without any credentials file" '(mode=app HOME=$t/nohome key=""; load_key && [ "${#key}" -ge 16 ])'
 check "authenticated mode: refuses to start without the credentials file" '! (mode=smoke HOME=$t/nohome key=""; load_key)'
 
-# 12f. --app-test scrubs every credential-like variable at mode entry: nothing key-like reaches any child, the test
-# canary included. Synthetic values only, with characters that need URL encoding, each carrying a distinct marker.
+# 12f. --app-test: an environment built from nothing plus a fixed list, no forwarding of any kind on any transport,
+# and an upload of an explicit file list only. The real main runs against a fake emulator host (a directory here): a
+# fake ssh runs the host's commands in that directory, refuses to start the remote stage, and records only booleans and
+# marker counts (never values); a fake rsync copies what it is given and records the same; a fake nix makes the APKs.
+# Every fixture starts from an empty environment plus synthetic inputs, so nothing of the caller's is written down.
 MARK=SYNTHmark7q
-creds=(API_SERVER_KEY APOFIS_E2E_CANARY HERMES_API_KEY GITHUB_TOKEN MY_SECRET DB_PASSWORD AWS_SECRET_ACCESS_KEY OPENAI_API_KEY)
-synthetic_env() { local v; for v in "${creds[@]}"; do printf '%s=%s\n' "$v" "${MARK}-$v-a%b&c+d/e=f"; done; }
-rc=0
-o=$(env $(synthetic_env) SSH_AUTH_SOCK=/tmp/agent.sock bash -c '
-  APOFIS_E2E_LIB=1 source "$1/run-e2e.sh"
-  mode=app
-  scrub_credentials
-  env; printf "canary=%s\n" "$APOFIS_E2E_CANARY"; key=$(echo fresh-random-key-0123456789); key_patterns' _ "$here" 2>&1) || rc=$?
-check "app test: no credential-like variable or canary survives mode entry" '[ "$rc" = 0 ] && lacks "$o" "$MARK"'
-check "app test: the ssh agent socket survives (ssh needs it to log in)" 'has "$o" "SSH_AUTH_SOCK=/tmp/agent.sock"'
-
-# The real startup and its error cleanup: a fake home whose credentials file holds a marker, a tripwire on reading it,
-# and a fake ssh that records its environment, arguments and stdin, then fails (stage 0 cannot take the lock).
-REAL_GREP=$(command -v grep)
-mkdir -p "$t/trip/bin" "$t/trip/home/.hermes" "$t/trip/run"
-printf 'API_SERVER_KEY=%s-file-x%%y&z\n' "$MARK" >"$t/trip/home/.hermes/.env"
-cat >"$t/trip/bin/ssh" <<'EOF2'
+SYS_PATH=$(dirname "$(command -v bash)"):/usr/bin:/bin
+for d in $(printf '%s\n' git ssh rsync flock timeout od mktemp grep awk sed ss pgrep find sha256sum realpath comm sort | while read -r c; do command -v "$c"; done | xargs -n1 dirname | sort -u); do SYS_PATH=$SYS_PATH:$d; done
+F=$t/c1
+mkdir -p "$F/fake" "$F/home/.hermes" "$F/home/.ssh" "$F/host" "$F/run" "$F/tmp" "$F/repo/tools/emulator" "$F/repo/gradle"
+printf 'API_SERVER_KEY=%s-file-x%%y&z\n' "$MARK" >"$F/home/.hermes/.env"
+printf 'Host *\n  ForwardAgent yes\n  ForwardX11 yes\n' >"$F/home/.ssh/config" # forwarding forced by the client configuration
+# A fixture repository: the tracked files the remote stage needs, and untracked files holding the marker.
+cp "$here/run-e2e.sh" "$F/repo/tools/emulator/run-e2e.sh"
+printf '{ }\n' >"$F/repo/flake.nix"; printf '{}\n' >"$F/repo/flake.lock"; printf '[versions]\n' >"$F/repo/gradle/libs.versions.toml"
+git -C "$F/repo" init -q && git -C "$F/repo" add -A && git -C "$F/repo" -c user.name=t -c user.email=t@t commit -qm fixture
+printf 'TOKEN=%s-untracked\n' "$MARK" >"$F/repo/.env"
+printf '%s\n' "$MARK" >"$F/repo/notes-untracked.txt"
+cat >"$F/fake/ssh" <<'EOF2'
 #!/usr/bin/env bash
-{ echo "== ssh $*"; env; timeout 1 cat || true; } >>"$TRIP_SSH" 2>&1
-exit 255
+. "$(dirname "$0")/conf" # FAKE_LOG, FAKE_HOST, MARK: the clean environment strips them, as it should
+# Records per call: forwarding switched off on the command line (booleans) and how often the marker appears in its
+# environment, arguments and input (counts). Runs the host's commands in the fake host directory.
+args=" $* "
+f() { case $args in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
+n() { grep -o "$MARK" <<<"$1" | grep -c . || true; }
+all="$*"
+while [ $# -gt 0 ]; do case $1 in -o | -R | -L | -D | -p) shift 2 ;; -*) shift ;; *) break ;; esac; done
+shift # the host
+cmd="$*" # like ssh: the rest, joined
+in=''
+case $cmd in *--remote*) ;; *) in=$(cat) ;; esac # the remote stage keeps its input open: not read, not started
+printf 'ssh a=%s x=%s fa=%s fx=%s caf=%s env=%s args=%s in=%s\n' "$(f -a)" "$(f -x)" "$(f ForwardAgent=no)" "$(f ForwardX11=no)" \
+  "$(f ClearAllForwardings=yes)" "$(n "$(env)")" "$(n "$all")" "$(n "$in")" >>"$FAKE_LOG"
+case $cmd in *--remote*) exit 1 ;; esac
+cd "$FAKE_HOST" && HOME=$FAKE_HOST bash -c "$cmd" <<<"$in"
 EOF2
-cat >"$t/trip/bin/grep" <<'EOF2'
+cat >"$F/fake/rsync" <<'EOF2'
 #!/usr/bin/env bash
-for a in "$@"; do case $a in *.hermes*) printf 'read %s\n' "$*" >>"$TRIP_READ" ;; esac; done
-exec "$REAL_GREP" "$@"
+. "$(dirname "$0")/conf"
+# Records the transport's forwarding options and marker counts (environment, source files), then copies as asked.
+e='' list='' src='' dst=''
+while [ $# -gt 0 ]; do case $1 in -e) e=$2; shift ;; --files-from=*) list=${1#*=} ;; -*) ;; *) [ -z "$src" ] && src=$1 || dst=$1 ;; esac; shift; done
+f() { case " $e " in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
+srcmark=$(if [ -n "$list" ]; then while IFS= read -r p; do grep -c "$MARK" "$src/$p" 2>/dev/null; done <"$list"; else grep -rc "$MARK" "$src" 2>/dev/null | cut -d: -f2; fi | awk '{s += $1} END {print s + 0}')
+printf 'rsync a=%s x=%s fa=%s caf=%s list=%s env=%s src=%s\n' "$(f -a)" "$(f -x)" "$(f ForwardAgent=no)" "$(f ClearAllForwardings=yes)" \
+  "$([ -n "$list" ] && echo 1 || echo 0)" "$(env | grep -c "$MARK")" "$srcmark" >>"$FAKE_LOG"
+[ -n "$list" ] || exit 0
+d=$FAKE_HOST/${dst#*:}
+while IFS= read -r p; do mkdir -p "$d/$(dirname "$p")" && cp "$src/$p" "$d/$p"; done <"$list"
 EOF2
-chmod +x "$t/trip/bin/ssh" "$t/trip/bin/grep"
-trip_case() { # <mode args...>: runs main, returns its exit; logs in $t/trip/ssh-<n> and $t/trip/read-<n>
-  local n=$1; shift
-  rm -f "$t/trip/ssh-$n" "$t/trip/read-$n"
-  env $(synthetic_env) HOME="$t/trip/home" XDG_RUNTIME_DIR="$t/trip/run" PATH="$t/trip/bin:$PATH" REAL_GREP="$REAL_GREP" \
-    TRIP_SSH="$t/trip/ssh-$n" TRIP_READ="$t/trip/read-$n" timeout 120 bash "$here/run-e2e.sh" "$@" </dev/null >"$t/trip/out-$n" 2>&1
+cat >"$F/fake/nix" <<'EOF2'
+#!/usr/bin/env bash
+. "$(dirname "$0")/conf"
+# The local build: makes the two APKs (no marker in them) and records whether the marker reached its environment.
+printf 'nix env=%s\n' "$(env | grep -c "$MARK")" >>"$FAKE_LOG"
+mkdir -p app/build/outputs/apk/debug app/build/outputs/apk/androidTest/debug
+echo apk >app/build/outputs/apk/debug/app-debug.apk; echo apk >app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+EOF2
+chmod +x "$F/fake/ssh" "$F/fake/rsync" "$F/fake/nix"
+c1_run() { # <log> <args...>: the real main from the fixture repository, from an empty environment plus synthetic inputs
+  local log=$1; shift
+  rm -rf "$F/host"; mkdir -p "$F/host/tmp/apofis-e2e/.state"; rm -f "$log" # the state directory exists on a used host
+  printf 'FAKE_LOG=%q\nFAKE_HOST=%q\nMARK=%q\n' "$log" "$F/host" "$MARK" >"$F/fake/conf"
+  env -i PATH="$F/fake:$SYS_PATH" HOME="$F/home" XDG_RUNTIME_DIR="$F/run" TMPDIR="$F/tmp" APOFIS_E2E_HOST=fakehost \
+    BUILD_LABEL="$MARK-innocently-named%2F&x" APOFIS_E2E_CANARY="$MARK-canary-0123456789" API_SERVER_KEY="$MARK-exported" \
+    timeout 300 bash "$F/repo/tools/emulator/run-e2e.sh" "$@" </dev/null >/dev/null 2>&1
 }
-rc=0; trip_case app --app-test BlurCostTest || rc=$?
-check "app test startup: stops at stage 0 and cleans up (the fake host refuses)" '[ "$rc" != 0 ] && [ -s "$t/trip/ssh-app" ] && grep -q "stage 0" "$t/trip/out-app"'
-check "app test startup and cleanup: no credential, canary or file marker in any ssh environment, argument or input" '! grep -q "$MARK" "$t/trip/ssh-app"'
-check "app test startup and cleanup: the credentials file is never read" '[ ! -e "$t/trip/read-app" ]'
-rc=0; trip_case smoke --smoke || rc=$?
-check "authenticated mode (control): reads the credentials file, so the tripwire can see a read" '[ -s "$t/trip/read-smoke" ]'
-check "authenticated mode (control): its children inherit the caller's environment, so the ssh check can see it" 'grep -q "$MARK" "$t/trip/ssh-smoke"'
+c1_run "$F/app.log" --app-test BlurCostTest || true
+counted() { awk -v k="$2" '{for (i = 1; i <= NF; i++) if (index($i, k "=") == 1) s += substr($i, length(k) + 2)} END {print s + 0}' "$1"; }
+calls() { grep -c "^$2 " "$1" 2>/dev/null || echo 0; }
+check "app test: the fake host was reached by ssh and the upload ran" '[ "$(calls "$F/app.log" ssh)" -gt 2 ] && [ "$(calls "$F/app.log" rsync)" -ge 1 ]'
+check "app test: every ssh call turns off agent, X11 and port forwarding on its command line" '! grep "^ssh " "$F/app.log" | grep -qv "a=1 x=1 fa=1 fx=1 caf=1"'
+check "app test: every rsync transport turns off agent, X11 and port forwarding" '! grep "^rsync " "$F/app.log" | grep -qv "a=1 x=1 fa=1 caf=1"'
+check "app test: the upload is an explicit file list, never a directory walk" '! grep "^rsync " "$F/app.log" | grep -q "list=0"'
+check "app test: no marker in any child's environment, argument, input or uploaded source" '[ "$(counted "$F/app.log" env)" = 0 ] && [ "$(counted "$F/app.log" args)" = 0 ] && [ "$(counted "$F/app.log" in)" = 0 ] && [ "$(counted "$F/app.log" src)" = 0 ]'
+check "app test: exactly the APKs and the remote stage's own files arrive on the host" '[ "$(cd "$F/host/tmp/apofis-e2e/app-src" 2>/dev/null && find . -type f | sort | tr "\n" " ")" = "./app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk ./app/build/outputs/apk/debug/app-debug.apk ./flake.lock ./flake.nix ./gradle/libs.versions.toml ./tools/emulator/run-e2e.sh " ]'
+check "app test: no marker anywhere on the fake host" '! grep -rq "$MARK" "$F/host"'
+c1_run "$F/smoke.log" --smoke || true
+check "authenticated mode (control): its children inherit the caller's environment, so the check above can see it" '[ "$(counted "$F/smoke.log" env)" -gt 0 ]'
+check "authenticated mode (control): its upload walks the tree with the untracked file, so the source check can see it" '[ "$(counted "$F/smoke.log" src)" -gt 0 ]'
 
 # 13. Every instrumentation test class writes its own result rows (Evidence), which the cleanup requires.
 for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
