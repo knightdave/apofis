@@ -63,7 +63,9 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }) {
+            // Glass draws its fill only. The blur path stays in the code; whether it ships is decided by trying it on a
+            // phone (a Settings switch), not by an automated measurement.
+            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }, blur = false) {
                 // Test tags become resource ids, so the end-to-end tests find chat items by their opaque keys.
                 Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
             }

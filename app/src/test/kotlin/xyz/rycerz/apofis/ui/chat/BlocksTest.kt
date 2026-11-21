@@ -339,4 +339,14 @@ class BlocksTest {
             assertEquals("$kind '$c'", replyRows("r1", full), live.update("r1", full))
         }
     }
+
+    @Test
+    fun everyReplyHasAFooter() {
+        val rows = ChatRows(ZoneId.of("UTC"))
+        val finished = rows.rows(listOf(AssistantReply("r1", emptyList(), "Done.", 0.0)))
+        assertEquals(FooterRow::class, finished.last()::class)
+        assertEquals("r1/end", finished.last().key)
+        val empty = rows.rows(listOf(AssistantReply("r2", emptyList(), "", 0.0)))
+        assertEquals(listOf("r2/end"), empty.filter { it !is DateRow }.map { it.key })
+    }
 }
