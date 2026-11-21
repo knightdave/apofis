@@ -7,7 +7,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,14 +14,18 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Size
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -50,13 +53,13 @@ import xyz.rycerz.apofis.ui.theme.transparent
 internal val TopBarHeight = 56.dp
 
 /** The gradient's fade below the bar's row. */
-private val TopFade = 24.dp
+internal val TopFade = 24.dp
 
 /**
- * The transparent top bar over the list: a page-colored gradient, opaque behind the status bar and the bar's row and
- * fading to clear over [TopFade] below it, keeps the title and the status line readable over scrolled text; no
- * elevation, no scroll tint. Only the title area and the buttons
- * take touches: the rest lets them through to the list.
+ * The transparent top bar over the list. Its bounds are the opaque part: the status bar and the row (at least
+ * [TopBarHeight], taller with large text); a page-colored gradient continues [TopFade] below them and fades to clear,
+ * so the title and the status line stay readable over scrolled text. No elevation, no scroll tint. Horizontal safe
+ * insets (side navigation, cutouts) keep the controls clear of the edges.
  */
 @Composable
 internal fun ChatTopBar(
@@ -68,16 +71,29 @@ internal fun ChatTopBar(
     modifier: Modifier = Modifier,
 ) {
     val surface = MaterialTheme.colorScheme.surface
-    val top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val solid = (top + TopBarHeight) / (top + TopBarHeight + TopFade)
     Box(
         modifier
             .fillMaxWidth()
-            .height(top + TopBarHeight + TopFade)
-            .background(Brush.verticalGradient(0f to surface, solid to surface, 1f to surface.transparent()))
+            .drawBehind {
+                val fade = TopFade.toPx()
+                val total = size.height + fade
+                drawRect(
+                    Brush.verticalGradient(0f to surface, size.height / total to surface, 1f to surface.transparent(), endY = total),
+                    size = Size(size.width, total),
+                )
+            }
             .testTag("chat.topbar"),
     ) {
-        Row(Modifier.padding(top = top, end = 4.dp).height(TopBarHeight).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier
+                .statusBarsPadding()
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+                .padding(end = 4.dp)
+                .heightIn(min = TopBarHeight)
+                .fillMaxWidth()
+                .testTag("chat.topbar.row"),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             navigationIcon()
             Box(Modifier.weight(1f)) { Title(state, onOpenConnection, onRetryLoad) }
             actions()

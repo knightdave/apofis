@@ -15,8 +15,21 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.foundation.layout.asPaddingValues
-import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.calculateStartPadding
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
@@ -53,6 +66,9 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.paneTitle
+import androidx.compose.ui.semantics.traversalIndex
+import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontStyle
@@ -98,98 +114,118 @@ fun ChatScreen(
     val follow = rememberFollow(listState, state)
     val backdrop = rememberBackdropState()
     val density = LocalDensity.current
-    var bottomArea by remember { mutableIntStateOf(0) } // the bottom area's height with its insets, px
-    var bottomContent by remember { mutableIntStateOf(0) } // the same without the larger of keyboard and navigation bar, px
+    var bottomContent by remember { mutableIntStateOf(0) } // the bottom area without the larger of keyboard and navigation bar, px
     val surface = MaterialTheme.colorScheme.surface
-    val fade = with(density) { 180.dp.toPx() }
-    val composerGap = with(density) { 8.dp.toPx() }
+    val sides = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)
 
-    val topPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + TopBarHeight + 8.dp
-    // The bottom is read when the list measures, after the bottom area (measured first) has stored its height.
-    val listPadding = remember(topPadding, density) {
-        object : PaddingValues {
-            override fun calculateLeftPadding(layoutDirection: LayoutDirection) = 0.dp
-            override fun calculateRightPadding(layoutDirection: LayoutDirection) = 0.dp
-            override fun calculateTopPadding() = topPadding
-            override fun calculateBottomPadding() = with(density) { bottomArea.toDp() } + 8.dp
-        }
-    }
-
-    Box(modifier.fillMaxSize().background(surface).testTag("chat.key:${state.sessionKey}")) { // the end-to-end tests read the open chat's key here
-        Column(
-            Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .zIndex(1f) // composed first (measured before the list) but drawn over it
-                .layout { measurable, constraints ->
-                    // Read by the list's padding during its measure in this same pass: no frame with a stale padding.
-                    val placeable = measurable.measure(constraints)
-                    bottomArea = placeable.height
-                    layout(placeable.width, placeable.height) { placeable.place(0, 0) }
+    // Like a scaffold: the bottom area and the bar are measured first, then the body is composed with their heights,
+    // so the list's padding and the uncovered region never lag a frame behind (keyboard, notes, large text).
+    SubcomposeLayout(modifier.fillMaxSize().background(surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }) { constraints -> // the end-to-end tests read the open chat's key here
+        val loose = constraints.copy(minWidth = 0, minHeight = 0)
+        val bottom = subcompose(ChromeSlot.BOTTOM) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .testTag("chat.bottom")
+                    .blockTouchesBelow()
+                    .coverForAccessibility(order = 1f)
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                    .navigationBarsPadding()
+                    .imePadding() // max(keyboard, navigation bar), applied once
+                    .onSizeChanged { bottomContent = it.height },
+            ) {
+                Column(Modifier.background(surface)) { // notes keep a backing of their own over scrolled text
+                    state.composerNote?.let { ComposerNoteLine(it) }
+                    if (linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
+                    state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                 }
-                .navigationBarsPadding()
-                .imePadding() // max(keyboard, navigation bar), applied once
-                .onSizeChanged { bottomContent = it.height },
-        ) {
-            state.composerNote?.let { ComposerNoteLine(it) }
-            if (linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
-            state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
-            Composer(
-                state.draft,
-                if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
-                { actions.onDraftChange(it, state.draftRevision) },
-                onSend = {
-                    linkFailed = false
-                    actions.onSendClick()
-                    follow.onSend()
-                    scope.launch { listState.scrollToItem(0) }
-                },
-                onStop = { state.live?.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
-                busy = state.sending,
-            )
-        }
-        if (state.status == StatusLine.LOAD_FAILED) {
-            Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-                WashTextButton(R.string.chat_load_retry, onRetryLoad)
-            }
-        } else {
-            MessageList(
-                state.items,
-                state.live,
-                state.notes,
-                state.answering,
-                actions,
-                onCancel = { it.idempotencyKey?.let(actions::onCancel) },
-                onStep = { detail = it },
-                listState = listState,
-                contentPadding = listPadding,
-                zone = zone,
-                today = today,
-                modifier = Modifier
-                    .backdropSource(backdrop)
-                    .drawWithContent {
-                        drawContent()
-                        // Inside the source, so the sharp list and any blurred sample of it both fade; no text below the composer.
-                        // The composer card's bottom edge: above the insets and the card's 8 dp outer margin (Composer.kt).
-                        val edge = size.height - (bottomArea - bottomContent) - composerGap
-                        drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = edge - fade, endY = edge), Offset(0f, edge - fade), Size(size.width, fade))
-                        drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
+                Composer(
+                    state.draft,
+                    if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
+                    { actions.onDraftChange(it, state.draftRevision) },
+                    onSend = {
+                        linkFailed = false
+                        actions.onSendClick()
+                        follow.onSend()
+                        scope.launch { listState.scrollToItem(0) }
                     },
-                onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
-            )
-            ScrollToBottomButton(
-                visible = follow.buttonVisible,
-                backdrop = backdrop,
-                onClick = {
-                    follow.onButton()
-                    scope.launch { listState.animateScrollToItem(0) }
-                },
-                // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
-                Modifier.align(Alignment.BottomEnd).padding(end = 2.dp).offset { IntOffset(0, -bottomArea - 2.dp.roundToPx()) },
-            )
+                    onStop = { state.live?.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
+                    busy = state.sending,
+                )
+            }
+        }.single().measure(loose)
+        val bar = subcompose(ChromeSlot.BAR) {
+            ChatTopBar(state, onOpenConnection, onRetryLoad, navigationIcon, appBarActions, Modifier.blockTouchesBelow().coverForAccessibility(order = -1f))
+        }.single().measure(loose)
+        val barHeight = bar.height
+        val bottomArea = bottom.height
+        val body = subcompose(ChromeSlot.BODY) {
+            if (state.status == StatusLine.LOAD_FAILED) {
+                Uncovered(barHeight, bottomArea, fullScreen = false) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                            WashTextButton(R.string.chat_load_retry, onRetryLoad)
+                        }
+                    }
+                }
+            } else {
+                val padding = PaddingValues(
+                    start = sides.asPaddingValues().calculateStartPadding(LocalLayoutDirection.current),
+                    end = sides.asPaddingValues().calculateEndPadding(LocalLayoutDirection.current),
+                    top = barHeight.toDp() + 8.dp,
+                    bottom = bottomArea.toDp() + 8.dp,
+                )
+                Uncovered(barHeight, bottomArea, fullScreen = true) {
+                    MessageList(
+                        state.items,
+                        state.live,
+                        state.notes,
+                        state.answering,
+                        actions,
+                        onCancel = { it.idempotencyKey?.let(actions::onCancel) },
+                        onStep = { detail = it },
+                        listState = listState,
+                        contentPadding = padding,
+                        zone = zone,
+                        today = today,
+                        modifier = Modifier
+                            .backdropSource(backdrop, surface)
+                            .drawWithContent {
+                                drawContent()
+                                // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
+                                // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom edge
+                                // (above the insets and the card's 8 dp outer margin, Composer.kt) and below it: text and
+                                // controls at the bottom are never washed out, text passing behind the composer fades.
+                                val gap = 8.dp.toPx()
+                                val rest = size.height - bottomArea - gap
+                                val edge = size.height - (bottomArea - bottomContent) - gap
+                                if (edge > rest) {
+                                    drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
+                                }
+                                drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
+                            },
+                        onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
+                    )
+                }
+                ScrollToBottomButton(
+                    visible = follow.buttonVisible,
+                    backdrop = backdrop,
+                    onClick = {
+                        follow.onButton()
+                        scope.launch { listState.animateScrollToItem(0) }
+                    },
+                    // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
+                    Modifier.windowInsetsPadding(sides).padding(end = 2.dp, bottom = 2.dp),
+                )
+            }
+        }.map { it.measure(loose) }
+        layout(constraints.maxWidth, constraints.maxHeight) {
+            body.first().place(0, barHeight) // the uncovered region
+            body.getOrNull(1)?.let { it.place(constraints.maxWidth - it.width, constraints.maxHeight - bottomArea - it.height) } // the scroll button
+            bottom.place(0, constraints.maxHeight - bottomArea, zIndex = 1f)
+            bar.place(0, 0, zIndex = 1f)
         }
-        ChatTopBar(state, onOpenConnection, onRetryLoad, navigationIcon, appBarActions, Modifier.align(Alignment.TopCenter))
     }
 
     state.confirmCancel?.let { id ->
@@ -315,3 +351,38 @@ private fun WashTextButton(label: Int, onClick: () -> Unit) {
     val source = remember { MutableInteractionSource() }
     TextButton(onClick = onClick, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) { Text(stringResource(label)) }
 }
+
+/**
+ * The part of the screen the bars leave uncovered, between [top] and [bottom] px (the root places it at [top]). With
+ * [fullScreen] the content keeps the whole screen (the list draws under the bars) but its parent spans only the
+ * uncovered part, so whatever lies under the bars gets no accessibility focus (semantic bounds are clipped to the
+ * parent; touches are stopped by the bars themselves); otherwise the content is laid out inside it.
+ */
+@Composable
+private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, content: @Composable () -> Unit) {
+    Layout(content) { measurables, constraints ->
+        val height = (constraints.maxHeight - top - bottom).coerceAtLeast(0)
+        val full = Constraints.fixed(constraints.maxWidth, constraints.maxHeight)
+        val placeable = measurables.single().measure(if (fullScreen) full else Constraints.fixed(constraints.maxWidth, height))
+        layout(constraints.maxWidth, height) { placeable.place(0, if (fullScreen) -top else 0) }
+    }
+}
+
+private enum class ChromeSlot { BOTTOM, BAR, BODY }
+
+/**
+ * An opaque overlay hides from accessibility what lies under it: Compose leaves out of the tree the parts of nodes
+ * covered by an "important" node drawn above them. A blank pane title makes this container important without making it
+ * focusable or read; its own buttons and texts stay separate nodes.
+ */
+private fun Modifier.coverForAccessibility(order: Float) = semantics {
+    paneTitle = ""
+    traversalIndex = order // read top to bottom: the bar (-1), the list (0), the bottom area (1), whatever the drawing order
+}
+
+/**
+ * Makes this opaque overlay a hit-test target, so a touch on its blank parts stops here and never reaches the list
+ * drawn underneath (Compose tests lower siblings only when no higher one is hit). Nothing is consumed: the overlay's
+ * own buttons and fields still get their touches.
+ */
+private fun Modifier.blockTouchesBelow() = pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent() } }

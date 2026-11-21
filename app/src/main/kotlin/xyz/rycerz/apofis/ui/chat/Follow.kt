@@ -17,7 +17,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.drop
-import xyz.rycerz.apofis.chat.ChatItem
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import xyz.rycerz.apofis.ui.theme.Motion
 
 /**
@@ -43,22 +44,26 @@ internal fun shouldPin(state: FollowState, contentGrew: Boolean, atBottom: Boole
 }
 
 /**
- * The chat's follow and scroll-button state. Nothing here reads the transcript: each streamed update costs one reference
- * comparison, and scrolling costs a few O(1) reads of the list state.
+ * The chat's follow and scroll-button state. Nothing here reads the transcript: each update costs a comparison of the
+ * live tail's size, and scrolling costs a few O(1) reads of the list state.
  */
 @Stable
 internal class Follower(private val list: LazyListState, internal var wasLive: Boolean) {
-    internal var state = FollowState(following = true, holdUntilMs = 0) // read by effects only, so changes recompose nothing
+    // Read by effects only, so changes recompose nothing. Not following until the first measured layout says the list
+    // is at the bottom: a position restored many screens up (recreation) is a reader.
+    internal var state = FollowState(following = false, holdUntilMs = 0)
+    internal var measured = false
+    internal var dragging = false
     internal var frameMs = 0L // the latest frame time an effect saw; the hold is judged against it
-    internal var items: List<ChatItem>? = null
+    internal var tail = -1L // the live tail's size last seen, -1 without a live reply
     internal var recentlyScrolled by mutableStateOf(false)
-    internal var dismissed by mutableStateOf(false) // tapped: hidden until the next drag
-    // Recomputed on scroll (O(1)); the screen recomposes only when the answer changes.
-    val buttonVisible by derivedStateOf { !dismissed && list.canScrollBackward && (list.isScrollInProgress || recentlyScrolled) }
+    internal var dismissed by mutableStateOf(false) // tapped: hidden until the next scroll settles
+    val buttonVisible by derivedStateOf {
+        !dismissed && scrollButtonVisible(list.canScrollBackward, list.isScrollInProgress, if (recentlyScrolled) 0L else Long.MAX_VALUE)
+    }
 
-    /** The scroll button: follow again and hide it while the list animates down. */
+    /** The scroll button: hidden while the list animates down; following resumes when that scroll settles at the bottom. */
     fun onButton() {
-        state = state.copy(following = true)
         dismissed = true
     }
 
@@ -66,18 +71,36 @@ internal class Follower(private val list: LazyListState, internal var wasLive: B
     fun onSend() {
         state = state.copy(following = true)
     }
+
+    /** A pin may move the list only when no one else scrolls it: a drag owns it through [state], any other scroll (TalkBack, keyboard, the button's animation) by being in progress. */
+    internal fun free() = dragging || !list.isScrollInProgress
+
+    internal fun atBottom() = list.firstVisibleItemIndex == 0 && list.firstVisibleItemScrollOffset == 0
+
+    /** The bottom row's shift from its resting place (a few visible rows: bounded); 0 for an empty list. */
+    internal fun distance(): Float =
+        if (list.layoutInfo.totalItemsCount == 0) 0f
+        else list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.toFloat() } ?: Float.POSITIVE_INFINITY
 }
 
 @Composable
 internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
-    val live = ui.live != null
-    val follower = remember(list) { Follower(list, live) }
+    val live = ui.live
+    val follower = remember(list) { Follower(list, live != null) }
     val threshold = with(LocalDensity.current) { 56.dp.toPx() }
+    LaunchedEffect(list, follower, threshold) {
+        snapshotFlow { list.layoutInfo.viewportSize.height }.first { it > 0 }
+        follower.state = onScrollSettled(follower.state, follower.distance(), threshold)
+        follower.measured = true
+    }
     LaunchedEffect(list, follower) {
         list.interactionSource.interactions.collect {
-            if (it is DragInteraction.Start) {
-                follower.state = onUserDrag(follower.state)
-                follower.dismissed = false
+            when (it) {
+                is DragInteraction.Start -> {
+                    follower.dragging = true
+                    follower.state = onUserDrag(follower.state)
+                }
+                is DragInteraction.Stop, is DragInteraction.Cancel -> follower.dragging = false
             }
         }
     }
@@ -87,33 +110,31 @@ internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
                 follower.recentlyScrolled = true
                 return@collectLatest
             }
-            // The bottom row's shift from its resting place, when it is on screen (a few visible rows: bounded).
-            val distance = list.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.toFloat() } ?: Float.POSITIVE_INFINITY
-            follower.state = onScrollSettled(follower.state, distance, threshold)
-            val stop = withFrameMillis { it }
-            while (scrollButtonVisible(away = true, scrolling = false, idleMs = withFrameMillis { it } - stop)) Unit
+            if (follower.measured) follower.state = onScrollSettled(follower.state, follower.distance(), threshold)
+            follower.dismissed = false
+            if (list.canScrollBackward) delay(Motion.SCROLL_BUTTON_HIDE.toLong()) // one timeout, cancelled by the next scroll
             follower.recentlyScrolled = false
         }
     }
-    // After the change is applied and before the list measures it: a follower stays pinned with no frame of lag. The
-    // list state is not read here (that would recompose on every scroll), so atBottom is unknown: false.
+    // After the change is applied and before the list measures it: a follower stays pinned with no frame of lag. Only
+    // growth of the live tail pins (not any new list of items), and never against a scroll someone else owns.
+    val tail = live?.let { it.text.length.toLong() + it.steps.size + (if (it.pending != null) 1 else 0) } ?: -1L
     SideEffect {
-        if (follower.items !== ui.items) {
-            val grew = follower.items != null
-            follower.items = ui.items
-            if (grew && shouldPin(follower.state, contentGrew = true, atBottom = false, nowMs = follower.frameMs)) list.requestScrollToItem(0)
-        }
+        val grew = tail >= 0 && follower.tail in 0 until tail
+        follower.tail = tail
+        if (grew && follower.measured && follower.free() &&
+            shouldPin(follower.state, contentGrew = true, atBottom = follower.atBottom(), nowMs = follower.frameMs)
+        ) list.requestScrollToItem(0)
     }
-    LaunchedEffect(live) {
-        val ended = follower.wasLive && !live
-        follower.wasLive = live
+    LaunchedEffect(live != null) {
+        val ended = follower.wasLive && live == null
+        follower.wasLive = live != null
         if (!ended) return@LaunchedEffect
         var now = withFrameMillis { it }
         follower.state = onRunEnded(follower.state, now)
         while (now < follower.state.holdUntilMs) {
             follower.frameMs = now
-            val atBottom = list.firstVisibleItemIndex == 0 && list.firstVisibleItemScrollOffset == 0
-            if (shouldPin(follower.state, contentGrew = false, atBottom = atBottom, nowMs = now)) list.scrollToItem(0)
+            if (follower.free() && shouldPin(follower.state, contentGrew = false, atBottom = follower.atBottom(), nowMs = now)) list.scrollToItem(0)
             now = withFrameMillis { it }
         }
         follower.frameMs = now

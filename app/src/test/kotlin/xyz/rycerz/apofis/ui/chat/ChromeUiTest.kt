@@ -1,6 +1,13 @@
 package xyz.rycerz.apofis.ui.chat
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.test.assertIsDisplayed
+import xyz.rycerz.apofis.ui.theme.backdropSource
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -28,6 +35,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.getBoundsInRoot
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.unit.dp
 import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
@@ -103,17 +111,17 @@ class ChromeUiTest {
     fun scrollButtonHidesAfterIdle() {
         show(chat())
         assertFalse(buttonShown()) // at the bottom, not scrolling
-        rule.onNode(hasScrollToIndexAction()).performTouchInput { swipeDown() } // away from the bottom of the reversed list
+        rule.onNode(hasScrollToIndexAction()).performTouchInput { swipeDown(startY = top + height / 4, endY = bottom - height / 4) } // away from the bottom; starts below the bar
         frames()
         assertTrue(list.canScrollBackward)
         assertTrue(buttonShown())
         var guard = 0
         while (list.isScrollInProgress) frames().also { check(guard++ < 600) }
-        // Scrolling ended during the last frame: whole frames up to just under 2000 ms keep the button.
-        val keep = (Motion.SCROLL_BUTTON_HIDE - 1) / 16 - 1
-        frames(keep)
-        assertTrue("after ${keep * 16} ms idle", buttonShown())
-        frames(Motion.SCROLL_BUTTON_SLIDE / 16 + 6) // the remaining idle frames, the exit animation and its removal
+        // Scrolling ended during the last frame: the last frame before 2000 ms keeps the button on screen.
+        frames(Motion.SCROLL_BUTTON_HIDE / 16 - 1)
+        rule.onNode(button).assertIsDisplayed()
+        // The first frame past it starts the exit; after the exit animation the button is gone.
+        frames(2 + Motion.SCROLL_BUTTON_SLIDE / 16 + 2)
         assertFalse(buttonShown())
     }
 
@@ -135,7 +143,8 @@ class ChromeUiTest {
         val row = SemanticsMatcher("a chat row") { node ->
             node.config.getOrNull(SemanticsProperties.TestTag)?.let { it.startsWith("user:") || it.startsWith("reply:") } == true
         }
-        val tops = rule.onAllNodes(row, useUnmergedTree = true).fetchSemanticsNodes().map { it.boundsInRoot.top }
+        // Layout positions, not the clipped semantic bounds: rows under the bar are drawn there but hidden from touch and TalkBack.
+        val tops = rule.onAllNodes(row, useUnmergedTree = true).fetchSemanticsNodes().map { it.layoutInfo.coordinates.positionInRoot().y }
         assertTrue(tops.isNotEmpty())
         with(rule.density) { assertTrue("topmost row ${tops.min()} px, bar bottom ${bar.bottom.toPx()} px", tops.min() < bar.bottom.toPx()) }
     }
@@ -157,5 +166,68 @@ class ChromeUiTest {
             }
         }
         assertEquals(Color.Red, rule.onNodeWithTag("glass").captureToImage().toPixelMap()[40, 40])
+    }
+
+    /**
+     * The node's pixels. Robolectric sometimes captures a frame with nothing drawn (the window background, #FAFAFA),
+     * also in unrelated goldens; such a capture is taken again after a frame, a few times at most.
+     */
+    private fun pixels(tag: String): androidx.compose.ui.graphics.PixelMap {
+        repeat(5) {
+            val px = rule.onNodeWithTag(tag).captureToImage().toPixelMap()
+            if (px[px.width / 2, px.height / 2] != Color(0xFFFAFAFA)) return px // these tests never draw the window color there
+            rule.mainClock.advanceTimeByFrame()
+            rule.waitForIdle()
+        }
+        return rule.onNodeWithTag(tag).captureToImage().toPixelMap()
+    }
+
+    /** I8: inside the glass the backdrop's sharp ink is replaced by its blur; just outside it is unchanged. */
+    @Test
+    fun glassReplacesTheSharpBackdrop() {
+        rule.setContent {
+            CompositionLocalProvider(LocalBlur provides true) {
+                val state = rememberBackdropState()
+                Box(Modifier.testTag("page").size(120.dp).background(Color.White)) {
+                    // The source: a black stroke on the page (the page itself belongs to the parent, as in the chat).
+                    Box(Modifier.fillMaxSize().backdropSource(state, Color.White)) {
+                        Box(Modifier.align(Alignment.Center).size(2.dp, 120.dp).background(Color.Black))
+                    }
+                    Box(Modifier.align(Alignment.Center).size(60.dp).frostedGlass(state, RectangleShape, Color.Transparent, Color.Transparent, blur = 12.dp))
+                }
+            }
+        }
+        val px = pixels("page")
+        val inside = px[120, 120].luminance()
+        val outside = px[120, 10].luminance()
+        assertTrue("outside the glass the stroke is sharp: $outside", outside < 0.1f)
+        assertTrue("inside the glass the stroke is blurred away: $inside", inside > 0.6f)
+    }
+
+    /** M2: a consumer under a local blur-off draws fill only (records no sample), even when handed a recorded backdrop. */
+    @Test
+    fun localBlurOffAtTheConsumerWins() {
+        var consumerBlur by mutableStateOf(true)
+        var fill by mutableStateOf(Color.Transparent)
+        lateinit var backdrop: xyz.rycerz.apofis.ui.theme.BackdropState
+        rule.setContent {
+            CompositionLocalProvider(LocalBlur provides true) {
+                backdrop = rememberBackdropState()
+                Box(Modifier.size(80.dp)) {
+                    Box(Modifier.fillMaxSize().backdropSource(backdrop, Color.Blue))
+                    CompositionLocalProvider(LocalBlur provides consumerBlur) {
+                        Box(Modifier.align(Alignment.Center).size(40.dp).frostedGlass(backdrop, RectangleShape, fill, Color.Transparent))
+                    }
+                }
+            }
+        }
+        rule.waitForIdle()
+        assertTrue("control: a consumer with blur on samples the backdrop", backdrop.samples > 0)
+        consumerBlur = false
+        rule.waitForIdle()
+        val before = backdrop.samples
+        fill = Color.Red // forces the consumer to draw again, now with blur off
+        rule.waitForIdle()
+        assertEquals("no sample once blur is off at the consumer", before, backdrop.samples)
     }
 }

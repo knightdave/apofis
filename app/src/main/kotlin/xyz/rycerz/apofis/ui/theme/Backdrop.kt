@@ -29,7 +29,9 @@ import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.node.CompositionLocalConsumerModifierNode
 import androidx.compose.ui.node.DrawModifierNode
+import androidx.compose.ui.node.currentValueOf
 import androidx.compose.ui.node.GlobalPositionAwareModifierNode
 import androidx.compose.ui.node.ModifierNodeElement
 import androidx.compose.ui.node.invalidateDraw
@@ -48,6 +50,7 @@ import kotlin.math.ceil
 @Stable
 class BackdropState internal constructor(internal val layer: GraphicsLayer?) {
     internal var origin by mutableStateOf(Offset.Unspecified)
+    internal var samples = 0 // blurred samples recorded from this backdrop (tests read it)
 }
 
 /** A backdrop that blurs only while [LocalBlur] is on (hardware rendering, not turned off; never in goldens). */
@@ -58,14 +61,19 @@ fun rememberBackdropState(): BackdropState {
 }
 
 /**
- * Records this node's drawing (only what is on screen: lazy content outside the viewport is not composed) into the
- * state's layer once per frame it draws, and draws that layer sharp. Glass belongs outside the source, so it is never sampled.
+ * Records this node's drawing (only what is on screen: lazy content outside the viewport is not composed) over an
+ * opaque [background] (the page behind it) into the state's layer once per frame it draws, and draws that layer sharp.
+ * The page is part of the recording so a blurred sample replaces the sharp ink under the glass instead of laying
+ * translucent blurred ink over it. Glass belongs outside the source, so it is never sampled.
  */
-fun Modifier.backdropSource(state: BackdropState): Modifier {
+fun Modifier.backdropSource(state: BackdropState, background: Color): Modifier {
     val layer = state.layer ?: return this
     return onGloballyPositioned { state.origin = it.positionInRoot() }
         .drawWithContent {
-            layer.record { this@drawWithContent.drawContent() }
+            layer.record {
+                drawRect(background)
+                this@drawWithContent.drawContent()
+            }
             drawLayer(layer)
         }
 }
@@ -103,7 +111,7 @@ private data class GlassElement(val state: BackdropState?, val shape: Shape, val
 }
 
 private class GlassNode(var state: BackdropState?, var shape: Shape, var fill: Color, var border: Color, var blur: Dp) :
-    Modifier.Node(), DrawModifierNode, GlobalPositionAwareModifierNode {
+    Modifier.Node(), DrawModifierNode, GlobalPositionAwareModifierNode, CompositionLocalConsumerModifierNode {
     private var sample: GraphicsLayer? = null
     private var position = Offset.Unspecified
 
@@ -123,7 +131,7 @@ private class GlassNode(var state: BackdropState?, var shape: Shape, var fill: C
 
     override fun ContentDrawScope.draw() {
         val outline = shape.createOutline(size, layoutDirection, this)
-        val source = state?.layer
+        val source = state?.layer?.takeIf { currentValueOf(LocalBlur) } // blur off here wins over a recording source
         val origin = state?.origin ?: Offset.Unspecified // a state read: a moved source redraws this
         if (source != null && origin.isSpecified && position.isSpecified && size.width >= 1f && size.height >= 1f) {
             val margin = blur.toPx()
@@ -135,6 +143,7 @@ private class GlassNode(var state: BackdropState?, var shape: Shape, var fill: C
             val at = position - origin
             val w = ceil((size.width + 2 * margin) * SAMPLE_SCALE).toInt()
             val h = ceil((size.height + 2 * margin) * SAMPLE_SCALE).toInt()
+            state?.let { it.samples++ }
             layer.record(IntSize(w, h)) {
                 scale(SAMPLE_SCALE, SAMPLE_SCALE, pivot = Offset.Zero) { translate(margin - at.x, margin - at.y) { drawLayer(source) } }
             }

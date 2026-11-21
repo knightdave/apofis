@@ -63,7 +63,7 @@ class PendingRevealTest {
 
     private fun scrollAway() {
         repeat(4) {
-            rule.onNode(hasScrollToIndexAction()).performTouchInput { swipeDown() }
+            rule.onNode(hasScrollToIndexAction()).performTouchInput { swipeDown(startY = top + height / 4, endY = bottom - height / 4) } // starts below the opaque top bar
             frames(60)
         }
         frames(600) // the last fling settles: a reveal never fights the user's own scroll

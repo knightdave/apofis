@@ -8,6 +8,10 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.gestures.scrollBy
 import java.time.ZoneOffset
@@ -98,12 +102,12 @@ class FollowTest {
 
     private lateinit var list: LazyListState
 
-    private fun show(initial: ChatUiState): (ChatUiState) -> Unit {
+    private fun show(initial: ChatUiState, index: Int = 0, offset: Int = 0): (ChatUiState) -> Unit {
         rule.mainClock.autoAdvance = false
         var ui by mutableStateOf(initial)
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
-                list = androidx.compose.foundation.lazy.rememberLazyListState()
+                list = androidx.compose.foundation.lazy.rememberLazyListState(index, offset)
                 ChatScreen(ui, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list)
             }
         }
@@ -191,7 +195,7 @@ class FollowTest {
     fun handoffStaysPinned() {
         val set = show(state(live(text(1200))))
         assertTrue(atBottom())
-        set(state(null, history + AssistantReply("r9", emptyList(), text(1600), FIXED_NOW))) // the stored reply, longer
+        set(state(null, history + AssistantReply("r99", emptyList(), text(1600), FIXED_NOW))) // the stored reply, longer
         frames()
         assertTrue("${list.firstVisibleItemIndex}/${list.firstVisibleItemScrollOffset}", atBottom())
         nudge(60f) // the stored rows settle during the hold and shift the list without any new content
@@ -200,5 +204,115 @@ class FollowTest {
         nudge(60f) // after the hold nothing pulls the list back without new content
         frames(10)
         assertEquals(60, distanceFromBottom())
+    }
+
+    /** The row on screen at the reader's position and its offset (the index shifts as rows are added below). */
+    private fun anchor() = list.layoutInfo.visibleItemsInfo.first().key to list.firstVisibleItemScrollOffset
+
+    /** I1: a position restored many rows up (recreation) is a reader, not a follower: growth and the run end leave it. */
+    @Test
+    fun restoredReaderIsNotPulled() {
+        val set = show(state(live(text(400))), index = 12, offset = 40)
+        assertFalse(atBottom())
+        val key = list.layoutInfo.visibleItemsInfo.first().key
+        val offset = list.firstVisibleItemScrollOffset
+        for (i in 1..20) {
+            set(state(live(text(400 + i * 100))))
+            frames()
+            assertEquals("frame $i", key, list.layoutInfo.visibleItemsInfo.first().key)
+            assertEquals("frame $i", offset, list.firstVisibleItemScrollOffset)
+        }
+        set(state(null, history + AssistantReply("r99", emptyList(), text(2400), FIXED_NOW)))
+        for (f in 0..(Motion.FOLLOW_HOLD / 16 + 4)) {
+            frames()
+            assertEquals("hold frame $f", key, list.layoutInfo.visibleItemsInfo.first().key)
+            assertEquals("hold frame $f", offset, list.firstVisibleItemScrollOffset)
+        }
+    }
+
+    /** I2: a scroll without a drag (TalkBack's scroll action) is not cancelled by streamed growth. */
+    @Test
+    fun semanticsScrollIsNotCancelledByGrowth() {
+        val set = show(state(live(text(400))))
+        assertTrue(atBottom())
+        rule.onNode(hasScrollToIndexAction()).performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, 800f) }
+        for (i in 1..120) {
+            if (i in 2..30) set(state(live(text(400 + i * 100))))
+            frames()
+        }
+        assertTrue("distance ${distanceFromBottom()}", distanceFromBottom() > 112)
+    }
+
+    /** I2: tapping the scroll button animates down; growth during the animation does not turn it into a jump. */
+    @Test
+    fun buttonAnimationIsNotTurnedIntoAJump() {
+        val set = show(state(live(text(400))))
+        drag(1200f)
+        assertTrue(distanceFromBottom() > 112)
+        frames(10)
+        // Shown again by a scroll: a small drag away.
+        rule.onNode(hasScrollToIndexAction()).performTouchInput {
+            down(center)
+            moveBy(Offset(0f, 60f))
+            moveBy(Offset(0f, 60f))
+            up()
+        }
+        frames(2)
+        rule.onNodeWithContentDescription("Scroll to the latest message").performClick()
+        frames(3)
+        set(state(live(text(2000))))
+        frames(1)
+        assertFalse("jumped to the bottom", atBottom())
+        frames(120)
+        assertTrue("${list.firstVisibleItemIndex}/${list.firstVisibleItemScrollOffset}", atBottom())
+        set(state(live(text(2400)))) // following again after the animation settled at the bottom
+        frames()
+        assertTrue(atBottom())
+    }
+
+    /** The drag itself releases following: with the finger still down, growth and the run end move nothing. */
+    @Test
+    fun heldDragReleasesFollowing() {
+        val set = show(state(live(text(400))))
+        nudge(40f) // following, 20 dp up: growth alone would pin this
+        frames(4)
+        val node = rule.onNode(hasScrollToIndexAction())
+        node.performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(0f, 30f)) } // away, about 150 dp
+        }
+        frames(4)
+        val held = anchor()
+        for (i in 1..10) {
+            set(state(live(text(400 + i * 100))))
+            frames()
+            assertEquals("growth frame $i", held, anchor())
+        }
+        val position = list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset
+        set(state(null, history + AssistantReply("r99", emptyList(), text(1600), FIXED_NOW)))
+        for (f in 0..(Motion.FOLLOW_HOLD / 16 + 4)) { // the reply's keys change at the swap: the position must hold
+            frames()
+            assertEquals("hold frame $f", position, list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset)
+        }
+        node.performTouchInput {
+            advanceEventTime(200)
+            up()
+        }
+        settle()
+    }
+
+    /** Settling just outside the 56 dp zone leaves the reader; just inside resumes following (with [reacquireWithin56dp]). */
+    @Test
+    fun settleJustOutside56dpStaysReleased() {
+        val set = show(state(live(text(400))))
+        drag(400f)
+        drag(-254f) // back to 146 px (73 dp) from the bottom: both drags lose the same touch slop
+        val now = distanceFromBottom()
+        assertTrue("distance $now", now in 113..170)
+        for (i in 1..5) {
+            set(state(live(text(400 + i * 100))))
+            frames()
+            assertTrue("frame $i: pulled to ${distanceFromBottom()}", distanceFromBottom() > 112)
+        }
     }
 }
