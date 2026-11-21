@@ -21,6 +21,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.material3.SheetValue
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -34,13 +38,18 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 
-/** The app's bottom sheet: 20 dp top corners on the page color, no tint or shadow, a small round handle. */
+/**
+ * The app's bottom sheet: 20 dp top corners on the page color, no tint or shadow, a small round handle. While
+ * [dismissible] is false (an action is running) drag, scrim and Back cannot hide it, so a failure still shows in it.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ApofisSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+fun ApofisSheet(onDismiss: () -> Unit, dismissible: Boolean = true, content: @Composable ColumnScope.() -> Unit) {
     val handle = stringResource(R.string.sheet_handle)
+    val canHide by rememberUpdatedState(dismissible)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(confirmValueChange = { it != SheetValue.Hidden || canHide }),
         shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
         containerColor = MaterialTheme.colorScheme.surface,
         tonalElevation = 0.dp,

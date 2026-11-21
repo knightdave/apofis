@@ -25,6 +25,9 @@ import xyz.rycerz.apofis.ui.drawer.PromptKind
 import xyz.rycerz.apofis.ui.drawer.groupSessions
 import androidx.compose.runtime.Composable
 import kotlinx.coroutines.test.runTest
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.createComposeRule
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -58,18 +61,20 @@ import xyz.rycerz.apofis.ui.theme.SeedSchemes
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
 class ScreenshotTest {
+    @get:Rule
+    val rule = createComposeRule()
     private fun connectVm() = ConnectViewModel(current = null, willClearCache = { false }, save = {})
 
     @Test
     fun connect_light() {
         val vm = connectVm()
-        shot("connect_light", ThemeMode.LIGHT) { ConnectScreen(vm, onBack = null) }
+        rule.shot("connect_light", ThemeMode.LIGHT) { ConnectScreen(vm, onBack = null) }
     }
 
     @Test
     fun connect_dark() {
         val vm = connectVm().apply { onUrlChange("http://[200:1234::1]:8642") }
-        shot("connect_dark", ThemeMode.DARK) { ConnectScreen(vm, onBack = null) }
+        rule.shot("connect_dark", ThemeMode.DARK) { ConnectScreen(vm, onBack = null) }
     }
 
     @Test
@@ -78,7 +83,7 @@ class ScreenshotTest {
         vm.onUrlChange("hermes.local:8642")
         vm.onKeyChange("sk-123")
         vm.connect()?.join()
-        shot("connect_error", ThemeMode.LIGHT) { ConnectScreen(vm, onBack = null) }
+        rule.shot("connect_error", ThemeMode.LIGHT) { ConnectScreen(vm, onBack = null) }
     }
 
     @Test
@@ -90,7 +95,7 @@ class ScreenshotTest {
         shadowOf(Looper.getMainLooper()).idle() // runs what is queued now, then returns
         assertTrue(check.isCompleted)
         assertEquals(ConnectState.ConfirmServerChange, vm.state)
-        windowShot("connect_server_change") { ConnectScreen(vm, onBack = null) }
+        rule.windowShot("connect_server_change", hasText("Switch server?")) { ConnectScreen(vm, onBack = null) }
     }
 
     @Composable
@@ -109,10 +114,10 @@ class ScreenshotTest {
     )
 
     @Test
-    fun settings_light() = shot("settings_light", ThemeMode.LIGHT) { Settings() }
+    fun settings_light() = rule.shot("settings_light", ThemeMode.LIGHT) { Settings() }
 
     @Test
-    fun settings_dark() = shot("settings_dark", ThemeMode.DARK) { Settings() }
+    fun settings_dark() = rule.shot("settings_dark", ThemeMode.DARK) { Settings() }
 
     // ---- chat ----
 
@@ -141,7 +146,7 @@ class ScreenshotTest {
         LiveReply("run_1", status, text, steps, pending, Connection.LIVE)
 
     private fun chatShot(name: String, state: ChatUiState, mode: ThemeMode = ThemeMode.LIGHT, seed: SeedSchemes? = null) =
-        shot(name, mode, seed) { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY) }
+        rule.shot(name, mode, seed) { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY) }
 
     @Test
     fun chat_empty() = chatShot("chat_empty", chat(emptyList(), title = ""))
@@ -303,31 +308,31 @@ class ScreenshotTest {
         Prompt(kind, "apofis-3", "Trip to Lisbon: three days, mostly on foot, with a list of bakeries", pinned = false, archived = false, running = running, token = 1, error = error)
 
     @Test
-    fun drawer_groups_light() = shot("drawer_groups_light", ThemeMode.LIGHT) { DrawerOpen(rows()) }
+    fun drawer_groups_light() = rule.shot("drawer_groups_light", ThemeMode.LIGHT) { DrawerOpen(rows()) }
 
     @Test
-    fun drawer_groups_dark() = shot("drawer_groups_dark", ThemeMode.DARK) { DrawerOpen(rows(), refreshFailed = true) }
+    fun drawer_groups_dark() = rule.shot("drawer_groups_dark", ThemeMode.DARK) { DrawerOpen(rows(), refreshFailed = true) }
 
     @Test
-    fun drawer_search() = shot("drawer_search", ThemeMode.LIGHT) { DrawerOpen(rows("plan"), query = "plan", hasArchived = false) }
+    fun drawer_search() = rule.shot("drawer_search", ThemeMode.LIGHT) { DrawerOpen(rows("plan"), query = "plan", hasArchived = false) }
 
     @Test
-    fun drawer_empty() = shot("drawer_empty", ThemeMode.LIGHT) { DrawerOpen(emptyList(), hasArchived = false) }
+    fun drawer_empty() = rule.shot("drawer_empty", ThemeMode.LIGHT) { DrawerOpen(emptyList(), hasArchived = false) }
 
     @Test
-    fun drawer_actions_sheet() = windowShot("drawer_actions_sheet") {
+    fun drawer_actions_sheet() = rule.windowShot("drawer_actions_sheet", hasText("Rename")) {
         DrawerOpen(rows())
         PromptHost(prompt(PromptKind.ACTIONS, error = ActionError.NETWORK), object : PromptActions {})
     }
 
     @Test
-    fun drawer_delete_confirm() = windowShot("drawer_delete_confirm") {
+    fun drawer_delete_confirm() = rule.windowShot("drawer_delete_confirm", hasText("The chat will be deleted permanently from the server.")) {
         DrawerOpen(rows())
         PromptHost(prompt(PromptKind.DELETE, running = true), object : PromptActions {})
     }
 
     @Test
-    fun archived_list() = shot("archived_list", ThemeMode.LIGHT) {
+    fun archived_list() = rule.shot("archived_list", ThemeMode.LIGHT) {
         ArchivedScreen(
             listOf(
                 DrawerRow.Chat("apofis-8", "Old apartment search", selected = false, running = false, needsInput = false),

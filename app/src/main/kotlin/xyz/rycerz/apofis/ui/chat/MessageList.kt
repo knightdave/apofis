@@ -15,6 +15,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.referentialEqualityPolicy
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -457,6 +459,7 @@ internal object Work {
     var largestHighlight = 0 // the longest code handed to the highlighter
     var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
     var timelineRows = 0L // timeline step rows composed
+    var pageEnds = 0L // text pages measured
 }
 
 /**
@@ -906,7 +909,7 @@ internal class ChatRows(private val zone: ZoneId) {
             is AssistantReply -> buildList {
                 if (item.steps.isNotEmpty()) add(StepsRow(item))
                 addAll(replyRows(item.key, item.text, closeFences = !item.live))
-                if (item.live || item.outcome != null) add(FooterRow(item))
+                add(FooterRow(item)) // every reply: live indicators, notices, Copy and Select
             }
         }
     }
@@ -928,15 +931,27 @@ internal fun MessageList(
     today: LocalDate,
     modifier: Modifier = Modifier,
     onLink: (String) -> Unit = {},
+    onSelect: (String) -> Unit = {},
+    current: (() -> List<ChatItem>)? = null,
 ) {
     val builder = remember(zone) { ChatRows(zone) }
-    val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
+    // Copy reads the reply as it is when tapped. Referential: comparing the items would compare a live reply's steps.
+    val latestHolder = remember { mutableStateOf(items, referentialEqualityPolicy()) }
+    latestHolder.value = items
+    val latest by latestHolder
     // One sideways scroll per table, shared by its slices (separate list items), by "<reply>/b<index>".
     val tableScrolls = remember { HashMap<String, ScrollState>() }
     val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     // An answer that came too late shows under the reply, live or stored, unless that request is somehow drawn again.
     val gone = notes.any { (ref, note) -> note.result == AnswerResult.GONE && ref != pendingId }
     val rows = builder.rows(items).let { if (gone) Joined(it, listOf(GoneRow)) else it }
+    // Copy and Select check the transcript as it is at action time: the owner's current state when given.
+    val onSelectNow by rememberUpdatedState(onSelect)
+    val currentNow by rememberUpdatedState(current)
+    val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
+    // No reply has actions while a run is live or unsettled: once per transcript, not per token.
+    @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
+    val active = live != null || remember(stored) { unsettled(stored) }
     LazyColumn(modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
         items(
             count = rows.size,
@@ -948,7 +963,7 @@ internal fun MessageList(
                 Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
                     when (row) {
                         is DateRow -> DateSeparator(row.day, today)
-                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
+                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, actions = rowActions)
                         is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
                             // Read at tap time: a step that has since changed kind or gone opens nothing.
                             (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
@@ -961,7 +976,10 @@ internal fun MessageList(
                                 TextBlock(row, onLink, source = source)
                             }
                         }
-                        is FooterRow -> ReplyFooter(row.reply, live.takeIf { row.reply.live }, notes, answering, actions)
+                        is FooterRow -> ReplyFooter(
+                            row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
+                            rowActions, active = active,
+                        )
                         is NoticeRow -> NoticeLine(row.notice.text)
                         GoneRow -> Notice(R.string.chat_answer_gone)
                     }

@@ -12,3 +12,4 @@ captures/
 *.apk
 *.aab
 result
+__pycache__/

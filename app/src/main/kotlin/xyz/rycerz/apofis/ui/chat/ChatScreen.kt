@@ -82,6 +82,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.key
 import androidx.compose.runtime.SideEffect
 import xyz.rycerz.apofis.chat.SendState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import xyz.rycerz.apofis.chat.ChatItem
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.ComposeError
@@ -109,12 +113,14 @@ fun ChatScreen(
     zone: ZoneId = ZoneId.systemDefault(),
     today: LocalDate = LocalDate.now(zone),
     listState: LazyListState = rememberLazyListState(),
+    currentState: (() -> ChatUiState)? = null, // the owner's state now, for Copy and Select at action time
 ) {
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
     val steps = remember { StepIndex() }
     val uriHandler = LocalUriHandler.current
     var linkFailed by remember { mutableStateOf(false) } // shown until the next send or the next link that opens
+    var selectKey by rememberSaveable { mutableStateOf<String?>(null) } // the Select view's item; never its text
     // The request sits at the bottom; a same-id request with a new generation is a new request and is revealed again.
     val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
@@ -138,6 +144,8 @@ fun ChatScreen(
     // The objects the slots use, read through a holder too: replacing the list state (and with it the follower), the
     // backdrop (the blur setting) or the link handler reaches the screen; equal identities notify nothing.
     val objects = rememberUpdatedState(Objects(listState, follow, backdrop, uriHandler))
+    // Read by the transcript slot only: the app passes a new lambda with every state, which must not reach the composer.
+    val current = rememberUpdatedState(currentState)
 
     val barSlot = remember {
         @Composable {
@@ -256,6 +264,8 @@ fun ChatScreen(
                                     drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
                                 },
                             onLink = { url -> linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure },
+                            onSelect = { selectKey = it },
+                            current = current.value?.let { now -> { now().items } },
                         )
                     }
                     ScrollToBottomButton(
@@ -351,6 +361,20 @@ fun ChatScreen(
         val found = steps.find(state.items, subject)
         LaunchedEffect(found == null) { if (found == null) detail = null }
         found?.let { ToolDetailSheet(it.step, it.live, onDismiss = { detail = null }) }
+    }
+    selectKey?.let { key ->
+        // Only the stored part is searched (a live merge appends just the live reply, which has no Select), once per
+        // transcript change, not per streamed token. Closes once the key no longer resolves.
+        @Suppress("UNCHECKED_CAST") val stored = (state.items as? Joined<ChatItem>)?.head ?: state.items
+        val running = state.live != null
+        val text = remember(stored, key, running) { actionable(stored, key.removePrefix(FULL), fullMessage = key.startsWith(FULL), running = running) } // as Copy and Select do
+        // A restored view waits for the transcript to load; once loaded, a miss closes it for good.
+        LaunchedEffect(text == null, state.loaded) { if (text == null && state.loaded) selectKey = null }
+        if (text != null) {
+            Dialog(onDismissRequest = { selectKey = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+                SelectTextScreen(text, onBack = { selectKey = null })
+            }
+        }
     }
 }
 

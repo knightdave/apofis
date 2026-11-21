@@ -12,7 +12,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import java.time.ZoneOffset
+import org.junit.Rule
 import org.junit.Test
+import androidx.compose.ui.test.junit4.createComposeRule
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
@@ -28,6 +30,9 @@ import xyz.rycerz.apofis.ui.shot
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
 class ChromeScreenshotTest {
+    @get:Rule
+    val rule = createComposeRule()
+
     @Composable
     private fun ButtonOverText() {
         Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(16.dp)) {
@@ -41,10 +46,10 @@ class ChromeScreenshotTest {
     }
 
     @Test
-    fun scroll_button_light() = shot("scroll_button_light", ThemeMode.LIGHT) { ButtonOverText() }
+    fun scroll_button_light() = rule.shot("scroll_button_light", ThemeMode.LIGHT) { ButtonOverText() }
 
     @Test
-    fun scroll_button_dark() = shot("scroll_button_dark", ThemeMode.DARK) { ButtonOverText() }
+    fun scroll_button_dark() = rule.shot("scroll_button_dark", ThemeMode.DARK) { ButtonOverText() }
 
     @Test
     fun chat_scrolled_under_bar() {
@@ -61,7 +66,7 @@ class ChromeScreenshotTest {
             )
         }
         val state = ChatUiState("apofis-1", "Plan the garden beds", StatusLine.IDLE, items, ComposerMode.SEND_DISABLED, "", "hermes.example")
-        shot("chat_scrolled_under_bar") {
+        rule.shot("chat_scrolled_under_bar") {
             // A few rows up from the bottom, so a paragraph sits under the bar's gradient.
             ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = rememberLazyListState(3, 160))
         }

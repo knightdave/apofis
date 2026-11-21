@@ -1,18 +1,21 @@
 package xyz.rycerz.apofis.ui
 
-import android.os.Looper
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.ComposeContentTestRule
 import com.github.takahirom.roborazzi.RoborazziOptions
 import com.github.takahirom.roborazzi.captureRoboImage
+import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.test.isRoot
+import androidx.compose.ui.graphics.asAndroidBitmap
 import com.github.takahirom.roborazzi.captureScreenRoboImage
-import java.time.Duration
 import java.time.LocalDate
 import java.time.ZoneOffset
-import org.robolectric.Robolectric
-import org.robolectric.Shadows.shadowOf
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.SeedSchemes
@@ -32,23 +35,32 @@ val FIXED_NOW: Double = FIXED_TODAY.atTime(11, 0).toEpochSecond(ZoneOffset.UTC).
 private fun GoldenTheme(mode: ThemeMode, seed: SeedSchemes?, pureBlack: Boolean, content: @Composable () -> Unit) =
     ApofisTheme(mode, dynamicColor = seed != null, pureBlack = pureBlack, reduceMotion = true, blur = false, seed = seed, content = content)
 
-fun shot(name: String, mode: ThemeMode = ThemeMode.LIGHT, seed: SeedSchemes? = null, pureBlack: Boolean = false, content: @Composable () -> Unit) =
-    captureRoboImage("src/test/screenshots/$name.png", options) { GoldenTheme(mode, seed, pureBlack, content) }
-
-/** Captures every window, so dialogs and bottom sheets are in the image. */
-fun windowShot(name: String, mode: ThemeMode = ThemeMode.LIGHT, content: @Composable () -> Unit) {
-    val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
-    activity.setContent { GoldenTheme(mode, seed = null, pureBlack = false, content = content) }
-    shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2)) // sheet and dialog enter animations end
-    captureScreenRoboImage("src/test/screenshots/$name.png", options)
+/**
+ * Captures [content] alone. The rule owns the activity, the composition and the clock: frames run until idle and a frame
+ * is drawn before the capture, so a golden never shows content that has not been composed or drawn yet.
+ */
+fun ComposeContentTestRule.shot(name: String, mode: ThemeMode = ThemeMode.LIGHT, seed: SeedSchemes? = null, pureBlack: Boolean = false, content: @Composable () -> Unit) {
+    setContent { GoldenTheme(mode, seed, pureBlack) { Box(Modifier.testTag(GOLDEN)) { content() } } }
+    waitForIdle()
+    // Roborazzi's own view capture sometimes read nothing Compose had drawn (a page-colored golden, in long runs);
+    // Compose's capture waits for a drawn frame, so the golden is that bitmap.
+    onNodeWithTag(GOLDEN).captureToImage().asAndroidBitmap().captureRoboImage("src/test/screenshots/$name.png", options)
 }
 
+private const val GOLDEN = "golden"
+
 /**
- * Like [windowShot], but driven by a Compose test rule's clock, so a sheet's enter animation always finishes before the
- * capture (the looper-idle version sometimes captured a sheet still hidden).
+ * Captures every window, so dialogs and bottom sheets are in the image. The rule owns the activity, the composition and
+ * the clock: frames run until idle (enter animations end), then [shown], a node only the modal has, must be displayed
+ * before the capture, so a modal that is missing or still hidden fails the test instead of becoming a baseline.
  */
-fun ComposeContentTestRule.windowShot(name: String, mode: ThemeMode = ThemeMode.LIGHT, content: @Composable () -> Unit) {
+fun ComposeContentTestRule.windowShot(name: String, shown: SemanticsMatcher, mode: ThemeMode = ThemeMode.LIGHT, content: @Composable () -> Unit) {
     setContent { GoldenTheme(mode, seed = null, pureBlack = false, content = content) }
     waitForIdle()
+    onNode(shown).assertIsDisplayed()
+    val roots = onAllNodes(isRoot())
+    roots.fetchSemanticsNodes().forEachIndexed { i, root ->
+        if (root.size.width > 0 && root.size.height > 0) roots[i].captureToImage() // every window drawn before the capture
+    }
     captureScreenRoboImage("src/test/screenshots/$name.png", options)
 }

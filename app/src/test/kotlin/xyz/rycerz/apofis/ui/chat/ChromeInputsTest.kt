@@ -6,6 +6,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.Clipboard
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.platform.UriHandler
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -57,12 +61,24 @@ class ChromeInputsTest {
     private var uri by mutableStateOf<UriHandler>(object : UriHandler {
         override fun openUri(uri: String) = Unit
     })
+    private var currentState by mutableStateOf<(() -> ChatUiState)?>(null)
+
+    private class FakeClipboard : Clipboard {
+        val writes = ArrayList<String?>()
+        override suspend fun getClipEntry(): ClipEntry? = null
+        override suspend fun setClipEntry(clipEntry: ClipEntry?) {
+            writes += clipEntry?.clipData?.getItemAt(0)?.text?.toString()
+        }
+        override val nativeClipboard get() = throw UnsupportedOperationException()
+    }
+
+    private val clipboard = FakeClipboard()
 
     private fun show() {
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
-                CompositionLocalProvider(LocalBlur provides blur, LocalUriHandler provides uri) {
-                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list)
+                CompositionLocalProvider(LocalBlur provides blur, LocalUriHandler provides uri, LocalClipboard provides clipboard) {
+                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState)
                 }
             }
         }
@@ -154,5 +170,21 @@ class ChromeInputsTest {
         ui = chat(listOf(UserMessage("n1", "A brand new transcript", false, FIXED_NOW)))
         rule.waitForIdle()
         rule.onNodeWithText("A brand new transcript").assertExists()
+    }
+
+    /**
+     * Task 5's current-state reader is an input too: Copy checks the drawn text against the reader's transcript at tap
+     * time and writes only when they agree. The first reader disagrees (Copy would skip); the replacement agrees.
+     */
+    @Test
+    fun replacedCurrentStateIsReadByCopy() {
+        ui = chat(listOf(AssistantReply("r1", emptyList(), "Hello", FIXED_NOW)))
+        currentState = { chat(listOf(AssistantReply("r1", emptyList(), "Hello, since edited", FIXED_NOW))) }
+        show()
+        currentState = { chat(listOf(AssistantReply("r1", emptyList(), "Hello", FIXED_NOW))) }
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Copy").performClick()
+        rule.waitForIdle()
+        assertEquals("Copy did not read the replacement reader", listOf<String?>("Hello"), clipboard.writes)
     }
 }

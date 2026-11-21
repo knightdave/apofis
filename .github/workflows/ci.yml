@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - run: python3 -I -m unittest discover -s server/apofis-push -p 'test_*.py' -v
       - uses: actions/setup-java@v6
         with:
           distribution: temurin

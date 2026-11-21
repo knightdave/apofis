@@ -7,6 +7,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import java.time.ZoneOffset
+import androidx.compose.ui.test.junit4.createComposeRule
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -25,9 +27,12 @@ import xyz.rycerz.apofis.ui.shot
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
 class MarkdownScreenshotTest {
+    @get:Rule
+    val rule = createComposeRule()
+
     private fun md(name: String, text: String, mode: ThemeMode = ThemeMode.LIGHT) {
         val rows = ChatRows(ZoneOffset.UTC).rows(listOf(AssistantReply("r1", emptyList(), text, FIXED_NOW))).filterIsInstance<TextRow>()
-        shot(name, mode) {
+        rule.shot(name, mode) {
             Column(Modifier.width(360.dp).background(MaterialTheme.colorScheme.surface)) {
                 for (row in rows) TextBlock(row)
             }

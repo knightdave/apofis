@@ -17,15 +17,19 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.NonSkippableComposable
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalViewConfiguration
+import android.os.SystemClock
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,7 +64,6 @@ import xyz.rycerz.apofis.ui.markdown.syntaxColors
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.scaled
-import xyz.rycerz.apofis.ui.theme.wash
 
 /**
  * One display chunk of a logical block: markdown (flat, full width) or a fenced code block (monospace, scrolls
@@ -131,11 +134,21 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
 }
 
 /**
- * Under a reply: the live indicators, the pending request and the outcome notice. A CHANGED note shows inside the
+ * Under a reply: the live indicators, the pending request, the outcome notice and Copy and Select ([MessageActionRow]),
+ * shown only while the chat has no live or unsettled run ([active], see [unsettled]). A CHANGED note shows inside the
  * block of the request that replaced the answered one, and only while that request is drawn (GONE notes: [GoneRow]).
  */
+@NonSkippableComposable // comparing two replies would compare their steps one by one; it reads only text and outcome
 @Composable
-internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<RequestRef, AnswerNote>, answering: Boolean, actions: ChatActions) {
+internal fun ReplyFooter(
+    reply: AssistantReply,
+    live: LiveReply?,
+    notes: Map<RequestRef, AnswerNote>,
+    answering: Boolean,
+    actions: ChatActions,
+    rowActions: RowActions? = null,
+    active: Boolean = false,
+) {
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         if (live != null) {
             val polling = live.connection == Connection.POLLING
@@ -144,25 +157,38 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Req
             if (live.connection == Connection.RECONNECTING) Label(R.string.chat_reconnecting)
             if (pending != null) {
                 val changed = showsChanged(notes, pending)
+                // Double-tap protection (see [AnswerGate]): the interval counts from when this block first showed this
+                // request, or the request changed. Accepted limit: a request that waited behind a sheet or out of view
+                // accepts an answer as soon as it is revealed.
+                val clock = LocalAnswerClock.current
+                val settle = LocalViewConfiguration.current.doubleTapTimeoutMillis
+                val gate = remember(pending.requestId, pending.executionGeneration) { AnswerGate(clock, settle) }
                 // A request with another id or generation is a new block: an open menu or typed answer never carries over.
                 key(pending.requestId, pending.executionGeneration) {
                     when (pending.kind) {
-                        "approval" -> ApprovalBlock(pending, changed, answering, actions::onApproval)
-                        "clarify" -> ClarifyBlock(pending, changed, answering, actions::onClarify)
+                        "approval" -> ApprovalBlock(pending, changed, answering, gate, actions::onApproval)
+                        "clarify" -> ClarifyBlock(pending, changed, answering, gate, actions::onClarify)
                         else -> UnsupportedBlock()
                     }
                 }
             }
-            if (live.status == "unknown") Notice(R.string.chat_unknown_notice, R.string.chat_unknown_action, actions::onResolveUnknown)
+            if (live.status == "unknown") Notice(R.string.chat_unknown_notice, R.string.chat_unknown_action, actions::onResolveUnknown, error = true)
         }
         when (reply.outcome) {
             ReplyOutcome.STOPPED -> Notice(R.string.chat_outcome_stopped)
-            ReplyOutcome.FAILED -> Notice(R.string.chat_outcome_failed)
-            ReplyOutcome.INTERRUPTED -> Notice(R.string.chat_outcome_interrupted)
+            ReplyOutcome.FAILED -> Notice(R.string.chat_outcome_failed, error = true)
+            ReplyOutcome.INTERRUPTED -> Notice(R.string.chat_outcome_interrupted, error = true)
             null -> Unit
+        }
+        // The first icon lines up with the 20 dp text inset (a 16 dp icon centred in its 48 dp target).
+        if (rowActions != null && !reply.live && !active && reply.text.isNotBlank()) {
+            MessageActionRow(reply, rowActions, Modifier.padding(start = 4.dp))
         }
     }
 }
+
+/** Monotonic milliseconds for the answer guard in [ReplyFooter]; tests provide their manual clock. */
+internal val LocalAnswerClock = staticCompositionLocalOf<() -> Long> { SystemClock::uptimeMillis }
 
 /** True when [pending] is the request that replaced an answered one (same id with a new generation included). */
 internal fun showsChanged(notes: Map<RequestRef, AnswerNote>, pending: PendingControl): Boolean {
@@ -198,15 +224,15 @@ private fun Label(@StringRes text: Int) {
     )
 }
 
-/** An info line under a reply, optionally with one action. */
+/** An info line under a reply, optionally with one action; [error]: the alert icon and the error color. */
 @Composable
-internal fun Notice(@StringRes text: Int, @StringRes action: Int? = null, onAction: () -> Unit = {}) {
-    val tint = MaterialTheme.colorScheme.onSurfaceVariant
+internal fun Notice(@StringRes text: Int, @StringRes action: Int? = null, onAction: () -> Unit = {}, error: Boolean = false) {
+    val tint = if (error) MaterialTheme.colorScheme.error else ApofisTheme.colors.muted
     Row(
         Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(painterResource(R.drawable.lucide_info), null, Modifier.size(15.dp), tint = tint)
+        Icon(painterResource(if (error) R.drawable.lucide_triangle_exclamation_point else R.drawable.lucide_info), null, Modifier.size(15.dp), tint = tint)
         Box(Modifier.width(6.dp))
         Text(
             stringResource(text),
@@ -214,9 +240,6 @@ internal fun Notice(@StringRes text: Int, @StringRes action: Int? = null, onActi
             style = MaterialTheme.typography.labelMedium,
             color = tint,
         )
-        if (action != null) {
-            val source = remember { MutableInteractionSource() }
-            TextButton(onClick = onAction, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) { Text(stringResource(action)) }
-        }
+        if (action != null) SmallTextButton(action, onAction)
     }
 }

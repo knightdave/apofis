@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -81,7 +82,9 @@ class PendingRevealTest {
         var ui by mutableStateOf(state(null))
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
-                ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+                CompositionLocalProvider(LocalAnswerClock provides { rule.mainClock.currentTime }) {
+                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+                }
             }
         }
         frames()
@@ -99,6 +102,7 @@ class PendingRevealTest {
         ui = state(approval(2)) // same request id, new generation: a new request
         frames()
         rule.onNodeWithText("Hermes wants to run a command").assertIsDisplayed()
+        frames(30) // past the answer guard
         rule.onNodeWithText("Deny").performClick()
         frames(2)
         assertEquals(listOf(Triple("ctl_1", 2L, ApprovalChoice.DENY)), choices)

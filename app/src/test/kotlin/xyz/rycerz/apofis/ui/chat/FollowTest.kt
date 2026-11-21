@@ -112,7 +112,9 @@ class FollowTest {
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                 list = androidx.compose.foundation.lazy.rememberLazyListState(index, offset)
-                ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list)
+                val now = ui
+                // As the app does: a new current-state reader with every state (it must not reach the composer or header).
+                ChatScreen(now, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = { now })
             }
         }
         frames(10)
