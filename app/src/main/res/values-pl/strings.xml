@@ -158,7 +158,6 @@
     <string name="chat_copy">Kopiuj</string>
     <string name="chat_select">Zaznacz tekst</string>
     <string name="select_title">Zaznacz tekst</string>
-    <string name="select_too_large">Za długie, by zaznaczyć</string>
     <string name="chat_show_more">Pokaż więcej</string>
     <string name="chat_show_less">Pokaż mniej</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>

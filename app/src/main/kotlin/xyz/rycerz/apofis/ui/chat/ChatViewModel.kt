@@ -52,6 +52,7 @@ data class ChatUiState(
     val unsent: UnsentText? = null, // text a send could not store, in its own notice above the composer
     val confirmDiscard: UnsentText? = null, // the unsent entry the user asked to discard, while it is still the one shown
     val draftRevision: Long = 0, // the draft's revision: an edit is applied only on the revision it was typed on
+    val loaded: Boolean = true, // false only before the stored transcript first arrives (items empty but not known empty)
 )
 
 /** A request Hermes waits on, by id and execution generation: a new generation is a different request. */
@@ -180,7 +181,7 @@ class ChatViewModel(
         viewModelScope,
         SharingStarted.Eagerly,
         composer.current(sessionKey).let {
-            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision)
+            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision, loaded = false)
         },
     )
 

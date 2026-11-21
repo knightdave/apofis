@@ -68,27 +68,31 @@ internal fun collapsedPrefix(text: String): String {
 }
 
 /**
- * Right aligned, at most 75 % wide, tinted with primary, collapsed to [USER_COLLAPSED_LINES] lines with Show more. A
- * sent message has Copy and Select below ([textOf] reads its text from the transcript when tapped); unsent messages
- * show their state and controls instead.
+ * Right aligned, at most 75 % wide, tinted with primary, collapsed to [USER_COLLAPSED_LINES] lines with Show more.
+ * Expanded, it shows the first bounded piece ([pageEnd]); a longer message then offers Show more again, which opens
+ * the whole text in the Select view. A sent message has Copy and Select below; unsent messages show their state and
+ * controls instead.
  */
 @Composable
 internal fun UserBubble(
     message: UserMessage,
     onRetry: (String) -> Unit,
     onCancel: (UserMessage) -> Unit,
-    onSelect: (String) -> Unit,
-    textOf: (String) -> String?,
+    actions: RowActions,
     initiallyExpanded: Boolean = false,
 ) {
     val scheme = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalAlignment = Alignment.End) {
         var expanded by rememberSaveable(message.key) { mutableStateOf(initiallyExpanded) }
-        val prefix = remember(message.text) { collapsedPrefix(message.text) }
-        var long by remember(message.text) { mutableStateOf(prefix.length < message.text.length) }
+        val text = message.text
+        val prefix = remember(text) { collapsedPrefix(text) }
+        val page = if (expanded) remember(text) { text.substring(0, pageEnd(text, 0)) } else ""
+        val more = expanded && page.length < text.length
+        // Decided by the latest layout, both ways (a wider window can make a long message fit).
+        var long by remember(text) { mutableStateOf(prefix.length < text.length) }
         Box(Modifier.fillMaxWidth(0.75f), contentAlignment = Alignment.CenterEnd) {
             Text(
-                if (expanded) message.text else prefix,
+                if (expanded) page else prefix,
                 Modifier
                     .alpha(if (message.state == SendState.QUEUED) 0.7f else 1f) // 0.7: the contrast floor
                     .background(ApofisTheme.colors.bubbleFill, bubbleShape)
@@ -97,13 +101,20 @@ internal fun UserBubble(
                 color = scheme.onSurface,
                 maxLines = if (expanded) Int.MAX_VALUE else USER_COLLAPSED_LINES,
                 overflow = TextOverflow.Ellipsis,
-                onTextLayout = { if (it.hasVisualOverflow || it.lineCount > USER_COLLAPSED_LINES) long = true },
+                onTextLayout = {
+                    long = prefix.length < text.length || if (expanded) more || it.lineCount > USER_COLLAPSED_LINES else it.hasVisualOverflow
+                },
             )
         }
-        if (long) SmallTextButton(if (expanded) R.string.chat_show_less else R.string.chat_show_more, { expanded = !expanded })
+        if (long) {
+            Row {
+                if (expanded) SmallTextButton(R.string.chat_show_less, { expanded = false })
+                if (!expanded || more) SmallTextButton(R.string.chat_show_more, { if (expanded) actions.onSelect(message.key) else expanded = true })
+            }
+        }
         if (message.steered && message.state == SendState.SENT) Caption(R.string.chat_steered) // delivered
         // Before the early return: ordinary stored bubbles have no idempotency key. Offset so the icons end at the bubble's edge.
-        if (message.state == SendState.SENT) MessageActionRow({ textOf(message.key) }, { onSelect(message.key) }, Modifier.offset(x = 16.dp), alignEnd = true)
+        if (message.state == SendState.SENT) MessageActionRow(message, actions, Modifier.offset(x = 16.dp), alignEnd = true)
         val key = message.idempotencyKey ?: return@Column
         when (message.state) {
             SendState.QUEUED -> Row(verticalAlignment = Alignment.CenterVertically) {

@@ -127,10 +127,10 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
 }
 
 /**
- * Under a reply: the live indicators, the pending request, the outcome notice and, once it is not live, Copy and
- * Select ([textOf] reads the reply from the transcript when tapped; [finishedNow]: see [MessageActionRow]). A CHANGED
- * note shows inside the block of the request that replaced the answered one, and only while that request is drawn
- * (GONE notes: [GoneRow]).
+ * Under a reply: the live indicators, the pending request, the outcome notice and, once its run is over (not live,
+ * not [active], see [activeReplies]), Copy and Select ([finishedNow]: see [MessageActionRow]). A CHANGED note shows
+ * inside the block of the request that replaced the answered one, and only while that request is drawn (GONE notes:
+ * [GoneRow]).
  */
 @Composable
 internal fun ReplyFooter(
@@ -139,9 +139,9 @@ internal fun ReplyFooter(
     notes: Map<RequestRef, AnswerNote>,
     answering: Boolean,
     actions: ChatActions,
-    onSelect: (String) -> Unit = {},
-    textOf: (String) -> String? = { null },
+    rowActions: RowActions? = null,
     finishedNow: Boolean = false,
+    active: Boolean = false,
 ) {
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         if (live != null) {
@@ -169,8 +169,8 @@ internal fun ReplyFooter(
             null -> Unit
         }
         // The first icon lines up with the 20 dp text inset (a 16 dp icon centred in its 48 dp target).
-        if (!reply.live && reply.text.isNotBlank()) {
-            MessageActionRow({ textOf(reply.key) }, { onSelect(reply.key) }, Modifier.padding(start = 4.dp), finishedNow = finishedNow)
+        if (rowActions != null && !reply.live && !active && reply.text.isNotBlank()) {
+            MessageActionRow(reply, rowActions, Modifier.padding(start = 4.dp), finishedNow = finishedNow)
         }
     }
 }

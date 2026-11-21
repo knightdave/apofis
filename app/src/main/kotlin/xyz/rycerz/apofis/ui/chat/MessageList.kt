@@ -930,6 +930,7 @@ internal fun MessageList(
     onLink: (String) -> Unit = {},
     onSelect: (String) -> Unit = {},
     justFinishedKey: String? = null,
+    currentItems: (() -> List<ChatItem>)? = null,
 ) {
     val builder = remember(zone) { ChatRows(zone) }
     val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
@@ -939,6 +940,13 @@ internal fun MessageList(
     // An answer that came too late shows under the reply, live or stored, unless that request is somehow drawn again.
     val gone = notes.any { (ref, note) -> note.result == AnswerResult.GONE && ref != pendingId }
     val rows = builder.rows(items).let { if (gone) Joined(it, listOf(GoneRow)) else it }
+    // Copy and Select check the transcript as it is at action time: the owner's current state when given.
+    val onSelectNow by rememberUpdatedState(onSelect)
+    val currentNow by rememberUpdatedState(currentItems)
+    val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
+    // Replies stored as part of the running turn are not history yet: once per transcript or run, not per token.
+    @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
+    val active = remember(stored, live?.runId) { activeReplies(stored, live?.runId) }
     LazyColumn(modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
         items(
             count = rows.size,
@@ -950,7 +958,7 @@ internal fun MessageList(
                 Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
                     when (row) {
                         is DateRow -> DateSeparator(row.day, today)
-                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, onSelect = onSelect, textOf = { actionText(latest, it) })
+                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, actions = rowActions)
                         is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
                             // Read at tap time: a step that has since changed kind or gone opens nothing.
                             (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
@@ -965,7 +973,7 @@ internal fun MessageList(
                         }
                         is FooterRow -> ReplyFooter(
                             row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
-                            onSelect, { actionText(latest, it) }, finishedNow = row.reply.key == justFinishedKey,
+                            rowActions, finishedNow = row.reply.key == justFinishedKey, active = row.reply.key in active,
                         )
                         is NoticeRow -> NoticeLine(row.notice.text)
                         GoneRow -> Notice(R.string.chat_answer_gone)
