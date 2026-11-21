@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import androidx.test.core.app.ApplicationProvider
+import okhttp3.ResponseBody.Companion.toResponseBody
 import androidx.work.Configuration
 import androidx.work.WorkManager
 import androidx.work.testing.WorkManagerTestInitHelper
@@ -124,6 +125,9 @@ class PushReceiverTest {
         assertEquals("only the connector reads the bytes, once", 1, reads)
         assertEquals(1, sinkCalls.size) // PushSink.onPush(context) and TestPush.onWake() take no body at all
         assertTrue(scheduled.isEmpty())
+        val stored = prefs.all.values.joinToString() + wake.all.values.joinToString()
+        assertFalse("the body appears in no log", "apofis-x" in logged())
+        assertFalse("the body appears in no stored value", "apofis-x" in stored)
     }
 
     @Test
@@ -525,6 +529,45 @@ class PushReceiverTest {
         }
         recoverPush(counting, null)
         assertEquals("no connection epoch read at start", listOf(PUSH_PREFS), read)
+    }
+
+    // Closing fixes.
+
+    @Test
+    fun aFailedOwnWriteFinishesTheBroadcastAtOnce() = runTest {
+        val (_, token) = enabled()
+        var finished = 0
+        lateinit var h: Handoff
+        h = Handoff { finished++ }
+        prefs.onCommit = { keys ->
+            log.step("commit ${keys.sorted()}")
+            if (Keys.ENDPOINT_NEW in keys) {
+                h.deadline() // the deadline comes during the event's own write, which then fails
+                false
+            } else {
+                true
+            }
+        }
+        var finishedAtRecovery = -1
+        PushReceiver().receive(ctx, intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m1") },
+            finish = { h.finishOnce() }, schedule = { finishedAtRecovery = finished }, handoff = h)
+        assertEquals("finished once, before any recovery work", 1, finishedAtRecovery)
+        assertEquals(1, finished)
+        assertTrue("the failed event is not ACKed", ctx.sent.none { it.action == "org.unifiedpush.android.distributor.MESSAGE_ACK" })
+    }
+
+    @Test
+    fun aDeliveredWakeCompletesTheTestPush() = runTest {
+        val (_, token) = enabled()
+        val answering = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("ok")
+                .body("".toResponseBody()).build()
+        }.build()
+        val test = TestPush({ 0L }, answering) { it }
+        assertTrue(test.send("https://ntfy.sh/upAbC123xyz_-9?up=1"))
+        val withTest = object : ContextWrapperWithWake(LogContext(app, log, prefs, sink, test)) {}
+        PushReceiver().receive(withTest, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule)
+        assertEquals(TestPushResult.WAKE_ARRIVED, test.lastResult.value)
     }
 }
 

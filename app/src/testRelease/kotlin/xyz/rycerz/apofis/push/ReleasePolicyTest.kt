@@ -70,11 +70,12 @@ class ReleasePolicyTest {
     @Test
     fun registrationLeftByADebugBuildIsReplaced() = runTest {
         // Same app id and key: a debug install journaled an e2e registration and a loopback endpoint, then release was installed over it.
-        val prefs = FakePrefs(mutableMapOf(Keys.ENABLED to true, Keys.GENERATION to 1L, Keys.REGISTRATION to "g1\txyz.rycerz.apofis.e2e\ttok-e2e",
+        val prefs = FakePrefs(mutableMapOf(Keys.ENABLED to true, Keys.GENERATION to 1L, Keys.REGISTRATION to "g1\txyz.rycerz.apofis.e2e\ttok-e2e\t0",
             Keys.ENDPOINT_NEW to "http://127.0.0.1:41234/upWIRECHECK012?up=1", Keys.ENDPOINT_NEW_TOKEN to "tok-e2e"))
         val port = FakePort().apply { installed += "xyz.rycerz.apofis.e2e" }
         val server = FakeServer("https://a.example/")
         val r = PushRegistrar(app, prefs, { FakeRecordApi(server) }, { 0L }, { 0L }, backgroundScope, pushPolicy, port)
+        assertNull("the current epoch, yet outside the release policy", currentRegistration(prefs, setOf(NTFY_PACKAGE), 0))
         r.publishPending()
         assertEquals(listOf("unregister g1 tok-e2e", "save $NTFY_PACKAGE", "register g2"), port.calls)
         assertTrue("no record for the loopback endpoint", server.created.isEmpty())

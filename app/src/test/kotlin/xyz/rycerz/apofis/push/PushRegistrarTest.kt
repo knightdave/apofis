@@ -125,7 +125,7 @@ class PushRegistrarTest {
             r.enableNow()
             endpointFor()
             apiA.sendFails = true
-            r.publishPending()
+            assertFalse("the worker retries a failed create", r.publishPending())
             assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
             apiA.sendFails = false
             r.publishPending()
@@ -365,7 +365,10 @@ class PushRegistrarTest {
             val r = registrar()
             turnedOn(r)
             endpointFor("https://evil.example/upAbC123xyz_-9?up=1") // refused
+            val before = apiA.calls.size
             r.publishPending()
+            assertEquals("refused endpoint: server error", PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+            assertEquals("refused endpoint: no request", before, apiA.calls.size)
             endpointFor(VALID2)
             apiA.failWith = ApiError.Network(java.io.IOException("ntfy.sh/upZyX987abc_-1"))
             r.publishPending()
@@ -632,7 +635,7 @@ class PushRegistrarTest {
             val r = registrar()
             turnedOn(r)
             now += ROTATE_AFTER_MS
-            log.killAt = log.count() + 3 // read, reservation, death before the create
+            log.killAt = log.count() + 6 // register: save, REGISTER, journal, sent; then the reservation, death before the create
             runCatching { r.verify(force = true) }.onSuccess { error("no death") }
             log.killAt = 0
             restart()
@@ -709,7 +712,8 @@ class PushRegistrarTest {
         with(World()) {
             port.installed += "xyz.rycerz.apofis.e2e"
             assertTrue(prefs.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
-                .putString(Keys.REGISTRATION, "g1\txyz.rycerz.apofis.e2e\ttok-e2e").commit())
+                .putString(Keys.REGISTRATION, "g1\txyz.rycerz.apofis.e2e\ttok-e2e\t0").commit())
+            assertNull("the current epoch, yet outside the policy", currentRegistration(prefs, NTFY_ONLY, 0))
             val r = registrar() // release-shaped policy: ntfy only
             r.publishPending()
             assertEquals(listOf("unregister g1 tok-e2e", "save $NTFY_PACKAGE", "register g2"), port.calls)
@@ -883,7 +887,13 @@ class PushRegistrarTest {
             // connect resumes: A is gone, the marker advances the epoch, the local job runs, then B's connection.
             current = null
             epoch++
-            r.reconcileLocal()
+            // What production schedules for that state: the local job too, without a network constraint.
+            androidx.work.testing.WorkManagerTestInitHelper.initializeTestWorkManager(app, androidx.work.Configuration.Builder()
+                .setTaskExecutor(androidx.work.testing.SynchronousExecutor()).setExecutor { }.build())
+            PublishWorker.recover(app, prefs)
+            val local = androidx.work.WorkManager.getInstance(app).getWorkInfosForUniqueWork(PublishWorker.LOCAL_NAME).get().single()
+            assertEquals(androidx.work.NetworkType.NOT_REQUIRED, local.constraints.requiredNetworkType)
+            r.reconcileLocal() // what that job runs
             current = apiB
             endpointFor(VALID3)
             r.publishPending()

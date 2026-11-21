@@ -13,11 +13,19 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import java.util.concurrent.TimeUnit
 
-/** Runs [PushRegistrar.publishPending] until it reports nothing left; retries (with backoff) whenever it could not act. */
+/**
+ * The network job verifies (hourly: record present, current and renewed, distributor installed) and then publishes; the
+ * local job only reconciles. Each retries (with backoff) whenever it could not act.
+ */
 class PublishWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val registrar = (applicationContext as? PushSinkProvider)?.pushRegistrar ?: return Result.retry()
-        val done = if (inputData.getBoolean(LOCAL, false)) registrar.reconcileLocal() else registrar.publishPending()
+        val done = if (inputData.getBoolean(LOCAL, false)) {
+            registrar.reconcileLocal()
+        } else {
+            registrar.verifyNow(force = false)
+            registrar.publishPending()
+        }
         return if (done) Result.success() else Result.retry()
     }
 
@@ -41,9 +49,7 @@ class PublishWorker(context: Context, params: WorkerParameters) : CoroutineWorke
                 prefs.contains(Keys.PENDING_ID)
             ) {
                 schedule(context)
-            }
-            // Revocation is a local broadcast: it runs without waiting for a network.
-            if (prefs.contains(Keys.REVOKE)) {
+                // Revocation and registration are local broadcasts: they run without waiting for a network.
                 WorkManager.getInstance(context).enqueueUniqueWork(LOCAL_NAME, ExistingWorkPolicy.REPLACE, request(local = true))
             }
         }

@@ -16,6 +16,8 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.unifiedpush.android.connector.UnifiedPush
@@ -33,6 +36,7 @@ internal const val VERIFY_EVERY_MS = 3_600_000L
 internal const val ROTATE_AFTER_MS = 30L * 24 * 3_600_000L
 internal const val MAX_SEQ = 999_999
 private const val MAX_CREATES = 3
+private const val REQUEST_TIMEOUT_MS = 15_000L
 private const val TAG = "Apofis"
 private const val ACTION_REGISTER = "org.unifiedpush.android.distributor.REGISTER"
 private const val ACTION_UNREGISTER = "org.unifiedpush.android.distributor.UNREGISTER"
@@ -105,7 +109,12 @@ private class Guarded(private val a: RecordApi, live: () -> Boolean) : RecordApi
     private suspend fun <T> g(block: suspend () -> T): T {
         if (!live()) throw Stale()
         val result = try {
-            block()
+            // Bounded: a hung server does not hold the registrar (and so a switch or Off) for the client's 120 s.
+            try {
+                withTimeout(REQUEST_TIMEOUT_MS) { block() }
+            } catch (_: TimeoutCancellationException) {
+                throw IOException("push record request timed out")
+            }
         } catch (e: Exception) {
             if (!live() && e !is CancellationException) throw Stale()
             throw e
@@ -172,8 +181,10 @@ class PushRegistrar(
 
     /** Off is committed (with the registration to revoke) before anything else happens. */
     suspend fun disable() {
-        op { _ ->
-            if (enabled()) rotate(off = true) else finishRevocations()
+        withContext(NonCancellable) { // the user confirmed Off: a cancelled caller does not undo it
+            op { _ ->
+                if (enabled()) rotate(off = true) else finishRevocations()
+            }
         }
         afterUserOp()
     }
@@ -188,6 +199,12 @@ class PushRegistrar(
 
     /** Hourly unless [force]: distributor still there and answering, record present, hidden and current. */
     suspend fun verify(force: Boolean = false) {
+        verifyNow(force)
+        afterUserOp()
+    }
+
+    /** [verify] without scheduling work: the network job runs it itself. */
+    internal suspend fun verifyNow(force: Boolean) {
         op { a ->
             val last = prefs.getLong(Keys.VERIFIED_AT, 0)
             if (!force && prefs.contains(Keys.VERIFIED_AT) && clock() - last in 0 until VERIFY_EVERY_MS) return@op
@@ -196,7 +213,7 @@ class PushRegistrar(
                 if (allowed().isEmpty()) {
                     rotate(off = true) // the distributor was uninstalled
                 } else {
-                    if (port.saved(context) == null || port.acked(context) == null) register() // unanswered or forgotten: ask again
+                    register() // idempotent: also notices a subscription the distributor lost
                     if (a != null) {
                         publish(a, force = false)
                         check(a)
@@ -205,7 +222,6 @@ class PushRegistrar(
             }
             commitLive { putLong(Keys.VERIFIED_AT, clock()) }
         }
-        afterUserOp()
     }
 
     /**
@@ -373,14 +389,14 @@ class PushRegistrar(
         // Gone, retitled, or a turn ran in it: left alone, a new record replaces it.
         if (row == null || !pristine(row, prefs.getString(Keys.RECORD_TITLE, null))) return publish(a, force = true)
         if (!row.hidden || row.pinned) a.hide(record)
-        if (clock() - prefs.getLong(Keys.PUBLISHED_AT, 0) >= ROTATE_AFTER_MS) publish(a, force = true)
+        if (!fresh()) publish(a, force = true)
     }
 
     private suspend fun publish(a: RecordApi, force: Boolean) {
         val target = confirmed() ?: return // waiting for this registration's NEW_ENDPOINT
         val checked = checkEndpoint(target, policy.origins(context), policy.loopbackOrigin(context))
         val endpoint = checked.url ?: return fail("endpoint refused: ${checked.reason}")
-        if (!force && prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.ENDPOINT, null) == endpoint) return
+        if (!force && fresh() && prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.ENDPOINT, null) == endpoint) return
         if (prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.PENDING_ENDPOINT, null) != endpoint) commitLive { removePending() }
         repeat(MAX_CREATES) {
             val id = prefs.getString(Keys.PENDING_ID, null) ?: reserve(endpoint) ?: return fail("no id left")
@@ -397,6 +413,9 @@ class PushRegistrar(
         }
         fail("no free id")
     }
+
+    /** The record is younger than the rotation age (a publication time in the future counts as due too). */
+    private fun fresh() = clock() - prefs.getLong(Keys.PUBLISHED_AT, 0) in 0 until ROTATE_AFTER_MS
 
     private fun SharedPreferences.Editor.removePending() {
         for (k in listOf(Keys.PENDING_ID, Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE)) remove(k)

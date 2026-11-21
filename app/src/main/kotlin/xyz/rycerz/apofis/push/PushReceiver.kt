@@ -79,7 +79,7 @@ internal class Handoff(private val finish: () -> Unit) {
     }
     @Synchronized fun deadline() {
         late = true
-        if (!claimed) Log.w(TAG, "PushReceiver: event lost, late")
+        if (!claimed && !finished) Log.w(TAG, "PushReceiver: event lost, late")
         if (!claimed || done) finishOnce()
     }
     @Synchronized fun finishOnce() {
@@ -127,7 +127,7 @@ class PushReceiver : MessagingReceiver() {
         context: Context,
         intent: Intent,
         finish: () -> Unit,
-        schedule: (Context) -> Unit = PublishWorker::schedule,
+        schedule: (Context) -> Unit = { PublishWorker.recover(it) },
         handoff: Handoff? = null,
     ) {
         this.handoff = handoff
@@ -179,7 +179,11 @@ class PushReceiver : MessagingReceiver() {
     private fun durably(prefs: android.content.SharedPreferences, edit: android.content.SharedPreferences.Editor.() -> Unit): Boolean {
         if (!PushStore.flush(prefs)) throw IOException("push prefs not written") // nothing unrelated after the claim
         if (handoff?.claim() == false) throw Abandoned()
-        return commit(prefs, edit).also { handoff?.done() }
+        return try {
+            commit(prefs, edit)
+        } finally {
+            handoff?.done() // also when the write failed: nothing after it keeps the broadcast open
+        }
     }
 
     private fun commit(prefs: android.content.SharedPreferences, edit: android.content.SharedPreferences.Editor.() -> Unit): Boolean =
@@ -202,13 +206,15 @@ class PushReceiver : MessagingReceiver() {
 
     override fun onMessage(context: Context, message: PushMessage, instance: String) {
         val app = context.applicationContext as? PushSinkProvider ?: return
+        val testPush = app.testPush // looked up before the lock and the claim: building them is not part of the hand-off
+        val sink = app.pushSink
         // Under the push lock: no generation or connection change can fall between this check and the wake's commit.
         PushStore.locked {
             if (!trusted(context) || instance != instanceOf(pushPrefs(context))) return@locked
             if (handoff?.claim() == false) throw Abandoned() // the sink's commit is the event's own first write
             try {
-                app.testPush?.onWake()
-                val sink = app.pushSink ?: return@locked
+                testPush?.onWake()
+                if (sink == null) return@locked
                 val handedOff = try {
                     sink.onPush(context, connectionEpoch(context))
                 } catch (e: Exception) {
