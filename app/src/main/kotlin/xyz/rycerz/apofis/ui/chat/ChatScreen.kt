@@ -1,14 +1,10 @@
 package xyz.rycerz.apofis.ui.chat
 
-import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -17,23 +13,49 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.layout.SubcomposeMeasureScope
+import androidx.compose.ui.layout.MeasureResult
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.calculateStartPadding
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.zIndex
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.platform.LocalDensity
+import xyz.rycerz.apofis.ui.theme.backdropSource
+import xyz.rycerz.apofis.ui.theme.rememberBackdropState
+import xyz.rycerz.apofis.ui.theme.transparent
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -41,21 +63,29 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.UriHandler
+import xyz.rycerz.apofis.ui.theme.BackdropState
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.paneTitle
+import androidx.compose.ui.semantics.traversalIndex
+import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.key
+import androidx.compose.runtime.SideEffect
 import xyz.rycerz.apofis.chat.SendState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import xyz.rycerz.apofis.chat.ChatItem
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.ComposeError
@@ -63,17 +93,14 @@ import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
 import java.time.LocalDate
 import java.time.ZoneId
-import xyz.rycerz.apofis.ui.theme.ApofisIconButton
-import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.wash
 
 /**
- * The chat: app bar with the title and the status line, the message list and the composer. Stateless: [state] comes
- * from [ChatViewModel], which also implements [actions]. [onOpenConnection] is called when the user taps a rejected
- * key; [onRetryLoad] when the chat could not be opened ([StatusLine.LOAD_FAILED]) and the user asks to try again.
- * [zone] and [today] label the date separators.
+ * The chat: the message list fills the screen under a transparent top bar (title and status line) and the bottom area
+ * (notes and the composer). Stateless: [state] comes from [ChatViewModel], which also implements [actions].
+ * [onOpenConnection] is called when the user taps a rejected key; [onRetryLoad] when the chat could not be opened
+ * ([StatusLine.LOAD_FAILED]) and the user asks to try again. [zone] and [today] label the date separators.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     state: ChatUiState,
@@ -85,90 +112,201 @@ fun ChatScreen(
     appBarActions: @Composable RowScope.() -> Unit = {},
     zone: ZoneId = ZoneId.systemDefault(),
     today: LocalDate = LocalDate.now(zone),
+    listState: LazyListState = rememberLazyListState(),
+    currentState: (() -> ChatUiState)? = null, // the owner's state now, for Copy and Select at action time
 ) {
-    val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
     val steps = remember { StepIndex() }
     val uriHandler = LocalUriHandler.current
     var linkFailed by remember { mutableStateOf(false) } // shown until the next send or the next link that opens
-    val pendingId = state.live?.pending?.requestId
-    LaunchedEffect(pendingId) { if (pendingId != null) listState.animateScrollToItem(0) } // the request sits at the bottom
+    var selectKey by rememberSaveable { mutableStateOf<String?>(null) } // the Select view's item; never its text
+    // The request sits at the bottom; a same-id request with a new generation is a new request and is revealed again.
+    val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
+    LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
+    val follow = rememberFollow(listState, state)
+    val backdrop = rememberBackdropState()
+    val density = LocalDensity.current
+    var bottomContent by remember { mutableIntStateOf(0) } // the bottom area without the larger of keyboard and navigation bar, px
 
-    Scaffold(
-        modifier.testTag("chat.key:${state.sessionKey}"), // the end-to-end tests read the open chat's key here
-        containerColor = MaterialTheme.colorScheme.surface,
-        topBar = {
-            TopAppBar(
-                title = { Title(state, onOpenConnection, onRetryLoad) },
-                navigationIcon = navigationIcon,
-                actions = appBarActions,
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
-            )
-        },
-        bottomBar = {
-            Column(Modifier.navigationBarsPadding().imePadding()) {
-                state.composerNote?.let { ComposerNoteLine(it) }
-                if (linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
-                state.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
+    // The slots read their inputs through these holders, so each recomposes only when its own inputs change: a streamed
+    // token changes the transcript, never the header's or the composer's inputs (equal values notify nothing).
+    val latest = rememberUpdatedState(state)
+    val barInput = rememberUpdatedState(ChatUiState("", state.title, state.status, emptyList(), ComposerMode.SEND_DISABLED, "", state.host))
+    val bottomInput = rememberUpdatedState(
+        BottomInput(
+            state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
+            state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed,
+        ),
+    )
+    val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
+    val callbacks = rememberUpdatedState(Callbacks(actions, onRetryLoad, zone, today))
+    // The objects the slots use, read through a holder too: replacing the list state (and with it the follower), the
+    // backdrop (the blur setting) or the link handler reaches the screen; equal identities notify nothing.
+    val objects = rememberUpdatedState(Objects(listState, follow, backdrop, uriHandler))
+    // Read by the transcript slot only: the app passes a new lambda with every state, which must not reach the composer.
+    val current = rememberUpdatedState(currentState)
+
+    val barSlot = remember {
+        @Composable {
+            SideEffect { ChromeProbe.barCompositions++ }
+            val c = barCallbacks.value
+            ChatTopBar(barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions, Modifier.blockTouchesBelow().coverForAccessibility(order = -1f))
+        }
+    }
+    val bottomSlot = remember {
+        @Composable {
+            SideEffect { ChromeProbe.bottomCompositions++ }
+            val input = bottomInput.value
+            val actions = callbacks.value.actions
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .testTag("chat.bottom")
+                    .blockTouchesBelow()
+                    .coverForAccessibility(order = 1f)
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                    .navigationBarsPadding()
+                    .imePadding() // max(keyboard, navigation bar), applied once
+                    .onSizeChanged { bottomContent = it.height },
+            ) {
+                Column(Modifier.background(MaterialTheme.colorScheme.surface)) { // notes keep a backing of their own over scrolled text
+                    input.note?.let { ComposerNoteLine(it) }
+                    if (input.linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
+                    input.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
+                }
                 Composer(
-                    state.draft,
-                    if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
-                    { actions.onDraftChange(it, state.draftRevision) },
+                    input.draft,
+                    input.mode,
+                    { actions.onDraftChange(it, input.draftRevision) },
                     onSend = {
+                        val o = objects.value // the current list and follower, at tap time
                         linkFailed = false
                         actions.onSendClick()
-                        scope.launch { listState.scrollToItem(0) }
+                        o.follow.onSend()
+                        scope.launch { o.list.scrollToItem(0) }
                     },
-                    onStop = { state.live?.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
-                    busy = state.sending,
+                    onStop = { input.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
+                    busy = input.sending,
                 )
             }
-        },
-    ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding)) {
-            if (state.status == StatusLine.LOAD_FAILED) {
-                Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-                    WashTextButton(R.string.chat_load_retry, onRetryLoad)
+        }
+    }
+    // The body for a pair of bar heights: the same lambda while they hold, so a token recomposes the body only through
+    // the state it reads; new heights compose it at once with the new padding (same pass, no stale frame).
+    val bodies = remember { BodyCache() }
+    val bodyFor = { barHeight: Int, bottomArea: Int ->
+        bodies.get(barHeight, bottomArea) {
+            @Composable {
+                val state = latest.value
+                val c = callbacks.value
+                val o = objects.value
+                val listState = o.list
+                val follow = o.follow
+                val backdrop = o.backdrop
+                SideEffect {
+                    ChromeProbe.bodyBackdropId = System.identityHashCode(backdrop)
+                    ChromeProbe.bodyBackdropHasLayer = backdrop.layer != null
                 }
-                return@Box
-            }
-            MessageList(
-                state.items,
-                state.live,
-                state.notes,
-                state.answering,
-                actions,
-                onCancel = { it.idempotencyKey?.let(actions::onCancel) },
-                onStep = { detail = it },
-                listState = listState,
-                contentPadding = PaddingValues(vertical = 8.dp),
-                zone = zone,
-                today = today,
-                onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
-            )
-            val away by remember { derivedStateOf { listState.canScrollBackward } }
-            if (away) {
-                ApofisIconButton(
-                    onClick = { scope.launch { listState.animateScrollToItem(0) } },
-                    contentDescription = stringResource(R.string.chat_scroll_to_bottom),
-                    Modifier.align(Alignment.BottomEnd).padding(end = 4.dp, bottom = 4.dp),
-                    visualSize = 32.dp,
-                ) {
-                    Box(
-                        Modifier
-                            .fillMaxSize()
-                            .background(ApofisTheme.colors.cardFill, CircleShape)
-                            .border(1.dp, ApofisTheme.colors.hairlineStrong, CircleShape),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(painterResource(R.drawable.lucide_arrow_down), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
+                val surface = MaterialTheme.colorScheme.surface
+                if (state.status == StatusLine.LOAD_FAILED) {
+                    Uncovered(barHeight, bottomArea, fullScreen = false) {
+                        BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            // Too little room (landscape with the keyboard): the title's own retry stays; a second Retry
+                            // in a viewport too small to reach would only promise a control that cannot be tapped.
+                            if (maxHeight >= 96.dp) {
+                                Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                                    WashTextButton(R.string.chat_load_retry, c.onRetryLoad)
+                                }
+                            }
+                        }
                     }
+                } else {
+                    val sides = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal).asPaddingValues()
+                    val direction = LocalLayoutDirection.current
+                    val density = LocalDensity.current
+                    val padding = with(density) {
+                        PaddingValues(
+                            start = sides.calculateStartPadding(direction),
+                            end = sides.calculateEndPadding(direction),
+                            top = barHeight.toDp() + 8.dp,
+                            bottom = bottomArea.toDp() + 8.dp,
+                        )
+                    }
+                    Uncovered(barHeight, bottomArea, fullScreen = true) {
+                        MessageList(
+                            state.items,
+                            state.live,
+                            state.notes,
+                            state.answering,
+                            c.actions,
+                            onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
+                            onStep = { detail = it },
+                            listState = listState,
+                            contentPadding = padding,
+                            zone = c.zone,
+                            today = c.today,
+                            modifier = Modifier
+                                .backdropSource(backdrop, surface)
+                                .drawWithContent {
+                                    drawContent()
+                                    // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
+                                    // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom
+                                    // edge (above the insets and the card's 8 dp outer margin, Composer.kt) and below it: text
+                                    // and controls at the bottom are never washed out, text passing behind the composer fades.
+                                    val gap = 8.dp.toPx()
+                                    val rest = size.height - bottomArea - gap
+                                    val edge = size.height - (bottomArea - bottomContent) - gap
+                                    if (edge > rest) {
+                                        drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
+                                    }
+                                    drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
+                                },
+                            onLink = { url -> linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure },
+                            onSelect = { selectKey = it },
+                            current = current.value?.let { now -> { now().items } },
+                        )
+                    }
+                    ScrollToBottomButton(
+                        visible = follow.buttonVisible,
+                        backdrop = backdrop,
+                        onClick = {
+                            follow.onButton()
+                            scope.launch { listState.animateScrollToItem(0) }
+                        },
+                        // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
+                        Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)).padding(end = 2.dp, bottom = 2.dp),
+                    )
                 }
             }
         }
     }
+
+    // Like a scaffold: the bottom area and the bar are measured first, then the body is composed with their heights, so
+    // the list's padding and the uncovered region never lag a frame behind (keyboard, notes, large text). The policy is
+    // remembered and reads no per-token state, so streaming never measures the root again.
+    val policy = remember {
+        val measure: SubcomposeMeasureScope.(Constraints) -> MeasureResult = { constraints ->
+            ChromeProbe.rootMeasures++
+            val loose = constraints.copy(minWidth = 0, minHeight = 0)
+            val bottom = subcompose(ChromeSlot.BOTTOM, bottomSlot).single().measure(loose)
+            val bar = subcompose(ChromeSlot.BAR, barSlot).single().measure(loose)
+            val body = subcompose(ChromeSlot.BODY, bodyFor(bar.height, bottom.height)).map { it.measure(loose) }
+            layout(constraints.maxWidth, constraints.maxHeight) {
+                body.first().place(0, bar.height) // the uncovered region
+                // The scroll button, at the end edge (mirrored in right-to-left layouts).
+                body.getOrNull(1)?.let { it.placeRelative(constraints.maxWidth - it.width, constraints.maxHeight - bottom.height - it.height) }
+                bottom.place(0, constraints.maxHeight - bottom.height, zIndex = 1f)
+                bar.place(0, 0, zIndex = 1f)
+            }
+        }
+        measure
+    }
+    SubcomposeLayout(
+        modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
+        policy,
+    )
 
     state.confirmCancel?.let { id ->
         // The dialog follows its own row: it rewords once a request may have gone out, and closes once the row is
@@ -224,6 +362,20 @@ fun ChatScreen(
         LaunchedEffect(found == null) { if (found == null) detail = null }
         found?.let { ToolDetailSheet(it.step, it.live, onDismiss = { detail = null }) }
     }
+    selectKey?.let { key ->
+        // Only the stored part is searched (a live merge appends just the live reply, which has no Select), once per
+        // transcript change, not per streamed token. Closes once the key no longer resolves.
+        @Suppress("UNCHECKED_CAST") val stored = (state.items as? Joined<ChatItem>)?.head ?: state.items
+        val running = state.live != null
+        val text = remember(stored, key, running) { actionable(stored, key.removePrefix(FULL), fullMessage = key.startsWith(FULL), running = running) } // as Copy and Select do
+        // A restored view waits for the transcript to load; once loaded, a miss closes it for good.
+        LaunchedEffect(text == null, state.loaded) { if (text == null && state.loaded) selectKey = null }
+        if (text != null) {
+            Dialog(onDismissRequest = { selectKey = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+                SelectTextScreen(text, onBack = { selectKey = null })
+            }
+        }
+    }
 }
 
 @Composable
@@ -272,56 +424,6 @@ private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: (
 }
 
 @Composable
-private fun Title(state: ChatUiState, onOpenConnection: () -> Unit, onRetryLoad: () -> Unit) {
-    val scheme = MaterialTheme.colorScheme
-    val action = when (state.status) {
-        StatusLine.KEY_REJECTED -> stringResource(R.string.chat_status_open_connection) to onOpenConnection
-        StatusLine.LOAD_FAILED -> stringResource(R.string.chat_load_retry) to onRetryLoad
-        else -> null
-    }
-    // The whole title area is the touch target: the status line alone is too small.
-    Column(
-        Modifier
-            .heightIn(min = 48.dp)
-            .then(if (action != null) Modifier.clickable(onClickLabel = action.first, onClick = action.second) else Modifier),
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Text(
-            state.title.ifEmpty { stringResource(R.string.chat_new_title) },
-            Modifier.testTag("chat.title"), // the end-to-end tests read the open chat's title here
-            style = MaterialTheme.typography.titleMedium,
-            color = scheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        val (icon, text, color) = when (state.status) {
-            StatusLine.IDLE -> Triple(null, state.host, scheme.onSurfaceVariant)
-            StatusLine.WORKING -> Triple(null, stringResource(R.string.chat_status_working), scheme.primary)
-            StatusLine.QUEUED -> Triple(null, stringResource(R.string.chat_status_queued), scheme.primary)
-            StatusLine.OFFLINE -> Triple(R.drawable.lucide_wifi_off, stringResource(R.string.chat_status_offline), scheme.error)
-            StatusLine.UNREACHABLE -> Triple(R.drawable.lucide_cloud_off, stringResource(R.string.chat_status_unreachable), scheme.error)
-            StatusLine.KEY_REJECTED -> Triple(R.drawable.lucide_key_round, stringResource(R.string.chat_status_key_rejected), scheme.error)
-            StatusLine.SERVER_ERROR -> Triple(R.drawable.lucide_triangle_exclamation_point, stringResource(R.string.chat_status_server_error), scheme.error)
-            StatusLine.CHAT_GONE -> Triple(R.drawable.lucide_triangle_exclamation_point, stringResource(R.string.chat_status_chat_gone), scheme.error)
-            StatusLine.LOAD_FAILED -> Triple(R.drawable.lucide_triangle_exclamation_point, stringResource(R.string.chat_status_load_failed), scheme.error)
-        }
-        StatusText(icon, text, color, tappable = action != null)
-    }
-}
-
-@Composable
-private fun StatusText(@DrawableRes icon: Int?, text: String, color: Color, tappable: Boolean) {
-    Row(Modifier.testTag("status.line").semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }, verticalAlignment = Alignment.CenterVertically) {
-        if (icon != null) {
-            Icon(painterResource(icon), null, Modifier.size(12.dp), tint = color)
-            Box(Modifier.width(4.dp))
-        }
-        Text(text, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        if (tappable) Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(12.dp), tint = color)
-    }
-}
-
-@Composable
 private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, dismiss: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -343,3 +445,88 @@ private fun WashTextButton(label: Int, onClick: () -> Unit) {
     val source = remember { MutableInteractionSource() }
     TextButton(onClick = onClick, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) { Text(stringResource(label)) }
 }
+
+/**
+ * The part of the screen the bars leave uncovered, between [top] and [bottom] px (the root places it at [top]). With
+ * [fullScreen] the content keeps the whole screen (the list draws under the bars) but its parent spans only the
+ * uncovered part, so whatever lies under the bars gets no accessibility focus (semantic bounds are clipped to the
+ * parent; touches are stopped by the bars themselves); otherwise the content is laid out inside it.
+ */
+@Composable
+private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, content: @Composable () -> Unit) {
+    Layout(content) { measurables, constraints ->
+        val height = (constraints.maxHeight - top - bottom).coerceAtLeast(0)
+        val full = Constraints.fixed(constraints.maxWidth, constraints.maxHeight)
+        val placeable = measurables.single().measure(if (fullScreen) full else Constraints.fixed(constraints.maxWidth, height))
+        layout(constraints.maxWidth, height) { placeable.place(0, if (fullScreen) -top else 0) }
+    }
+}
+
+private enum class ChromeSlot { BOTTOM, BAR, BODY }
+
+/** What the composer slot shows: equal values notify nothing, so tokens do not recompose it. */
+private data class BottomInput(
+    val draft: String,
+    val draftRevision: Long,
+    val mode: ComposerMode,
+    val sending: Boolean,
+    val note: ComposerNote?,
+    val unsent: UnsentText?,
+    val runId: String?,
+    val linkFailed: Boolean,
+)
+
+private data class BarCallbacks(
+    val onOpenConnection: () -> Unit,
+    val onRetryLoad: () -> Unit,
+    val navigationIcon: @Composable () -> Unit,
+    val appBarActions: @Composable RowScope.() -> Unit,
+)
+
+private data class Objects(val list: LazyListState, val follow: Follower, val backdrop: BackdropState, val uri: UriHandler)
+
+private data class Callbacks(val actions: ChatActions, val onRetryLoad: () -> Unit, val zone: ZoneId, val today: LocalDate)
+
+/** The body lambda for the last pair of bar heights. */
+private class BodyCache {
+    private var key = -1L
+    private var body: (@Composable () -> Unit)? = null
+
+    fun get(top: Int, bottom: Int, make: () -> @Composable () -> Unit): @Composable () -> Unit {
+        val k = top.toLong() shl 32 or (bottom.toLong() and 0xffffffffL)
+        if (k != key || body == null) {
+            key = k
+            body = make()
+        }
+        return body!!
+    }
+}
+
+/** Counters the tests read to prove that streamed tokens leave the chrome alone; a few increments, no other cost. */
+internal object ChromeProbe {
+    var barCompositions = 0
+    var bottomCompositions = 0
+    var rootMeasures = 0
+    var pins = 0 // requests the follow rules made to move the list to the bottom
+    // Which backdrop the transcript was last composed with, as scalars: no reference keeps it alive after the screen.
+    var bodyBackdropId = 0
+    var bodyBackdropHasLayer = false
+}
+
+/**
+ * An opaque overlay hides from accessibility what lies under it: Compose leaves out of the tree the parts of nodes
+ * covered by an "important" node drawn above them. A blank pane title makes this container important without making it
+ * focusable or read; its own buttons and texts stay separate nodes.
+ */
+private fun Modifier.coverForAccessibility(order: Float) = semantics {
+    paneTitle = ""
+    isTraversalGroup = true // so the index orders the container's controls as one unit, not one by one by position
+    traversalIndex = order // read top to bottom: the bar (-1), the list (0), the bottom area (1), whatever the drawing order
+}
+
+/**
+ * Makes this opaque overlay a hit-test target, so a touch on its blank parts stops here and never reaches the list
+ * drawn underneath (Compose tests lower siblings only when no higher one is hit). Nothing is consumed: the overlay's
+ * own buttons and fields still get their touches.
+ */
+private fun Modifier.blockTouchesBelow() = pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent() } }

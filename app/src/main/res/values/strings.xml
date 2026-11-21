@@ -95,6 +95,19 @@
     <string name="chat_clarify_hint">Your answer</string>
     <string name="chat_clarify_send">Send answer</string>
     <string name="chat_reasoning">Reasoning</string>
+    <plurals name="steps_more">
+        <item quantity="one">Show %d more step</item>
+        <item quantity="other">Show %d more steps</item>
+    </plurals>
+    <string name="steps_fewer">Show fewer steps</string>
+    <string name="state_expanded">Expanded</string>
+    <string name="state_collapsed">Collapsed</string>
+    <string name="sheet_handle">Drag handle</string>
+    <string name="steps_earlier">Earlier steps (%d)</string>
+    <string name="steps_later">Later steps (%d)</string>
+    <string name="page_previous">Previous part</string>
+    <string name="page_next">Next part</string>
+    <string name="page_part">Part %1$d</string>
     <string name="chat_tool_running">Running</string>
     <string name="chat_tool_failed">Failed</string>
     <string name="tool_arguments">Arguments</string>
@@ -150,6 +163,12 @@
     <string name="copy_done">Copied</string>
     <string name="copy_too_large">Too large to copy</string>
     <string name="copy_failed">Could not copy</string>
+    <string name="chat_copy">Copy</string>
+    <string name="chat_select">Select text</string>
+    <string name="select_title">Select text</string>
+    <string name="chat_show_more">Show more</string>
+    <string name="chat_show_less">Show less</string>
+    <string name="chat_show_full">Show full message</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
     <string name="drawer_open">Open chat list</string>
     <string name="drawer_new_chat">New chat</string>
@@ -175,4 +194,10 @@
     <string name="drawer_error_closed">The connection was closed</string>
     <string name="archived_title">Archived chats</string>
     <string name="drawer_more_actions">More actions</string>
+    <string name="notif_channel_replies">Replies</string>
+    <string name="notif_channel_answers">Needs your answer</string>
+    <string name="notif_reply_finished">Reply finished</string>
+    <string name="notif_reply_failed">Reply did not finish</string>
+    <string name="notif_needs_answer">Hermes needs your answer</string>
+    <string name="notif_public">New activity in a chat</string>
 </resources>

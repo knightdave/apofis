@@ -2,6 +2,7 @@ package xyz.rycerz.apofis
 
 import android.app.Application
 import android.util.Log
+import xyz.rycerz.apofis.notify.ensureChannels
 import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.PushSink
 import xyz.rycerz.apofis.push.PushSinkProvider
@@ -15,6 +16,7 @@ class ApofisApp : Application(), SendQueueProvider, PushSinkProvider {
 
     override fun onCreate() {
         super.onCreate()
+        ensureChannels(this) // also renames them after a language change
         // Push work and wake demand left by the last process.
         // Off the main thread: it reads preferences, and with push Off and nothing persisted it only does that.
         Thread { runCatching { recoverPush(this, pushSink) }.onFailure { Log.w("Apofis", "Push recovery failed: ${it.javaClass.name}") } }.start()

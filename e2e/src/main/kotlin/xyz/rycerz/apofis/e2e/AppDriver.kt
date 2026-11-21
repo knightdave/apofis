@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.e2e
 
 import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
@@ -16,6 +17,7 @@ import org.junit.runner.Description
 
 const val APP = "xyz.rycerz.apofis"
 const val LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
+const val POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS"
 const val OUT_DIR = "/data/local/tmp/apofis-e2e" // written as the shell user; run-e2e.sh pulls it
 const val SESSIONS = "$OUT_DIR/sessions.txt" // the session journal, created empty by run-e2e.sh before the tests run
 private const val TAG = "ApofisE2e"
@@ -65,11 +67,16 @@ class AppDriver {
 
     // ---- app lifecycle
 
-    /** Clears the app's data (checked), grants local network access, launches. */
+    /** Clears the app's data (checked), grants local network access and (API 33+) notifications, launches. */
     fun freshStart(grantLocalNetwork: Boolean = true) {
         val cleared = shell("pm clear $APP").trim()
         if (cleared != "Success") fail("pm clear did not confirm: $cleared")
         if (grantLocalNetwork) grantLocalNetwork()
+        // Granted up front, so the first send shows no permission dialog over the screen the tests drive.
+        if (Build.VERSION.SDK_INT >= 33) {
+            val out = shell("pm grant $APP $POST_NOTIFICATIONS")
+            if (out.isNotBlank()) fail("pm grant $POST_NOTIFICATIONS failed: $out")
+        }
         launch()
     }
 
@@ -185,7 +192,7 @@ class AppDriver {
 
     // ---- acting
 
-    private fun setField(field: AccessibilityNodeInfo, text: String) {
+    fun setField(field: AccessibilityNodeInfo, text: String) {
         // Not UiObject2.setText: it logs the text it sets, and the key must never reach logcat.
         val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
         if (!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) fail("Could not fill a text field")

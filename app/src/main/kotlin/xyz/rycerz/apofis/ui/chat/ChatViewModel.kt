@@ -8,6 +8,9 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -52,6 +55,7 @@ data class ChatUiState(
     val unsent: UnsentText? = null, // text a send could not store, in its own notice above the composer
     val confirmDiscard: UnsentText? = null, // the unsent entry the user asked to discard, while it is still the one shown
     val draftRevision: Long = 0, // the draft's revision: an edit is applied only on the revision it was typed on
+    val loaded: Boolean = true, // false only before the stored transcript first arrives (items empty but not known empty)
 )
 
 /** A request Hermes waits on, by id and execution generation: a new generation is a different request. */
@@ -128,6 +132,11 @@ class ChatViewModel(
     private val connected: Connected,
     online: Flow<Boolean> = flowOf(true),
 ) : ViewModel(), ChatActions {
+    private val accepted = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /** Emits when the composer took a send; the screen asks for notifications on the first (the view model holds no UI). */
+    val sendAccepted: SharedFlow<Unit> = accepted.asSharedFlow()
+
     private val repo = connected.repo
     private val follower = connected.follower
     private val composer = connected.composer // draft, send in flight and send failure: outlive this view model
@@ -180,7 +189,7 @@ class ChatViewModel(
         viewModelScope,
         SharingStarted.Eagerly,
         composer.current(sessionKey).let {
-            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision)
+            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision, loaded = false)
         },
     )
 
@@ -222,7 +231,10 @@ class ChatViewModel(
             repo.send(sessionKey, text, onStored = ::stored)
             local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
         }
-        if (started != null) local.update { it.copy(composerNote = null) }
+        if (started != null) {
+            local.update { it.copy(composerNote = null) }
+            accepted.tryEmit(Unit)
+        }
     }
 
     override fun onStopClick(runId: String) = request { follower.stop(sessionKey, runId) }
@@ -377,14 +389,22 @@ internal class LiveMerger(private val now: () -> Double = { System.currentTimeMi
 internal fun withLive(transcript: List<ChatItem>, live: LiveReply?, now: () -> Double = { System.currentTimeMillis() / 1000.0 }): List<ChatItem> =
     LiveMerger(now).merge(transcript, live)
 
-/** A read-only view of [head] followed by [tail]. Equal views with the same [head] compare only their tails. */
+/**
+ * A read-only view of [head] followed by [tail]. Two views with the same [head] are equal when their tails hold the
+ * same item instances: this equality gates UI updates (state flows, Compose state), and comparing a live reply's
+ * content would visit every one of its steps on each update. A rebuilt live item is a new instance, so it is a change.
+ */
 internal class Joined<T>(val head: List<T>, val tail: List<T>) : AbstractList<T>() {
     override val size get() = head.size + tail.size
 
     override fun get(index: Int): T = if (index < head.size) head[index] else tail[index - head.size]
 
     override fun equals(other: Any?): Boolean =
-        if (other is Joined<*> && other.head === head) other.tail == tail else super.equals(other)
+        if (other is Joined<*> && other.head === head) {
+            other.tail.size == tail.size && tail.indices.all { other.tail[it] === tail[it] }
+        } else {
+            super.equals(other)
+        }
 
     override fun hashCode() = super.hashCode()
 }

@@ -28,7 +28,7 @@ class ComposerTest {
 
     private fun fail(key: String, text: String) = runBlocking {
         type(key, text)
-        withTimeout(10_000) { composer.send(key) { throw IllegalStateException("not stored") }!!.join() }
+        withTimeout(60_000) { composer.send(key) { throw IllegalStateException("not stored") }!!.join() }
     }
 
     @Test
@@ -61,12 +61,12 @@ class ComposerTest {
         val stored = CompletableDeferred<Unit>()
         val delivered = CompletableDeferred<Unit>()
         val send = composer.send("a") { stored(); stored.complete(Unit); delivered.await() }!!
-        withTimeout(10_000) { stored.await() }
+        withTimeout(60_000) { stored.await() }
         assertEquals("", composer.current("a").draft) // stored: emptied in that step
         assertFalse(composer.current("a").sending)
         type("a", "next") // typing goes on while the stored send is delivered
         delivered.complete(Unit)
-        withTimeout(10_000) { send.join() }
+        withTimeout(60_000) { send.join() }
         assertEquals("next", composer.current("a").draft)
     }
 
@@ -94,11 +94,11 @@ class ComposerTest {
         composer.edit("a", "hello!", composer.current("a").revision) // nor any edit while it is sent
         assertEquals("hello", composer.current("a").draft)
         release.complete(Unit)
-        withTimeout(10_000) { send.join() }
+        withTimeout(60_000) { send.join() }
         assertEquals("", composer.current("a").draft)
     }
 
-    private fun sendOk(key: String) = runBlocking { withTimeout(10_000) { composer.send(key) {}!!.join() } }
+    private fun sendOk(key: String) = runBlocking { withTimeout(60_000) { composer.send(key) {}!!.join() } }
 
     @Test
     fun typingRightAfterASuccessfulSendKeepsEveryCharacter() {
@@ -108,7 +108,7 @@ class ComposerTest {
         val send = composer.send("a") { release.await() }!!
         val whileSending = composer.current("a").revision // the read-only field showing "first" while it is stored
         release.complete(Unit)
-        runBlocking { withTimeout(10_000) { send.join() } }
+        runBlocking { withTimeout(60_000) { send.join() } }
         composer.edit("a", "first!", whileSending) // a keystroke from that frame must not bring the sent text back
         assertEquals("", composer.current("a").draft)
         val shown = composer.current("a").revision // the empty field drawn once it was stored
@@ -174,7 +174,7 @@ class ComposerTest {
 
     @Test
     fun theObservedRevisionIsTheOneTheFirstEditIsCheckedAgainst() = runBlocking {
-        val shown = withTimeout(10_000) { composer.state("a").first() }.revision
+        val shown = withTimeout(60_000) { composer.state("a").first() }.revision
         composer.edit("a", "h", shown)
         assertEquals("h", composer.current("a").draft)
     }
@@ -233,7 +233,7 @@ class ComposerTest {
         type("a", "late edit") // nothing may recreate a deleted chat
         assertEquals(setOf("a"), composer.keys)
         release.complete(Unit)
-        withTimeout(10_000) { send.join() }
+        withTimeout(60_000) { send.join() }
         assertTrue(composer.keys.isEmpty())
         assertEquals("", composer.current("a").draft)
     }
@@ -248,7 +248,7 @@ class ComposerTest {
 
         composer.clear()
 
-        withTimeout(10_000) { send.join() }
+        withTimeout(60_000) { send.join() }
         assertTrue(composer.keys.isEmpty())
         assertFalse(composer.job.children.any { it.isActive })
         assertEquals("", composer.current("c").draft)

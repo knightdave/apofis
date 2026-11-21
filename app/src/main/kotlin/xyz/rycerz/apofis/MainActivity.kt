@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis
 
+import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -27,6 +28,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val container = (application as ApofisApp).container
+        if (savedInstanceState == null) openChat(intent) // a recreated activity must not reopen a tapped chat
         // The activity's own lifecycle: Apofis has one activity, and no foreground service keeps streams alive.
         lifecycle.addObserver(
             LifecycleEventObserver { _, event ->
@@ -61,10 +63,23 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }) {
+            // Glass draws its fill only. The blur path stays in the code; whether it ships is decided by trying it on a
+            // phone (a Settings switch), not by an automated measurement.
+            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }, blur = false) {
                 // Test tags become resource ids, so the end-to-end tests find chat items by their opaque keys.
                 Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        openChat(intent)
+    }
+
+    /** A notification tap; the container ignores anything but a chat of the current connection. */
+    private fun openChat(intent: Intent) {
+        val container = (application as ApofisApp).container
+        lifecycleScope.launch { container.openChat(intent) }
     }
 }

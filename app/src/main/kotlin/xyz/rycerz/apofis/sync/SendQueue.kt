@@ -13,6 +13,7 @@ import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.notify.NoticeNotDelivered
 
 /** Implemented by Task 8: told about every run this queue started. */
 fun interface RunStarter {
@@ -193,16 +194,19 @@ class SendQueue(
         }
         val blocking = db.activeRunDao().blockingQueued()
         if (blocking.isEmpty()) return false
+        var undelivered = false
         for (runId in blocking) {
             try {
                 settle(runId)
             } catch (e: CancellationException) {
                 throw e
+            } catch (_: NoticeNotDelivered) {
+                undelivered = true // settled, but its notice is not posted: the worker retries
             } catch (_: Exception) {
                 // checked again on the worker's next try
             }
         }
-        return drain()
+        return drain() && !undelivered
     }
 
     /**

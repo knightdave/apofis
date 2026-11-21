@@ -94,6 +94,21 @@
     <string name="chat_clarify_hint">Twoja odpowiedź</string>
     <string name="chat_clarify_send">Wyślij odpowiedź</string>
     <string name="chat_reasoning">Rozumowanie</string>
+    <plurals name="steps_more">
+        <item quantity="one">Pokaż jeszcze %d krok</item>
+        <item quantity="few">Pokaż jeszcze %d kroki</item>
+        <item quantity="many">Pokaż jeszcze %d kroków</item>
+        <item quantity="other">Pokaż jeszcze %d kroku</item>
+    </plurals>
+    <string name="steps_fewer">Pokaż mniej kroków</string>
+    <string name="state_expanded">Rozwinięte</string>
+    <string name="state_collapsed">Zwinięte</string>
+    <string name="sheet_handle">Uchwyt przeciągania</string>
+    <string name="steps_earlier">Wcześniejsze kroki (%d)</string>
+    <string name="steps_later">Późniejsze kroki (%d)</string>
+    <string name="page_previous">Poprzednia część</string>
+    <string name="page_next">Następna część</string>
+    <string name="page_part">Część %1$d</string>
     <string name="chat_tool_running">W toku</string>
     <string name="chat_tool_failed">Błąd</string>
     <string name="tool_arguments">Argumenty</string>
@@ -146,6 +161,12 @@
     <string name="copy_done">Skopiowano</string>
     <string name="copy_too_large">Za duże, by skopiować</string>
     <string name="copy_failed">Nie udało się skopiować</string>
+    <string name="chat_copy">Kopiuj</string>
+    <string name="chat_select">Zaznacz tekst</string>
+    <string name="select_title">Zaznacz tekst</string>
+    <string name="chat_show_more">Pokaż więcej</string>
+    <string name="chat_show_less">Pokaż mniej</string>
+    <string name="chat_show_full">Pokaż całą wiadomość</string>
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
     <string name="drawer_open">Otwórz listę czatów</string>
     <string name="drawer_new_chat">Nowy czat</string>
@@ -171,4 +192,10 @@
     <string name="drawer_error_closed">Połączenie zostało zamknięte</string>
     <string name="archived_title">Zarchiwizowane czaty</string>
     <string name="drawer_more_actions">Więcej opcji</string>
+    <string name="notif_channel_replies">Odpowiedzi</string>
+    <string name="notif_channel_answers">Czeka na Twoją odpowiedź</string>
+    <string name="notif_reply_finished">Odpowiedź gotowa</string>
+    <string name="notif_reply_failed">Odpowiedź nie została dokończona</string>
+    <string name="notif_needs_answer">Hermes czeka na Twoją odpowiedź</string>
+    <string name="notif_public">Nowa aktywność w czacie</string>
 </resources>

@@ -6,6 +6,8 @@
     <!-- Android 17 blocks apps targeting it from LAN addresses without this runtime permission; asked for only when
          the server is on the local network. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Android 13+: needed to show the "reply finished" and "needs your answer" notifications; asked once, at the first send. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- No foreground service by design: the app must never call setForeground or use long-running workers. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" tools:node="remove" />
 
@@ -51,10 +53,13 @@
             android:name="org.unifiedpush.android.connector.internal.LinkActivity"
             tools:node="remove" />
         <!-- singleTask: a second instance would take over the app-wide Back target the Connect screen uses. -->
+        <!-- adjustResize: the system does not pan the window for the keyboard; the chat applies the keyboard inset itself
+             (imePadding), once. With the default the window was panned as well and the composer moved up twice. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

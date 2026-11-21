@@ -65,6 +65,16 @@ class ReleasePolicyTest {
         for (absent in listOf("xyz.rycerz.apofis.e2e", "ComponentActivity", "MessagingReceiverImpl", "RaiseToForegroundService", "LinkActivity", "FOREGROUND_SERVICE")) {
             assertFalse(absent, absent in manifest)
         }
+        // The shipping release manifest (the unit-test one adds the test libraries' permissions) requests exactly the
+        // allowed permissions (the permission check script's set), POST_NOTIFICATIONS among them.
+        val shipping = File("build/intermediates/merged_manifests/release/processReleaseManifest/AndroidManifest.xml").readText()
+        val permissions = Regex("""<uses-permission[^>]*android:name="([^"]+)"""").findAll(shipping).map { it.groupValues[1] }.toSet()
+        assertEquals(
+            setOf("android.permission.INTERNET", "android.permission.ACCESS_LOCAL_NETWORK", "android.permission.POST_NOTIFICATIONS",
+                "android.permission.WAKE_LOCK", "android.permission.ACCESS_NETWORK_STATE", "android.permission.RECEIVE_BOOT_COMPLETED",
+                "xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"),
+            permissions,
+        )
     }
 
     @Test

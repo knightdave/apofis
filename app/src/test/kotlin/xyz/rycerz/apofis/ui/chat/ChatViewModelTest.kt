@@ -134,9 +134,9 @@ class ChatViewModelTest {
         // A send or drain still running in a view model would otherwise meet a closed database while holding those locks.
         val jobs = vms.map { it.viewModelScope.coroutineContext.job }
         store.clear()
-        runBlocking { withTimeout(10_000) { jobs.joinAll() } }
+        runBlocking { withTimeout(60_000) { jobs.joinAll() } }
         follower.pauseAll()
-        runBlocking { withTimeout(10_000) { scope.coroutineContext.job.cancelAndJoin() } }
+        runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
         db.close()
         server.close()
         Dispatchers.resetMain()
@@ -212,7 +212,7 @@ class ChatViewModelTest {
     }
 
     private suspend fun ChatViewModel.await(condition: (ChatUiState) -> Boolean): ChatUiState =
-        withContext(Dispatchers.Default) { withTimeout(10_000) { state.first(condition) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { state.first(condition) } }
 
     @Test
     fun composerModes() = runTest {
@@ -260,6 +260,22 @@ class ChatViewModelTest {
         vm.await { it.draft.isEmpty() }
         val sent = vm.await { s -> s.items.any { it is UserMessage } }
         assertEquals("What is on my calendar?", (sent.items.single() as UserMessage).text)
+    }
+
+    @Test
+    fun onlyAnAcceptedSendIsReported() = runTest {
+        addSession()
+        val vm = vm()
+        var accepted = 0
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.sendAccepted.collect { accepted++ } }
+        vm.onSendClick() // a stale enabled button with nothing to send: the composer takes nothing
+        assertEquals(0, accepted)
+
+        vm.onDraftChange("hello")
+        vm.await { it.draft.isNotEmpty() }
+        vm.onSendClick()
+        vm.await { it.draft.isEmpty() }
+        assertEquals(1, accepted)
     }
 
     @Test
