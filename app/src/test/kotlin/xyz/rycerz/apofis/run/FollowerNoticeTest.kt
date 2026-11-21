@@ -236,6 +236,30 @@ class FollowerNoticeTest {
     }
 
     @Test
+    fun settleReturnsOnlyAfterDelivery() = runTest {
+        val log = CopyOnWriteArrayList<String>()
+        val f = RunFollower(
+            api, db, repo, backgroundScope, delayMs = {},
+            onNotice = object : NoticeSink {
+                override suspend fun notice(sessionKey: String, runId: String, runStartedAt: Long, notice: Notice, eventId: String, generation: Long, replay: Boolean) {
+                    log += "handed over"
+                }
+
+                override suspend fun delivered() {
+                    log += "delivered"
+                }
+            },
+            generation = { GEN },
+        )
+        stored()
+        on(STATUS, status("waiting_for_approval", control("approval", "p1")))
+        f.settle(RUN)
+        log += "returned"
+
+        assertEquals(listOf("handed over", "delivered", "returned"), log)
+    }
+
+    @Test
     fun controlsClearedByAFreshWriter() = runTest {
         val f = follower() // a new process: this writer never handed over the request shown before
         stored()

@@ -127,6 +127,7 @@ class ChatViewModel(
     private val sessionKey: String,
     private val connected: Connected,
     online: Flow<Boolean> = flowOf(true),
+    private val onSendAccepted: () -> Unit = {}, // the composer took a send (the first one asks for notifications)
 ) : ViewModel(), ChatActions {
     private val repo = connected.repo
     private val follower = connected.follower
@@ -222,7 +223,10 @@ class ChatViewModel(
             repo.send(sessionKey, text, onStored = ::stored)
             local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
         }
-        if (started != null) local.update { it.copy(composerNote = null) }
+        if (started != null) {
+            local.update { it.copy(composerNote = null) }
+            onSendAccepted()
+        }
     }
 
     override fun onStopClick(runId: String) = request { follower.stop(sessionKey, runId) }

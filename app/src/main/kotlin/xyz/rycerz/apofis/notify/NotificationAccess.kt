@@ -35,20 +35,21 @@ private fun runtime(context: Context, prefs: SharedPreferences): Runtime = when 
 }
 
 /**
- * The first send's one chance: on API 33+ it is used up by the first call whatever the state, so a permission granted
- * then and revoked later is never asked for again. Asks through [launch] only while not granted. The mark is committed
- * first, so a process death during the dialog never leads to a second automatic ask. True when it asked.
+ * The first accepted send's one chance: on API 33+ it is used up by the first call whatever the state, so a permission
+ * granted then and revoked later is never asked for again. Asks through [launch] only while not granted. The mark is
+ * applied (in memory at once, so repeated sends see it; on disk without blocking the click). True when it asked.
  */
-@SuppressLint("UseKtx", "InlinedApi") // commit()'s result is checked; only reached on API 33+
+@SuppressLint("InlinedApi", "UseKtx") // only reached on API 33+; androidx.core is not a direct dependency
 internal fun askNotificationsOnce(context: Context, prefs: SharedPreferences, launch: (String) -> Unit): Boolean {
     if (Build.VERSION.SDK_INT < 33 || prefs.getBoolean(ASKED, false)) return false
-    if (!prefs.edit().putBoolean(ASKED, true).commit()) return false
-    if (runtime(context, prefs) == Runtime.GRANTED) return false
+    val granted = runtime(context, prefs) == Runtime.GRANTED
+    prefs.edit().putBoolean(ASKED, true).apply()
+    if (granted) return false
     launch(Manifest.permission.POST_NOTIFICATIONS)
     return true
 }
 
-/** For the first send (and an explicit Settings tap): asks once ever, on API 33+, while never asked. */
+/** For the first accepted send (and an explicit Settings tap): asks once ever, on API 33+, while never asked. */
 @Composable
 fun rememberAskNotificationsOnce(prefs: SharedPreferences): () -> Unit {
     val context = LocalContext.current

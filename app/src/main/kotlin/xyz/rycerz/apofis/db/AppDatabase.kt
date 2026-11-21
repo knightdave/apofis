@@ -45,7 +45,7 @@ val MIGRATION_2_3 = object : Migration(2, 3) {
         )
         db.execSQL(
             "CREATE TABLE IF NOT EXISTS `NoticeStateEntity` (`sessionKey` TEXT NOT NULL, `generation` INTEGER NOT NULL, `runStartedAt` INTEGER NOT NULL, " +
-                "`runId` TEXT NOT NULL, `notice` TEXT NOT NULL, `eventId` TEXT NOT NULL, PRIMARY KEY(`sessionKey`))",
+                "`runId` TEXT NOT NULL, `notice` TEXT NOT NULL, `eventId` TEXT NOT NULL, `alerted` TEXT NOT NULL, PRIMARY KEY(`sessionKey`))",
         )
     }
 }

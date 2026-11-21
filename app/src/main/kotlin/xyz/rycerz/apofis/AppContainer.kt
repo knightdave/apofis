@@ -152,19 +152,21 @@ class AppContainer(
     fun epoch(): Long = cachePrefs.getLong(CONNECTION_EPOCH, 0)
 
     val notifyPrefs: SharedPreferences = app.getSharedPreferences(NOTIFY_PREFS, Context.MODE_PRIVATE)
-    private val visibleChat = MutableStateFlow<String?>(null)
-    val notifier by lazy { Notifier(app, notifyPrefs, db, ::epoch, visibleChat::value, scope) }
+    private val visibleChat = MutableStateFlow<Pair<Long, String>?>(null) // (epoch of its graph, key)
+    val notifier by lazy { Notifier(app, notifyPrefs, db, ::epoch, { visibleChat.value?.takeIf { it.first == epoch() }?.second }, scope) }
 
     /**
-     * From the UI: [key]'s chat screen is shown in a started activity ([shown]) or no longer is. Showing it cancels its
-     * notification, in the notifier's lane: nothing here waits for disk or the notification service.
+     * From the UI: [key]'s chat screen of the graph built under [generation] is shown in a started activity ([shown])
+     * or no longer is. Showing it cancels its notification, in the notifier's lane: nothing here waits for disk or the
+     * notification service. A late callback of an old graph never touches the new one's chat of the same key.
      */
-    fun chatShown(key: String, shown: Boolean) {
+    fun chatShown(generation: Long, key: String, shown: Boolean) {
         if (shown) {
-            visibleChat.value = key
-            notifier.cancel(key, epoch())
+            if (generation != epoch()) return // an old graph's chat starting late
+            visibleChat.value = generation to key
+            notifier.cancel(key, generation)
         } else {
-            visibleChat.compareAndSet(key, null)
+            visibleChat.compareAndSet(generation to key, null)
         }
     }
 
@@ -177,13 +179,18 @@ class AppContainer(
         chatRequest.compareAndSet(request, null)
     }
 
+    /** The key a tap [request] may open in [conn], checked at the moment of navigation; null: stale, ignore it. */
+    fun tapTarget(request: Pair<Long, String>, conn: Connected?): String? =
+        request.second.takeIf { conn != null && conn.isOpen && request.first == conn.generation && request.first == epoch() }
+
     /** A notification tap: only `apofis://chat/<current epoch>/<chat on this phone>` opens it; anything else is ignored. */
     suspend fun openChat(intent: Intent?): Boolean {
         val epoch = epoch()
         val key = chatKey(intent, epoch) ?: return false
         if (db.sessionDao().get(key)?.hidden != false) return false
         notifier.cancel(key, epoch)
-        chatRequest.value = epoch to key // a switch meanwhile clears it, and the route compares the epoch again
+        if (epoch() != epoch) return false // switched during the lookup; the route compares the epoch again anyway
+        chatRequest.value = epoch to key
         return true
     }
 
@@ -325,10 +332,13 @@ class AppContainer(
             disconnect()
             null
         } else {
-            credentials.load()?.let(::build)?.also { scope.launch { scheduleQueuedSends() } }
+            credentials.load()?.let(::build)?.also {
+                scope.launch { scheduleQueuedSends() }
+                scope.launch { notifier.replayOutbox() } // notices a process death left between the commit and the post
+            }
         }
-        // Notices a process death left between the commit and the post; also removes another epoch's leftovers.
-        scope.launch { notifier.replayOutbox() }
+        // Another epoch's leftovers (a switch a death interrupted); reads nothing about chats, posts nothing.
+        scope.launch { notifier.cleanup() }
     }
 
     /** Erases the credentials; the switch mark is removed only once that reached the disk, so a restart stays disconnected. */

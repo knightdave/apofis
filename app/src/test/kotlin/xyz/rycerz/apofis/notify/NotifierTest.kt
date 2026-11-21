@@ -80,6 +80,7 @@ class NotifierTest {
     }
 
     private suspend fun ask(key: String, run: String, started: Long, request: String, generation: Long = gen) {
+        if (db.activeRunDao().get(run) == null) db.activeRunDao().upsert(ActiveRunEntity(run, key, null, "waiting_for_approval", started))
         notifier.notice(key, run, started, Notice.NEEDS_ANSWER, "req:$run:$request:$generation", generation, replay = false)
         notifier.idle()
     }
@@ -108,7 +109,6 @@ class NotifierTest {
     fun oldFinishAfterNewApproval() = runTest {
         start()
         row(A, "run_a", started = 1) // run A's finish committed; the post never happened
-        db.activeRunDao().upsert(ActiveRunEntity("run_b", A, null, "waiting_for_approval", 2))
         ask(A, "run_b", started = 2, request = "r1") // run B started later and needs an answer
 
         notifier.replayOutbox() // A's finish comes back afterwards
@@ -237,7 +237,7 @@ class NotifierTest {
         row(B, "run_b", 1)
         gen = 6 // the switch committed the new epoch, then the process died before the cleanup
 
-        start().replayOutbox() // the next process
+        start().cleanup() // the next process, connected or not
 
         assertTrue(active().isEmpty())
         assertTrue(rows(5).isEmpty())
@@ -496,6 +496,126 @@ class NotifierTest {
         ask(A, run, 1, "p\t3") // after the finish: dropped only if the stored order decoded
 
         assertEquals(str(R.string.notif_reply_finished), text(A))
+    }
+
+    private fun loud(key: String) = shown(key)?.let { !silent(it) } == true
+
+    @Test
+    fun approvalsAlertOncePerRequest() = runTest {
+        start()
+        ask(A, "run_a", 1, "pA")
+        assertTrue(loud(A))
+        ask(A, "run_a", 1, "pB")
+        assertEquals("req:run_a:pB:5", shown(A)!!.extras.getString("xyz.rycerz.apofis.event"))
+        ask(A, "run_a", 1, "pA") // an older snapshot accepted last: already alerted
+        assertEquals("req:run_a:pB:5", shown(A)!!.extras.getString("xyz.rycerz.apofis.event"))
+
+        start() // a new process: A is no longer in the tray, so it comes back silently, once
+        ask(A, "run_a", 1, "pA")
+        assertEquals("req:run_a:pA:5", shown(A)!!.extras.getString("xyz.rycerz.apofis.event"))
+        assertTrue(!loud(A))
+
+        notifier.switchEpoch { gen = 6 } // the same ids on another connection are new
+        ask(A, "run_a", 1, "pA", generation = 6)
+        assertTrue(loud(A))
+    }
+
+    @Test
+    fun approvalDeathBeforePostIsRetriedSilently() = runTest {
+        start()
+        notifier.beforePost = { error("process death before the OS post") }
+        ask(A, "run_a", 1, "p1")
+        assertNull(shown(A))
+
+        start().also { it.beforePost = {} }
+        ask(A, "run_a", 1, "p1") // the next accepted read derives it again
+        assertNotNull(shown(A))
+        assertTrue(!loud(A))
+    }
+
+    @Test
+    fun approvalAfterDeathPastPostIsNotRepeated() = runTest {
+        start()
+        ask(A, "run_a", 1, "p1")
+        val first = shadowOf(nm).getNotification(A, active().single().id)
+        start()
+        ask(A, "run_a", 1, "p1")
+        assertTrue(first === shadowOf(nm).getNotification(A, active().single().id)) // not posted again
+    }
+
+    @Test
+    fun clearUsesTheDisplayedIdentity() = runTest {
+        start()
+        ask(A, "run_a", 1, "p1")
+        db.noticeStateDao().clear() // its order never written (a death), or lost
+
+        clear(A, "run_a")
+
+        assertNull(shown(A))
+    }
+
+    @Test
+    fun lateRequestAfterSettlementIsDropped() = runTest {
+        start()
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", A, null, "running", 1))
+        clear(A, "run_a") // a 404 settled the run and retired its request
+        db.activeRunDao().delete("run_a")
+
+        notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) // handed over late
+        notifier.idle()
+
+        assertNull(shown(A))
+    }
+
+    @Test
+    fun suppressedFinishIsConsumedBeforeAnythingElse() = runTest {
+        start()
+        visible = A
+        row(A, "run_a", 1)
+        notifier.beforeAck = { error("process death") }
+        finish(A, "run_a", 1)
+
+        visible = null
+        notifier.beforeAck = {}
+        start().replayOutbox() // the next process, chat no longer on screen
+
+        assertTrue(active().isEmpty())
+        assertTrue(rows().isEmpty())
+    }
+
+    @Test
+    fun startupRetiresASupersededNotification() = runTest {
+        start()
+        finish(A, "run_a", 1)
+        db.noticeStateDao().upsert(xyz.rycerz.apofis.db.NoticeStateEntity(A, gen, 2, "run_b", "FINISHED", "run:run_b")) // decided later, cancel lost
+
+        start().replayOutbox()
+
+        assertNull(shown(A))
+    }
+
+    @Test
+    fun chatHiddenBeforeThePostIsTakenBack() = runTest {
+        start()
+        notifier.beforePost = { chat(A, hidden = true) } // the hide commits after the title read
+        finish(A, "run_a", 1)
+
+        assertNull(shown(A))
+    }
+
+    @Test
+    fun laneHoldsOneControlPerChat() = runTest {
+        start()
+        val release = CountDownLatch(1)
+        notifier.beforeAck = { release.await(10, TimeUnit.SECONDS) }
+        notifier.notice(B, "run_b", 1, Notice.FINISHED, "run:run_b", gen, replay = false) // holds the lane
+        repeat(100) {
+            notifier.clearNeedsAnswer(A, "run_a", gen)
+            notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p$it:$gen", gen, replay = false)
+        }
+        assertTrue("pending ${notifier.pending}", notifier.pending <= 2)
+        release.countDown()
+        notifier.idle()
     }
 
     @Test

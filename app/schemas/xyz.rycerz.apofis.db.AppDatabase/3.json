@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 3,
-    "identityHash": "aa3b717f19a61151867693fa9421cdb7",
+    "identityHash": "f66a5123eec6aaba12f391a581ec95ff",
     "entities": [
       {
         "tableName": "SessionEntity",
@@ -380,7 +380,7 @@
       },
       {
         "tableName": "NoticeStateEntity",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionKey` TEXT NOT NULL, `generation` INTEGER NOT NULL, `runStartedAt` INTEGER NOT NULL, `runId` TEXT NOT NULL, `notice` TEXT NOT NULL, `eventId` TEXT NOT NULL, PRIMARY KEY(`sessionKey`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionKey` TEXT NOT NULL, `generation` INTEGER NOT NULL, `runStartedAt` INTEGER NOT NULL, `runId` TEXT NOT NULL, `notice` TEXT NOT NULL, `eventId` TEXT NOT NULL, `alerted` TEXT NOT NULL, PRIMARY KEY(`sessionKey`))",
         "fields": [
           {
             "fieldPath": "sessionKey",
@@ -417,6 +417,12 @@
             "columnName": "eventId",
             "affinity": "TEXT",
             "notNull": true
+          },
+          {
+            "fieldPath": "alerted",
+            "columnName": "alerted",
+            "affinity": "TEXT",
+            "notNull": true
           }
         ],
         "primaryKey": {
@@ -429,7 +435,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'aa3b717f19a61151867693fa9421cdb7')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'f66a5123eec6aaba12f391a581ec95ff')"
     ]
   }
 }

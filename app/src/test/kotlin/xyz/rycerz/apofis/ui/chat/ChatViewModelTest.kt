@@ -152,7 +152,9 @@ class ChatViewModelTest {
 
     private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
-    private fun vm(): ChatViewModel = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected, online) } })
+    private var accepted = 0
+
+    private fun vm(): ChatViewModel = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected, online) { accepted++ } } })
         .get("vm${created++}", ChatViewModel::class).also { vms += it }
 
     private fun json(body: String, code: Int = 200) =
@@ -260,6 +262,20 @@ class ChatViewModelTest {
         vm.await { it.draft.isEmpty() }
         val sent = vm.await { s -> s.items.any { it is UserMessage } }
         assertEquals("What is on my calendar?", (sent.items.single() as UserMessage).text)
+    }
+
+    @Test
+    fun onlyAnAcceptedSendIsReported() = runTest {
+        addSession()
+        val vm = vm()
+        vm.onSendClick() // a stale enabled button with nothing to send: the composer takes nothing
+        assertEquals(0, accepted)
+
+        vm.onDraftChange("hello")
+        vm.await { it.draft.isNotEmpty() }
+        vm.onSendClick()
+        vm.await { it.draft.isEmpty() }
+        assertEquals(1, accepted)
     }
 
     @Test

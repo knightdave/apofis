@@ -81,19 +81,60 @@ class OpenChatIntentTest {
     @Test
     fun shownChatCancelsAndSuppresses() = runTest {
         post("apofis-a")
-        container.chatShown("apofis-a", true)
+        container.chatShown(container.epoch(), "apofis-a", true)
         container.notifier.idle()
         assertTrue(nm.activeNotifications.isEmpty())
         post("apofis-a", "run_2", started = 2)
         assertTrue(nm.activeNotifications.isEmpty())
 
-        container.chatShown("apofis-b", false) // another chat's screen going away changes nothing
+        container.chatShown(container.epoch(), "apofis-b", false) // another chat's screen going away changes nothing
         post("apofis-a", "run_3", started = 3)
         assertTrue(nm.activeNotifications.isEmpty())
 
-        container.chatShown("apofis-a", false) // the activity stopped
+        container.chatShown(container.epoch(), "apofis-a", false) // the activity stopped
         post("apofis-a", "run_4", started = 4)
         assertEquals(1, nm.activeNotifications.size)
+    }
+
+    @Test
+    fun oldGraphCallbacksLeaveTheNewOneAlone() = runTest {
+        val old = container.epoch()
+        container.connect(Credentials("https://a.example/", "key-a"))
+        session("apofis-a")
+        container.chatShown(container.epoch(), "apofis-a", true)
+        container.chatShown(old, "apofis-a", false) // the old route disposing late
+        post("apofis-a", "run_9", started = 9)
+        assertTrue(nm.activeNotifications.isEmpty()) // still suppressed: the new graph's chat is on screen
+
+        container.chatShown(container.epoch(), "apofis-a", false)
+        container.chatShown(old, "apofis-a", true) // the old route starting late
+        post("apofis-a", "run_10", started = 10)
+        assertEquals(1, nm.activeNotifications.size)
+    }
+
+    @Test
+    fun tapCheckedAgainstTheLiveGraph() = runTest {
+        container.connect(Credentials("https://a.example/", "key-a"))
+        val conn = container.connected()!!
+        val g = container.epoch()
+        assertEquals("apofis-a", container.tapTarget(g to "apofis-a", conn))
+        assertNull(container.tapTarget(g - 1 to "apofis-a", conn)) // published by an old lookup after the switch
+
+        container.connect(Credentials("https://a.example/", "key-b"))
+        assertNull(container.tapTarget(g to "apofis-a", conn)) // the old graph, closed
+        assertNull(container.tapTarget(g to "apofis-a", container.connected())) // the new graph: another epoch
+        assertNull(container.tapTarget(g + 1 to "apofis-a", null)) // no connection: no screen change
+    }
+
+    @Test
+    fun disconnectedStartPostsNothing() = runTest {
+        db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:r", "apofis-a", "r", 1, "FINISHED", container.epoch(), 0))
+
+        assertNull(container.load()) // no usable credentials
+        container.notifier.idle()
+        container.notifier.idle() // after the start's cleanup
+
+        assertTrue(nm.activeNotifications.isEmpty())
     }
 
     @Test

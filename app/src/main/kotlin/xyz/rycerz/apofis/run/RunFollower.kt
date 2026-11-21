@@ -172,6 +172,8 @@ class RunFollower(
             null
         }
         if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
+        // Outside every lock: a background check reports done only once its notices are posted or durably decided.
+        onNotice.delivered()
         return status
     }
 
