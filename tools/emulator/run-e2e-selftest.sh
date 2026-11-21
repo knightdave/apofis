@@ -625,6 +625,50 @@ check "authenticated mode (control): the same peer does receive the real key, so
 check "app test: runs without any credentials file" '(mode=app HOME=$t/nohome key=""; load_key && [ "${#key}" -ge 16 ])'
 check "authenticated mode: refuses to start without the credentials file" '! (mode=smoke HOME=$t/nohome key=""; load_key)'
 
+# 12f. --app-test scrubs every credential-like variable at mode entry: nothing key-like reaches any child, the test
+# canary included. Synthetic values only, with characters that need URL encoding, each carrying a distinct marker.
+MARK=SYNTHmark7q
+creds=(API_SERVER_KEY APOFIS_E2E_CANARY HERMES_API_KEY GITHUB_TOKEN MY_SECRET DB_PASSWORD AWS_SECRET_ACCESS_KEY OPENAI_API_KEY)
+synthetic_env() { local v; for v in "${creds[@]}"; do printf '%s=%s\n' "$v" "${MARK}-$v-a%b&c+d/e=f"; done; }
+rc=0
+o=$(env $(synthetic_env) SSH_AUTH_SOCK=/tmp/agent.sock bash -c '
+  APOFIS_E2E_LIB=1 source "$1/run-e2e.sh"
+  mode=app
+  scrub_credentials
+  env; printf "canary=%s\n" "$APOFIS_E2E_CANARY"; key=$(echo fresh-random-key-0123456789); key_patterns' _ "$here" 2>&1) || rc=$?
+check "app test: no credential-like variable or canary survives mode entry" '[ "$rc" = 0 ] && lacks "$o" "$MARK"'
+check "app test: the ssh agent socket survives (ssh needs it to log in)" 'has "$o" "SSH_AUTH_SOCK=/tmp/agent.sock"'
+
+# The real startup and its error cleanup: a fake home whose credentials file holds a marker, a tripwire on reading it,
+# and a fake ssh that records its environment, arguments and stdin, then fails (stage 0 cannot take the lock).
+REAL_GREP=$(command -v grep)
+mkdir -p "$t/trip/bin" "$t/trip/home/.hermes" "$t/trip/run"
+printf 'API_SERVER_KEY=%s-file-x%%y&z\n' "$MARK" >"$t/trip/home/.hermes/.env"
+cat >"$t/trip/bin/ssh" <<'EOF2'
+#!/usr/bin/env bash
+{ echo "== ssh $*"; env; timeout 1 cat || true; } >>"$TRIP_SSH" 2>&1
+exit 255
+EOF2
+cat >"$t/trip/bin/grep" <<'EOF2'
+#!/usr/bin/env bash
+for a in "$@"; do case $a in *.hermes*) printf 'read %s\n' "$*" >>"$TRIP_READ" ;; esac; done
+exec "$REAL_GREP" "$@"
+EOF2
+chmod +x "$t/trip/bin/ssh" "$t/trip/bin/grep"
+trip_case() { # <mode args...>: runs main, returns its exit; logs in $t/trip/ssh-<n> and $t/trip/read-<n>
+  local n=$1; shift
+  rm -f "$t/trip/ssh-$n" "$t/trip/read-$n"
+  env $(synthetic_env) HOME="$t/trip/home" XDG_RUNTIME_DIR="$t/trip/run" PATH="$t/trip/bin:$PATH" REAL_GREP="$REAL_GREP" \
+    TRIP_SSH="$t/trip/ssh-$n" TRIP_READ="$t/trip/read-$n" timeout 120 bash "$here/run-e2e.sh" "$@" </dev/null >"$t/trip/out-$n" 2>&1
+}
+rc=0; trip_case app --app-test BlurCostTest || rc=$?
+check "app test startup: stops at stage 0 and cleans up (the fake host refuses)" '[ "$rc" != 0 ] && [ -s "$t/trip/ssh-app" ] && grep -q "stage 0" "$t/trip/out-app"'
+check "app test startup and cleanup: no credential, canary or file marker in any ssh environment, argument or input" '! grep -q "$MARK" "$t/trip/ssh-app"'
+check "app test startup and cleanup: the credentials file is never read" '[ ! -e "$t/trip/read-app" ]'
+rc=0; trip_case smoke --smoke || rc=$?
+check "authenticated mode (control): reads the credentials file, so the tripwire can see a read" '[ -s "$t/trip/read-smoke" ]'
+check "authenticated mode (control): its children inherit the caller's environment, so the ssh check can see it" 'grep -q "$MARK" "$t/trip/ssh-smoke"'
+
 # 13. Every instrumentation test class writes its own result rows (Evidence), which the cleanup requires.
 for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
   grep -q '^ *@Test' "$f" || continue

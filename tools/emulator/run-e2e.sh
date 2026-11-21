@@ -128,6 +128,20 @@ instrument_target() {
   esac
 }
 
+# Names of credential-like variables: any word KEY, TOKEN, SECRET, PASSWORD, PASS, CREDENTIAL(S) or AUTH, and canaries.
+CREDENTIAL_RE='(^|_)(KEYS?|TOKENS?|SECRETS?|PASSWORDS?|PASSWD|PASS|CREDENTIALS?|AUTH)(_|$)|CANARY'
+
+# --app-test needs no credential. At mode entry, once, every credential-like variable leaves this shell, so nothing
+# started from here on (ssh, rsync, the remote stage, any helper) can inherit one; the test canary goes too. The ssh
+# agent socket stays: it is how ssh logs in, not a secret value.
+scrub_credentials() {
+  local v
+  for v in $(compgen -e); do
+    [ "$v" != SSH_AUTH_SOCK ] && [[ ${v^^} =~ $CREDENTIAL_RE ]] && unset "$v"
+  done
+  APOFIS_E2E_CANARY=''
+}
+
 # The credential in $key. --app-test needs none, so the real key is never read in that mode: a disposable per-run
 # canary stands in. Everything that answers the emulator host (the key request, the scan patterns) and the local scans
 # then use the canary, and nothing derived from the real key can leave this host.
@@ -634,7 +648,7 @@ key_patterns() {
     p+=("$b" "$(printf '%s' "$b" | tr '+/' '-_')")
   done
   # For testing the leak path with a disposable canary instead of the key (see the README).
-  [ "${#APOFIS_E2E_CANARY}" -lt 16 ] || p+=("$APOFIS_E2E_CANARY")
+  [ "$mode" = app ] || [ "${#APOFIS_E2E_CANARY}" -lt 16 ] || p+=("$APOFIS_E2E_CANARY") # never in app mode
   printf '%s\n' "${#p[@]}" "${p[@]}"
 }
 
@@ -1195,6 +1209,7 @@ main() {
     --in-shell) shift; in_shell "$@"; return ;;
     *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]> | --app-test <Class>" >&2; exit 2 ;;
   esac
+  [ "$mode" != app ] || scrub_credentials # first, before anything is started
   [[ $tests =~ ^[A-Za-z0-9_#]+$ || ($mode == app && $tests =~ ^app:[A-Za-z0-9_]+$) ]] || die "bad test name: $tests"
   no_core_dumps || die "could not disable core dumps"
   # The first action: this host's lock, before anything else is touched here or on the emulator host.
