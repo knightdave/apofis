@@ -1,6 +1,19 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.annotation.StringRes
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.heightIn
@@ -58,9 +71,9 @@ import xyz.rycerz.apofis.ui.theme.wash
  * so only Deny is offered.
  */
 @Composable
-internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, onChoice: (String, Long, ApprovalChoice) -> Unit) {
+internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onChoice: (String, Long, ApprovalChoice) -> Unit) {
     val command = control.command?.takeIf { it.isNotBlank() }
-    val choose = { choice: ApprovalChoice -> onChoice(control.requestId, control.executionGeneration, choice) }
+    val choose = { choice: ApprovalChoice -> if (gate.tryAnswer()) onChoice(control.requestId, control.executionGeneration, choice) }
     ControlCard(R.string.chat_approval_title, changed, R.drawable.lucide_triangle_exclamation_point, ApofisTheme.colors.warning) {
         if (command != null) {
             CodeSurface {
@@ -75,26 +88,34 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
         } else {
             Text(stringResource(R.string.chat_approval_no_command), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
-            Pill(stringResource(R.string.chat_approval_deny), filled = false, enabled = !answering) { choose(ApprovalChoice.DENY) }
+        Row(
+            Modifier.fillMaxWidth().padding(top = 8.dp).exposure(gate),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Pill(stringResource(R.string.chat_approval_deny), filled = false, enabled = !answering, gate) { choose(ApprovalChoice.DENY) }
             if (command != null) {
-                Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering) { choose(ApprovalChoice.ONCE) }
+                Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering, gate) { choose(ApprovalChoice.ONCE) }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
                     ApofisIconButton(onClick = { menu = true }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
                         Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
                     }
                     DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
+                        // The menu is its own window: while it holds the focus over this request, the request is in view.
+                        val focused = windowFocused(menu = true)
+                        SideEffect { gate.menuFocused = focused }
+                        DisposableEffect(Unit) { onDispose { gate.menuFocused = false } }
                         val session = remember { MutableInteractionSource() }
                         DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_session)) }, onClick = {
                             menu = false
                             choose(ApprovalChoice.SESSION)
-                        }, Modifier.wash(session), interactionSource = session)
+                        }, Modifier.pressStart(gate).wash(session), interactionSource = session)
                         val always = remember { MutableInteractionSource() }
                         DropdownMenuItem(text = { Text(stringResource(R.string.chat_approval_always)) }, onClick = {
                             menu = false
                             choose(ApprovalChoice.ALWAYS)
-                        }, Modifier.wash(always), interactionSource = always)
+                        }, Modifier.pressStart(gate).wash(always), interactionSource = always)
                     }
                 }
             }
@@ -104,11 +125,11 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
 
 /** A question from Hermes, answered right here, by this block's own request id and generation. */
 @Composable
-internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, onAnswer: (String, Long, String) -> Unit) {
+internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onAnswer: (String, Long, String) -> Unit) {
     ControlCard(R.string.chat_clarify_title, changed) {
         control.question?.let { Text(it, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface) }
         var answer by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf("") }
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp).exposure(gate), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 answer,
                 { answer = it },
@@ -118,8 +139,9 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
                 enabled = !answering,
             )
             ApofisIconButton(
-                onClick = { onAnswer(control.requestId, control.executionGeneration, answer) },
+                onClick = { if (gate.tryAnswer()) onAnswer(control.requestId, control.executionGeneration, answer) },
                 contentDescription = stringResource(R.string.chat_clarify_send),
+                Modifier.pressStart(gate),
                 enabled = !answering && answer.isNotBlank(),
             ) {
                 Icon(painterResource(R.drawable.lucide_arrow_up), null, Modifier.size(20.dp))
@@ -181,12 +203,13 @@ private fun ControlCard(
  * the wash and focus ring on the pill itself.
  */
 @Composable
-private fun Pill(label: String, filled: Boolean, enabled: Boolean, onClick: () -> Unit) {
+private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerGate, onClick: () -> Unit) {
     val source = remember { MutableInteractionSource() }
     val scheme = MaterialTheme.colorScheme
     Box(
         Modifier
             .heightIn(min = 48.dp)
+            .pressStart(gate)
             .clickable(source, indication = null, enabled = enabled, role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
@@ -202,4 +225,55 @@ private fun Pill(label: String, filled: Boolean, enabled: Boolean, onClick: () -
             Text(label, style = MaterialTheme.typography.labelLarge, color = if (filled) scheme.onPrimary else scheme.onSurface)
         }
     }
+}
+
+/**
+ * When a request may be answered. [shownAt] is when its answer controls last became answerable on screen (null
+ * while they are not); the footer sets it. An answer is accepted only from a press that BEGAN at least a double-tap
+ * interval ([settle]) after that, in the same unbroken stretch, and only if that still holds on release. A press
+ * begun earlier, or one whose stretch was broken in between, answers nothing. An activation with no press (an
+ * accessibility action) is judged at the moment it arrives.
+ */
+internal class AnswerGate(private val clock: () -> Long, private val settle: Long) {
+    var shownAt: Long? = null
+    var exposed by mutableStateOf(false) // the answer row is fully inside the visible list
+    var menuFocused by mutableStateOf(false) // the request's own menu window has the focus
+    var pressStart: Long? = null // when the press now in progress began (pointer or key down)
+
+    fun now() = clock()
+
+    /** Called by an answer control's click: consumes the press. */
+    fun tryAnswer(): Boolean {
+        val start = pressStart
+        pressStart = null
+        val shown = shownAt ?: return false
+        val now = clock()
+        return (start ?: now) - shown >= settle && now - shown >= settle
+    }
+}
+
+private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
+
+/** Records when a press on an answer control begins: first, before the control's own click handling sees it. */
+private fun Modifier.pressStart(gate: AnswerGate): Modifier = this
+    .pointerInput(gate) {
+        awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            gate.pressStart = gate.now()
+            // Once the gesture is over (after the click, if there was one), no press is in progress.
+            do {
+                val event = awaitPointerEvent(PointerEventPass.Final)
+            } while (event.changes.any { it.pressed })
+            gate.pressStart = null
+        }
+    }
+    .onPreviewKeyEvent {
+        if (it.type == KeyEventType.KeyDown && it.key in activationKeys && gate.pressStart == null) gate.pressStart = gate.now()
+        false
+    }
+
+/** Keeps [AnswerGate.exposed] true only while this row lies wholly inside what is drawn of the list. */
+private fun Modifier.exposure(gate: AnswerGate): Modifier = onGloballyPositioned { coordinates ->
+    val visible = coordinates.boundsInWindow()
+    gate.exposed = coordinates.isAttached && visible.width >= coordinates.size.width - 1 && visible.height >= coordinates.size.height - 1
 }

@@ -7,6 +7,7 @@ import java.time.ZoneId
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -187,7 +188,7 @@ class DrawerViewModel(
         if (refreshing || (sessions.value.isNotEmpty() && last != null && t - last < REFRESH_INTERVAL_MS)) return
         lastRefresh = t
         refreshing = true
-        viewModelScope.launch {
+        refreshJob = viewModelScope.launch {
             val failed = try {
                 repo.refreshSessions(onCached = composer::retain) // idle drafts of chats gone from the phone are forgotten
                 false
@@ -329,8 +330,9 @@ class DrawerViewModel(
     /** For tests: actions started and not yet applied. */
     internal fun busyActions(): Int = inFlight.get()
 
-    /** For tests: a drawer refresh is still running. */
-    internal fun refreshInFlight(): Boolean = refreshing
+    /** For tests: the last drawer refresh, to join. */
+    internal var refreshJob: Job? = null
+        private set
 
     /** Under [ops]: a new local chat, opened. */
     private suspend fun openNew(): String = repo.createLocalSession().also { selectedFlow.value = it }

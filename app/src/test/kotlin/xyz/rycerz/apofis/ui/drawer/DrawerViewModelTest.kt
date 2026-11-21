@@ -36,6 +36,8 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.joinAll
+import androidx.lifecycle.viewModelScope
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -103,7 +105,9 @@ class DrawerViewModelTest {
     @After
     fun tearDown() {
         assertFalse("a held response timed out", gaveUp.get())
+        val scopes = created.map { it.viewModelScope.coroutineContext.job }
         store.clear()
+        runBlocking { withTimeout(10_000) { scopes.joinAll() } } // the view models' work ends before Room closes
         follower.pauseAll()
         runBlocking { withTimeout(10_000) { scope.coroutineContext.job.cancelAndJoin() } }
         db.close()
@@ -123,12 +127,14 @@ class DrawerViewModelTest {
         }
     }
 
+    private val created = CopyOnWriteArrayList<DrawerViewModel>()
+
     private fun vm(lastChat: String? = null): DrawerViewModel = ViewModelProvider.create(
         store,
         viewModelFactory {
             initializer { DrawerViewModel(connected, lastChat = lastChat, onSelected = { saved += it }, now = clock::get, zone = { ZoneOffset.UTC }) }
         },
-    ).get(DrawerViewModel::class)
+    ).get(DrawerViewModel::class).also { created += it }
 
     private fun ok(body: String = "{}") = { _: RecordedRequest -> MockResponse.Builder().code(200).body(body).addHeader("Content-Type", "application/json").build() }
 
@@ -154,11 +160,10 @@ class DrawerViewModelTest {
 
     /**
      * A test must not end while the drawer's refresh still runs: tearing down under it made every later test in this
-     * class that waits for a database-driven reaction time out (seen in fix round 2; the shared resource behind it was
-     * not identified).
+     * class that waits for a database-driven reaction time out (seen in fix round 2). Joins the refresh's own job.
      */
     private suspend fun refreshDone(vm: DrawerViewModel) =
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.refreshInFlight()) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(10_000) { vm.refreshJob?.join() } }
 
     private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
@@ -182,6 +187,7 @@ class DrawerViewModelTest {
         clock.addAndGet(1)
         vm.onOpen() // exactly 30 s: refreshes again
         withContext(Dispatchers.Default) { withTimeout(10_000) { while (sessionsListed() < 2) delay(5) } }
+        refreshDone(vm)
         assertEquals(2, sessionsListed())
     }
 
@@ -592,7 +598,8 @@ class DrawerViewModelTest {
         val forB = vm.prompt.value!!
         db.sessionDao().delete("apofis-a")
         vm.rows.await { it.chats().none { c -> c.key == "apofis-a" } }
-        withContext(Dispatchers.Default) { delay(200) } // give a wrong close the chance to happen
+        // The older prompt's watch was cancelled when the newer prompt replaced it (collectLatest, synchronously), so
+        // the removal reached no watcher of a's: nothing can close b's prompt later.
         assertEquals(forB, vm.prompt.value)
     }
 

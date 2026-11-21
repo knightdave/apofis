@@ -1,5 +1,22 @@
 package xyz.rycerz.apofis.ui.chat
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.material3.DrawerState
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.Text
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTouchInput
+import xyz.rycerz.apofis.ui.drawerCovers
+import xyz.rycerz.apofis.ui.onShownInWindow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
@@ -167,5 +184,153 @@ class AnswerGuardTest {
         tick(300)
         rule.onNodeWithText("Allow once").performClick()
         assertEquals(1, approvals.size)
+    }
+
+    // ---- fix round 3: a press counts only if it began on a settled request; the controls must be in view ----
+
+    private var hostFocused by mutableStateOf(true)
+    private var menuFocused by mutableStateOf(true)
+
+    @Composable
+    private fun Footer(pending: PendingControl?, obscured: Boolean = false) =
+        CompositionLocalProvider(LocalWindowFocus provides { menu -> if (menu) menuFocused else hostFocused }, LocalObscured provides obscured) {
+            ReplyFooter(reply, live(pending), emptyMap(), answering = false, actions)
+        }
+
+    @Test
+    fun aPressBegunBeforeTheIntervalEndsNeverAnswersEvenIfReleasedAfter() {
+        rule.setContent { Themed { Footer(approval) } }
+        tick(299)
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(2)
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        rule.waitForIdle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick() // a fresh press after the interval
+        assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.ONCE)), approvals)
+    }
+
+    @Test
+    fun anAccessibilityClickIsGatedToo() {
+        rule.setContent { Themed { Footer(approval) } }
+        rule.onNodeWithText("Deny").performSemanticsAction(SemanticsActions.OnClick)
+        assertTrue("$approvals", approvals.isEmpty())
+        tick(300)
+        rule.onNodeWithText("Deny").performSemanticsAction(SemanticsActions.OnClick)
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun losingAndRegainingWindowFocusRestartsTheInterval() {
+        rule.setContent { Themed { Footer(approval) } }
+        tick(1_000)
+        hostFocused = false // a system dialog or the other split-screen pane
+        tick(1_000)
+        hostFocused = true
+        rule.waitForIdle()
+        rule.onNodeWithText("Allow once").performClick()
+        assertTrue("$approvals", approvals.isEmpty())
+        tick(300)
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun scrollingTheButtonsOutOfViewAndBackRestartsTheInterval() {
+        val listState = LazyListState()
+        val history = (1..20).flatMap { listOf(UserMessage("u$it", "Question $it", false, FIXED_NOW), AssistantReply("r$it", emptyList(), "Answer $it", FIXED_NOW)) }
+        val l = live(approval)
+        val items = withLive(history + UserMessage("u21", "Clean up", false, FIXED_NOW, runId = "run_1"), l) { FIXED_NOW }
+        rule.setContent {
+            Themed {
+                CompositionLocalProvider(LocalWindowFocus provides { true }) {
+                    MessageList(items, l, emptyMap(), answering = false, actions = actions, onCancel = {}, onStep = {}, listState = listState, contentPadding = PaddingValues(), zone = ZoneOffset.UTC, today = FIXED_TODAY)
+                }
+            }
+        }
+        tick(1_000)
+        val row = rule.onNodeWithText("Allow once").fetchSemanticsNode().boundsInRoot.height
+        rule.runOnIdle { listState.dispatchRawDelta(row * 1.5f) } // the heading stays, the buttons go below the clip
+        tick(1_000)
+        rule.onNodeWithText("Hermes wants to run a command").assertExists()
+        rule.runOnIdle { listState.dispatchRawDelta(-row * 1.5f) }
+        rule.waitForIdle()
+        rule.onNodeWithText("Allow once").performClick()
+        assertTrue("$approvals", approvals.isEmpty())
+        tick(300)
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun aCancelledDrawerDragRestartsTheInterval() {
+        val drawer = DrawerState(DrawerValue.Closed)
+        var sheetShown by mutableStateOf(false)
+        val rest = floatArrayOf(Float.MAX_VALUE)
+        rule.setContent {
+            Themed {
+                ModalNavigationDrawer(
+                    drawerContent = { ModalDrawerSheet(Modifier.onShownInWindow(rest) { sheetShown = it }) { Text("Drawer") } },
+                    drawerState = drawer,
+                ) {
+                    CompositionLocalProvider(LocalObscured provides drawerCovers(drawer, sheetShown, promptOpen = false)) {
+                        Box(Modifier.fillMaxSize().testTag("chat")) { ReplyFooter(reply, live(approval), emptyMap(), answering = false, actions) }
+                    }
+                }
+            }
+        }
+        tick(1_000)
+        val resting = drawer.currentOffset
+        rule.onNodeWithTag("chat").performTouchInput { // a short, slow pull
+            down(Offset(5f, centerY))
+            repeat(10) { moveBy(Offset(12f, 0f), delayMillis = 32) }
+        }
+        rule.waitForIdle()
+        assertTrue("the drawer moved: ${drawer.currentOffset} vs $resting", drawer.currentOffset > resting)
+        assertEquals("the anchors still say closed", DrawerValue.Closed, drawer.currentValue)
+        tick(1_000)
+        rule.onNodeWithTag("chat").performTouchInput { repeat(10) { moveBy(Offset(-12f, 0f), delayMillis = 32) }; up() } // back, let go
+        rule.waitForIdle()
+        assertEquals(DrawerValue.Closed, drawer.currentValue)
+        rule.onNodeWithText("Allow once").performClick()
+        assertTrue("$approvals", approvals.isEmpty())
+        tick(300)
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun theRequestsOwnMenuWorksWhileItHoldsTheFocus() {
+        var pending by mutableStateOf(approval)
+        rule.setContent { Themed { Footer(pending) } }
+        tick(1_000)
+        for ((label, choice) in listOf("Allow for this chat" to ApprovalChoice.SESSION, "Always allow" to ApprovalChoice.ALWAYS)) {
+            hostFocused = true
+            rule.onNodeWithContentDescription("More approval options").performClick()
+            rule.waitForIdle() // the menu window is shown (and focused) before the chat loses the focus
+            hostFocused = false // the menu's window takes the focus
+            menuFocused = true
+            rule.waitForIdle()
+            rule.onNodeWithText(label).performClick()
+            rule.waitForIdle()
+            assertEquals(choice, approvals.last().third)
+            pending = pending.copy(requestId = pending.requestId + "x") // the next request
+            hostFocused = true
+            rule.waitForIdle()
+            tick(1_000)
+        }
+        assertEquals(2, approvals.size)
+        // A request replaced while its menu is open: the new one waits its own interval.
+        rule.onNodeWithContentDescription("More approval options").performClick()
+        hostFocused = false
+        rule.waitForIdle()
+        pending = pending.copy(executionGeneration = 9)
+        hostFocused = true
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("More approval options").performClick()
+        hostFocused = false
+        rule.waitForIdle()
+        rule.onNodeWithText("Always allow").performClick()
+        assertEquals(2, approvals.size)
     }
 }

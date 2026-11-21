@@ -80,20 +80,29 @@ internal const val TEXT_PAGE_LINES = 24
  */
 internal data class VisibleSteps(val hidden: Int, val shown: List<IndexedValue<Step>>, val later: Int = 0)
 
-/** [visibleSteps]'s page while on the newest steps: it follows the run as steps arrive. */
+/** [visibleSteps]'s page while following the newest steps (until the reader moves to another page). */
 internal const val NEWEST = -1
 
 /**
- * More than two steps and not [expanded]: the last two, the rest hidden. Expanded: the page of at most [STEP_PAGE]
- * steps that ends before [pageEnd] ([NEWEST], or an end at or past the last step: the newest page). Older pages keep
- * their end, so they stay put while steps arrive; stepping from a page to the next one ends where it started, so pages
- * never overlap and the oldest is the short one. Reads and builds only the shown entries.
+ * More than two steps and not [expanded]: the last two, the rest hidden. Expanded: page [page] of fixed chunks of
+ * [STEP_PAGE] counted from the oldest step (page k is steps k*40 until (k+1)*40); the last page is the short, growing
+ * one, shown for [NEWEST]. The index is clamped into range on every read. Reads and builds only the shown entries.
  */
-internal fun visibleSteps(steps: List<Step>, expanded: Boolean, pageEnd: Int = NEWEST): VisibleSteps {
+internal fun visibleSteps(steps: List<Step>, expanded: Boolean, page: Int = NEWEST): VisibleSteps {
     val size = steps.size
-    val end = if (expanded && pageEnd in 0 until size) pageEnd else size
-    val start = if (expanded) maxOf(0, end - STEP_PAGE) else if (size <= 2) 0 else size - 2
+    if (!expanded) {
+        val start = if (size <= 2) 0 else size - 2
+        return VisibleSteps(start, List(size - start) { IndexedValue(start + it, steps[start + it]) })
+    }
+    val k = shownPage(size, page)
+    val start = k * STEP_PAGE
+    val end = minOf(size, start + STEP_PAGE)
     return VisibleSteps(start, List(end - start) { IndexedValue(start + it, steps[start + it]) }, size - end)
+}
+
+private fun shownPage(size: Int, page: Int): Int {
+    val last = if (size == 0) 0 else (size - 1) / STEP_PAGE
+    return if (page < 0 || page > last) last else page
 }
 
 /**
@@ -126,9 +135,10 @@ private class StepsRef(val steps: List<Step>)
 private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) -> Unit, initiallyExpanded: Boolean, initiallyOpenReasoning: Set<Int>) {
     val steps = ref.steps
     var expanded by rememberSaveable(replyKey) { mutableStateOf(initiallyExpanded) }
-    var pageEnd by rememberSaveable(replyKey) { mutableIntStateOf(NEWEST) } // where the shown page ends, or NEWEST
+    var page by rememberSaveable(replyKey) { mutableIntStateOf(NEWEST) } // the one saved paging state
     var opened by rememberSaveable(replyKey) { mutableStateOf(initiallyOpenReasoning.sorted()) }
-    val visible = visibleSteps(steps, expanded, pageEnd)
+    val visible = visibleSteps(steps, expanded, page)
+    val shown = shownPage(steps.size, page)
     Column(
         Modifier
             .padding(horizontal = 16.dp, vertical = 6.dp)
@@ -140,12 +150,11 @@ private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) ->
         if (steps.size > 2) {
             ExpandRow(expanded, steps.size - 2) {
                 expanded = !expanded
-                pageEnd = NEWEST
+                page = NEWEST
             }
         }
-        // Navigation starts from the page shown, never from a saved end the steps no longer reach (a stored reply can
-        // have fewer steps than the live one), so one tap always moves.
-        if (expanded && visible.hidden > 0) PageRow(stringResource(R.string.steps_earlier, visible.hidden)) { pageEnd = visible.hidden }
+        // From the page shown (the index clamped on read): one tap always moves exactly one page.
+        if (expanded && visible.hidden > 0) PageRow(stringResource(R.string.steps_earlier, visible.hidden)) { page = shown - 1 }
         val last = visible.shown.lastIndex
         visible.shown.forEachIndexed { position, (i, step) ->
             // Keyed by what the row shows: another call at the same index is a new row, so a press on the old one ends.
@@ -159,12 +168,7 @@ private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) ->
                 }
             }
         }
-        if (expanded && visible.later > 0) {
-            PageRow(stringResource(R.string.steps_later, visible.later)) {
-                val next = steps.size - visible.later + STEP_PAGE
-                pageEnd = if (next >= steps.size) NEWEST else next
-            }
-        }
+        if (expanded && visible.later > 0) PageRow(stringResource(R.string.steps_later, visible.later)) { page = shown + 1 }
     }
 }
 
@@ -328,26 +332,28 @@ internal fun MiniDots(modifier: Modifier = Modifier) {
 }
 
 /**
- * [text] one page at a time, with Previous and Next buttons and "Part k". Only the page on screen is ever measured:
- * its end is found from its start ([pageEnd]); the starts of the pages already visited are kept for Previous.
- * [page] draws a page's text with the modifier it is given (tagged "[tag].page"); the pager is tagged [tag].
+ * [text] one page at a time, with Previous and Next buttons and "Part k". The only saved state is the page index,
+ * clamped on every read. Page boundaries are walked forward from offset 0 ([pageEnd], one page per step) and kept in
+ * memory for this text; showing page k measures at most k+1 pages, once. [page] draws a page's text with the
+ * modifier it is given (tagged "[tag].page"); the pager is tagged [tag].
  */
 @Composable
 internal fun PagedText(text: String, tag: String, labelColor: Color, page: @Composable (String, Modifier) -> Unit) {
-    // The starts of pages 1..k, saved; a different text starts over.
-    var starts by rememberSaveable(tag, text.length) { mutableStateOf(listOf(0)) }
-    if (starts.last() > text.length) starts = listOf(0)
-    val start = starts.last()
-    val end = remember(text, start) { pageEnd(text, start) }
+    val pages = remember { TextPages() }
+    pages.follow(text)
+    var index by rememberSaveable(tag) { mutableIntStateOf(0) }
+    val shown = pages.reach(index)
+    val end = pages.endOf(shown)
     Column(Modifier.testTag(tag)) {
-        page(text.substring(start, end), Modifier.testTag("$tag.page"))
-        if (starts.size > 1 || end < text.length) {
+        page(text.substring(pages.startOf(shown), end), Modifier.testTag("$tag.page"))
+        if (shown > 0 || end < text.length) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                ApofisIconButton({ starts = starts.dropLast(1) }, stringResource(R.string.page_previous), enabled = starts.size > 1, visualSize = 24.dp) {
+                // Pure functions of the page shown: activations queued before the next frame land on the same page.
+                ApofisIconButton({ index = maxOf(0, shown - 1) }, stringResource(R.string.page_previous), enabled = shown > 0, visualSize = 24.dp) {
                     Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(16.dp).rotate(180f), tint = labelColor)
                 }
-                Text(stringResource(R.string.page_part, starts.size), style = MaterialTheme.typography.labelSmall, color = labelColor)
-                ApofisIconButton({ starts = starts + end }, stringResource(R.string.page_next), enabled = end < text.length, visualSize = 24.dp) {
+                Text(stringResource(R.string.page_part, shown + 1), style = MaterialTheme.typography.labelSmall, color = labelColor)
+                ApofisIconButton({ if (end < text.length) index = shown + 1 }, stringResource(R.string.page_next), enabled = end < text.length, visualSize = 24.dp) {
                     Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(16.dp), tint = labelColor)
                 }
             }
@@ -355,16 +361,52 @@ internal fun PagedText(text: String, tag: String, labelColor: Color, page: @Comp
     }
 }
 
-/** How far around a cut the grapheme boundary is looked for, in UTF-16 units. */
-internal const val GRAPHEME_WINDOW = 64
+/**
+ * The page starts of one text, found walking forward from 0. The same text keeps them; an appended text keeps those
+ * whose measurement saw enough of it to be final; any other change starts over.
+ */
+private class TextPages {
+    private var text = ""
+    private val starts = arrayListOf(0) // starts[k + 1] is where page k ends
+    private var complete = false // the walk has reached the end of the text
+
+    fun follow(next: String) {
+        if (next === text) return
+        if (next.length > text.length && next.startsWith(text)) {
+            // A page end depends on the text up to one code point past its limit: earlier ends are final.
+            var keep = 1
+            while (keep < starts.size && starts[keep - 1] + TEXT_PAGE_CHARS + 2 <= text.length) keep++
+            starts.subList(keep, starts.size).clear()
+        } else {
+            starts.subList(1, starts.size).clear()
+        }
+        complete = false
+        text = next
+    }
+
+    /** Measures pages up to [k] (or the end of the text) and returns the page index to show, clamped. */
+    fun reach(k: Int): Int {
+        while (!complete && starts.size <= k + 1) {
+            val end = pageEnd(text, starts.last())
+            if (end >= text.length) complete = true else starts += end
+        }
+        return k.coerceIn(0, starts.size - 1)
+    }
+
+    fun startOf(k: Int) = starts[k]
+
+    fun endOf(k: Int) = if (k + 1 < starts.size) starts[k + 1] else text.length
+}
 
 /**
  * The end of the page of [text] that starts at [start] (a grapheme boundary): at most [TEXT_PAGE_CHARS] characters
  * and [TEXT_PAGE_LINES] line breaks (CR, LF and CRLF each count once), after the last line break in reach, else at
- * the last grapheme boundary in reach ([cutBefore]). Reads at most the page and a small window around its end.
+ * [cutAt]. Reads at most the page and one code point past it.
  */
 internal fun pageEnd(text: CharSequence, start: Int): Int {
-    val limit = minOf(text.length, start + TEXT_PAGE_CHARS)
+    Work.pageEnds++
+    val cap = start + TEXT_PAGE_CHARS
+    val limit = minOf(text.length, cap)
     var i = start
     var lines = 0
     var afterBreak = -1
@@ -380,36 +422,29 @@ internal fun pageEnd(text: CharSequence, start: Int): Int {
         }
         i++
     }
-    if (limit == text.length && i == limit) return text.length
-    return if (afterBreak > start) afterBreak else cutBefore(text, start, start + TEXT_PAGE_CHARS)
+    if (i == text.length) return text.length
+    return if (afterBreak > start) afterBreak else cutAt(text, start, cap)
 }
 
 /**
- * A cut of [text] at or before [at] (and after [start]) that falls between two graphemes, found with the platform's
- * BreakIterator on a window of [GRAPHEME_WINDOW] units around [at] (a run of regional indicators is widened back to
- * its start, up to 1,024 units, so flags pair correctly). Oversized clusters: when no boundary lies between [start]
- * and [at] in the window, the first boundary after [at] within the window is used (a page may run a little long);
- * a cluster longer than the whole window is cut at [at] or one unit earlier, never inside a surrogate pair.
+ * The one cut for every cap in this task: the last grapheme boundary of [text] at or before [cap], so a cap is never
+ * exceeded. [from] must be a grapheme boundary (0 or an earlier cut): ICU's character BreakIterator reads only from
+ * [from] to one code point past [cap], so flags, ZWJ sequences, combining marks and CRLF stay whole. When no boundary
+ * lies after [from] (one cluster longer than the window), the cut is the last code point boundary at or before [cap].
  */
-internal fun cutBefore(text: CharSequence, start: Int, at: Int): Int {
-    if (at >= text.length) return text.length
-    var lo = maxOf(start, at - GRAPHEME_WINDOW)
-    while (lo > start && lo > at - 1024 && lo >= 2 && isRegionalIndicator(text, lo - 2)) lo -= 2
-    val hi = minOf(text.length, at + GRAPHEME_WINDOW)
+internal fun cutAt(text: CharSequence, from: Int, cap: Int): Int {
+    if (cap >= text.length) return text.length
+    if (cap <= from) return from
+    val after = cap + if (Character.isHighSurrogate(text[cap]) && cap + 1 < text.length) 2 else 1 // what follows the cap
     val graphemes = BreakIterator.getCharacterInstance()
-    graphemes.setText(text.subSequence(lo, hi).toString())
-    val before = graphemes.preceding(at - lo + 1).let { if (it == BreakIterator.DONE) -1 else it + lo }
-    if (before > start && (before > lo || lo == start)) return before // the window's own start is no real boundary
-    val after = graphemes.following(at - lo).let { if (it == BreakIterator.DONE) -1 else it + lo }
-    if (after in (at + 1)..hi && (after < hi || hi == text.length)) return after
-    return if (Character.isLowSurrogate(text[at]) && at - 1 > start) at - 1 else at
+    graphemes.setText(text.subSequence(from, after).toString())
+    val boundary = graphemes.preceding(cap - from + 1)
+    if (boundary != BreakIterator.DONE && boundary > 0) return from + boundary
+    return if (Character.isLowSurrogate(text[cap]) && Character.isHighSurrogate(text[cap - 1])) cap - 1 else cap
 }
 
-private fun isRegionalIndicator(text: CharSequence, i: Int): Boolean =
-    i + 1 < text.length && Character.isHighSurrogate(text[i]) && Character.toCodePoint(text[i], text[i + 1]) in 0x1F1E6..0x1F1FF
-
-/** [text] cut to at most [limit] characters between two graphemes (the live tool previews' display cap). */
-internal fun displayPrefix(text: String, limit: Int): String = if (text.length <= limit) text else text.substring(0, cutBefore(text, 0, limit))
+/** [text] cut to at most [limit] characters at the last grapheme boundary (the live tool previews' display cap). */
+internal fun displayPrefix(text: String, limit: Int): String = if (text.length <= limit) text else text.substring(0, cutAt(text, 0, limit))
 
 /** At most [ONE_LINE_MAX] characters, never ending on half a surrogate pair. */
 internal fun oneLine(text: String): String {

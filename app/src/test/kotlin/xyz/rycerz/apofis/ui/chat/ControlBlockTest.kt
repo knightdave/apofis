@@ -198,7 +198,7 @@ class ControlBlockTest {
         assertTrue(choices.isEmpty())
         advance(1000)
         pending = pending.copy(executionGeneration = 2)
-        advance(16)
+        advance(48)
         rule.onNodeWithContentDescription("More approval options").performClick()
         advance(16)
         rule.onNodeWithText("Allow for this chat").performClick()

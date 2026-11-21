@@ -458,6 +458,7 @@ internal object Work {
     var largestHighlight = 0 // the longest code handed to the highlighter
     var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
     var timelineRows = 0L // timeline step rows composed
+    var pageEnds = 0L // text pages measured
 }
 
 /**

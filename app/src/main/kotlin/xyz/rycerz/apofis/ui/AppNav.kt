@@ -27,6 +27,9 @@ import xyz.rycerz.apofis.ui.drawer.PromptHost
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.material3.DrawerState
 import androidx.compose.runtime.LaunchedEffect
 import xyz.rycerz.apofis.ui.chat.LocalObscured
 import androidx.compose.runtime.collectAsState
@@ -164,6 +167,8 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     val prompt by drawer.prompt.collectAsState()
     var showArchived by rememberSaveable { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
+    var drawerShown by remember { mutableStateOf(false) } // the drawer is out of its resting place
+    val drawerRest = remember { floatArrayOf(Float.MAX_VALUE) }
     val scope = rememberCoroutineScope()
     val keyboard = LocalSoftwareKeyboardController.current
     val focus = LocalFocusManager.current
@@ -206,7 +211,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     } else {
         ModalNavigationDrawer(
             drawerContent = {
-                ModalDrawerSheet(Modifier.fillMaxWidth(0.75f), drawerContainerColor = MaterialTheme.colorScheme.surface) {
+                ModalDrawerSheet(Modifier.fillMaxWidth(0.75f).onShownInWindow(drawerRest) { drawerShown = it }, drawerContainerColor = MaterialTheme.colorScheme.surface) {
                     DrawerContent(
                         rows,
                         query,
@@ -225,9 +230,9 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
             },
             drawerState = drawerState,
         ) {
-            // The drawer over the chat (open, opening or a prompt from it): pending requests cannot be answered.
-            val covered = drawerState.currentValue != DrawerValue.Closed || drawerState.targetValue != DrawerValue.Closed || prompt != null
-            CompositionLocalProvider(LocalObscured provides covered) {
+            // The drawer over the chat, even a little (a pull that is let go again), or a prompt from it: pending
+            // requests cannot be answered.
+            CompositionLocalProvider(LocalObscured provides drawerCovers(drawerState, drawerShown, promptOpen = prompt != null)) {
             val sessionKey = selected
             if (sessionKey == null) {
                 ChatScreen(
@@ -253,4 +258,18 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         }
     }
     prompt?.let { PromptHost(it, drawer) }
+}
+
+/** Whether the drawer covers the chat: any part of it on screen ([sheetShown]), moving, open, or [promptOpen]. */
+internal fun drawerCovers(state: DrawerState, sheetShown: Boolean, promptOpen: Boolean): Boolean =
+    sheetShown || promptOpen || state.currentValue != DrawerValue.Closed || state.targetValue != DrawerValue.Closed
+
+/**
+ * Reports whether this drawer sheet is out of its resting place: its right edge beyond the leftmost it has been (where
+ * the closed drawer rests, which may not be exactly the window's edge). [rest] keeps that leftmost edge.
+ */
+internal fun Modifier.onShownInWindow(rest: FloatArray, onShown: (Boolean) -> Unit): Modifier = onGloballyPositioned {
+    val right = it.boundsInWindow().right
+    if (right < rest[0]) rest[0] = right
+    onShown(right > rest[0] + 0.5f)
 }

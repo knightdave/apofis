@@ -27,7 +27,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.NonSkippableComposable
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
-import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.getValue
@@ -156,30 +155,25 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Req
             if (live.connection == Connection.RECONNECTING) Label(R.string.chat_reconnecting)
             if (pending != null) {
                 val changed = showsChanged(notes, pending)
-                // An answer needs a request the user has seen: it is accepted only once the request has been answerable
-                // on screen for a double-tap interval. The interval starts when the block is placed in the visible list
-                // with nothing over it (no sheet, dialog or drawer, the window focused) and starts again whenever that
-                // stops being true, or when the request is replaced. So the second tap of a double tap never answers the
-                // request that appeared between the taps, nor one that waited behind a sheet.
+                // An answer needs a request the user has seen (see [AnswerGate]): its controls fully in view, nothing of
+                // the app over them, the window (or the request's own menu) focused, no answer in flight. Each time this
+                // becomes true the interval starts again; a replaced request is a new gate.
                 val clock = LocalAnswerClock.current
-                val uncovered = !LocalObscured.current && LocalWindowInfo.current.isWindowFocused
-                var placed by remember(pending.requestId, pending.executionGeneration) { mutableStateOf(false) }
-                val visible = placed && uncovered
-                var shownAt by remember(pending.requestId, pending.executionGeneration) { mutableStateOf<Long?>(null) }
-                DisposableEffect(pending.requestId, pending.executionGeneration, visible) {
-                    shownAt = if (visible) clock() else null
+                val settle = LocalViewConfiguration.current.doubleTapTimeoutMillis
+                val gate = remember(pending.requestId, pending.executionGeneration) { AnswerGate(clock, settle) }
+                val obscured = LocalObscured.current // read unconditionally: a composable call inside && would shift groups
+                val focused = windowFocused()
+                val visible = gate.exposed && !answering && !obscured && (focused || gate.menuFocused)
+                DisposableEffect(gate, visible) {
+                    gate.shownAt = if (visible) clock() else null
                     onDispose { }
                 }
-                val settle = LocalViewConfiguration.current.doubleTapTimeoutMillis
-                val seen = { shownAt.let { it != null && clock() - it >= settle } }
                 // A request with another id or generation is a new block: an open menu or typed answer never carries over.
                 key(pending.requestId, pending.executionGeneration) {
-                    Box(Modifier.onPlaced { placed = true }) {
-                        when (pending.kind) {
-                            "approval" -> ApprovalBlock(pending, changed, answering) { id, gen, choice -> if (seen()) actions.onApproval(id, gen, choice) }
-                            "clarify" -> ClarifyBlock(pending, changed, answering) { id, gen, answer -> if (seen()) actions.onClarify(id, gen, answer) }
-                            else -> UnsupportedBlock()
-                        }
+                    when (pending.kind) {
+                        "approval" -> ApprovalBlock(pending, changed, answering, gate, actions::onApproval)
+                        "clarify" -> ClarifyBlock(pending, changed, answering, gate, actions::onClarify)
+                        else -> UnsupportedBlock()
                     }
                 }
             }
@@ -196,6 +190,13 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Req
 
 /** True while something of the app covers the chat (a sheet, a dialog, the open drawer): requests cannot be answered. */
 internal val LocalObscured = compositionLocalOf { false }
+
+/** Window focus for the answer guard; tests provide their own (menu: the request's own menu window). */
+internal val LocalWindowFocus = staticCompositionLocalOf<((menu: Boolean) -> Boolean)?> { null }
+
+/** Whether the window this is composed in has focus: the chat's, or the request's menu when [menu]. */
+@Composable
+internal fun windowFocused(menu: Boolean = false): Boolean = LocalWindowFocus.current?.invoke(menu) ?: LocalWindowInfo.current.isWindowFocused
 
 /** Monotonic milliseconds for the answer guard in [ReplyFooter]; tests provide their manual clock. */
 internal val LocalAnswerClock = staticCompositionLocalOf<() -> Long> { SystemClock::uptimeMillis }
