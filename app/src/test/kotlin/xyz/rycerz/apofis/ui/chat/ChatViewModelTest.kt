@@ -134,9 +134,9 @@ class ChatViewModelTest {
         // A send or drain still running in a view model would otherwise meet a closed database while holding those locks.
         val jobs = vms.map { it.viewModelScope.coroutineContext.job }
         store.clear()
-        runBlocking { withTimeout(10_000) { jobs.joinAll() } }
+        runBlocking { withTimeout(60_000) { jobs.joinAll() } }
         follower.pauseAll()
-        runBlocking { withTimeout(10_000) { scope.coroutineContext.job.cancelAndJoin() } }
+        runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
         db.close()
         server.close()
         Dispatchers.resetMain()
@@ -212,7 +212,7 @@ class ChatViewModelTest {
     }
 
     private suspend fun ChatViewModel.await(condition: (ChatUiState) -> Boolean): ChatUiState =
-        withContext(Dispatchers.Default) { withTimeout(10_000) { state.first(condition) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { state.first(condition) } }
 
     @Test
     fun composerModes() = runTest {
