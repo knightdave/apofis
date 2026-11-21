@@ -92,7 +92,7 @@ class RunFollower(
     private val onRunFinished: suspend (sessionKey: String) -> Unit = {},
     private val active: () -> Boolean = { true }, // false once this follower's connection is closed
     private val onNotice: NoticeSink = NoticeSink { _, _, _, _, _, _, _ -> },
-    private val onControlsCleared: (key: String, runId: String, requestId: String) -> Unit = { _, _, _ -> },
+    private val onControlsCleared: (key: String, runId: String) -> Unit = { _, _ -> }, // no answer pending for the run any more
     private val generation: () -> Long = { 0 }, // this follower's connection, captured into every notice it hands on
 ) : RunStarter {
     private val lives = ConcurrentHashMap<String, MutableStateFlow<LiveReply?>>()
@@ -120,6 +120,9 @@ class RunFollower(
 
     /** True while a status read for [runId] is requested and not yet applied; for tests. */
     internal fun refreshOwed(runId: String): Boolean = refreshers[runId]?.owed == true
+
+    /** True while [runId]'s status writer holds its lock; for tests. */
+    internal fun writerLocked(runId: String): Boolean = refreshers[runId]?.locked == true
 
     /** Run ids with a follower job; for tests. */
     internal val following: Set<String> get() = synchronized(jobs) { jobs.keys.toSet() }
@@ -255,8 +258,8 @@ class RunFollower(
     private inner class Refresher(private val run: ActiveRunEntity) {
         private val tickets = AtomicLong()
         private val applying = Mutex()
+        val locked: Boolean get() = applying.isLocked
         private var applied = 0L // guarded by [applying]
-        private var asked: String? = null // the approval or clarify request last handed on as a notice; guarded by [applying]
         private val stopping = Mutex() // guards the two fields below and orders the stop intent's writes
         private var stopsInFlight = 0
         private var stopAccepted = false // by the server, for this run; also true for an intent stored before a restart
@@ -286,7 +289,6 @@ class RunFollower(
          * stream event passes no ticket. False when the database failed: nothing was shown and the caller retries.
          */
         suspend fun publish(status: String, pending: PendingControl?, ticket: Long? = null): Boolean = withContext(NonCancellable) {
-            var notice: (suspend () -> Unit)? = null
             try {
                 beforeStatusStore(status)
                 applying.withLock {
@@ -299,41 +301,33 @@ class RunFollower(
                     } else {
                         val accepted = held == stored(status)
                         edit(run) { it.copy(status = held, pending = if (accepted) pending else null) }
-                        if (accepted && status !in TERMINAL) notice = noticeFor(pending)
+                        // Handed over under the lock, so the notifier gets accepted reads in the order they were accepted.
+                        if (accepted && status !in TERMINAL) handOverControls(pending)
                     }
                 }
+                true
             } catch (_: SQLException) {
-                return@withContext false
+                false
             }
-            try {
-                notice?.invoke() // outside the lock: it reads the database and talks to the OS
-            } catch (_: Exception) {
-                // the status is stored and shown; a failing notification must not undo that
-            }
-            true
         }
 
         /**
-         * Under [applying], for an accepted non-terminal status: a newly pending approval or clarify request becomes a
-         * NEEDS_ANSWER notice (not stored: the next accepted read derives it again); no pending control any more
-         * clears the request last handed on.
+         * Under [applying], for an accepted non-terminal status: a pending approval or clarify request becomes a
+         * NEEDS_ANSWER notice (not stored: the next accepted read derives it again, the notifier drops a repeat); no
+         * pending control clears the run's request notification. Both only hand over; nothing here waits for the OS.
          */
-        private fun noticeFor(pending: PendingControl?): (suspend () -> Unit)? {
+        private suspend fun handOverControls(pending: PendingControl?) {
             val request = pending?.takeIf { it.kind == "approval" || it.kind == "clarify" }?.requestId
-            val last = asked
-            val key = run.sessionKey
-            val id = run.runId
             val gen = generation()
-            return when {
-                request != null && request != last -> {
-                    asked = request
-                    { onNotice.notice(key, id, run.startedAt, Notice.NEEDS_ANSWER, "req:$id:$request:$gen", gen, false) }
+            try {
+                when {
+                    request != null -> onNotice.notice(run.sessionKey, run.runId, run.startedAt, Notice.NEEDS_ANSWER, "req:${run.runId}:$request:$gen", gen, false)
+                    pending == null -> onControlsCleared(run.sessionKey, run.runId)
                 }
-                pending == null && last != null -> {
-                    asked = null
-                    { onControlsCleared(key, id, last) }
-                }
-                else -> null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // the status is stored and shown; a failing notification must not undo that
             }
         }
 
@@ -539,7 +533,7 @@ class RunFollower(
                 // Already recorded where the request returned; the row stays for a later resumeAll.
             } catch (_: IllegalArgumentException) {
                 // HermesApi refuses a malformed run id before any request: the run can never be followed.
-                finish("failed", sync = false)
+                finish("failed", sync = false, verified = false) // a local refusal, not a status the server reported
             }
         }
 
@@ -670,7 +664,7 @@ class RunFollower(
          * run, so the session's queue is never blocked, but then nothing counts as delivered. Only the fetch is
          * cancellable: once the write has committed, the hand-off always completes.
          */
-        suspend fun finish(status: String?, sync: Boolean = true): Boolean {
+        suspend fun finish(status: String?, sync: Boolean = true, verified: Boolean = true): Boolean {
             try {
                 if (sync) {
                     var wrote = false
@@ -679,7 +673,7 @@ class RunFollower(
                         // The hand-off runs inside the repository call, only after its transaction has committed.
                         // Each page request's success is recorded as it returns, before mapping, the database phase and the drain.
                         repo.syncMessages(key, onResponse = { recordKey(accepted = true) }, afterCommit = { handOff(settled) }) { rows ->
-                            settled = write(status, buildTranscript(rows))
+                            settled = write(status, buildTranscript(rows), verified)
                             wrote = true
                         }
                     } catch (e: ApiError) {
@@ -697,7 +691,7 @@ class RunFollower(
                     if (wrote) return true
                 }
                 withContext(NonCancellable) {
-                    val settled = withRepositoryLock { db.withTransaction { write(status, items = null) } }
+                    val settled = withRepositoryLock { db.withTransaction { write(status, items = null, verified) } }
                     handOff(settled) // reached only when the transaction returned normally
                 }
                 return true
@@ -719,7 +713,7 @@ class RunFollower(
          * Inside the repository lock and a transaction. A pending send is removed only when the transcript the user
          * would see ([items]; null: unknown) shows it; otherwise it becomes failed `unconfirmed` and stays on screen.
          */
-        private suspend fun write(status: String?, items: List<ChatItem>?): Boolean {
+        private suspend fun write(status: String?, items: List<ChatItem>?, verified: Boolean): Boolean {
             beforeFinishWrite()
             // Still owned, checked under the repository lock that a switch, a cache clear and a delete also take: a closed
             // connection's follower settles nothing (a same-server switch keeps the row for the new one), and a deleted
@@ -727,7 +721,7 @@ class RunFollower(
             outboxRow = null
             if (!active()) return false
             val owned = db.activeRunDao().get(id)?.takeIf { it.sessionKey == key && db.sessionDao().get(key) != null } ?: return false
-            val notice = when (status) {
+            val notice = if (!verified) null else when (status) {
                 "completed" -> Notice.FINISHED
                 "failed", "interrupted" -> Notice.FAILED // interrupted also ends a resolved unknown run
                 else -> null // cancelled (a stop), or gone from the server: nothing verified to tell
@@ -769,14 +763,15 @@ class RunFollower(
             refreshers -= id
             state(key).update { if (it?.runId == id) null else it }
             if (!settled) return
-            outboxRow?.let { row ->
-                try {
-                    onNotice.notice(key, id, row.runStartedAt, Notice.valueOf(row.notice), row.eventId, row.generation, false)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    // the row stays in the outbox for the next replay
-                }
+            val row = outboxRow
+            try {
+                // A finish replaces the run's request; a stop, a gone run or a local failure only retires it.
+                if (row != null) onNotice.notice(key, id, row.runStartedAt, Notice.valueOf(row.notice), row.eventId, row.generation, false)
+                else onControlsCleared(key, id)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // a finish row stays in the outbox for the next replay
             }
             try {
                 onRunFinished(key)

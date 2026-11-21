@@ -63,6 +63,8 @@ class Connected internal constructor(
     private val scope: CoroutineScope,
     /** The composer of the cached chats: the container's one, shared by its connections. */
     val composer: Composer = Composer(scope),
+    /** The connection epoch this graph was built under. */
+    val generation: Long = 0,
 ) {
     private val liveApi = api
     private val liveRepo = repo
@@ -151,37 +153,37 @@ class AppContainer(
 
     val notifyPrefs: SharedPreferences = app.getSharedPreferences(NOTIFY_PREFS, Context.MODE_PRIVATE)
     private val visibleChat = MutableStateFlow<String?>(null)
-    val notifier by lazy {
-        Notifier(app, notifyPrefs, db, ::epoch, visibleChat::value) { key ->
-            db.sessionDao().get(key)?.takeIf { !it.hidden }?.let { it.title?.takeIf(String::isNotBlank) ?: app.getString(R.string.chat_new_title) }
-        }
-    }
+    val notifier by lazy { Notifier(app, notifyPrefs, db, ::epoch, visibleChat::value, scope) }
 
-    /** From the UI: [key]'s chat screen is shown in a started activity ([shown]) or no longer is. Showing it cancels its notification. */
+    /**
+     * From the UI: [key]'s chat screen is shown in a started activity ([shown]) or no longer is. Showing it cancels its
+     * notification, in the notifier's lane: nothing here waits for disk or the notification service.
+     */
     fun chatShown(key: String, shown: Boolean) {
         if (shown) {
             visibleChat.value = key
-            notifier.cancel(key)
+            notifier.cancel(key, epoch())
         } else {
             visibleChat.compareAndSet(key, null)
         }
     }
 
-    private val chatRequest = MutableStateFlow<String?>(null)
+    private val chatRequest = MutableStateFlow<Pair<Long, String>?>(null)
 
-    /** A chat a notification tap asked to open; the chat route selects it and calls [chatOpened]. */
-    val chatToOpen: StateFlow<String?> = chatRequest.asStateFlow()
+    /** A tapped chat as (epoch, key); the chat route of the connection with that epoch selects it, then [chatOpened]. */
+    val chatToOpen: StateFlow<Pair<Long, String>?> = chatRequest.asStateFlow()
 
-    fun chatOpened(key: String) {
-        chatRequest.compareAndSet(key, null)
+    fun chatOpened(request: Pair<Long, String>) {
+        chatRequest.compareAndSet(request, null)
     }
 
-    /** A notification tap: only `apofis://chat/<current generation>/<chat on this phone>` opens it; anything else is ignored. */
+    /** A notification tap: only `apofis://chat/<current epoch>/<chat on this phone>` opens it; anything else is ignored. */
     suspend fun openChat(intent: Intent?): Boolean {
-        val key = chatKey(intent, epoch()) ?: return false
+        val epoch = epoch()
+        val key = chatKey(intent, epoch) ?: return false
         if (db.sessionDao().get(key)?.hidden != false) return false
-        notifier.cancel(key)
-        chatRequest.value = key
+        notifier.cancel(key, epoch)
+        chatRequest.value = epoch to key // a switch meanwhile clears it, and the route compares the epoch again
         return true
     }
 
@@ -264,9 +266,10 @@ class AppContainer(
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
                 // The generation moves with the marker: from here on no notice, clear or tap of the old one is accepted.
-                commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true).putLong(CONNECTION_EPOCH, epoch() + 1))
-                runCatching { db.noticeOutboxDao().clear() }.onFailure(::logFailure) // a row left is dropped by its generation
-                notifier.cancelAll()
+                // The epoch moves with the marker, inside the notifier's lane: no notice, clear or tap of the old one
+                // is accepted afterwards, and its notifications and rows go. A death here is finished by the start sweep.
+                notifier.switchEpoch { commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true).putLong(CONNECTION_EPOCH, epoch() + 1)) }
+                chatRequest.value = null
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
                     commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
                     withRepositoryLock {
@@ -322,11 +325,10 @@ class AppContainer(
             disconnect()
             null
         } else {
-            credentials.load()?.let(::build)?.also {
-                scope.launch { scheduleQueuedSends() }
-                scope.launch { notifier.replayOutbox() } // notices a process death left between the commit and the post
-            }
+            credentials.load()?.let(::build)?.also { scope.launch { scheduleQueuedSends() } }
         }
+        // Notices a process death left between the commit and the post; also removes another epoch's leftovers.
+        scope.launch { notifier.replayOutbox() }
     }
 
     /** Erases the credentials; the switch mark is removed only once that reached the disk, so a restart stays disconnected. */
@@ -385,10 +387,10 @@ class AppContainer(
                 queue.drain()
                 runScope.launch { refreshQuietly(repo, composer) } // not on the follower's own, non-cancellable path
             }
-        }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, request ->
-            notifier.clearNeedsAnswer(key, run, request, generation)
+        }, active = open::get, onNotice = notifier, onControlsCleared = { key, run ->
+            notifier.clearNeedsAnswer(key, run, generation)
         }, generation = { generation })
-        return Connected(c, api, db, repo, queue, follower, open, runScope, composer)
+        return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation)
     }
 }
 

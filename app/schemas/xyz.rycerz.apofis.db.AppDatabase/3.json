@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 3,
-    "identityHash": "604e0f32cd8153cfc68fa8c3d0672d07",
+    "identityHash": "aa3b717f19a61151867693fa9421cdb7",
     "entities": [
       {
         "tableName": "SessionEntity",
@@ -325,7 +325,7 @@
       },
       {
         "tableName": "NoticeOutboxEntity",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `runId` TEXT NOT NULL, `runStartedAt` INTEGER NOT NULL, `notice` TEXT NOT NULL, `generation` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`eventId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `runId` TEXT NOT NULL, `runStartedAt` INTEGER NOT NULL, `notice` TEXT NOT NULL, `generation` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`generation`, `eventId`))",
         "fields": [
           {
             "fieldPath": "eventId",
@@ -373,14 +373,63 @@
         "primaryKey": {
           "autoGenerate": false,
           "columnNames": [
+            "generation",
             "eventId"
+          ]
+        }
+      },
+      {
+        "tableName": "NoticeStateEntity",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionKey` TEXT NOT NULL, `generation` INTEGER NOT NULL, `runStartedAt` INTEGER NOT NULL, `runId` TEXT NOT NULL, `notice` TEXT NOT NULL, `eventId` TEXT NOT NULL, PRIMARY KEY(`sessionKey`))",
+        "fields": [
+          {
+            "fieldPath": "sessionKey",
+            "columnName": "sessionKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "generation",
+            "columnName": "generation",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "runStartedAt",
+            "columnName": "runStartedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "runId",
+            "columnName": "runId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "notice",
+            "columnName": "notice",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventId",
+            "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sessionKey"
           ]
         }
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '604e0f32cd8153cfc68fa8c3d0672d07')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'aa3b717f19a61151867693fa9421cdb7')"
     ]
   }
 }

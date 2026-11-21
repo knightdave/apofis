@@ -63,8 +63,11 @@ class NotificationAccessTest {
 
     @Test
     @Config(sdk = [37])
-    fun grantedWithoutAskingIsNeverAsked() {
+    fun grantedAtFirstSendThenRevokedIsNeverAsked() {
         shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+        assertFalse(ask()) // the first send: nothing to ask, and its one chance is used
+        shadowOf(app).denyPermissions(Manifest.permission.POST_NOTIFICATIONS) // revoked later
+        assertEquals(Runtime.DENIED, access().runtime)
         assertFalse(ask())
         assertTrue(asks.isEmpty())
     }

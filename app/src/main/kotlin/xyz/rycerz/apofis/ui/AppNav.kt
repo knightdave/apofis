@@ -182,11 +182,13 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     BackHandler(drawerState.isOpen) { scope.launch { drawerState.close() } }
     LaunchedEffect(showArchived, archived.isEmpty()) { if (showArchived && archived.isEmpty()) showArchived = false }
     LaunchedEffect(drawer) {
-        container.chatToOpen.filterNotNull().collect {
-            drawer.onSelect(it)
-            showArchived = false
-            drawerState.close()
-            container.chatOpened(it)
+        container.chatToOpen.filterNotNull().collect { request ->
+            if (request.first == conn.generation) { // only the graph of the tap's epoch; the drawer checks the row again
+                drawer.onSelect(request.second)
+                showArchived = false
+                drawerState.close()
+            }
+            container.chatOpened(request)
         }
     }
     val askNotifications = rememberAskNotificationsOnce(container.notifyPrefs)

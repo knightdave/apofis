@@ -60,8 +60,10 @@ class OpenChatIntentTest {
     private fun view(uri: Uri) = Intent(Intent.ACTION_VIEW, uri).setClass(app, MainActivity::class.java)
     private fun view(uri: String) = view(Uri.parse(uri))
 
-    private suspend fun post(k: String) =
-        container.notifier.notice(k, "run_$k", 1, Notice.FINISHED, "run:run_$k", container.epoch(), replay = false)
+    private suspend fun post(k: String, run: String = "run_$k", started: Long = 1) {
+        container.notifier.notice(k, run, started, Notice.FINISHED, "run:$run", container.epoch(), replay = false)
+        container.notifier.idle()
+    }
 
     @Test
     fun currentGenerationAndExistingKeySelectsAndCancels() = runTest {
@@ -69,8 +71,9 @@ class OpenChatIntentTest {
         assertEquals(1, nm.activeNotifications.size)
 
         assertTrue(container.openChat(view(chatUri(container.epoch(), "apofis-a"))))
+        container.notifier.idle()
 
-        assertEquals("apofis-a", container.chatToOpen.value)
+        assertEquals(container.epoch() to "apofis-a", container.chatToOpen.value)
         assertTrue(nm.activeNotifications.isEmpty())
         assertTrue(container.openChat(view(chatUri(container.epoch(), "apofis-arch")))) // archived chats open as from the drawer
     }
@@ -79,16 +82,17 @@ class OpenChatIntentTest {
     fun shownChatCancelsAndSuppresses() = runTest {
         post("apofis-a")
         container.chatShown("apofis-a", true)
+        container.notifier.idle()
         assertTrue(nm.activeNotifications.isEmpty())
-        container.notifier.notice("apofis-a", "run_2", 2, Notice.FINISHED, "run:run_2", container.epoch(), replay = false)
+        post("apofis-a", "run_2", started = 2)
         assertTrue(nm.activeNotifications.isEmpty())
 
         container.chatShown("apofis-b", false) // another chat's screen going away changes nothing
-        container.notifier.notice("apofis-a", "run_3", 3, Notice.FINISHED, "run:run_3", container.epoch(), replay = false)
+        post("apofis-a", "run_3", started = 3)
         assertTrue(nm.activeNotifications.isEmpty())
 
         container.chatShown("apofis-a", false) // the activity stopped
-        container.notifier.notice("apofis-a", "run_4", 4, Notice.FINISHED, "run:run_4", container.epoch(), replay = false)
+        post("apofis-a", "run_4", started = 4)
         assertEquals(1, nm.activeNotifications.size)
     }
 
@@ -114,6 +118,7 @@ class OpenChatIntentTest {
         )
         for (intent in ignored) assertFalse(intent.toString(), container.openChat(intent))
         assertFalse(container.openChat(null))
+        container.notifier.idle()
 
         assertNull(container.chatToOpen.value)
         assertEquals(1, nm.activeNotifications.size)
@@ -126,13 +131,16 @@ class OpenChatIntentTest {
         val old = container.epoch()
         post("apofis-a")
         db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:r", "apofis-a", "r", 1, "FINISHED", old, 0))
+        assertTrue(container.openChat(view(chatUri(old, "apofis-a")))) // a tap not yet consumed by the chat route
 
         container.connect(Credentials("https://a.example/", "key-b")) // same server, new key: the chats stay
 
         assertEquals("Title apofis-a", db.sessionDao().get("apofis-a")!!.title)
         assertEquals(old + 1, container.epoch())
         assertTrue(nm.activeNotifications.isEmpty())
-        assertTrue(db.noticeOutboxDao().all().isEmpty())
+        assertTrue(db.noticeOutboxDao().all(old).isEmpty())
+        assertNull(container.chatToOpen.value) // the pending tap of the old connection is gone
         assertFalse(container.openChat(view(chatUri(old, "apofis-a"))))
+        assertEquals(old + 1, container.connected()!!.generation)
     }
 }

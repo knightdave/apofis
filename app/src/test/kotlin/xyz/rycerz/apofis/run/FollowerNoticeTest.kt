@@ -49,8 +49,13 @@ class FollowerNoticeTest {
     private lateinit var repo: ChatRepository
     private val routes = ConcurrentHashMap<String, (RecordedRequest) -> MockResponse>()
     private val sent = CopyOnWriteArrayList<Sent>()
-    private val cleared = CopyOnWriteArrayList<Triple<String, String, String>>()
-    private val sink = NoticeSink { k, r, s, n, e, g, replay -> sent += Sent(k, r, s, n, e, g, replay) }
+    private val cleared = CopyOnWriteArrayList<Pair<String, String>>()
+    private val lockedAtHandOver = CopyOnWriteArrayList<Boolean>()
+    private var follower: RunFollower? = null
+    private val sink = NoticeSink { k, r, s, n, e, g, replay ->
+        lockedAtHandOver += follower!!.writerLocked(r)
+        sent += Sent(k, r, s, n, e, g, replay)
+    }
 
     @Before
     fun setUp() {
@@ -73,8 +78,8 @@ class FollowerNoticeTest {
 
     private fun TestScope.follower(done: CompletableDeferred<Unit>? = null) = RunFollower(
         api, db, repo, backgroundScope, delayMs = {}, onRunFinished = { done?.complete(Unit) },
-        onNotice = sink, onControlsCleared = { k, r, q -> cleared += Triple(k, r, q) }, generation = { GEN },
-    )
+        onNotice = sink, onControlsCleared = { k, r -> cleared += k to r }, generation = { GEN },
+    ).also { follower = it }
 
     private fun on(path: String, vararg responses: () -> MockResponse) {
         val n = AtomicInteger()
@@ -99,7 +104,7 @@ class FollowerNoticeTest {
         db.activeRunDao().upsert(ActiveRunEntity(RUN, KEY, null, "running", startedAt = 42L))
     }
 
-    private suspend fun outbox() = db.noticeOutboxDao().all()
+    private suspend fun outbox() = db.noticeOutboxDao().all(GEN)
 
     @Test
     fun completedFinishWritesOutboxInTransaction() = runTest {
@@ -181,21 +186,34 @@ class FollowerNoticeTest {
     }
 
     @Test
-    fun newApprovalOnce() = runTest {
+    fun approvalHandedOverWithItsRequest() = runTest {
         val f = follower()
         stored()
         on(STATUS, status("waiting_for_approval", control("approval", "p1")))
         f.settle(RUN)
-        f.settle(RUN) // the same request read again
+        f.settle(RUN) // read again: handed over again, in order; the notifier drops the repeat
 
-        assertEquals(listOf(Sent(KEY, RUN, 42L, Notice.NEEDS_ANSWER, "req:$RUN:p1:$GEN", GEN, replay = false)), sent)
+        assertEquals(Sent(KEY, RUN, 42L, Notice.NEEDS_ANSWER, "req:$RUN:p1:$GEN", GEN, replay = false), sent.first())
         assertTrue(outbox().isEmpty()) // never stored: the next accepted read derives it again
 
         on(STATUS, status("waiting_for_approval", control("clarify", "p2")))
         f.settle(RUN)
         on(STATUS, status("waiting_for_approval", control("something_new", "p3")))
         f.settle(RUN)
-        assertEquals(listOf("req:$RUN:p1:$GEN", "req:$RUN:p2:$GEN"), sent.map { it.eventId })
+        assertEquals(listOf("req:$RUN:p1:$GEN", "req:$RUN:p1:$GEN", "req:$RUN:p2:$GEN"), sent.map { it.eventId })
+        assertTrue(cleared.isEmpty()) // an unsupported control still waits: nothing is cleared
+    }
+
+    @Test
+    fun handOverUnderWriterLockInAcceptedOrder() = runTest {
+        val f = follower()
+        stored()
+        on(STATUS, status("waiting_for_approval", control("approval", "p1")), status("running"))
+        f.settle(RUN)
+        f.settle(RUN)
+
+        assertEquals(listOf(true), lockedAtHandOver) // a newer read cannot overtake: it waits for the lock
+        assertEquals(listOf(KEY to RUN), cleared)
     }
 
     @Test
@@ -214,19 +232,49 @@ class FollowerNoticeTest {
         f.settle(RUN) // the older read, showing the approval, is not applied
 
         assertTrue(sent.isEmpty())
-        assertTrue(cleared.isEmpty())
+        assertEquals(listOf(KEY to RUN), cleared) // only the newer read's (no control)
     }
 
     @Test
-    fun controlsClearedCarriesRequest() = runTest {
-        val f = follower()
+    fun controlsClearedByAFreshWriter() = runTest {
+        val f = follower() // a new process: this writer never handed over the request shown before
         stored()
-        on(STATUS, status("waiting_for_approval", control("approval", "p1")), status("running"), status("running"))
-        f.settle(RUN)
-        f.settle(RUN)
+        on(STATUS, status("running"))
         f.settle(RUN)
 
-        assertEquals(listOf(Triple(KEY, RUN, "p1")), cleared)
+        assertEquals(listOf(KEY to RUN), cleared)
+    }
+
+    @Test
+    fun silentEndsRetireTheRequest() = runTest {
+        val f = follower()
+        messages()
+        stored()
+        on(STATUS, status("cancelled"))
+        f.settle(RUN)
+        stored()
+        on(STATUS, json("""{"error":{"code":"run_not_found"}}""", 404))
+        f.settle(RUN)
+
+        assertEquals(listOf(KEY to RUN, KEY to RUN), cleared)
+        assertTrue(sent.isEmpty())
+        assertTrue(outbox().isEmpty())
+    }
+
+    @Test
+    fun malformedRunIdIsNoVerifiedOutcome() = runTest {
+        val done = CompletableDeferred<Unit>()
+        val f = follower(done)
+        f.resumeAll()
+        stored()
+        db.activeRunDao().upsert(ActiveRunEntity("bad/id", KEY, null, "running", 1L))
+        f.onRunStarted(KEY, "bad/id")
+        done.await()
+
+        assertNull(db.activeRunDao().get("bad/id")) // still cleaned up
+        assertTrue(outbox().none { it.runId == "bad/id" })
+        assertTrue(sent.none { it.runId == "bad/id" })
+        assertTrue(KEY to "bad/id" in cleared)
     }
 
     @Test

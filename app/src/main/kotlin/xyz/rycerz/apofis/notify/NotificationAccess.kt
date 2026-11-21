@@ -14,7 +14,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 
 const val NOTIFY_PREFS = "notify"
-private const val ASKED = "permission_asked" // the runtime permission was asked once; never asked again automatically
+private const val ASKED = "permission_asked" // the first send happened (asked, or already granted then): never asked again automatically
 
 /** What may show a notification; each part is shown separately in Settings. */
 data class NotificationAccess(val runtime: Runtime, val appEnabled: Boolean, val repliesEnabled: Boolean, val answersEnabled: Boolean)
@@ -35,13 +35,15 @@ private fun runtime(context: Context, prefs: SharedPreferences): Runtime = when 
 }
 
 /**
- * Asks for the runtime permission through [launch] only while it was never asked; the mark is committed first, so a
- * process death during the dialog never leads to a second automatic ask. True when it asked.
+ * The first send's one chance: on API 33+ it is used up by the first call whatever the state, so a permission granted
+ * then and revoked later is never asked for again. Asks through [launch] only while not granted. The mark is committed
+ * first, so a process death during the dialog never leads to a second automatic ask. True when it asked.
  */
-@SuppressLint("UseKtx", "InlinedApi") // commit()'s result is checked; [runtime] is NEVER_ASKED only on API 33+
+@SuppressLint("UseKtx", "InlinedApi") // commit()'s result is checked; only reached on API 33+
 internal fun askNotificationsOnce(context: Context, prefs: SharedPreferences, launch: (String) -> Unit): Boolean {
-    if (runtime(context, prefs) != Runtime.NEVER_ASKED) return false
+    if (Build.VERSION.SDK_INT < 33 || prefs.getBoolean(ASKED, false)) return false
     if (!prefs.edit().putBoolean(ASKED, true).commit()) return false
+    if (runtime(context, prefs) == Runtime.GRANTED) return false
     launch(Manifest.permission.POST_NOTIFICATIONS)
     return true
 }

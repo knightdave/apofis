@@ -71,15 +71,30 @@ data class ReplyOutcomeEntity(
 
 /**
  * A finish notice written in the same transaction that settles its run ([eventId] `run:<runId>`), so a process death
- * before the notification is posted cannot lose it. [notice] is a Notice name; [generation] the connection it came from.
+ * before the notification is posted cannot lose it. [notice] is a Notice name; [generation] the connection epoch it
+ * was created under (the same run id on another connection is another row).
  */
-@Entity
+@Entity(primaryKeys = ["generation", "eventId"])
 data class NoticeOutboxEntity(
-    @PrimaryKey val eventId: String,
+    val eventId: String,
     val sessionKey: String,
     val runId: String,
     val runStartedAt: Long,
     val notice: String,
     val generation: Long,
     val createdAt: Long,
+)
+
+/**
+ * Per chat, the last event whose effect (posted, or deliberately not shown) is done: the order every later event of
+ * the chat is compared with. Written only after that effect, in the transaction that removes its outbox row.
+ */
+@Entity
+data class NoticeStateEntity(
+    @PrimaryKey val sessionKey: String,
+    val generation: Long,
+    val runStartedAt: Long,
+    val runId: String,
+    val notice: String,
+    val eventId: String,
 )

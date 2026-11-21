@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 /** Cache of the server transcript plus the user's unsent messages. */
 @Database(
-    entities = [SessionEntity::class, MessageEntity::class, PendingSendEntity::class, ActiveRunEntity::class, ReplyOutcomeEntity::class, NoticeOutboxEntity::class],
+    entities = [SessionEntity::class, MessageEntity::class, PendingSendEntity::class, ActiveRunEntity::class, ReplyOutcomeEntity::class, NoticeOutboxEntity::class, NoticeStateEntity::class],
     version = 3,
     exportSchema = true,
 )
@@ -20,6 +20,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun activeRunDao(): ActiveRunDao
     abstract fun replyOutcomeDao(): ReplyOutcomeDao
     abstract fun noticeOutboxDao(): NoticeOutboxDao
+    abstract fun noticeStateDao(): NoticeStateDao
 }
 
 /**
@@ -34,12 +35,17 @@ val MIGRATION_1_2 = object : Migration(1, 2) {
     }
 }
 
-/** Version 3 adds the notice outbox; nothing else changes. */
+/** Version 3 adds the notice outbox and the per-chat notice order; nothing else changes. */
 val MIGRATION_2_3 = object : Migration(2, 3) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL(
             "CREATE TABLE IF NOT EXISTS `NoticeOutboxEntity` (`eventId` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `runId` TEXT NOT NULL, " +
-                "`runStartedAt` INTEGER NOT NULL, `notice` TEXT NOT NULL, `generation` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`eventId`))",
+                "`runStartedAt` INTEGER NOT NULL, `notice` TEXT NOT NULL, `generation` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, " +
+                "PRIMARY KEY(`generation`, `eventId`))",
+        )
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `NoticeStateEntity` (`sessionKey` TEXT NOT NULL, `generation` INTEGER NOT NULL, `runStartedAt` INTEGER NOT NULL, " +
+                "`runId` TEXT NOT NULL, `notice` TEXT NOT NULL, `eventId` TEXT NOT NULL, PRIMARY KEY(`sessionKey`))",
         )
     }
 }

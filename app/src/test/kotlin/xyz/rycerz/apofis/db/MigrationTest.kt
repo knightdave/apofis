@@ -10,6 +10,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -67,7 +68,8 @@ class MigrationTest {
         assertEquals("run_1", send.runId)
         assertTrue(send.attempted)
         assertEquals(ActiveRunEntity("run_1", "apofis-a", 4, "running", 9, polling = false, stopRequested = true), db.activeRunDao().get("run_1"))
-        assertTrue(db.noticeOutboxDao().all().isEmpty())
+        assertTrue(db.noticeOutboxDao().all(0).isEmpty())
+        assertNull(db.noticeStateDao().get("apofis-a"))
     }
 
     @Test
@@ -92,7 +94,9 @@ class MigrationTest {
             assertEquals(listOf("hi"), db.messageDao().rows("apofis-a").map { it.content })
             assertFalse(db.sessionDao().get("apofis-a")!!.stale)
             db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:run_1", "apofis-a", "run_1", 9, "FINISHED", 1, 2)) // the new table works
-            assertNotNull(db.noticeOutboxDao().get("run:run_1"))
+            assertNotNull(db.noticeOutboxDao().get(1, "run:run_1"))
+            db.noticeStateDao().upsert(NoticeStateEntity("apofis-a", 1, 9, "run_1", "FINISHED", "run:run_1"))
+            assertNotNull(db.noticeStateDao().get("apofis-a"))
         } finally {
             db.close()
         }
