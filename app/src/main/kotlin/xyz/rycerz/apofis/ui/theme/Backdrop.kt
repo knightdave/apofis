@@ -137,8 +137,8 @@ private class GlassNode(var state: BackdropState?, var shape: Shape, var fill: C
             val margin = blur.toPx()
             val layer = sample ?: requireGraphicsContext().createGraphicsLayer().also { sample = it }
             layer.clip = true // the blur works on this sub-rectangle only, never on the whole viewport
-            // Recorded and blurred at half resolution, drawn scaled up (a blur hides the lost detail): at full resolution
-            // the emulator measured 13 ms more at p95, at half 6 ms (Task 7 report).
+            // Recorded and blurred at half resolution and drawn scaled up: a quarter of the pixels to blur, and the blur
+            // hides the lost detail.
             layer.renderEffect = if (margin > 0f) BlurEffect(margin * SAMPLE_SCALE, margin * SAMPLE_SCALE, TileMode.Clamp) else null
             val at = position - origin
             val w = ceil((size.width + 2 * margin) * SAMPLE_SCALE).toInt()

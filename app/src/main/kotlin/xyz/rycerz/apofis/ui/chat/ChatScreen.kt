@@ -196,7 +196,10 @@ fun ChatScreen(
                 val listState = o.list
                 val follow = o.follow
                 val backdrop = o.backdrop
-                SideEffect { ChromeProbe.bodyBackdrop = backdrop }
+                SideEffect {
+                    ChromeProbe.bodyBackdropId = System.identityHashCode(backdrop)
+                    ChromeProbe.bodyBackdropHasLayer = backdrop.layer != null
+                }
                 val surface = MaterialTheme.colorScheme.surface
                 if (state.status == StatusLine.LOAD_FAILED) {
                     Uncovered(barHeight, bottomArea, fullScreen = false) {
@@ -481,7 +484,9 @@ internal object ChromeProbe {
     var bottomCompositions = 0
     var rootMeasures = 0
     var pins = 0 // requests the follow rules made to move the list to the bottom
-    var bodyBackdrop: xyz.rycerz.apofis.ui.theme.BackdropState? = null // the backdrop the transcript was last composed with
+    // Which backdrop the transcript was last composed with, as scalars: no reference keeps it alive after the screen.
+    var bodyBackdropId = 0
+    var bodyBackdropHasLayer = false
 }
 
 /**

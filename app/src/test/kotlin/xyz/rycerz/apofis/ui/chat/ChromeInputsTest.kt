@@ -105,16 +105,15 @@ class ChromeInputsTest {
     @Test
     fun blurSwitchReachesTheBackdrop() {
         show()
-        val off = ChromeProbe.bodyBackdrop!!
-        assertTrue(off.layer == null)
+        val off = ChromeProbe.bodyBackdropId
+        assertTrue(!ChromeProbe.bodyBackdropHasLayer)
         blur = true
         rule.waitForIdle()
-        val on = ChromeProbe.bodyBackdrop!!
-        assertTrue("the transcript still uses the backdrop without a layer", on !== off && on.layer != null)
+        val on = ChromeProbe.bodyBackdropId
+        assertTrue("the transcript still uses the backdrop without a layer", on != off && ChromeProbe.bodyBackdropHasLayer)
         blur = false
         rule.waitForIdle()
-        val offAgain = ChromeProbe.bodyBackdrop!!
-        assertTrue("the transcript keeps the recording backdrop after blur was switched off", offAgain !== on && offAgain.layer == null)
+        assertTrue("the transcript keeps the recording backdrop after blur was switched off", ChromeProbe.bodyBackdropId != on && !ChromeProbe.bodyBackdropHasLayer)
     }
 
     @Test

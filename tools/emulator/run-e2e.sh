@@ -5,8 +5,6 @@
 #   tools/emulator/run-e2e.sh --full              every e2e test: smoke, self-tests and the seven survival scenarios
 #   tools/emulator/run-e2e.sh --scenario <name>   one survival scenario, e.g. stopDuringRun
 #   tools/emulator/run-e2e.sh --test <Class[#method]>   any test in the e2e module
-#   tools/emulator/run-e2e.sh --app-test <Class>  an instrumented test of the app itself (e.g. BlurCostTest): no tunnel,
-#                                                 the key never leaves this host, no server and no model run
 #
 # Runs on the build host; it calls itself on the emulator host with --remote and --in-shell (internal).
 # tools/emulator/run-e2e-selftest.sh sources it (APOFIS_E2E_LIB=1) to test its safeguards without any host.
@@ -30,10 +28,6 @@ E2E_OUT=$E2E_ROOT/build/e2e        # verified copies
 DEVICE_OUT=/data/local/tmp/apofis-e2e
 PKG=xyz.rycerz.apofis.e2e
 RUNNER=$PKG/androidx.test.runner.AndroidJUnitRunner
-APP_PKG=xyz.rycerz.apofis                   # --app-test: the app's own instrumented tests (app/src/androidTest)
-APP_RUNNER=$APP_PKG.test/androidx.test.runner.AndroidJUnitRunner
-APP_OUT=/sdcard/Android/data/$APP_PKG/files/blur # where they write their files (the app's own storage)
-APP_FILES=(blur-cost.txt blur-on.png blur-off.png blur-on-keyboard.png blur-off-keyboard.png) # BlurCostTest's files
 AVD=apofis-e2e
 IMAGE="system-images;android-37.0;default;x86_64"
 SESSION_RE='apofis-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
@@ -112,53 +106,7 @@ allowlist() {
   printf '%s\n' instrument.txt results.txt logcat.txt
   for t in "${SMOKE[@]}" "${SCENARIOS[@]}"; do printf '%s.png\nfailed-%s.png\n' "$t" "$t"; done
   for t in "${EVIDENCE[@]}"; do printf '%s.png\n' "$t"; done
-  printf '%s\n' "${APP_FILES[@]}"
 }
-
-# The test names a run accepts: all, smoke, app:<Class> (--app-test) or <Class[#method]> of the e2e module.
-tests_ok() { [[ $1 =~ ^(all|smoke|app:[A-Za-z0-9_]+|[A-Za-z0-9_#]+)$ ]]; }
-
-# The am instrument arguments for <tests>: the filter and the runner.
-instrument_target() {
-  case $1 in
-    all) printf '%s' "-e package $PKG $RUNNER" ;;
-    smoke) printf '%s' "-e class $PKG.SmokeE2eTest,$PKG.HarnessSelfTest $RUNNER" ;;
-    app:*) printf '%s' "-e class $APP_PKG.${1#app:} $APP_RUNNER" ;;
-    *) printf '%s' "-e class $PKG.$1 $RUNNER" ;;
-  esac
-}
-
-# --app-test needs no credential. At mode entry the script runs itself again with an environment built from nothing
-# plus this fixed list, so no child it starts (the local build, ssh, rsync, the remote stage) can inherit anything else:
-# not a credential under any name, not the test canary. SSH_AUTH_SOCK lets ssh log in here; forwarding it is off.
-APP_ENV=(PATH HOME USER LOGNAME LANG LC_ALL TERM TMPDIR XDG_RUNTIME_DIR SSH_AUTH_SOCK
-  APOFIS_E2E_HOST APOFIS_HERMES_PORT APOFIS_BUILD_TIMEOUT APOFIS_BOOT_TIMEOUT APOFIS_TEST_TIMEOUT)
-
-# Every ssh (rsync's too): no agent forwarding and no X11 forwarding, whatever the ssh configuration says; in app
-# mode no port forwarding at all (it needs no tunnel).
-SSH_OPTS=(-o BatchMode=yes -a -x -o ForwardAgent=no -o ForwardX11=no)
-
-# The only files --app-test uploads: the APKs it installs, built here, and the remote stage's own files (tracked): its
-# script, and the flake with the version catalog it reads to make the emulator shell. Never a directory walk.
-app_upload_list() {
-  printf '%s\n' tools/emulator/run-e2e.sh flake.nix flake.lock gradle/libs.versions.toml \
-    app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-}
-
-# The credential in $key. --app-test needs none, so the real key is never read in that mode: a disposable per-run
-# canary stands in. Everything that answers the emulator host (the key request, the scan patterns) and the local scans
-# then use the canary, and nothing derived from the real key can leave this host.
-load_key() {
-  if [ "$mode" = app ]; then
-    key=apofis-app-canary-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    return 0
-  fi
-  key=$(grep -E '^API_SERVER_KEY=' ~/.hermes/.env 2>/dev/null | cut -d= -f2- | tr -d "\"'") || key=''
-  [ "${#key}" -ge 16 ]
-}
-
-# The build host answers the emulator host's key request only in modes that need it: never for --app-test.
-key_allowed() { [ -z "$interrupted" ] && [ "$mode" != app ]; }
 allowed() { allowlist | grep -qxF -- "$1"; }
 
 # The session journal's line forms: "send <key> <scenario>" (written before each send in chat <key>), one
@@ -319,7 +267,7 @@ free_port() { local o; o=$(ss -Hltn "sport = :$1") || rdie ss; [ -z "$o" ]; }
 remote() {
   local tests=$1 tunnel_port=$2 run_id=$3 nonce=$4 d
   no_core_dumps || rdie core
-  tests_ok "$tests" && [[ $tunnel_port =~ ^[0-9]+$ && $run_id =~ ^$RUNID_RE$ && $nonce =~ ^[0-9a-f]{8}$ ]] ||
+  [[ $tests =~ ^(all|smoke|[A-Za-z0-9_#]+)$ && $tunnel_port =~ ^[0-9]+$ && $run_id =~ ^$RUNID_RE$ && $nonce =~ ^[0-9a-f]{8}$ ]] ||
     rdie args
   root=$HOME/$REMOTE_DIR
   state=$root/.state
@@ -337,13 +285,10 @@ remote() {
   export ANDROID_TMP=$state/tmp GRADLE_USER_HOME=$state/gradle TMPDIR=$state/tmp TMP=$state/tmp TEMP=$state/tmp
   # -XX:-UsePerfData: the JVM would otherwise write /tmp/hsperfdata_<user> whatever java.io.tmpdir says.
   export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$state/tmp -XX:-UsePerfData"
-  # App mode runs from the uploaded list alone (a path flake: no git, nothing else of the tree).
-  local src=$root flake=.#emulator
-  if [[ $tests == app:* ]]; then src=$root/app-src flake=path:$root/app-src#emulator; fi
-  cd "$src"
-  exec nix develop "$flake" -c env HOME="$state/home" XDG_CONFIG_HOME="$state/xdg/config" XDG_CACHE_HOME="$state/xdg/cache" \
+  cd "$root"
+  exec nix develop .#emulator -c env HOME="$state/home" XDG_CONFIG_HOME="$state/xdg/config" XDG_CACHE_HOME="$state/xdg/cache" \
     XDG_DATA_HOME="$state/xdg/data" XDG_STATE_HOME="$state/xdg/state" XDG_RUNTIME_DIR="$state/xdg/runtime" \
-    "$src/tools/emulator/run-e2e.sh" --in-shell "$tests" "$tunnel_port" "$out" "$nonce"
+    "$root/tools/emulator/run-e2e.sh" --in-shell "$tests" "$tunnel_port" "$out" "$nonce"
 }
 
 # Writes a heartbeat to the build host every 5 s; when the connection is gone the write fails and the run is stopped.
@@ -354,7 +299,7 @@ heartbeat() {
 }
 
 in_shell() {
-  local tests=$1 tunnel_port=$2 nonce=$4 p target start
+  local tests=$1 tunnel_port=$2 nonce=$4 p filter start
   out=$3
   state=${out%/runs/*}
   root=${state%/.state}
@@ -371,16 +316,16 @@ in_shell() {
   ask "PID $$"
   heartbeat $$ </dev/null {proto}<&- &
   hb_pid=$!
-  target=$(instrument_target "$tests")
-  local test_apk=e2e/build/outputs/apk/debug/e2e-debug.apk test_task=:e2e:assembleDebug
-  if [[ $tests == app:* ]]; then test_apk=app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk test_task=:app:assembleDebugAndroidTest; fi
+  case $tests in
+    all) filter="-e package $PKG" ;;
+    smoke) filter="-e class $PKG.SmokeE2eTest,$PKG.HarnessSelfTest" ;;
+    *) filter="-e class $PKG.$tests" ;;
+  esac
 
-  if [[ $tests != app:* ]]; then # app mode: the APKs were built on the build host and uploaded
-    rmsg build
-    bg bounded "$BUILD_TIMEOUT" ./gradlew --no-daemon --no-configuration-cache --console=plain \
-      -Pkotlin.compiler.execution.strategy=in-process :app:assembleDebug "$test_task" >"$out/gradle.log" 2>&1 ||
-      rdie build-failed
-  fi
+  rmsg build
+  bg bounded "$BUILD_TIMEOUT" ./gradlew --no-daemon --no-configuration-cache --console=plain \
+    -Pkotlin.compiler.execution.strategy=in-process :app:assembleDebug :e2e:assembleDebug >"$out/gradle.log" 2>&1 ||
+    rdie build-failed
 
   # adb's default server port must be free: never share a server.
   free_port 5037 || rdie adb-port
@@ -428,22 +373,6 @@ in_shell() {
     input keyevent 82; mkdir -p '"$DEVICE_OUT"' && : > '"$DEVICE_OUT/sessions.txt"' && [ -f '"$DEVICE_OUT/sessions.txt"' ] && echo ready' |
     tr -d '\r')" = ready ] || rdie device-failed
 
-  if [[ $tests == app:* ]]; then
-    # The app's own test: no server, no tunnel, no key. Its files are pulled with the device files at the end.
-    ADB_TIMEOUT=180 adb install -r -t app/build/outputs/apk/debug/app-debug.apk >"$out/install.log" 2>&1 || rdie install-failed
-    ADB_TIMEOUT=180 adb install -r -t "$test_apk" >>"$out/install.log" 2>&1 || rdie install-failed
-    rmsg instrument
-    # shellcheck disable=SC2086 # the target is split into its words on purpose
-    bounded "$TEST_TIMEOUT" "$ADB_BIN" shell am instrument -w -r $target </dev/null >"$out/instrument.txt" 2>&1 {proto}<&- &
-    child=$!
-    local arc=0
-    wait "$child" || arc=$?
-    child=''
-    [ "$arc" = 0 ] || rdie instrument-failed
-    rmsg instrument-done
-    return
-  fi
-
   # Two ways in: the emulator's host alias 10.0.2.2 (a private address: the app needs local network access on
   # API 37), and the device's loopback, which adb reverse maps to the tunnel (needs no permission; also used by
   # the tests' own API calls).
@@ -458,7 +387,7 @@ in_shell() {
   [[ $health == *" 200 "* ]] || rdie hermes-failed
   rmsg hermes-ok
   ADB_TIMEOUT=180 adb install -r -t app/build/outputs/apk/debug/app-debug.apk >"$out/install.log" 2>&1 || rdie install-failed
-  ADB_TIMEOUT=180 adb install -r -t "$test_apk" >>"$out/install.log" 2>&1 || rdie install-failed
+  ADB_TIMEOUT=180 adb install -r -t e2e/build/outputs/apk/debug/e2e-debug.apk >>"$out/install.log" 2>&1 || rdie install-failed
 
   rmsg instrument
   key_sent=1 # from here on the app may have created sessions: the journal must come back
@@ -468,7 +397,7 @@ in_shell() {
   # an environment, in a file, or in this shell's own variables.
   { IFS= read -r -t 120 -u "$proto" k && [ -n "$k" ] && printf '%s\n' "$k"; } |
     bounded "$TEST_TIMEOUT" "$ADB_BIN" shell "IFS= read -r k && [ -n \"\$k\" ] && exec am instrument -w -r -e apofisKey \"\$k\" \
--e apofisUrl $hermes_url -e apofisDirectUrl $direct_url -e apofisNonce $nonce $target || echo 'no key: instrumentation not started'" \
+-e apofisUrl $hermes_url -e apofisDirectUrl $direct_url -e apofisNonce $nonce $filter $RUNNER || echo 'no key: instrumentation not started'" \
     >"$out/instrument.txt" 2>&1 {proto}<&- &
   child=$!
   local irc=0
@@ -490,8 +419,6 @@ finish() {
   if [ -n "$booted" ]; then
     ADB_TIMEOUT=90 adb pull "$DEVICE_OUT" "$out/device" >/dev/null 2>&1
     pull_rc=$?
-    # The app's own test files (absent in the other modes, so a failed pull is ignored).
-    [ "$pull_rc" != 0 ] || ADB_TIMEOUT=90 adb pull "$APP_OUT" "$out/device/app" >/dev/null 2>&1
     if ADB_TIMEOUT=60 adb logcat -d -v threadtime ApofisE2e:V TestRunner:V AndroidRuntime:E '*:S' >"$out/logcat.txt" 2>/dev/null &&
       [ -s "$out/logcat.txt" ]; then logcat_ok=1; else rmsg logcat-failed; rc=$CLEANUP_EXIT; fi
   fi
@@ -577,7 +504,6 @@ stage() {
     for t in "${SMOKE[@]}" "${SCENARIOS[@]}" "${EVIDENCE[@]}" "${SMOKE[@]/#/failed-}" "${SCENARIOS[@]/#/failed-}"; do
       copy "$out/device/$t.png" "$t.png" || return 1
     done
-    for t in "${APP_FILES[@]}"; do copy "$out/device/app/$t" "$t" || return 1; done
     # One result file from the tests' own: "<Class>.<test> PASS|FAIL" for each well-formed one.
     for f in "$out"/device/results/*.txt; do
       b=${f##*/}
@@ -635,7 +561,7 @@ sessions_state='' journal=() published='' export_files=() export_state='' lock_t
 incoming='' wd_pid='' orig_out='' orig_err=''
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
-rsh() { bounded "${RSH_TIMEOUT:-60}" ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+rsh() { bounded "${RSH_TIMEOUT:-60}" ssh -o BatchMode=yes "$HOST" "$@"; }
 # Runs one of the shared functions on the emulator host: rsh_fn <function> <args...>.
 rsh_fn() { { declare -f "${SHARED_FNS[@]}"; printf '%q ' "$@"; echo; } | rsh bash -s; }
 
@@ -656,7 +582,7 @@ key_patterns() {
     p+=("$b" "$(printf '%s' "$b" | tr '+/' '-_')")
   done
   # For testing the leak path with a disposable canary instead of the key (see the README).
-  [ "$mode" = app ] || [ "${#APOFIS_E2E_CANARY}" -lt 16 ] || p+=("$APOFIS_E2E_CANARY") # never in app mode (not even set there)
+  [ "${#APOFIS_E2E_CANARY}" -lt 16 ] || p+=("$APOFIS_E2E_CANARY")
   printf '%s\n' "${#p[@]}" "${p[@]}"
 }
 
@@ -986,10 +912,8 @@ run_remote() {
   local tests=$1 line='' partial='' r deadline='' n
   mkfifo -m 600 "$tmp/in" "$tmp/out"
   # shellcheck disable=SC2029 # the arguments are meant to expand here
-  local dir=$REMOTE_DIR
-  [[ $tests != app:* ]] || dir=$REMOTE_DIR/app-src # app mode: only the uploaded list lives there
-  bounded "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" -o ServerAliveInterval=15 \
-    -o ServerAliveCountMax=4 "$HOST" "cd ~/$dir && exec tools/emulator/run-e2e.sh --remote $tests $tunnel_port $run_id $nonce" \
+  bounded "$REMOTE_TIMEOUT" ssh -o BatchMode=yes -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 "$HOST" "cd ~/$REMOTE_DIR && exec tools/emulator/run-e2e.sh --remote $tests $tunnel_port $run_id $nonce" \
     <"$tmp/in" >"$tmp/out" 2>/dev/null &
   remote_pid=$!
   exec {rin}>"$tmp/in" {rout}<"$tmp/out"
@@ -1006,7 +930,7 @@ run_remote() {
         '@@HB@@') ;;
         '@@MSG '*'@@') r=${line#@@MSG }; remote_msg "${r%@@}" ;;
         '@@PID '*'@@') r=${line#@@PID }; r=${r%@@}; [[ $r =~ ^[0-9]+$ ]] && remote_shell_pid=$r ;;
-        '@@KEY@@') if key_allowed; then key_sent_local=1; printf '%s\n' "$key" >&"$rin" || true; else printf '\n' >&"$rin" || true; fi ;;
+        '@@KEY@@') if [ -z "$interrupted" ]; then key_sent_local=1; printf '%s\n' "$key" >&"$rin" || true; else printf '\n' >&"$rin" || true; fi ;;
         '@@PATTERNS@@') key_patterns >&"$rin" || true ;;
         '@@J '*'@@')
           r=${line#@@J }; r=${r%@@}
@@ -1118,7 +1042,7 @@ import_export() {
     return 1
   fi
   for e in "${export_files[@]}"; do printf '%s\n' "${e#* }"; done >"$tmp/files"
-  bounded 600 rsync -e "ssh ${SSH_OPTS[*]}" --times --chmod=Fu+rw --temp-dir="$(cd "$incoming" && pwd)" --files-from="$tmp/files" "$src" "$incoming/" >/dev/null 2>&1 || fail="copy"
+  bounded 600 rsync --times --chmod=Fu+rw --temp-dir="$(cd "$incoming" && pwd)" --files-from="$tmp/files" "$src" "$incoming/" >/dev/null 2>&1 || fail="copy"
   if [ -z "$fail" ]; then
     for e in "${export_files[@]}"; do
       h=${e%% *} f=${e#* }
@@ -1173,7 +1097,6 @@ evaluate() {
           for t in "${SCENARIOS[@]}"; do expected+=("SurvivalE2eTest#$t"); done ;;
     scenario) expected=("SurvivalE2eTest#$arg") ;;
     test) [[ $arg != *'#'* ]] || expected=("$arg") ;;
-    app) [ "$arg" != BlurCostTest ] || expected=("BlurCostTest#measure") ;;
   esac
   if [[ $mode == smoke || $mode == full ]]; then for t in "${SELFTESTS[@]}"; do expected+=("HarnessSelfTest#$t"); done; fi
   log "results:"
@@ -1195,11 +1118,6 @@ evaluate() {
     esac
   done
   [ -s "$dir/logcat.txt" ] || { log "  missing logcat.txt (logcat retrieval failed)"; bad=1; }
-  if [ "$mode" = app ] && [ "$arg" = BlurCostTest ]; then
-    for t in "${APP_FILES[@]}"; do [ -s "$dir/$t" ] || { log "  missing $t"; bad=1; }; done
-    # From the verified copy: the measured numbers, lines of the test's own fixed form only.
-    [ ! -f "$dir/blur-cost.txt" ] || grep -E '^(hardware|blur|p95_delta_ms)=[A-Za-z0-9_.=%() ,-]*$' "$dir/blur-cost.txt" | while IFS= read -r t; do log "  $t"; done
-  fi
   if [ "$bad" != 0 ]; then
     # From the verified copy (checksums matched, key absent): the test failures' stack traces.
     grep -A12 '^INSTRUMENTATION_STATUS: stack=' "$dir/instrument.txt" | head -60 >&2
@@ -1214,20 +1132,11 @@ main() {
     --full) tests=all mode=full ;;
     --scenario) arg=${2:?scenario name} tests=SurvivalE2eTest#$arg mode=scenario ;;
     --test) arg=${2:?test class} tests=$arg mode=test ;;
-    --app-test) arg=${2:?test class} tests=app:$arg mode=app ;;
     --remote) shift; remote "$@"; return ;;
     --in-shell) shift; in_shell "$@"; return ;;
-    *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]> | --app-test <Class>" >&2; exit 2 ;;
+    *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]>" >&2; exit 2 ;;
   esac
-  if [ "$mode" = app ]; then # first, before anything is started: a clean environment, then no forwarding of any kind
-    if [ -z "${APOFIS_E2E_CLEAN_ENV:-}" ]; then
-      local keep=() v
-      for v in "${APP_ENV[@]}"; do [ -z "${!v+x}" ] || keep+=("$v=${!v}"); done
-      exec env -i "${keep[@]}" APOFIS_E2E_CLEAN_ENV=1 bash "$0" "$@"
-    fi
-    SSH_OPTS+=(-o ClearAllForwardings=yes)
-  fi
-  [[ $tests =~ ^[A-Za-z0-9_#]+$ || ($mode == app && $tests =~ ^app:[A-Za-z0-9_]+$) ]] || die "bad test name: $tests"
+  [[ $tests =~ ^[A-Za-z0-9_#]+$ ]] || die "bad test name: $tests"
   no_core_dumps || die "could not disable core dumps"
   # The first action: this host's lock, before anything else is touched here or on the emulator host.
   exec 7>"${XDG_RUNTIME_DIR:-/tmp}/apofis-e2e.lock"
@@ -1242,7 +1151,8 @@ main() {
   trap 'on_signal 143' TERM
   trap 'on_signal 129' HUP
   trap ':' PIPE
-  load_key || die "API_SERVER_KEY not found in ~/.hermes/.env"
+  key=$(grep -E '^API_SERVER_KEY=' ~/.hermes/.env | cut -d= -f2- | tr -d "\"'")
+  [ "${#key}" -ge 16 ] || die "API_SERVER_KEY not found in ~/.hermes/.env"
   log "run $run_id, nonce $nonce"
 
   log "stage 0: the emulator host's lock"
@@ -1252,53 +1162,35 @@ main() {
   [[ $r =~ ^LISTENERS=(none|[0-9]+(,[0-9]+)*)$ ]] || die "could not list the emulator host's listeners"
   ports_before=${r#LISTENERS=}
 
-  if [ "$mode" = app ]; then
-    log "stage 1: building the APKs here; uploading only them and the remote stage's own files to $HOST:~/$REMOTE_DIR/app-src"
-    bounded "$BUILD_TIMEOUT" nix develop -c ./gradlew --console=plain :app:assembleDebug :app:assembleDebugAndroidTest \
-      >"$tmp/gradle.log" 2>&1 || die "the local build failed"
-    app_upload_list >"$tmp/upload"
-    while IFS= read -r f; do [ -f "$f" ] && [ ! -L "$f" ] || die "missing upload file $f"; done <"$tmp/upload"
-    git ls-files --error-unmatch tools/emulator/run-e2e.sh flake.nix flake.lock gradle/libs.versions.toml >/dev/null 2>&1 ||
-      die "the remote stage's files must be tracked"
-    rsh_fn remove_tree "$REMOTE_DIR/app-src" >/dev/null 2>&1 || die "could not clear $HOST:~/$REMOTE_DIR/app-src"
-    bounded 600 rsync -e "ssh ${SSH_OPTS[*]}" --times --files-from="$tmp/upload" ./ "$HOST:$REMOTE_DIR/app-src/" >/dev/null 2>&1 ||
-      die "upload failed"
-  else
-    log "stage 1: rsync to $HOST:~/$REMOTE_DIR"
-    # shellcheck disable=SC2029
-    rsh "cd ~/$REMOTE_DIR && { [ -d .git ] || git init -q; } && printf \"/.state/\\n/app-src/\\n\" > .git/info/exclude" >/dev/null 2>&1 || die "could not prepare $HOST"
-    bounded 600 rsync -e "ssh ${SSH_OPTS[*]}" -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/.state/ --exclude=/app-src/ ./ "$HOST:$REMOTE_DIR/" >/dev/null 2>&1 ||
-      die "rsync failed"
-    # The flake only sees files git knows about; .gitignore keeps build output out of the Nix store copy.
-    # shellcheck disable=SC2029
-    RSH_TIMEOUT=120 rsh "cd ~/$REMOTE_DIR && git add -A" >/dev/null 2>&1 || die "git add failed on $HOST"
-  fi
+  log "stage 1: rsync to $HOST:~/$REMOTE_DIR"
+  # shellcheck disable=SC2029
+  rsh "cd ~/$REMOTE_DIR && { [ -d .git ] || git init -q; } && echo /.state/ > .git/info/exclude" >/dev/null 2>&1 || die "could not prepare $HOST"
+  bounded 600 rsync -a --delete --filter=':- .gitignore' --exclude=/.git --exclude=/.state/ ./ "$HOST:$REMOTE_DIR/" >/dev/null 2>&1 ||
+    die "rsync failed"
+  # The flake only sees files git knows about; .gitignore keeps build output out of the Nix store copy.
+  # shellcheck disable=SC2029
+  RSH_TIMEOUT=120 rsh "cd ~/$REMOTE_DIR && git add -A" >/dev/null 2>&1 || die "git add failed on $HOST"
 
-  if [ "$mode" = app ]; then
-    tunnel_port=0 # the app's own test needs no server: no tunnel
-    log "stage 2: no tunnel (--app-test: no server, the key stays on this host)"
-  else
-    log "stage 2: reverse tunnel to Hermes"
-    # shellcheck disable=SC2016
-    tunnel_port=$(rsh 'for p in $(seq 18642 18662); do o=$(ss -Hltn "sport = :$p") || exit 1; [ -n "$o" ] || { echo "$p"; exit 0; }; done; exit 1' 2>/dev/null) ||
-      tunnel_port=''
-    [[ $tunnel_port =~ ^18[0-9]{3}$ ]] || die "no free tunnel port on $HOST"
-    # Its stdin is held by this script: when this script dies for any reason, the remote cat ends and the tunnel closes.
-    exec {tun_fd}> >(exec ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
-      -R "127.0.0.1:$tunnel_port:127.0.0.1:$HERMES_PORT" "$HOST" 'exec cat >/dev/null' >/dev/null 2>&1)
-    tunnel_pid=$!
-    local listen=''
-    for _ in $(seq 20); do
-      # shellcheck disable=SC2029
-      listen=$(RSH_TIMEOUT=20 rsh "ss -Hltn 'sport = :$tunnel_port'" 2>/dev/null | awk '{print $4}' | sort -u) || listen=''
-      [ -z "$listen" ] || break
-      alive "$tunnel_pid" || die "the tunnel exited"
-      sleep 1
-    done
-    # The requested bind is not enough: the server's SSH policy could widen it, so the actual listener is checked.
-    [ "$listen" = "127.0.0.1:$tunnel_port" ] || die "the tunnel does not listen on 127.0.0.1:$tunnel_port only"
-    log "tunnel up: $HOST 127.0.0.1:$tunnel_port -> 127.0.0.1:$HERMES_PORT (verified loopback only)"
-  fi
+  log "stage 2: reverse tunnel to Hermes"
+  # shellcheck disable=SC2016
+  tunnel_port=$(rsh 'for p in $(seq 18642 18662); do o=$(ss -Hltn "sport = :$p") || exit 1; [ -n "$o" ] || { echo "$p"; exit 0; }; done; exit 1' 2>/dev/null) ||
+    tunnel_port=''
+  [[ $tunnel_port =~ ^18[0-9]{3}$ ]] || die "no free tunnel port on $HOST"
+  # Its stdin is held by this script: when this script dies for any reason, the remote cat ends and the tunnel closes.
+  exec {tun_fd}> >(exec ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
+    -R "127.0.0.1:$tunnel_port:127.0.0.1:$HERMES_PORT" "$HOST" 'exec cat >/dev/null' >/dev/null 2>&1)
+  tunnel_pid=$!
+  local listen=''
+  for _ in $(seq 20); do
+    # shellcheck disable=SC2029
+    listen=$(RSH_TIMEOUT=20 rsh "ss -Hltn 'sport = :$tunnel_port'" 2>/dev/null | awk '{print $4}' | sort -u) || listen=''
+    [ -z "$listen" ] || break
+    alive "$tunnel_pid" || die "the tunnel exited"
+    sleep 1
+  done
+  # The requested bind is not enough: the server's SSH policy could widen it, so the actual listener is checked.
+  [ "$listen" = "127.0.0.1:$tunnel_port" ] || die "the tunnel does not listen on 127.0.0.1:$tunnel_port only"
+  log "tunnel up: $HOST 127.0.0.1:$tunnel_port -> 127.0.0.1:$HERMES_PORT (verified loopback only)"
 
   local rc=0
   run_remote "$tests" || rc=$?
