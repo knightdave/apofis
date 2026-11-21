@@ -36,6 +36,7 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.MIGRATION_1_2
 import xyz.rycerz.apofis.push.HermesRecordApi
 import xyz.rycerz.apofis.push.PublishWorker
+import xyz.rycerz.apofis.push.PushStore
 import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.RealUnifiedPush
 import xyz.rycerz.apofis.push.UnifiedPushPort
@@ -174,11 +175,12 @@ class AppContainer(
 
     /**
      * Test hooks: [beforeResume] runs on the lifecycle path after the started check, before the follower opens its gate;
-     * [afterResume] once it has opened it; [beforeSwitch] at the start of a switch.
+     * [afterResume] once it has opened it; [beforeSwitch] at the start of a switch; [afterSwitchMarker] right after its marker.
      */
     internal var beforeResume: suspend () -> Unit = {}
     internal var afterResume: suspend () -> Unit = {}
     internal var beforeSwitch: () -> Unit = {}
+    internal var afterSwitchMarker: () -> Unit = {}
 
     private val foreground = Foreground(scope, resume = { stillStarted ->
         val c = connected()
@@ -240,13 +242,15 @@ class AppContainer(
                     switching = true
                     current
                 }
-                connectionGeneration.incrementAndGet()
+                PushStore.locked { connectionGeneration.incrementAndGet() } // ordered with the receiver's wake hand-off
                 beforeSwitch()
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
-                // The marker comes before any push side effect, so a death after one restarts disconnected, never on the
-                // old credentials. Push must persist the old registration's revocation, or the switch fails.
+                // The old registration's revocation is committed first (or the switch fails), then the marker, then the
+                // push side effects: a death anywhere leaves the revocation for the next start to finish.
+                push.prepareSwitch()
                 commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
-                push.forgetServer(old?.let { HermesRecordApi(it.credentials.baseUrl, it.api) })
+                afterSwitchMarker()
+                push.finishSwitch()
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {

@@ -49,17 +49,21 @@ class TestPush(private val elapsed: () -> Long, client: OkHttpClient, private va
             windowFrom = null
             result.value = null
         }
-        val url = validate(endpoint)
-        val ok = url != null && try {
-            val request = Request.Builder().url(url).header("X-UnifiedPush", "1").post(BODY.toRequestBody("application/json".toMediaType())).build()
-            withContext(Dispatchers.IO) { client.newCall(request).execute().use { it.isSuccessful } }
-        } catch (_: IOException) {
-            false
-        }
-        synchronized(this) {
-            sending = false
-            if (ok) windowFrom = elapsed()
-            result.value = if (ok) TestPushResult.SENT else TestPushResult.SEND_FAILED
+        var ok = false
+        try {
+            val url = validate(endpoint)
+            ok = url != null && try {
+                val request = Request.Builder().url(url).header("X-UnifiedPush", "1").post(BODY.toRequestBody("application/json".toMediaType())).build()
+                withContext(Dispatchers.IO) { client.newCall(request).execute().use { it.isSuccessful } }
+            } catch (_: IOException) {
+                false
+            }
+            synchronized(this) {
+                if (ok) windowFrom = elapsed()
+                result.value = if (ok) TestPushResult.SENT else TestPushResult.SEND_FAILED
+            }
+        } finally {
+            synchronized(this) { sending = false } // also when cancelled: the next send must work
         }
         return ok
     }

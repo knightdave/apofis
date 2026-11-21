@@ -3,7 +3,7 @@ package xyz.rycerz.apofis.push
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
 
-/** What the app needs to know about a record before it hides, adopts or deletes it. */
+/** What the app needs to know about a record before it adopts or hides it. */
 data class RecordRow(
     val title: String?,
     val source: String,
@@ -24,9 +24,6 @@ interface RecordApi {
     /** Null when the record does not exist. */
     suspend fun read(id: String): RecordRow?
     suspend fun hide(id: String)
-
-    /** A missing record counts as deleted. */
-    suspend fun delete(id: String)
 }
 
 class HermesRecordApi(override val server: String, private val api: HermesApi) : RecordApi {
@@ -42,6 +39,4 @@ class HermesRecordApi(override val server: String, private val api: HermesApi) :
     override suspend fun hide(id: String) {
         api.patchSession(id, pinned = false, hidden = true)
     }
-
-    override suspend fun delete(id: String) = api.deleteSession(id)
 }

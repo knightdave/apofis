@@ -49,7 +49,6 @@ class FakeServer(val url: String) {
     val rows = mutableMapOf<String, Row>()
     val retired = mutableSetOf<String>()
     val created = mutableListOf<Pair<String, String>>() // (id, prompt)
-    val deleted = mutableListOf<String>()
 }
 
 class FakeRecordApi(private val s: FakeServer, private val log: EventLog = EventLog()) : RecordApi {
@@ -85,12 +84,6 @@ class FakeRecordApi(private val s: FakeServer, private val log: EventLog = Event
         call("hide $id")
         s.rows.getValue(id).apply { hidden = true; pinned = false }
     }
-
-    override suspend fun delete(id: String) {
-        call("delete $id")
-        if (s.rows.remove(id) != null) s.deleted += id
-        s.retired += id
-    }
 }
 
 /** The connector seen through [UnifiedPushPort]: unregistering the last instance forgets the saved distributor. */
@@ -101,6 +94,7 @@ class FakePort(private val log: EventLog = EventLog()) : UnifiedPushPort {
     val registered = mutableSetOf<String>()
     val calls = mutableListOf<String>()
     var journalAs: String? = null // a connector that would send REGISTER to this package instead
+    var lostRegistration = false // the connector's database lost the registration: the next REGISTER has a new token
 
     override fun distributors(c: Context) = installed.toList()
     override fun saved(c: Context) = saved?.takeIf { it in installed }
@@ -110,7 +104,8 @@ class FakePort(private val log: EventLog = EventLog()) : UnifiedPushPort {
     }
     override fun register(c: Context, instance: String, journal: (String, String) -> Unit) {
         log.step("register $instance")
-        journal(journalAs ?: saved ?: NTFY_PACKAGE, "tok-$instance")
+        journal(journalAs ?: saved ?: NTFY_PACKAGE, if (lostRegistration) "tok-$instance-new" else "tok-$instance")
+        log.step("REGISTER sent $instance")
         calls += "register $instance"; registered += instance
     }
     override fun unregister(c: Context, r: Registration) {

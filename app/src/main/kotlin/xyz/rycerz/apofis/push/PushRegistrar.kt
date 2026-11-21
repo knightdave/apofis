@@ -16,7 +16,6 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,26 +23,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.unifiedpush.android.connector.UnifiedPush
 import xyz.rycerz.apofis.api.ApiError
 
 internal fun recordId(installId: String, seq: Int) = "apofis-push-$installId-$seq"
-private val RECORD_ID = Regex("apofis-push-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[1-9][0-9]{0,5}")
 internal const val VERIFY_EVERY_MS = 3_600_000L
 internal const val ROTATE_AFTER_MS = 30L * 24 * 3_600_000L
 internal const val MAX_SEQ = 999_999
-internal const val MAX_DEBT = 64
-internal const val DEBT_RESERVE = 2 // publishes stop at 62, so turning off (record plus pending) always fits
-internal const val SETTLE_MS = 15 * 60_000L // a create sent this long ago has landed or never will (client timeout is 2 min)
 private const val MAX_CREATES = 3
-private const val SWITCH_DRAIN_MS = 5_000L
 private const val TAG = "Apofis"
-private const val UNREGISTER = "UNREGISTER"
-private const val DELETE = "DELETE"
 private const val ACTION_REGISTER = "org.unifiedpush.android.distributor.REGISTER"
 private const val ACTION_UNREGISTER = "org.unifiedpush.android.distributor.UNREGISTER"
 
@@ -102,41 +92,33 @@ private class Journaling(base: Context, private val journal: (String, String) ->
 /** The connection changed during an operation: it ends without another request or result. */
 private class Stale : Exception()
 
-/** Every call checks [live] before it starts and before its result is used. */
+/** Every call checks [live] before it starts and before its result, value or error, is used. */
 private class Guarded(private val a: RecordApi, private val live: () -> Boolean) : RecordApi {
     override val server get() = a.server
     private suspend fun <T> g(block: suspend () -> T): T {
         if (!live()) throw Stale()
-        return block().also { if (!live()) throw Stale() }
+        val result = try {
+            block()
+        } catch (e: Exception) {
+            if (!live() && e !is CancellationException) throw Stale()
+            throw e
+        }
+        if (!live()) throw Stale()
+        return result
     }
     override suspend fun create(id: String, title: String, prompt: String) = g { a.create(id, title, prompt) }
     override suspend fun read(id: String) = g { a.read(id) }
     override suspend fun hide(id: String) = g { a.hide(id) }
-    override suspend fun delete(id: String) = g { a.delete(id) }
-}
-
-/** The old connection during a switch: all its calls together get [SWITCH_DRAIN_MS]; past that they fail like I/O. */
-private class TimeBoxed(private val a: RecordApi) : RecordApi {
-    private val deadline = System.nanoTime() + SWITCH_DRAIN_MS * 1_000_000
-    override val server get() = a.server
-    private suspend fun <T> t(block: suspend () -> T): T = try {
-        withTimeout(maxOf(0, (deadline - System.nanoTime()) / 1_000_000)) { block() }
-    } catch (_: TimeoutCancellationException) {
-        throw IOException("switch cleanup time used up")
-    }
-    override suspend fun create(id: String, title: String, prompt: String) = t { a.create(id, title, prompt) }
-    override suspend fun read(id: String) = t { a.read(id) }
-    override suspend fun hide(id: String) = t { a.hide(id) }
-    override suspend fun delete(id: String) = t { a.delete(id) }
 }
 
 /**
  * Registers this install with an allowed distributor and keeps its endpoint in one hidden record on the connected
- * server. Every operation commits its intent before its first side effect, and every operation starts by finishing
- * whatever intent is persisted ([reconcile]), so a restart completes any sequence. A record is created only under a
- * reserved id and a per-operation title, adopted only when that title and the `api_server` source prove it is ours,
- * deleted only after a fresh read proves it is ours and empty, and kept as debt until then. Operations run one at a
- * time, off the main thread, and end as soon as the connection changes.
+ * server. Off and a server switch take effect on the phone: the old registration is committed for revocation before
+ * any other step and then unregistered at the distributor, so its endpoint leads nowhere. The app never deletes a
+ * record; old ones stay hidden on their server and the hook prefers the newest per install. A record is created under
+ * a reserved id and a per-operation title, and adopted after an uncertain create only when that title and the
+ * `api_server` source prove it is ours. Every operation finishes the persisted intents first ([reconcile]), runs one
+ * at a time off the main thread, and ends as soon as the connection it was started under changes.
  */
 @SuppressLint("UseKtx") // the KTX edit drops commit()'s result, which every write here must check
 class PushRegistrar(
@@ -153,6 +135,7 @@ class PushRegistrar(
 ) {
     private val mutex = Mutex()
     @Volatile private var failed = false
+    @Volatile private var registeredThisProcess = false
     private val state = MutableStateFlow(compute())
 
     val ui: StateFlow<PushUi> = state.asStateFlow()
@@ -171,31 +154,30 @@ class PushRegistrar(
             reconcile(a)
             if (!enabled()) {
                 if (allowed().isEmpty()) return@op
-                commit { putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, generation() + 1) }
+                commitLive { putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, generation() + 1) }
             }
             register()
         }
         afterUserOp()
     }
 
+    /** Off is committed (with the registration to revoke) before anything else happens. */
     suspend fun disable() {
-        op { a ->
-            reconcile(a)
-            if (enabled()) turnOff(a)
+        op { _ ->
+            if (enabled()) rotate(off = true) else finishRevocations()
         }
         afterUserOp()
     }
 
-    /** Finishes persisted intents, publishes, drains debt. True when nothing is left for this connection to retry. */
+    /** Finishes persisted intents and publishes. True when nothing is left for this connection to retry. */
     suspend fun publishPending(): Boolean = op { a ->
         reconcile(a)
         if (a == null) return@op !failed && !needsServer()
-        if (enabled()) step { publish(a, force = false) }
-        val drained = step { drain(a) } == true
-        !failed && drained && !prefs.contains(Keys.PENDING_ID)
+        if (enabled()) publish(a, force = false)
+        !failed && !prefs.contains(Keys.PENDING_ID)
     } ?: false
 
-    /** Hourly unless [force]: distributor still there and answering, record present, hidden and current, debt drained. */
+    /** Hourly unless [force]: distributor still there and answering, record present, hidden and current. */
     suspend fun verify(force: Boolean = false) {
         op { a ->
             val last = prefs.getLong(Keys.VERIFIED_AT, 0)
@@ -203,79 +185,73 @@ class PushRegistrar(
             reconcile(a)
             if (enabled()) {
                 if (allowed().isEmpty()) {
-                    turnOff(a) // the distributor was uninstalled
+                    rotate(off = true) // the distributor was uninstalled
                 } else {
                     if (port.saved(context) == null || port.acked(context) == null) register() // unanswered or forgotten: ask again
-                    if (a != null) step { publish(a, force = false); check(a) }
+                    if (a != null) {
+                        publish(a, force = false)
+                        check(a)
+                    }
                 }
             }
-            if (a != null) step { drain(a) }
-            commit { putLong(Keys.VERIFIED_AT, clock()) }
+            commitLive { putLong(Keys.VERIFIED_AT, clock()) }
         }
         afterUserOp()
     }
 
     /**
-     * Called by AppContainer.connect after the switch marker is committed and before the old connection closes ([old]
-     * null when there is none). The current registration becomes revocation debt of its server, the instance rotates,
-     * and, only if push is still on, an allowed distributor is registered anew; its endpoint is used once its
-     * NEW_ENDPOINT arrives. Throws when the intent cannot be committed: the switch must not go on without it.
+     * First half of a server switch, called by AppContainer.connect before its switch marker: commits the revocation of
+     * the current registration and a fresh instance (a new ntfy topic). Throws when that cannot be committed; the switch
+     * must not go on without it. [finishSwitch] or any later start performs it.
      */
-    suspend fun forgetServer(old: RecordApi?) {
+    suspend fun prepareSwitch() {
         withContext(Dispatchers.IO) {
             mutex.withLock {
                 try {
                     flushOrThrow()
-                    val boxed = old?.let(::TimeBoxed)
-                    finishRevocation(boxed)
-                    handleEvents(boxed) // a revocation the receiver committed wins over re-registering
-                    if (enabled() || prefs.contains(Keys.RECORD) || prefs.contains(Keys.PENDING_ID)) {
-                        commit { beginRevocation(old?.server) }
-                        finishRevocation(boxed)
-                    } else if (boxed != null) {
-                        drain(boxed)
+                    if (enabled() || prefs.contains(Keys.REGISTRATION) || prefs.contains(Keys.RECORD)) {
+                        if (!PushStore.locked { PushStore.commit(prefs) { beginRevocation() } }) throw IOException("push prefs not written")
                     }
                 } finally {
                     state.value = compute()
                 }
             }
         }
+    }
+
+    /** Second half of a switch, after the marker: unregisters the old registration and, only if push is on, registers anew. */
+    suspend fun finishSwitch() {
+        op { _ -> finishRevocations() }
         afterUserOp()
     }
 
-    private suspend fun <T> op(block: suspend (RecordApi?) -> T): T? = withContext(Dispatchers.IO) {
-        mutex.withLock {
-            val start = connectionGeneration()
-            failed = false // every operation derives the outcome afresh
-            try {
-                flushOrThrow()
-                block(api()?.let { a -> Guarded(a) { connectionGeneration() == start } })
-            } catch (_: Stale) {
-                null
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logFailure(e)
-                failed = true
-                null
-            } finally {
-                state.value = compute()
+    private suspend fun <T> op(block: suspend (RecordApi?) -> T): T? {
+        val start = connectionGeneration() // at admission: an operation queued across a switch belongs to the old connection
+        return withContext(Dispatchers.IO) {
+            mutex.withLock {
+                failed = false // every operation derives the outcome afresh
+                live = { connectionGeneration() == start }
+                try {
+                    flushOrThrow()
+                    block(api()?.let { a -> Guarded(a, live) })
+                } catch (_: Stale) {
+                    null
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logFailure(e)
+                    failed = true
+                    null
+                } finally {
+                    live = { true }
+                    state.value = compute()
+                }
             }
         }
     }
 
-    /** One step's failure is recorded and does not stop the next step. */
-    private suspend fun <T> step(block: suspend () -> T): T? = try {
-        block()
-    } catch (e: Stale) {
-        throw e
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Exception) {
-        logFailure(e)
-        failed = true
-        null
-    }
+    // The running operation's connection check; applying any result commits only while it holds.
+    private var live: () -> Boolean = { true }
 
     private fun afterUserOp() {
         if (needsWork(prefs, policy.distributors(context))) scheduleWork()
@@ -287,30 +263,36 @@ class PushRegistrar(
     /** The policy's distributors that are installed, in policy order; read at every use, never from storage. */
     private fun allowed(): List<String> = port.distributors(context).let { installed -> policy.distributors(context).filter { it in installed } }
 
-    private fun newEndpoint() = prefs.getString(Keys.ENDPOINT_NEW, null)?.takeIf { prefs.getString(Keys.ENDPOINT_NEW_INSTANCE, null) == currentInstance() }
+    private fun confirmed() = confirmedEndpoint(prefs, policy.distributors(context))
 
-    private fun needsServer() = readDebt(prefs).isNotEmpty() || prefs.contains(Keys.PENDING_ID) ||
-        (enabled() && newEndpoint().let { it != null && it != prefs.getString(Keys.ENDPOINT, null) })
+    private fun needsServer() = prefs.contains(Keys.PENDING_ID) || (enabled() && confirmed().let { it != null && it != prefs.getString(Keys.ENDPOINT, null) })
 
     private fun flushOrThrow() {
         if (!PushStore.flush(prefs)) throw IOException("push prefs not written")
     }
 
-    private fun commit(edit: SharedPreferences.Editor.() -> Unit) {
-        if (!PushStore.commit(prefs, edit)) throw IOException("push prefs not written")
+    /** A commit that applies a result: under the push lock, only while the operation's connection is still current. */
+    private fun commitLive(edit: SharedPreferences.Editor.() -> Unit) {
+        val ok = PushStore.locked {
+            if (!live()) throw Stale()
+            PushStore.commit(prefs, edit)
+        }
+        if (!ok) throw IOException("push prefs not written")
     }
 
-    /** Walks every persisted intent: revocation, the receiver's events, an enable without a usable registration. */
+    /** Walks every persisted intent: revocations, the receiver's events, push on without a usable registration. */
     private suspend fun reconcile(a: RecordApi?) {
-        finishRevocation(a)
-        handleEvents(a)
+        finishRevocations()
+        if (prefs.contains(Keys.UNREGISTERED_INSTANCE)) {
+            if (prefs.getString(Keys.UNREGISTERED_INSTANCE, null) == currentInstance() && enabled()) rotate(off = true)
+            else commitLive { remove(Keys.UNREGISTERED_INSTANCE) }
+        }
         if (!enabled()) return
         val r = registrationOf(prefs)
         if (r?.instance == currentInstance() && r.distributor !in policy.distributors(context)) {
-            // Journaled by a build with another policy: revoke it and register with an allowed distributor.
-            commit { beginRevocation(a?.server) }
-            finishRevocation(a)
-        } else if (r?.instance != currentInstance()) {
+            rotate(off = false) // journaled by a build with another policy: revoke it, register with an allowed distributor
+        } else if (!registeredThisProcess || confirmed() == null) {
+            // Once per process, and until the distributor confirms: an endpoint update lost to a failed commit is resent.
             register()
         }
     }
@@ -321,175 +303,99 @@ class PushRegistrar(
         port.save(context, d)
         port.register(context, instance) { distributor, token ->
             check(distributor in policy.distributors(context)) { "distributor not allowed" }
-            commit { putString(Keys.REGISTRATION, Registration(instance, distributor, token).encode()) }
+            commitLive { putString(Keys.REGISTRATION, Registration(instance, distributor, token).encode()) }
         }
+        registeredThisProcess = true
     }
 
     /**
-     * One commit: the current registration to revoke, the record and an attempted pending id (with their titles) into
-     * their server's debt, the next generation. The reserve keeps room for both.
+     * One commit, before any other step: the current registration joins the revocations, the instance advances (a fresh
+     * topic), the record is left behind, and a revocation the receiver committed for this instance is consumed with it.
      */
-    private fun SharedPreferences.Editor.beginRevocation(fallbackServer: String?) {
-        val server = prefs.getString(Keys.SERVER, null) ?: fallbackServer
-        val add = listOfNotNull(entry(Keys.RECORD, Keys.RECORD_TITLE, 0), pendingEntry())
-        if (server != null && add.isNotEmpty()) putDebt(server, readDebt(prefs)[server].orEmpty() + add)
+    private fun SharedPreferences.Editor.beginRevocation(off: Boolean = false) {
         val revoke = registrationOf(prefs)?.takeIf { it.instance == currentInstance() } ?: Registration(currentInstance(), null, null)
-        putString(Keys.REVOKE_PHASE, UNREGISTER).putString(Keys.REVOKE_REGISTRATION, revoke.encode()).putLong(Keys.GENERATION, generation() + 1)
-        for (k in listOf(Keys.SERVER, Keys.RECORD, Keys.RECORD_TITLE, Keys.ENDPOINT, Keys.PUBLISHED_AT, Keys.ENDPOINT_NEW, Keys.ENDPOINT_NEW_INSTANCE, Keys.REGISTRATION)) remove(k)
-        removePending()
+        putString(Keys.REVOKE, (revocationsOf(prefs) + revoke).joinToString("\n") { it.encode() })
+        putLong(Keys.GENERATION, generation() + 1)
+        if (off || prefs.getString(Keys.UNREGISTERED_INSTANCE, null) == currentInstance()) putBoolean(Keys.ENABLED, false)
+        for (k in listOf(Keys.REGISTRATION, Keys.RECORD, Keys.RECORD_TITLE, Keys.ENDPOINT, Keys.PUBLISHED_AT, Keys.PENDING_ID,
+            Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE, Keys.ENDPOINT_NEW, Keys.ENDPOINT_NEW_TOKEN, Keys.UNREGISTERED_INSTANCE)) remove(k)
     }
 
-    private fun entry(id: String, title: String, since: Long): DebtEntry? =
-        prefs.getString(id, null)?.let { DebtEntry(it, prefs.getString(title, null) ?: return null, since) }
-
-    /** A pending id goes to debt only if its create may have been sent; one never sent can never appear. */
-    private fun pendingEntry() = prefs.getLong(Keys.PENDING_ATTEMPTED_AT, -1).takeIf { it >= 0 }?.let { entry(Keys.PENDING_ID, Keys.PENDING_TITLE, maxOf(it, 1)) }
-
-    private fun SharedPreferences.Editor.putDebt(server: String, entries: List<DebtEntry>) {
-        val all = readDebt(prefs).toMutableMap()
-        if (entries.isEmpty()) all.remove(server) else all[server] = entries
-        if (all.isEmpty()) remove(Keys.DEBT) else putString(Keys.DEBT, Json.encodeToString(all))
+    private fun rotate(off: Boolean) {
+        commitLive { beginRevocation(off) }
+        finishRevocations()
     }
 
-    private fun SharedPreferences.Editor.removePending() {
-        for (k in listOf(Keys.PENDING_ID, Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE, Keys.PENDING_ATTEMPTED_AT)) remove(k)
-    }
-
-    private suspend fun turnOff(a: RecordApi?) {
-        commit {
-            beginRevocation(a?.server)
-            putBoolean(Keys.ENABLED, false).remove(Keys.UNREGISTERED_INSTANCE)
-        }
-        finishRevocation(a)
-    }
-
-    /** Repeats whatever step of a revocation was persisted but not confirmed; the re-registration comes before NONE. */
-    private suspend fun finishRevocation(a: RecordApi?) {
-        if (prefs.getString(Keys.REVOKE_PHASE, null) == UNREGISTER) {
-            Registration.decode(prefs.getString(Keys.REVOKE_REGISTRATION, null))?.let { port.unregister(context, it) }
-            commit { putString(Keys.REVOKE_PHASE, DELETE) }
-        }
-        if (prefs.getString(Keys.REVOKE_PHASE, null) == DELETE) {
-            if (a != null) drain(a)
-            if (enabled()) register()
-            commit { remove(Keys.REVOKE_PHASE).remove(Keys.REVOKE_REGISTRATION) }
-        }
-    }
-
-    /** What PushReceiver committed: an unregistration of the current instance turns push off; stale events are dropped. */
-    private suspend fun handleEvents(a: RecordApi?) {
-        val gone = prefs.getString(Keys.UNREGISTERED_INSTANCE, null)
-        if (gone != null) {
-            if (gone == currentInstance() && enabled()) turnOff(a) else commit { remove(Keys.UNREGISTERED_INSTANCE) }
-        }
-        if (prefs.contains(Keys.ENDPOINT_NEW) && newEndpoint() == null) commit { remove(Keys.ENDPOINT_NEW).remove(Keys.ENDPOINT_NEW_INSTANCE) }
+    /** Unregisters every committed revocation; re-registers if push is on; then clears them. Repeating is harmless. */
+    private fun finishRevocations() {
+        val pending = revocationsOf(prefs)
+        if (pending.isEmpty()) return
+        for (r in pending) port.unregister(context, r)
+        if (enabled()) register()
+        commitLive { remove(Keys.REVOKE) }
     }
 
     private suspend fun check(a: RecordApi) {
         val record = prefs.getString(Keys.RECORD, null) ?: return
         val row = a.read(record)
-        // Gone, or retitled by someone else: a new record replaces it (the old one stays debt, never deleted unproved).
-        if (row == null || row.title != prefs.getString(Keys.RECORD_TITLE, null) || row.source != "api_server") return publish(a, force = true)
+        // Gone, retitled, or a turn ran in it (a hide would then reach rows the app never made): a new record replaces it.
+        if (row == null || row.title != prefs.getString(Keys.RECORD_TITLE, null) || row.source != "api_server" ||
+            row.messageCount != 0 || row.parent != null || row.endReason != null
+        ) {
+            return publish(a, force = true)
+        }
         if (!row.hidden || row.pinned) a.hide(record)
         if (clock() - prefs.getLong(Keys.PUBLISHED_AT, 0) >= ROTATE_AFTER_MS) publish(a, force = true)
     }
 
     private suspend fun publish(a: RecordApi, force: Boolean) {
-        val target = newEndpoint() ?: prefs.getString(Keys.ENDPOINT, null) ?: return // waiting for NEW_ENDPOINT
+        val target = confirmed() ?: return // waiting for this registration's NEW_ENDPOINT
         val checked = checkEndpoint(target, policy.origins(context), policy.loopbackOrigin(context))
         val endpoint = checked.url ?: return fail("endpoint refused: ${checked.reason}")
-        if (prefs.getString(Keys.SERVER, null).let { it != null && it != a.server }) return fail("record of another server")
-        val record = prefs.getString(Keys.RECORD, null)
-        if (!force && record != null && !prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.ENDPOINT, null) == endpoint) return
-        if (prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.PENDING_ENDPOINT, null) != endpoint) {
-            val pending = pendingEntry()
-            commit {
-                if (pending != null) putDebt(a.server, readDebt(prefs)[a.server].orEmpty() + pending)
-                removePending()
-            }
-        }
+        if (!force && prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.ENDPOINT, null) == endpoint) return
+        if (prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.PENDING_ENDPOINT, null) != endpoint) commitLive { removePending() }
         repeat(MAX_CREATES) {
-            val id = prefs.getString(Keys.PENDING_ID, null) ?: reserve(a.server, endpoint) ?: return fail("no id or debt room left")
+            val id = prefs.getString(Keys.PENDING_ID, null) ?: reserve(endpoint) ?: return fail("no id left")
             val title = prefs.getString(Keys.PENDING_TITLE, null)!!
-            if (!prefs.contains(Keys.PENDING_ATTEMPTED_AT)) commit { putLong(Keys.PENDING_ATTEMPTED_AT, clock()) }
             val ours = try {
                 a.create(id, title, prompt(endpoint)) || a.read(id)?.let { it.title == title && it.source == "api_server" } == true
             } catch (e: ApiError.Conflict) {
                 if (e.code != "session_deleted") throw e
                 false // retired: never reused
             }
-            if (ours) return finish(a, id, title, endpoint, record)
-            // A stranger's row holds the id, or it is retired: a create of ours can never land there. Never adopted, never debt.
-            commit { removePending() }
+            if (ours) return finish(a, id, title, endpoint)
+            commitLive { removePending() } // a stranger's row holds the id, or it is retired: never adopted
         }
         fail("no free id")
     }
 
-    private fun reserve(server: String, endpoint: String): String? {
+    private fun SharedPreferences.Editor.removePending() {
+        for (k in listOf(Keys.PENDING_ID, Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE)) remove(k)
+    }
+
+    private fun reserve(endpoint: String): String? {
         val seq = prefs.getInt(Keys.SEQ, 0) + 1
-        if (seq > MAX_SEQ || readDebt(prefs).values.sumOf { it.size } >= MAX_DEBT - DEBT_RESERVE) return null
+        if (seq > MAX_SEQ) return null
         val install = prefs.getString(Keys.INSTALL_ID, null) ?: UUID.randomUUID().toString()
         val id = recordId(install, seq)
         val marker = ByteArray(8).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) }
         val title = policy.recordTitle(context, id, marker)
-        commit {
-            putString(Keys.INSTALL_ID, install).putInt(Keys.SEQ, seq).putString(Keys.SERVER, server)
+        commitLive {
+            putString(Keys.INSTALL_ID, install).putInt(Keys.SEQ, seq)
             putString(Keys.PENDING_ID, id).putString(Keys.PENDING_ENDPOINT, endpoint).putString(Keys.PENDING_TITLE, title)
             policy.recordIntent(prefs, this, id, title)
         }
         return id
     }
 
-    private suspend fun finish(a: RecordApi, id: String, title: String, endpoint: String, old: String?) {
+    private suspend fun finish(a: RecordApi, id: String, title: String, endpoint: String) {
         a.hide(id)
-        val oldEntry = entry(Keys.RECORD, Keys.RECORD_TITLE, 0)?.takeIf { old != id }
-        commit {
+        commitLive {
             putString(Keys.RECORD, id).putString(Keys.RECORD_TITLE, title).putString(Keys.ENDPOINT, endpoint)
-            putString(Keys.SERVER, a.server).putLong(Keys.PUBLISHED_AT, clock())
-            if (oldEntry != null) putDebt(a.server, readDebt(prefs)[a.server].orEmpty() + oldEntry)
+            putLong(Keys.PUBLISHED_AT, clock())
             removePending()
         }
     }
-
-    /** Settles this server's debt entries; stops at the first failure. True when none is left. */
-    private suspend fun drain(a: RecordApi): Boolean {
-        var left = false
-        for (e in readDebt(prefs)[a.server].orEmpty()) {
-            val settled = try {
-                settle(a, e)
-            } catch (x: Stale) {
-                throw x
-            } catch (x: CancellationException) {
-                throw x
-            } catch (x: Exception) {
-                logFailure(x)
-                return false
-            }
-            if (settled) commit { putDebt(a.server, readDebt(prefs)[a.server].orEmpty() - e) } else left = true
-        }
-        return !left
-    }
-
-    /** True when [e] needs nothing more: deleted after a fresh proof that it is ours, or provably never created. */
-    private suspend fun settle(a: RecordApi, e: DebtEntry): Boolean {
-        // 404 is final for a confirmed record; an attempted create may still land, so it waits SETTLE_MS.
-        var row = a.read(e.id) ?: return e.since == 0L || clock() - e.since >= SETTLE_MS
-        if (!ownedAndEmpty(e, row)) return false // not provably ours: never deleted, never forgotten
-        if (!row.hidden || row.pinned) {
-            a.hide(e.id)
-            row = a.read(e.id) ?: return e.since == 0L
-            if (!ownedAndEmpty(e, row) || !row.hidden || row.pinned) return false
-        }
-        // Known limit: Hermes has no conditional delete, so the row can still change between this read and the DELETE;
-        // only a holder of the same API key can do that.
-        a.delete(e.id)
-        return true
-    }
-
-    // No messages, parent or end reason: no turn ever ran in it, so it has no delegate or continuation rows for the
-    // DELETE to cascade to (Hermes delete_session).
-    private fun ownedAndEmpty(e: DebtEntry, row: RecordRow) = RECORD_ID.matches(e.id) && row.title == e.title &&
-        row.source == "api_server" && row.messageCount == 0 && row.parent == null && row.endReason == null
 
     private fun prompt(endpoint: String) = buildJsonObject { put("v", 1); put("endpoint", endpoint) }.toString()
 
@@ -502,14 +408,15 @@ class PushRegistrar(
         val distributor = registrationOf(prefs)?.distributor?.takeIf { it in policy.distributors(context) }
             ?: allowed().firstOrNull() ?: NTFY_PACKAGE
         val s = when {
+            PushStore.isDirty(prefs) -> PushState.Registering // memory may differ from disk: nothing is confirmed
             !enabled() -> if (allowed().isEmpty()) PushState.NoDistributor else PushState.Off
             failed -> PushState.ServerError(distributor)
-            // The endpoint the record holds came from this instance's own NEW_ENDPOINT (which also means acknowledged).
-            prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && newEndpoint() == prefs.getString(Keys.ENDPOINT, null) ->
+            // The record holds the endpoint the distributor confirmed for the current registration's token.
+            prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && confirmed().let { it != null && it == prefs.getString(Keys.ENDPOINT, null) } ->
                 PushState.On(distributor)
             else -> PushState.Registering
         }
-        return PushUi(s, prefs.contains(Keys.REVOKE_PHASE) || readDebt(prefs).isNotEmpty())
+        return PushUi(s)
     }
 
     // Server and transport text can carry the endpoint or ids: only the class name is ever logged.

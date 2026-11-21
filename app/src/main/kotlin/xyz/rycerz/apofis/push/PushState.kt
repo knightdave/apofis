@@ -8,5 +8,4 @@ sealed interface PushState {
     data class ServerError(val distributor: String) : PushState
 }
 
-/** [cleanupPending]: revocation debt not yet confirmed on any server, shown apart from [state] (also when Off). */
-data class PushUi(val state: PushState, val cleanupPending: Boolean)
+data class PushUi(val state: PushState)

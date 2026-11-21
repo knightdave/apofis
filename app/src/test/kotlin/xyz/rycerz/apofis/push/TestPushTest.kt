@@ -12,6 +12,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -176,5 +177,21 @@ class TestPushTest {
         now += 1
         assertTrue(t.send(endpoint))
         assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun aCancelledSendReleasesItsSlot() = runTest {
+        val inFlight = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        lateinit var t: TestPush
+        t = push(answering { if (calls == 1) { inFlight.countDown(); release.await(10, java.util.concurrent.TimeUnit.SECONDS) } })
+        val job = backgroundScope.launch(kotlinx.coroutines.Dispatchers.Default) { t.send(endpoint) }
+        assertTrue(inFlight.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        job.cancel() // the Settings sheet closed while the POST was out
+        release.countDown()
+        job.join()
+        now += 10_000
+        assertTrue("the same instance sends again", t.send(endpoint))
+        assertEquals(TestPushResult.SENT, t.lastResult.value)
     }
 }

@@ -34,6 +34,7 @@ class PushSwitchTest {
     private val cache = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
     private val push = pushPrefs(app)
     private val markerAtPushEffect = mutableListOf<Boolean>()
+    private var dieAtUnregister = false
 
     // Records whether the switch marker was on disk at every connector call.
     private val fake = FakePort()
@@ -43,9 +44,12 @@ class PushSwitchTest {
             markerAtPushEffect += cache.contains(SWITCH_MARKER)
             fake.register(c, instance, journal)
             // Its NEW_ENDPOINT arrives while the switch still runs (connected() is null then).
-            push.edit().putString(Keys.ENDPOINT_NEW, "https://ntfy.sh/upAbC123xyz_-9?up=1").putString(Keys.ENDPOINT_NEW_INSTANCE, instance).commit()
+            push.edit().putString(Keys.ENDPOINT_NEW, "https://ntfy.sh/upAbC123xyz_-9?up=1").putString(Keys.ENDPOINT_NEW_TOKEN, "tok-$instance").commit()
         }
-        override fun unregister(c: Context, r: Registration) = fake.unregister(c, r).also { markerAtPushEffect += cache.contains(SWITCH_MARKER) }
+        override fun unregister(c: Context, r: Registration) {
+            if (dieAtUnregister) throw xyz.rycerz.apofis.push.Death()
+            fake.unregister(c, r).also { markerAtPushEffect += cache.contains(SWITCH_MARKER) }
+        }
     }
 
     @Before
@@ -70,5 +74,36 @@ class PushSwitchTest {
         // The endpoint that arrived during the switch is published by work scheduled after it.
         val work = WorkManager.getInstance(app).getWorkInfosForUniqueWork(PublishWorker.NAME).get()
         assertEquals(1, work.size)
+    }
+
+    @Test
+    fun theRevocationSurvivesADeathInTheSwitch() = runTest {
+        val container = AppContainer(app, store, port) { db }
+        container.connect(Credentials("https://a.example/", "key-a"))
+        assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
+            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1").encode()).commit())
+        dieAtUnregister = true // the process dies at the first push side effect, after the marker
+        runCatching { container.connect(Credentials("https://b.example/", "key-b")) }
+        dieAtUnregister = false
+        assertTrue(push.contains(Keys.REVOKE))
+        // Next process: starts disconnected (the marker), and the push work alone finishes the revocation.
+        val restarted = AppContainer(app, store, port) { db }
+        assertEquals(null, restarted.connected())
+        restarted.push.publishPending()
+        assertTrue(fake.calls.contains("unregister g1 tok-g1"))
+        assertTrue(!push.contains(Keys.REVOKE))
+    }
+
+    @Test
+    fun theRevocationIsOnDiskBeforeTheMarker() = runTest {
+        val container = AppContainer(app, store, port) { db }
+        container.connect(Credentials("https://a.example/", "key-a"))
+        assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
+            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1").encode()).commit())
+        container.afterSwitchMarker = { throw xyz.rycerz.apofis.push.Death() } // dies between the marker and any push step
+        runCatching { container.connect(Credentials("https://a.example/", "key-a2")) } // a same-URL key change
+        assertTrue("the obligation was committed before the marker", push.contains(Keys.REVOKE))
+        AppContainer(app, store, port) { db }.push.publishPending()
+        assertTrue(fake.calls.contains("unregister g1 tok-g1"))
     }
 }

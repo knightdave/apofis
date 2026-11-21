@@ -32,7 +32,7 @@ class PushRegistrarDebugTest {
             val r = PushRegistrar(app, prefs, { FakeRecordApi(server, log) }, { 0L }, { 0L }, backgroundScope, pushPolicy, port)
             r.enableNow()
             assertEquals(listOf("save $E2E_PACKAGE", "register g1"), port.calls)
-            prefs.edit().putString(Keys.ENDPOINT_NEW, "http://127.0.0.1:41234/upWIRECHECK012?up=1").putString(Keys.ENDPOINT_NEW_INSTANCE, "g1").commit()
+            prefs.edit().putString(Keys.ENDPOINT_NEW, "http://127.0.0.1:41234/upWIRECHECK012?up=1").putString(Keys.ENDPOINT_NEW_TOKEN, registrationOf(prefs)?.token).commit()
             val died = runCatching { r.publishPending() }.isFailure
             assertEquals(killAtReservation, died)
             if (died) {

@@ -27,9 +27,12 @@ class PublishWorker(context: Context, params: WorkerParameters) : CoroutineWorke
             WorkManager.getInstance(context).enqueueUniqueWork(NAME, ExistingWorkPolicy.REPLACE, request())
         }
 
-        /** At process start and after a switch: schedules when any persisted intent is left. */
+        /**
+         * At process start and after a switch: schedules when any persisted intent is left, and whenever push is on, so the
+         * registration is confirmed again once per process (an endpoint update lost to a failed commit is resent).
+         */
         fun recover(context: Context, prefs: SharedPreferences = pushPrefs(context)) {
-            if (needsWork(prefs, pushPolicy.distributors(context))) schedule(context)
+            if (needsWork(prefs, pushPolicy.distributors(context)) || prefs.getBoolean(Keys.ENABLED, false)) schedule(context)
         }
 
         private fun request() = OneTimeWorkRequestBuilder<PublishWorker>()

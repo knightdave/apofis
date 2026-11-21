@@ -96,7 +96,7 @@ class PushReceiverTest {
         val (_, token) = enabled()
         deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m1") })
         assertEquals(
-            listOf("commit [endpoint_new, endpoint_new_instance]", "broadcast MESSAGE_ACK to $NTFY_PACKAGE", "schedule", "finish"),
+            listOf("commit [endpoint_new, endpoint_new_token]", "broadcast MESSAGE_ACK to $NTFY_PACKAGE", "schedule", "finish"),
             log.events,
         )
         assertEquals(VALID, prefs.disk[Keys.ENDPOINT_NEW])
@@ -130,9 +130,9 @@ class PushReceiverTest {
     fun commitFailure() = runTest {
         val (_, token) = enabled()
         commitsSucceed = false
-        deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID) })
+        deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m1") })
+        assertTrue("an endpoint that is not on disk is not ACKed", ctx.sent.none { it.action == "org.unifiedpush.android.distributor.MESSAGE_ACK" })
         assertTrue(scheduled.isEmpty())
-        assertEquals("finish", log.events.last())
         assertNull(prefs.disk[Keys.ENDPOINT_NEW])
         val logs = logged()
         assertTrue("logged by class", "PushReceiver" in logs)
@@ -141,6 +141,11 @@ class PushReceiverTest {
         deliver(intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)); putExtra("id", "m4") })
         assertTrue(sinkCalls.isEmpty())
         assertTrue(ctx.sent.isEmpty())
+        // The disk recovers: the next event writes the whole map first and hands the endpoint on for publishing.
+        commitsSucceed = true
+        deliver(intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) })
+        assertTrue("endpoint now durable", prefs.disk[Keys.ENDPOINT_NEW] == VALID)
+        assertEquals(1, scheduled.size)
     }
 
     @Test
@@ -182,7 +187,7 @@ class PushReceiverTest {
         assertEquals(1, scheduled.size)
         r.publishPending()
         assertEquals(PushState.Off, r.ui.value.state)
-        assertEquals(listOf(record), server.deleted)
+        assertEquals("the record stays on the server", listOf(record), server.rows.keys.toList())
         assertNull(RealUnifiedPush.saved(ctx))
     }
 
@@ -209,43 +214,59 @@ class PushReceiverTest {
 
     @Test
     fun untrustedTokensChangeNothing() = runTest {
-        val (r, _) = enabled()
-        // A registration of the same instance with a distributor outside the policy (left by another build).
-        RealUnifiedPush.save(ctx, OTHER)
-        RealUnifiedPush.register(ctx, r.currentInstance()) { _, _ -> }
-        val foreign = ctx.sent.last { it.action == "org.unifiedpush.android.distributor.REGISTER" }.getStringExtra("token")!!
-        deliver(intent("NEW_ENDPOINT", foreign) { putExtra("endpoint", VALID) })
-        assertNull(prefs.getString(Keys.ENDPOINT_NEW, null))
-        deliver(intent("UNREGISTERED", foreign))
+        val (_, token) = enabled()
+        // The connector holds a fallback registration of the same instance with a package outside the policy (left by
+        // another build): set up through the plain connector receiver, which follows migrations.
+        val plain = object : org.unifiedpush.android.connector.MessagingReceiver() {
+            override fun getKeyManager(context: Context) = PlainKeyManager
+            override fun onNewEndpoint(context: Context, endpoint: org.unifiedpush.android.connector.data.PushEndpoint, instance: String) {}
+            override fun onRegistrationFailed(context: Context, reason: org.unifiedpush.android.connector.FailedReason, instance: String) {}
+            override fun onUnregistered(context: Context, instance: String) {}
+            override fun onMessage(context: Context, message: org.unifiedpush.android.connector.data.PushMessage, instance: String) {}
+        }
+        plain.onReceive(ctx, intent("TEMP_UNAVAILABLE", token) { putExtra("newDistributor", OTHER) })
+        val foreign = ctx.sent.last { it.action == "org.unifiedpush.android.distributor.REGISTER" && it.`package` == OTHER }.getStringExtra("token")!!
+        for (action in listOf("NEW_ENDPOINT", "UNREGISTERED", "MESSAGE")) {
+            deliver(intent(action, foreign) { putExtra("endpoint", VALID); putExtra("bytesMessage", byteArrayOf(1)) })
+            assertEquals(action, listOf("finish"), log.events) // dropped before the connector could act on it
+        }
         assertNull(prefs.getString(Keys.UNREGISTERED_INSTANCE, null))
-        deliver(intent("MESSAGE", foreign) { putExtra("bytesMessage", byteArrayOf(1)) })
         assertTrue(sinkCalls.isEmpty())
+        // The allowed registration survived and still delivers.
+        deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID) })
+        assertEquals(token, prefs.getString(Keys.ENDPOINT_NEW_TOKEN, null))
     }
 
     @Test
-    fun oldInstanceIgnored() = runTest {
+    fun oldInstanceEventsDropped() = runTest {
         val r = registrar()
         r.enableNow()
+        val old = tokenOf("g1")
         r.disable()
+        RealUnifiedPush.register(ctx, "g1") { _, _ -> } // a connector registration of an old instance that is still known
         r.enableNow()
-        r.disable()
-        r.enableNow() // g5: g1 and g3 were unregistered by disable; register g3 again to have a live old token
-        val live = tokenOf("g5")
-        RealUnifiedPush.register(ctx, "g3") { _, _ -> }
-        val old = ctx.sent.last { it.action == "org.unifiedpush.android.distributor.REGISTER" }.getStringExtra("token")!!
-
-        deliver(intent("NEW_ENDPOINT", old) { putExtra("endpoint", VALID) })
-        assertNull(prefs.getString(Keys.ENDPOINT_NEW, null))
-        assertTrue(scheduled.isEmpty())
-        assertEquals(old, ctx.sent.single { it.action == "org.unifiedpush.android.distributor.UNREGISTER" }.getStringExtra("token"))
-        // g3 is gone, g5 still works.
+        val live = tokenOf("g3")
+        scheduled.clear()
         deliver(intent("NEW_ENDPOINT", old) { putExtra("endpoint", VALID) })
         assertEquals(listOf("finish"), log.events)
+        assertNull(prefs.getString(Keys.ENDPOINT_NEW, null))
+        assertTrue(scheduled.isEmpty())
         deliver(intent("NEW_ENDPOINT", live) { putExtra("endpoint", VALID) })
-        assertEquals("g5", prefs.getString(Keys.ENDPOINT_NEW_INSTANCE, null))
+        assertEquals(live, prefs.getString(Keys.ENDPOINT_NEW_TOKEN, null))
     }
 
-    // Step 2c (I5).
+    @Test
+    fun lateEventsAreNotHandled() = runTest {
+        val (_, token) = enabled()
+        log.events.clear()
+        ctx.sent.clear()
+        var finished = false
+        PushReceiver().receive(ctx, intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m1") },
+            finish = { finished = true }, schedule = schedule, receivedAt = 0, now = { ADMISSION_MS + 1 })
+        assertTrue(finished)
+        assertTrue("neither committed nor ACKed", log.events.isEmpty() && ctx.sent.isEmpty())
+        assertNull(prefs.getString(Keys.ENDPOINT_NEW, null))
+    }
 
     @Test
     fun heldWorkManagerNeverHoldsTheReceiver() = runTest {
@@ -261,16 +282,46 @@ class PushReceiverTest {
         assertTrue(ctx.sent.any { it.action == "org.unifiedpush.android.distributor.MESSAGE_ACK" })
     }
 
+    /**
+     * Stands in for Task 4's wake: demand and done counters with the connection epoch they belong to, recovered at
+     * process start into exactly one wake job, and never across a connection change.
+     */
+    private var epoch = 1L
+    private var wakeStore = wake // a restart reads it back from disk
+    private val wakeSink = object : PushSink {
+        override fun onPush(context: Context) =
+            wakeStore.edit().putLong(WAKE_DEMAND, wakeStore.getLong(WAKE_DEMAND, 0) + 1).putLong(WAKE_EPOCH, epoch).commit()
+        override fun recover(context: Context) {
+            val w = wakeStore
+            if (w.getLong(WAKE_EPOCH, 0) == epoch && w.getLong(WAKE_DEMAND, 0) > w.getLong(WAKE_DONE, 0)) {
+                WorkManager.getInstance(context).enqueueUniqueWork("apofis-wake", androidx.work.ExistingWorkPolicy.KEEP,
+                    androidx.work.OneTimeWorkRequestBuilder<HandedOn>().build())
+            }
+        }
+    }
+
     @Test
     fun deathAfterAck() = runTest {
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
         val (_, token) = enabled()
-        // MESSAGE: the demand is on disk before the ACK; a death right after the ACK leaves demand above done.
-        log.killAt = log.count() + 3 // demand, ACK, death at finish
-        runCatching { deliver(intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)); putExtra("id", "m1") }) }
+        val withWake = object : ContextWrapperWithWake(LogContext(app, log, prefs, wakeSink)) {}
+        // MESSAGE: the demand is on disk before the ACK; the process dies right after the ACK.
+        log.killAt = log.count() + 2 // ACK, then death at finish
+        runCatching {
+            PushReceiver().receive(withWake, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)); putExtra("id", "m1") },
+                finish = { log.step("finish") }, schedule = schedule)
+        }
         log.killAt = 0
         assertEquals(1L, wake.disk[WAKE_DEMAND])
-        assertNull(wake.disk[WAKE_DONE]) // Task 4's recovery runs the check for demand > done
+        // Restart: the process start hands the demand on, as one wake job.
+        wakeStore = wake.restart()
+        recoverPush(object : ContextWrapperWithWake(LogContext(app, log, prefs.restart(), wakeSink)) {}, wakeSink)
+        assertEquals(1, WorkManager.getInstance(app).getWorkInfosForUniqueWork("apofis-wake").get().size)
+        // A wake of the old connection does not become demand of the new one.
+        WorkManagerTestInitHelper.initializeTestWorkManager(app)
+        epoch++
+        wakeSink.recover(app)
+        assertTrue(WorkManager.getInstance(app).getWorkInfosForUniqueWork("apofis-wake").get().isEmpty())
         // NEW_ENDPOINT: a process start schedules the publish, which completes it.
         log.killAt = log.count() + 3 // commit, ACK, death at schedule
         runCatching { deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m2") }) }
@@ -280,7 +331,6 @@ class PushReceiverTest {
         val restarted = registrar()
         assertTrue(restarted.publishPending())
         assertEquals(PushState.On(NTFY_PACKAGE), restarted.ui.value.state)
-        assertFalse(needsWork(prefs, setOf(NTFY_PACKAGE)))
     }
 
     @Test
@@ -303,21 +353,20 @@ class PushReceiverTest {
     @Test
     fun wakeCheckAndCommitAreOneStep() = runTest {
         val (_, token) = enabled()
-        val accepted = instanceOf(prefs)
         val inSink = CountDownLatch(1)
         val release = CountDownLatch(1)
-        var generationAtCommit: String? = null
+        var epochAtCommit = 0L
         val slow = LogContext(app, log, prefs, PushSink {
             inSink.countDown()
             release.await(10, TimeUnit.SECONDS)
-            generationAtCommit = instanceOf(prefs)
+            epochAtCommit = epoch
             true
         })
         val receiver = Thread { PushReceiver().receive(object : ContextWrapperWithWake(slow) {}, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule) }
         receiver.start()
         assertTrue(inSink.await(10, TimeUnit.SECONDS))
-        // A disable or switch commits the next generation through PushStore: it must wait for the wake hand-off.
-        val bump = Thread { PushStore.commit(prefs) { putLong(Keys.GENERATION, prefs.getLong(Keys.GENERATION, 0) + 1) } }
+        // A connection change (AppContainer bumps its generation under the push lock) must wait for the hand-off.
+        val bump = Thread { PushStore.locked { epoch++ } }
         bump.start()
         val watchdog = System.nanoTime() + 10_000_000_000
         while (bump.state != Thread.State.BLOCKED && System.nanoTime() < watchdog) Thread.yield()
@@ -325,8 +374,8 @@ class PushReceiverTest {
         release.countDown()
         receiver.join(10_000)
         bump.join(10_000)
-        assertEquals(accepted, generationAtCommit)
-        assertTrue(instanceOf(prefs) != accepted)
+        assertEquals(1L, epochAtCommit)
+        assertEquals(2L, epoch)
     }
 
     @Test
@@ -347,4 +396,9 @@ class PushReceiverTest {
             assertEquals(action, listOf(PushReceiver::class.java.name), found.map { it.activityInfo.name })
         }
     }
+}
+
+/** The stand-in wake job. */
+class HandedOn(context: Context, params: androidx.work.WorkerParameters) : androidx.work.Worker(context, params) {
+    override fun doWork() = Result.success()
 }
