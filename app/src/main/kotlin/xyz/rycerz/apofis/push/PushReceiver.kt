@@ -3,10 +3,13 @@ package xyz.rycerz.apofis.push
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
-import android.os.SystemClock
 import android.util.Log
 import java.io.IOException
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import xyz.rycerz.apofis.connectionEpoch
 import org.unifiedpush.android.connector.FailedReason
 import org.unifiedpush.android.connector.MessagingReceiver
 import org.unifiedpush.android.connector.data.PushEndpoint
@@ -21,8 +24,8 @@ internal const val WAKE_DONE = "done"
 internal const val WAKE_LOST = "lost"
 internal const val WAKE_EPOCH = "epoch"
 
-/** An event still queued this long after its receipt is not handled (and so not ACKed): its broadcast deadline is near. */
-internal const val ADMISSION_MS = 8_000L
+/** Every broadcast's pending result is finished at most this long after receipt (Android allows 10 s in the foreground). */
+internal const val BUDGET_MS = 8_000L
 
 private const val TAG = "Apofis"
 private const val EXTRA_TOKEN = "token"
@@ -30,13 +33,13 @@ private const val EXTRA_NEW_DISTRIBUTOR = "newDistributor"
 private val REVOCATIONS = setOf("org.unifiedpush.android.connector.UNREGISTERED", "org.unifiedpush.android.connector.REGISTRATION_FAILED")
 
 /**
- * Takes a delivered push, which carries no body here. [onPush] runs under the push lock, which every connection change
- * (AppContainer's generation counter) and push generation change also takes: an epoch read inside it cannot change
- * before it returns. It returns true only after a checked durable commit of the wake demand. [recover] runs at every
- * process start and hands on demand that is not done yet.
+ * Takes a delivered push, which carries no body here. [onPush] runs under the push lock, after the receiver checked that
+ * the registration belongs to [epoch], the persisted connection epoch (`connection_epoch`), which only changes under
+ * that lock. It returns true only after a checked durable commit of the wake demand for that epoch. [recover] runs at
+ * every process start and hands on demand of the current epoch that is not done yet.
  */
 fun interface PushSink {
-    fun onPush(context: Context): Boolean
+    fun onPush(context: Context, epoch: Long): Boolean
     fun recover(context: Context) {}
 }
 
@@ -55,6 +58,23 @@ internal fun recoverPush(context: Context, sink: PushSink?) {
 
 // One thread for every event, so they are handled in delivery order; nothing on it waits on other work.
 private val events = Executors.newSingleThreadExecutor()
+private val deadlines = Executors.newSingleThreadScheduledExecutor()
+
+/**
+ * Runs [work] on [lane] and finishes the broadcast exactly once, at the latest [BUDGET_MS] after receipt: when the
+ * deadline comes first for an event the lane has not started, that event is abandoned (not handled, not ACKed: the
+ * distributor delivers again); an event already started is finished on time and its work goes on.
+ */
+internal fun admit(lane: Executor, deadline: (Runnable) -> Unit, finish: () -> Unit, work: (finish: () -> Unit) -> Unit) {
+    val finished = AtomicBoolean()
+    val claimed = AtomicBoolean()
+    val finishOnce = { if (finished.compareAndSet(false, true)) finish() }
+    deadline {
+        if (claimed.compareAndSet(false, true)) Log.w(TAG, "PushReceiver: event lost, late")
+        finishOnce()
+    }
+    lane.execute { if (claimed.compareAndSet(false, true)) work(finishOnce) }
+}
 
 /**
  * The only UnifiedPush receiver (the library's own is removed in the manifest). An event reaches the connector only
@@ -71,21 +91,12 @@ class PushReceiver : MessagingReceiver() {
     override fun getKeyManager(context: Context): KeyManager = PlainKeyManager
 
     override fun onReceive(context: Context, intent: Intent) {
-        val receivedAt = SystemClock.elapsedRealtime()
         val pending = goAsync()
-        events.execute { receive(context, intent, finish = { pending?.finish() }, receivedAt = receivedAt) }
+        admit(events, { deadlines.schedule(it, BUDGET_MS, TimeUnit.MILLISECONDS) }, { pending?.finish() }) { finish -> receive(context, intent, finish) }
     }
 
-    internal fun receive(
-        context: Context,
-        intent: Intent,
-        finish: () -> Unit,
-        schedule: (Context) -> Unit = PublishWorker::schedule,
-        receivedAt: Long = SystemClock.elapsedRealtime(),
-        now: () -> Long = SystemClock::elapsedRealtime,
-    ) {
+    internal fun receive(context: Context, intent: Intent, finish: () -> Unit, schedule: (Context) -> Unit = PublishWorker::schedule) {
         try {
-            if (now() - receivedAt > ADMISSION_MS) return lost("late") // the distributor delivers again; re-registration resends endpoints
             val prefs = pushPrefs(context)
             val wasDirty = PushStore.isDirty(prefs)
             if (!PushStore.flush(prefs)) return lost("prefs not written") // a lost write may sit in memory: touch nothing
@@ -101,16 +112,24 @@ class PushReceiver : MessagingReceiver() {
             super.onReceive(context, if (migration) Intent(intent).apply { removeExtra(EXTRA_NEW_DISTRIBUTOR) } else intent)
         } catch (e: Exception) {
             Log.w(TAG, "PushReceiver: event not handled: ${e.javaClass.name}")
+            if (PushStore.isDirty(pushPrefs(context))) {
+                // What it learned is not on disk: leave On now, and recover after the next write (and at the next start).
+                (context.applicationContext as? PushSinkProvider)?.pushRegistrar?.refresh()
+                changed = true
+            }
         } finally {
             if (changed) runCatching { schedule(context) } // not awaited: the commit is the hand-off, recovery re-schedules
             finish()
         }
     }
 
-    /** Under the push lock: the token is the journaled one of the current instance, with an allowed distributor. */
+    /**
+     * Under the push lock: the token is the journaled one of the current instance, with an allowed distributor, made under
+     * the current connection epoch.
+     */
     private fun trusted(context: Context): Boolean {
         val r = currentRegistration(pushPrefs(context), pushPolicy.distributors(context))
-        return r != null && token != null && token == r.token
+        return r != null && token != null && token == r.token && r.epoch == connectionEpoch(context)
     }
 
     private fun commit(prefs: android.content.SharedPreferences, edit: android.content.SharedPreferences.Editor.() -> Unit): Boolean =
@@ -139,7 +158,7 @@ class PushReceiver : MessagingReceiver() {
             app.testPush?.onWake()
             val sink = app.pushSink ?: return@locked
             val handedOff = try {
-                sink.onPush(context)
+                sink.onPush(context, connectionEpoch(context))
             } catch (e: Exception) {
                 false
             }

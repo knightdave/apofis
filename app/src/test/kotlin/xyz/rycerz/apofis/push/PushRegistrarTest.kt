@@ -620,11 +620,11 @@ class PushRegistrarTest {
             log.killAt = log.count() + 5 // enable commit, save, register, journal commit, death before REGISTER is sent
             runCatching { r.enableNow() }.onSuccess { error("no death") }
             log.killAt = 0
-            assertTrue(port.registered.isEmpty())
+            assertTrue("the distributor never heard of it", port.subscribed.isEmpty())
             restart()
             assertTrue(needsWork(prefs, NTFY_ONLY))
             registrar().publishPending()
-            assertEquals(setOf("g1"), port.registered)
+            assertEquals(setOf("tok-g1"), port.subscribed)
         }
         // A 30-day renewal of the same endpoint, death before its create.
         with(World()) {
@@ -719,7 +719,7 @@ class PushRegistrarTest {
             val r = registrar()
             r.enableNow()
             assertNull(registrationOf(prefs))
-            assertTrue(port.registered.isEmpty())
+            assertTrue(port.subscribed.isEmpty())
         }
     }
 
@@ -747,6 +747,86 @@ class PushRegistrarTest {
             connection++
             assertTrue(runCatching { r.prepareSwitch() }.exceptionOrNull() is java.io.IOException)
             assertEquals(emptyList<String>(), port.calls)
+        }
+    }
+
+    // Fix round 3.
+
+    @Test
+    fun adoptionRefusesARepurposedRow() = runTest {
+        with(World()) {
+            val r = registrar()
+            r.enableNow()
+            endpointFor()
+            val lost = object : RecordApi by apiA { // the create reached Hermes, its answer was lost
+                override suspend fun create(id: String, title: String, prompt: String): Boolean {
+                    apiA.create(id, title, prompt)
+                    throw ApiError.Network(java.io.IOException("reset"))
+                }
+            }
+            current = lost
+            r.publishPending()
+            current = apiA
+            // Someone used the visible row: a run, then compression (Hermes would hide and unpin the whole lineage).
+            a.rows.getValue(id(1)).apply { messageCount = 12; endReason = "compression" }
+            apiA.calls.clear()
+            r.verify(force = true)
+            assertFalse("no PATCH to a row that is not provably our pristine record", apiA.calls.contains("hide ${id(1)}"))
+            assertFalse(a.rows.getValue(id(1)).hidden)
+            assertEquals(id(2), prefs.getString(Keys.RECORD, null))
+            assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        }
+    }
+
+    @Test
+    fun aDisplacedTokenIsRevoked() = runTest {
+        // The connector lost its database; ntfy kept the subscription. The next start's REGISTER gets a new token.
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            port.lostRegistration = true
+            restart()
+            val restarted = registrar()
+            restarted.publishPending()
+            assertEquals(setOf("tok-g1-new0"), port.subscribed)
+            assertTrue(port.calls.contains("unregister g1 tok-g1 token-only"))
+            restarted.disable() // before the new endpoint arrived
+            assertEquals("no token ever registered stays subscribed", emptySet<String>(), port.subscribed)
+        }
+        // Death right after the replacement was journaled: the displaced token is in the same commit, so it is revoked.
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            port.lostRegistration = true
+            restart()
+            log.killAt = log.count() + 4 // save, register, journal commit, death before REGISTER is sent
+            runCatching { registrar().publishPending() }.onSuccess { error("no death") }
+            log.killAt = 0
+            restart()
+            assertTrue(revocationsOf(prefs).any { it.token == "tok-g1" })
+            val again = registrar()
+            again.publishPending()
+            again.disable()
+            assertEquals(emptySet<String>(), port.subscribed)
+        }
+    }
+
+    @Test
+    fun offIsNotShownUntilHandedToTheDistributor() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            val failing = object : UnifiedPushPort by port {
+                override fun unregister(c: android.content.Context, r: Registration, connector: Boolean) = throw IllegalStateException("broadcast failed")
+            }
+            val withFailingPort = PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, TestPolicy(), failing) { scheduled++ }
+            scheduled = 0
+            withFailingPort.disable()
+            assertTrue(prefs.contains(Keys.REVOKE))
+            assertEquals(PushState.Registering, withFailingPort.ui.value.state)
+            assertTrue(scheduled > 0)
+            registrar().publishPending()
+            assertEquals(PushUi(PushState.Off), registrar().ui.value)
         }
     }
 }

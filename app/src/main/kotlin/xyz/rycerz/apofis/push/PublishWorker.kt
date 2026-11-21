@@ -10,17 +10,21 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import java.util.concurrent.TimeUnit
 
 /** Runs [PushRegistrar.publishPending] until it reports nothing left; retries (with backoff) whenever it could not act. */
 class PublishWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val registrar = (applicationContext as? PushSinkProvider)?.pushRegistrar ?: return Result.retry()
-        return if (registrar.publishPending()) Result.success() else Result.retry()
+        val done = if (inputData.getBoolean(LOCAL, false)) registrar.reconcileLocal() else registrar.publishPending()
+        return if (done) Result.success() else Result.retry()
     }
 
     companion object {
         const val NAME = "apofis-push-publish"
+        const val LOCAL_NAME = "apofis-push-revoke"
+        private const val LOCAL = "local"
 
         /** Replaces any queued run; returns at once (WorkManager stores it asynchronously). */
         fun schedule(context: Context) {
@@ -33,10 +37,14 @@ class PublishWorker(context: Context, params: WorkerParameters) : CoroutineWorke
          */
         fun recover(context: Context, prefs: SharedPreferences = pushPrefs(context)) {
             if (needsWork(prefs, pushPolicy.distributors(context)) || prefs.getBoolean(Keys.ENABLED, false)) schedule(context)
+            // Revocation is a local broadcast: it runs without waiting for a network.
+            if (prefs.contains(Keys.REVOKE)) {
+                WorkManager.getInstance(context).enqueueUniqueWork(LOCAL_NAME, ExistingWorkPolicy.REPLACE, request(local = true))
+            }
         }
 
-        private fun request() = OneTimeWorkRequestBuilder<PublishWorker>()
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+        private fun request(local: Boolean = false) = OneTimeWorkRequestBuilder<PublishWorker>()
+            .apply { if (local) setInputData(workDataOf(LOCAL to true)) else setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()) }
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
     }

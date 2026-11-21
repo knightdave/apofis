@@ -86,15 +86,26 @@ class FakeRecordApi(private val s: FakeServer, private val log: EventLog = Event
     }
 }
 
-/** The connector seen through [UnifiedPushPort]: unregistering the last instance forgets the saved distributor. */
+/**
+ * The connector seen through [UnifiedPushPort], with the distributor's subscriptions tracked by token: unregistering the
+ * last instance forgets the saved distributor; [lostRegistration] drops the connector's token mapping (its database was
+ * lost) while the distributor keeps the subscription.
+ */
 class FakePort(private val log: EventLog = EventLog()) : UnifiedPushPort {
     val installed = mutableListOf(NTFY_PACKAGE)
     var saved: String? = null
     var acked = true
-    val registered = mutableSetOf<String>()
+    val connectorTokens = mutableMapOf<String, String>() // instance to token, as the connector knows it
+    val subscribed = mutableSetOf<String>() // tokens the distributor holds
     val calls = mutableListOf<String>()
     var journalAs: String? = null // a connector that would send REGISTER to this package instead
-    var lostRegistration = false // the connector's database lost the registration: the next REGISTER has a new token
+    var lostRegistration = false
+        set(v) {
+            field = v
+            if (v) connectorTokens.clear()
+        }
+    private var nextToken = 0
+    val registered: Set<String> get() = connectorTokens.keys
 
     override fun distributors(c: Context) = installed.toList()
     override fun saved(c: Context) = saved?.takeIf { it in installed }
@@ -104,13 +115,18 @@ class FakePort(private val log: EventLog = EventLog()) : UnifiedPushPort {
     }
     override fun register(c: Context, instance: String, journal: (String, String) -> Unit) {
         log.step("register $instance")
-        journal(journalAs ?: saved ?: NTFY_PACKAGE, if (lostRegistration) "tok-$instance-new" else "tok-$instance")
+        val token = connectorTokens[instance] ?: (if (lostRegistration) "tok-$instance-new${nextToken++}" else "tok-$instance")
+        connectorTokens[instance] = token
+        journal(journalAs ?: saved ?: NTFY_PACKAGE, token)
         log.step("REGISTER sent $instance")
-        calls += "register $instance"; registered += instance
+        calls += "register $instance"; subscribed += token
     }
-    override fun unregister(c: Context, r: Registration) {
-        log.step("unregister ${r.instance}"); calls += "unregister ${r.instance}" + (r.token?.let { " $it" } ?: ""); registered -= r.instance
-        if (registered.isEmpty()) saved = null
+    override fun unregister(c: Context, r: Registration, connector: Boolean) {
+        log.step("unregister ${r.instance}")
+        calls += "unregister ${r.instance}" + (r.token?.let { " $it" } ?: "") + (if (connector) "" else " token-only")
+        r.token?.let { subscribed -= it }
+        if (connector) connectorTokens.remove(r.instance)?.let { subscribed -= it }
+        if (connectorTokens.isEmpty()) saved = null
     }
 }
 
@@ -181,6 +197,8 @@ class LogContext(
     override val pushSink: PushSink? = null,
     override val testPush: TestPush? = null,
 ) : ContextWrapper(base), PushSinkProvider {
+    var registrar: PushRegistrar? = null
+    override val pushRegistrar: PushRegistrar? get() = registrar
     val sent = mutableListOf<Intent>()
     override fun getApplicationContext(): Context = this
     override fun getSharedPreferences(name: String, mode: Int): SharedPreferences =

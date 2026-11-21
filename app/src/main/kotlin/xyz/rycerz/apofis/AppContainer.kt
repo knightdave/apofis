@@ -108,6 +108,10 @@ private const val TAG = "Apofis"
 internal const val CACHE_PREFS = "cache"
 private const val CACHE_URL = "cache_base_url" // the server the cached rows came from
 internal const val SWITCH_MARKER = "switch_in_progress" // present from the first write of a switch until its last
+// Advanced in the same commit that writes SWITCH_MARKER: every connection gets a new epoch (shared with the notifications).
+internal const val CONNECTION_EPOCH = "connection_epoch"
+
+internal fun connectionEpoch(c: Context) = c.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).getLong(CONNECTION_EPOCH, 0)
 
 private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity")
 private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
@@ -133,6 +137,7 @@ class AppContainer(
     private val app: Application,
     val credentials: CredentialStore = CredentialStore(app),
     pushPort: UnifiedPushPort = RealUnifiedPush,
+    pushStore: SharedPreferences = pushPrefs(app),
     openDatabase: () -> AppDatabase = { Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").addMigrations(MIGRATION_1_2).build() },
 ) {
     val preferences = Preferences(app)
@@ -161,9 +166,9 @@ class AppContainer(
 
     /** Push registration on the current server; its records live there, revocation debt per server. */
     val push by lazy {
-        PushRegistrar(app, pushPrefs(app), api = { connected()?.let { HermesRecordApi(it.credentials.baseUrl, it.api) } },
+        PushRegistrar(app, pushStore, api = { connected()?.let { HermesRecordApi(it.credentials.baseUrl, it.api) } },
             connectionGeneration = connectionGeneration::get, clock = System::currentTimeMillis, scope = scope, port = pushPort,
-            scheduleWork = { PublishWorker.schedule(app) })
+            scheduleWork = { PublishWorker.recover(app, pushStore) }, epoch = { connectionEpoch(app) })
     }
     val testPush by lazy { TestPush(SystemClock::elapsedRealtime, OkHttpClient()) { validateEndpoint(it, pushPolicy.origins(app), pushPolicy.loopbackOrigin(app)) } }
 
@@ -233,6 +238,9 @@ class AppContainer(
      */
     suspend fun connect(c: Credentials): Unit = withContext(NonCancellable + Dispatchers.IO) {
         switchLock.withLock {
+            // The old registration's revocation is committed first. If that fails, nothing else has changed: the old
+            // connection stays as it was.
+            push.prepareSwitch()
             var old: Connected? = null
             var next: Connected? = null
             var done = false
@@ -245,10 +253,11 @@ class AppContainer(
                 PushStore.locked { connectionGeneration.incrementAndGet() } // ordered with the receiver's wake hand-off
                 beforeSwitch()
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
-                // The old registration's revocation is committed first (or the switch fails), then the marker, then the
-                // push side effects: a death anywhere leaves the revocation for the next start to finish.
-                push.prepareSwitch()
-                commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true))
+                // Then the marker with the next connection epoch, then the push side effects: a death anywhere leaves the
+                // revocation for the next start to finish.
+                PushStore.locked {
+                    commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true).putLong(CONNECTION_EPOCH, cachePrefs.getLong(CONNECTION_EPOCH, 0) + 1))
+                }
                 afterSwitchMarker()
                 push.finishSwitch()
                 old?.close()

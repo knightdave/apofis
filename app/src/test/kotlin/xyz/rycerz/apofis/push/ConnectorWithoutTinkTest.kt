@@ -18,7 +18,7 @@ class ConnectorWithoutTinkTest {
     private val app = ApplicationProvider.getApplicationContext<Application>()
     private val log = EventLog()
     private var pushes = 0
-    private val ctx = LogContext(app, log, pushSink = PushSink { pushes++; true })
+    private val ctx = LogContext(app, log, pushSink = PushSink { _, _ -> pushes++; true })
 
     @Before
     fun setUp() {
@@ -48,7 +48,7 @@ class ConnectorWithoutTinkTest {
         var journaled: Pair<String, String>? = null
         RealUnifiedPush.register(ctx, "g1") { d, t ->
             journaled = d to t
-            prefs.edit().putString(Keys.REGISTRATION, Registration("g1", d, t).encode()).commit()
+            prefs.edit().putString(Keys.REGISTRATION, Registration("g1", d, t, 0).encode()).commit()
         }
         val register = ctx.sent.single { it.action == "org.unifiedpush.android.distributor.REGISTER" }
         assertEquals(NTFY_PACKAGE, register.`package`)
@@ -68,7 +68,7 @@ class ConnectorWithoutTinkTest {
         assertEquals(before, prefs.all.toMap())
 
         ctx.sent.clear()
-        RealUnifiedPush.unregister(ctx, Registration("g1", null, null))
+        RealUnifiedPush.unregister(ctx, Registration("g1", null, null), connector = true)
         assertEquals(token, ctx.sent.single { it.action == "org.unifiedpush.android.distributor.UNREGISTER" }.getStringExtra("token"))
         assertNull(RealUnifiedPush.saved(ctx))
         deliver("MESSAGE", token) { putExtra("bytesMessage", "late".toByteArray()) }
@@ -84,12 +84,12 @@ class ConnectorWithoutTinkTest {
         // Death at the connector's own UNREGISTER broadcast, after it deleted its token: ours went out first.
         ctx.sent.clear()
         log.killAt = log.count() + 2 // our broadcast, then death before the connector's
-        runCatching { RealUnifiedPush.unregister(ctx, r) }.onSuccess { error("no death") }
+        runCatching { RealUnifiedPush.unregister(ctx, r, connector = true) }.onSuccess { error("no death") }
         log.killAt = 0
         assertEquals(listOf(r.token), ctx.sent.filter { it.action == "org.unifiedpush.android.distributor.UNREGISTER" }.map { it.getStringExtra("token") })
         // The replay after restart: the connector no longer knows the token, the journal still does.
         ctx.sent.clear()
-        RealUnifiedPush.unregister(ctx, r)
+        RealUnifiedPush.unregister(ctx, r, connector = true)
         val replay = ctx.sent.single { it.action == "org.unifiedpush.android.distributor.UNREGISTER" }
         assertEquals(NTFY_PACKAGE, replay.`package`)
         assertEquals(r.token, replay.getStringExtra("token"))

@@ -36,7 +36,7 @@ class PushReceiverTest {
     private val sinkCalls = mutableListOf<Context>()
 
     // Stands in for Task 4's sink: a checked commit of the wake demand.
-    private val sink = PushSink { _ ->
+    private val sink = PushSink { _, _ ->
         sinkCalls += app
         log.step("demand")
         sinkCommits && wake.edit().putLong(WAKE_DEMAND, wake.getLong(WAKE_DEMAND, 0) + 1).commit()
@@ -47,7 +47,7 @@ class PushReceiverTest {
     private val server = FakeServer("https://a.example/")
 
     /** LogContext plus the `wake` prefs from [wake], so its contents can be checked on the fake disk. */
-    private open inner class ContextWrapperWithWake(private val base: LogContext) : android.content.ContextWrapper(base), PushSinkProvider by base {
+    private open inner class ContextWrapperWithWake(val base: LogContext) : android.content.ContextWrapper(base), PushSinkProvider by base {
         val sent get() = base.sent
         override fun getApplicationContext(): Context = this
         override fun getSharedPreferences(name: String, mode: Int) = if (name == WAKE_PREFS) wake else base.getSharedPreferences(name, mode)
@@ -132,7 +132,8 @@ class PushReceiverTest {
         commitsSucceed = false
         deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m1") })
         assertTrue("an endpoint that is not on disk is not ACKed", ctx.sent.none { it.action == "org.unifiedpush.android.distributor.MESSAGE_ACK" })
-        assertTrue(scheduled.isEmpty())
+        assertEquals("recovery scheduled", 1, scheduled.size)
+        scheduled.clear()
         assertNull(prefs.disk[Keys.ENDPOINT_NEW])
         val logs = logged()
         assertTrue("logged by class", "PushReceiver" in logs)
@@ -256,16 +257,53 @@ class PushReceiverTest {
     }
 
     @Test
-    fun lateEventsAreNotHandled() = runTest {
-        val (_, token) = enabled()
-        log.events.clear()
-        ctx.sent.clear()
-        var finished = false
-        PushReceiver().receive(ctx, intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m1") },
-            finish = { finished = true }, schedule = schedule, receivedAt = 0, now = { ADMISSION_MS + 1 })
-        assertTrue(finished)
-        assertTrue("neither committed nor ACKed", log.events.isEmpty() && ctx.sent.isEmpty())
-        assertNull(prefs.getString(Keys.ENDPOINT_NEW, null))
+    fun everyBroadcastFinishesWithinTheBudget() {
+        // A lane held by earlier work and a deadline the test fires by hand.
+        val lane = mutableListOf<Runnable>()
+        val deadline = mutableListOf<Runnable>()
+        var finishes = 0
+        var worked = 0
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { worked++ }
+        deadline.single().run() // the budget runs out while the event still waits for the lane
+        assertEquals(1, finishes)
+        lane.single().run() // the lane frees up: the abandoned event is not handled (no commit, no ACK)
+        assertEquals(0, worked)
+        assertEquals(1, finishes)
+        // An event the lane started is finished on time; its work goes on and finishes it no second time.
+        lane.clear(); deadline.clear(); finishes = 0
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { finish -> deadline.single().run(); worked++; finish() }
+        lane.single().run()
+        assertEquals(1, worked)
+        assertEquals(1, finishes)
+    }
+
+    @Test
+    fun aWakeOfAnotherConnectionEpochIsDropped() = runTest {
+        val (_, token) = enabled() // journaled under connection epoch 0
+        app.getSharedPreferences(xyz.rycerz.apofis.CACHE_PREFS, Context.MODE_PRIVATE).edit().putLong(xyz.rycerz.apofis.CONNECTION_EPOCH, 1).commit()
+        deliver(intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)); putExtra("id", "m1") })
+        assertTrue(sinkCalls.isEmpty())
+        assertEquals("dropped before the connector: no ACK", listOf("finish"), log.events)
+    }
+
+    @Test
+    fun aFailedEndpointLeavesOnAndRecovers() = runTest {
+        val (r, token) = enabled()
+        ctx.base.registrar = r
+        deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID) })
+        r.publishPending()
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        // ntfy sends a replacement endpoint; it cannot be written. No other event, UI action or restart follows.
+        commitsSucceed = false
+        scheduled.clear()
+        deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID2); putExtra("id", "m1") })
+        assertEquals("On is left at once", PushState.Registering, r.ui.value.state)
+        assertEquals("recovery is scheduled", 1, scheduled.size)
+        // The scheduled work runs once the disk takes writes again.
+        commitsSucceed = true
+        assertTrue(r.publishPending())
+        assertEquals("""{"v":1,"endpoint":"$VALID2"}""", server.created.last().second)
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
     }
 
     @Test
@@ -286,10 +324,10 @@ class PushReceiverTest {
      * Stands in for Task 4's wake: demand and done counters with the connection epoch they belong to, recovered at
      * process start into exactly one wake job, and never across a connection change.
      */
-    private var epoch = 1L
+    private var epoch = 0L // the current connection epoch, as the stand-in's recovery sees it
     private var wakeStore = wake // a restart reads it back from disk
     private val wakeSink = object : PushSink {
-        override fun onPush(context: Context) =
+        override fun onPush(context: Context, epoch: Long) = // the epoch the receiver checked the registration against
             wakeStore.edit().putLong(WAKE_DEMAND, wakeStore.getLong(WAKE_DEMAND, 0) + 1).putLong(WAKE_EPOCH, epoch).commit()
         override fun recover(context: Context) {
             val w = wakeStore
@@ -342,7 +380,7 @@ class PushReceiverTest {
         assertNull(wake.disk[WAKE_DEMAND])
         // A sink that throws loses the wake the same way.
         deliver(intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }.also { sinkCommits = true })
-        val throwing = LogContext(app, log, prefs, PushSink { throw IllegalStateException("disk") })
+        val throwing = LogContext(app, log, prefs, PushSink { _, _ -> throw IllegalStateException("disk") })
         PushReceiver().receive(object : ContextWrapperWithWake(throwing) {}, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule)
         assertEquals(2L, wake.disk[WAKE_LOST])
         val logs = logged()
@@ -356,7 +394,7 @@ class PushReceiverTest {
         val inSink = CountDownLatch(1)
         val release = CountDownLatch(1)
         var epochAtCommit = 0L
-        val slow = LogContext(app, log, prefs, PushSink {
+        val slow = LogContext(app, log, prefs, PushSink { _, _ ->
             inSink.countDown()
             release.await(10, TimeUnit.SECONDS)
             epochAtCommit = epoch
@@ -374,8 +412,8 @@ class PushReceiverTest {
         release.countDown()
         receiver.join(10_000)
         bump.join(10_000)
-        assertEquals(1L, epochAtCommit)
-        assertEquals(2L, epoch)
+        assertEquals(0L, epochAtCommit)
+        assertEquals(1L, epoch)
     }
 
     @Test

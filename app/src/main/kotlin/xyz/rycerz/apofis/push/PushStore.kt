@@ -27,12 +27,15 @@ internal object Keys {
     const val FLUSH = "flush"
 }
 
-/** A connector registration as journaled before its REGISTER broadcast: what is needed to unregister it later. */
-data class Registration(val instance: String, val distributor: String?, val token: String?) {
-    fun encode() = listOfNotNull(instance, distributor, token).joinToString("\t")
+/**
+ * A connector registration as journaled before its REGISTER broadcast: what is needed to unregister it later, and the
+ * connection epoch it was made under (its wakes belong to that connection only).
+ */
+data class Registration(val instance: String, val distributor: String?, val token: String?, val epoch: Long? = null) {
+    fun encode() = listOfNotNull(instance, distributor, token, epoch?.toString()).joinToString("\t")
 
     companion object {
-        fun decode(s: String?) = s?.split('\t')?.let { Registration(it[0], it.getOrNull(1), it.getOrNull(2)) }
+        fun decode(s: String?) = s?.split('\t')?.let { Registration(it[0], it.getOrNull(1), it.getOrNull(2), it.getOrNull(3)?.toLongOrNull()) }
     }
 }
 

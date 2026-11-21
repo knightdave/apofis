@@ -47,8 +47,11 @@ interface UnifiedPushPort {
     /** [journal] (distributor, token) runs before each REGISTER broadcast; if it throws, nothing is sent. */
     fun register(c: Context, instance: String, journal: (String, String) -> Unit)
 
-    /** Unregisters [r]: from its journaled token first, then through the connector. */
-    fun unregister(c: Context, r: Registration)
+    /**
+     * Unregisters [r] from its journaled token; with [connector], also its instance through the connector. A token the
+     * current instance replaced is unregistered without [connector], which would drop the replacement too.
+     */
+    fun unregister(c: Context, r: Registration, connector: Boolean)
 }
 
 object RealUnifiedPush : UnifiedPushPort {
@@ -59,11 +62,11 @@ object RealUnifiedPush : UnifiedPushPort {
     override fun register(c: Context, instance: String, journal: (String, String) -> Unit) =
         UnifiedPush.register(Journaling(c, journal), instance, null, null, PlainKeyManager)
 
-    override fun unregister(c: Context, r: Registration) {
+    override fun unregister(c: Context, r: Registration, connector: Boolean) {
         // The connector deletes its token before broadcasting (U/UnifiedPush.kt:320-336), so a death there would lose the
         // UNREGISTER; ours goes first from the journal. Distributors ignore a repeated UNREGISTER.
         if (r.distributor != null && r.token != null) broadcastUnregister(c, r.distributor, r.token)
-        UnifiedPush.unregister(c, r.instance, PlainKeyManager)
+        if (connector) UnifiedPush.unregister(c, r.instance, PlainKeyManager)
     }
 
     // As the connector sends it (U/UnifiedPush.kt:338-361).
@@ -130,6 +133,8 @@ class PushRegistrar(
     private val scope: CoroutineScope,
     private val policy: PushPolicy = pushPolicy,
     private val port: UnifiedPushPort = RealUnifiedPush,
+    /** The persisted connection epoch (`connection_epoch`); registrations journal it. */
+    private val epoch: () -> Long = { 0 },
     /** Schedules PublishWorker; called when a user-started operation leaves persisted work behind. */
     private val scheduleWork: () -> Unit = {},
 ) {
@@ -221,8 +226,19 @@ class PushRegistrar(
 
     /** Second half of a switch, after the marker: unregisters the old registration and, only if push is on, registers anew. */
     suspend fun finishSwitch() {
-        op { _ -> finishRevocations() }
+        op { _ -> reconcile(null) }
         afterUserOp()
+    }
+
+    /** The local half of recovery (no network): revocations, receiver events, registration. True when no revocation is left. */
+    suspend fun reconcileLocal(): Boolean = op { _ ->
+        reconcile(null)
+        !prefs.contains(Keys.REVOKE)
+    } ?: false
+
+    /** Recomputes the shown state, e.g. after the receiver failed to store an endpoint. */
+    fun refresh() {
+        state.value = compute()
     }
 
     private suspend fun <T> op(block: suspend (RecordApi?) -> T): T? {
@@ -303,9 +319,15 @@ class PushRegistrar(
         port.save(context, d)
         port.register(context, instance) { distributor, token ->
             check(distributor in policy.distributors(context)) { "distributor not allowed" }
-            commitLive { putString(Keys.REGISTRATION, Registration(instance, distributor, token).encode()) }
+            commitLive {
+                // A token this replaces may still be subscribed: it is revoked, in the same commit.
+                val displaced = registrationOf(prefs)?.takeIf { it.token != null && it.token != token }
+                if (displaced != null) putString(Keys.REVOKE, (revocationsOf(prefs) + displaced).joinToString("\n") { it.encode() })
+                putString(Keys.REGISTRATION, Registration(instance, distributor, token, epoch()).encode())
+            }
         }
         registeredThisProcess = true
+        finishRevocations()
     }
 
     /**
@@ -324,26 +346,26 @@ class PushRegistrar(
     private fun rotate(off: Boolean) {
         commitLive { beginRevocation(off) }
         finishRevocations()
+        if (enabled()) register()
     }
 
-    /** Unregisters every committed revocation; re-registers if push is on; then clears them. Repeating is harmless. */
+    /** Unregisters every committed revocation, then clears them. Repeating is harmless. */
     private fun finishRevocations() {
         val pending = revocationsOf(prefs)
         if (pending.isEmpty()) return
-        for (r in pending) port.unregister(context, r)
-        if (enabled()) register()
+        for (r in pending) port.unregister(context, r, connector = r.instance != currentInstance())
         commitLive { remove(Keys.REVOKE) }
     }
+
+    /** Our title and source, and no turn ever ran in it: a hide reaches only this row (Hermes applies flags to a lineage). */
+    private fun pristine(row: RecordRow, title: String?) = row.title == title && row.source == "api_server" &&
+        row.messageCount == 0 && row.parent == null && row.endReason == null
 
     private suspend fun check(a: RecordApi) {
         val record = prefs.getString(Keys.RECORD, null) ?: return
         val row = a.read(record)
-        // Gone, retitled, or a turn ran in it (a hide would then reach rows the app never made): a new record replaces it.
-        if (row == null || row.title != prefs.getString(Keys.RECORD_TITLE, null) || row.source != "api_server" ||
-            row.messageCount != 0 || row.parent != null || row.endReason != null
-        ) {
-            return publish(a, force = true)
-        }
+        // Gone, retitled, or a turn ran in it: left alone, a new record replaces it.
+        if (row == null || !pristine(row, prefs.getString(Keys.RECORD_TITLE, null))) return publish(a, force = true)
         if (!row.hidden || row.pinned) a.hide(record)
         if (clock() - prefs.getLong(Keys.PUBLISHED_AT, 0) >= ROTATE_AFTER_MS) publish(a, force = true)
     }
@@ -358,7 +380,8 @@ class PushRegistrar(
             val id = prefs.getString(Keys.PENDING_ID, null) ?: reserve(endpoint) ?: return fail("no id left")
             val title = prefs.getString(Keys.PENDING_TITLE, null)!!
             val ours = try {
-                a.create(id, title, prompt(endpoint)) || a.read(id)?.let { it.title == title && it.source == "api_server" } == true
+                // Adopted after an uncertain create only if a fresh read shows it is still our own pristine record.
+                a.create(id, title, prompt(endpoint)) || a.read(id)?.let { pristine(it, title) } == true
             } catch (e: ApiError.Conflict) {
                 if (e.code != "session_deleted") throw e
                 false // retired: never reused
@@ -408,7 +431,7 @@ class PushRegistrar(
         val distributor = registrationOf(prefs)?.distributor?.takeIf { it in policy.distributors(context) }
             ?: allowed().firstOrNull() ?: NTFY_PACKAGE
         val s = when {
-            PushStore.isDirty(prefs) -> PushState.Registering // memory may differ from disk: nothing is confirmed
+            PushStore.isDirty(prefs) || prefs.contains(Keys.REVOKE) -> PushState.Registering // not on disk, or not yet handed to the distributor
             !enabled() -> if (allowed().isEmpty()) PushState.NoDistributor else PushState.Off
             failed -> PushState.ServerError(distributor)
             // The record holds the endpoint the distributor confirmed for the current registration's token.

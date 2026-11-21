@@ -46,9 +46,9 @@ class PushSwitchTest {
             // Its NEW_ENDPOINT arrives while the switch still runs (connected() is null then).
             push.edit().putString(Keys.ENDPOINT_NEW, "https://ntfy.sh/upAbC123xyz_-9?up=1").putString(Keys.ENDPOINT_NEW_TOKEN, "tok-$instance").commit()
         }
-        override fun unregister(c: Context, r: Registration) {
+        override fun unregister(c: Context, r: Registration, connector: Boolean) {
             if (dieAtUnregister) throw xyz.rycerz.apofis.push.Death()
-            fake.unregister(c, r).also { markerAtPushEffect += cache.contains(SWITCH_MARKER) }
+            fake.unregister(c, r, connector).also { markerAtPushEffect += cache.contains(SWITCH_MARKER) }
         }
     }
 
@@ -96,14 +96,69 @@ class PushSwitchTest {
 
     @Test
     fun theRevocationIsOnDiskBeforeTheMarker() = runTest {
+        // WorkManager holds its work (no process of this test runs it): the next start below finishes the revocation.
+        val held = java.util.concurrent.Executor { }
+        WorkManagerTestInitHelper.initializeTestWorkManager(app, androidx.work.Configuration.Builder().setTaskExecutor(held).setExecutor(held).build())
         val container = AppContainer(app, store, port) { db }
         container.connect(Credentials("https://a.example/", "key-a"))
         assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
             .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1").encode()).commit())
-        container.afterSwitchMarker = { throw xyz.rycerz.apofis.push.Death() } // dies between the marker and any push step
+        var revokeAtMarker = false
+        container.afterSwitchMarker = { // dies between the marker and any push step
+            revokeAtMarker = push.contains(Keys.REVOKE)
+            throw xyz.rycerz.apofis.push.Death()
+        }
         runCatching { container.connect(Credentials("https://a.example/", "key-a2")) } // a same-URL key change
-        assertTrue("the obligation was committed before the marker", push.contains(Keys.REVOKE))
+        assertTrue("the obligation was committed before the marker", revokeAtMarker)
         AppContainer(app, store, port) { db }.push.publishPending()
         assertTrue(fake.calls.contains("unregister g1 tok-g1"))
+        assertTrue(!push.contains(Keys.REVOKE))
+    }
+
+    // Fix round 3.
+
+    @Test
+    fun aFailedSwitchPreparationLeavesTheOldConnectionIntact() = runTest {
+        val disk = xyz.rycerz.apofis.push.FakePrefs()
+        val container = AppContainer(app, store, port, disk) { db }
+        val a = Credentials("https://a.example/", "key-a")
+        container.connect(a)
+        assertTrue(disk.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
+            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1", 1).encode()).commit())
+        val before = container.connected()!!
+        disk.onCommit = { false } // the push intent cannot be written
+        assertTrue(runCatching { container.connect(Credentials("https://b.example/", "key-b")) }.isFailure)
+        assertTrue("still connected to the old server", container.connected() === before && before.isOpen)
+        assertEquals(a, store.load())
+        assertTrue(!cache.contains(SWITCH_MARKER))
+        assertTrue("nothing revoked on disk", disk.disk[Keys.REVOKE] == null)
+        assertTrue(fake.calls.isEmpty())
+    }
+
+    @Test
+    fun localRevocationNeedsNoNetwork() = runTest {
+        val disk = xyz.rycerz.apofis.push.FakePrefs(mutableMapOf(Keys.REVOKE to Registration("g1", "io.heckel.ntfy", "tok-g1").encode()))
+        PublishWorker.recover(app, disk)
+        val local = WorkManager.getInstance(app).getWorkInfosForUniqueWork(PublishWorker.LOCAL_NAME).get().single()
+        assertEquals(androidx.work.NetworkType.NOT_REQUIRED, local.constraints.requiredNetworkType)
+    }
+
+    @Test
+    fun aWakeForTheOldRegistrationIsDroppedOnceTheSwitchStarts() = runTest {
+        val container = AppContainer(app, store, port) { db }
+        container.connect(Credentials("https://a.example/", "key-a"))
+        val epoch = connectionEpoch(app)
+        assertTrue(push.edit().putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, 1)
+            .putString(Keys.REGISTRATION, Registration("g1", "io.heckel.ntfy", "tok-g1", epoch).encode()).commit())
+        var wakes = 0
+        val sink = xyz.rycerz.apofis.push.PushSink { _, _ -> wakes++; true }
+        val ctx = xyz.rycerz.apofis.push.LogContext(app, xyz.rycerz.apofis.push.EventLog(), null, sink)
+        container.beforeSwitch = { // the switch has begun (its generation already advanced): a MESSAGE for the old token
+            xyz.rycerz.apofis.push.PushReceiver().receive(ctx, android.content.Intent("org.unifiedpush.android.connector.MESSAGE")
+                .setPackage(app.packageName).putExtra("token", "tok-g1").putExtra("bytesMessage", byteArrayOf(1)), {}) { }
+        }
+        container.connect(Credentials("https://b.example/", "key-b"))
+        assertEquals(0, wakes)
+        assertEquals(epoch + 1, connectionEpoch(app))
     }
 }
