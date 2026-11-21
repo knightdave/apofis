@@ -51,27 +51,30 @@ internal const val USER_COLLAPSED_LINES = 9
 internal const val COLLAPSED_MAX_CHARS = 4000
 
 /**
- * What a collapsed bubble lays out: [text] up to the end of its tenth line (one more than shown, so the layout sees
- * the overflow) and at most [COLLAPSED_MAX_CHARS] characters, never ending inside a surrogate pair.
+ * What a collapsed bubble lays out: the first [pieceEnd] piece of at most [COLLAPSED_MAX_CHARS], ended before its
+ * tenth line break (one line more than shown, so the layout sees the overflow). CR, LF and CRLF are one break each,
+ * and a cut before a break is a grapheme boundary.
  */
 internal fun collapsedPrefix(text: String): String {
-    var end = minOf(text.length, COLLAPSED_MAX_CHARS)
+    val end = pieceEnd(text, 0, COLLAPSED_MAX_CHARS)
     var lines = 0
-    for (i in 0 until end) {
-        if (text[i] == '\n' && ++lines == USER_COLLAPSED_LINES + 1) {
-            end = i
-            break
+    var i = 0
+    while (i < end) {
+        val c = text[i]
+        if (c == '\n' || c == '\r') {
+            if (++lines == USER_COLLAPSED_LINES + 1) return text.substring(0, i)
+            if (c == '\r' && i + 1 < end && text[i + 1] == '\n') i++
         }
+        i++
     }
-    if (end in 1 until text.length && text[end - 1].isHighSurrogate()) end--
     return text.substring(0, end)
 }
 
 /**
  * Right aligned, at most 75 % wide, tinted with primary, collapsed to [USER_COLLAPSED_LINES] lines with Show more.
- * Expanded, it shows the first bounded piece ([pageEnd]); a longer message then offers Show more again, which opens
- * the whole text in the Select view. A sent message has Copy and Select below; unsent messages show their state and
- * controls instead.
+ * Expanded, it shows the first [pieceEnd] piece, which always holds the collapsed prefix; a longer message then
+ * offers Show full message, which opens the whole text in the Select view. A sent message has Copy and Select below;
+ * unsent messages show their state and controls instead.
  */
 @Composable
 internal fun UserBubble(
@@ -86,7 +89,7 @@ internal fun UserBubble(
         var expanded by rememberSaveable(message.key) { mutableStateOf(initiallyExpanded) }
         val text = message.text
         val prefix = remember(text) { collapsedPrefix(text) }
-        val page = if (expanded) remember(text) { text.substring(0, pageEnd(text, 0)) } else ""
+        val page = if (expanded) remember(text) { text.substring(0, pieceEnd(text, 0)) } else ""
         val more = expanded && page.length < text.length
         // Decided by the latest layout, both ways (a wider window can make a long message fit).
         var long by remember(text) { mutableStateOf(prefix.length < text.length) }
@@ -109,7 +112,8 @@ internal fun UserBubble(
         if (long) {
             Row {
                 if (expanded) SmallTextButton(R.string.chat_show_less, { expanded = false })
-                if (!expanded || more) SmallTextButton(R.string.chat_show_more, { if (expanded) actions.onSelect(message.key) else expanded = true })
+                if (more) SmallTextButton(R.string.chat_show_full, { actions.onSelect(message.key) })
+                if (!expanded) SmallTextButton(R.string.chat_show_more, { expanded = true })
             }
         }
         if (message.steered && message.state == SendState.SENT) Caption(R.string.chat_steered) // delivered

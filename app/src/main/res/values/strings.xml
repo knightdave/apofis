@@ -162,6 +162,7 @@
     <string name="select_title">Select text</string>
     <string name="chat_show_more">Show more</string>
     <string name="chat_show_less">Show less</string>
+    <string name="chat_show_full">Show full message</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
     <string name="drawer_open">Open chat list</string>
     <string name="drawer_new_chat">New chat</string>

@@ -57,8 +57,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.key
 import xyz.rycerz.apofis.chat.SendState
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import xyz.rycerz.apofis.chat.ChatItem
@@ -91,7 +89,7 @@ fun ChatScreen(
     appBarActions: @Composable RowScope.() -> Unit = {},
     zone: ZoneId = ZoneId.systemDefault(),
     today: LocalDate = LocalDate.now(zone),
-    currentItems: (() -> List<ChatItem>)? = null, // the owner's transcript now, for Copy and Select at action time
+    currentState: (() -> ChatUiState)? = null, // the owner's state now, for Copy and Select at action time
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -99,11 +97,6 @@ fun ChatScreen(
     val steps = remember { StepIndex() }
     val uriHandler = LocalUriHandler.current
     var linkFailed by remember { mutableStateOf(false) } // shown until the next send or the next link that opens
-    // The reply that was live on this screen when its run ended: its action row enters once. Advanced on every state.
-    val finish = rememberSaveable(saver = FinishHolder.Saver) { FinishHolder() }
-    var finishFrame by remember { mutableIntStateOf(0) } // one recomposition after a handoff consumes its key
-    val justFinished = finishFrame.let { finish.update(state.live?.runId, state.items) }
-    LaunchedEffect(justFinished) { if (justFinished != null) withFrameNanos { finishFrame++ } }
     var selectKey by rememberSaveable { mutableStateOf<String?>(null) } // the Select view's item; never its text
     // The request sits at the bottom; a same-id request with a new generation is a new request and is revealed again.
     val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
@@ -162,8 +155,7 @@ fun ChatScreen(
                 today = today,
                 onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
                 onSelect = { selectKey = it },
-                justFinishedKey = justFinished,
-                currentItems = currentItems,
+                current = currentState?.let { now -> { now().let { Shown(it.items, it.live?.runId) } } },
             )
             val away by remember { derivedStateOf { listState.canScrollBackward } }
             if (away) {
@@ -245,7 +237,7 @@ fun ChatScreen(
         // Only the stored part is searched (a live merge appends just the live reply, which has no Select), once per
         // transcript change, not per streamed token. Closes once the key no longer resolves.
         @Suppress("UNCHECKED_CAST") val stored = (state.items as? Joined<ChatItem>)?.head ?: state.items
-        val text = remember(stored, key) { selectSource(stored, key) }
+        val text = remember(stored, key, state.live?.runId) { actionable(stored, state.live?.runId, key) } // as Copy and Select do
         // A restored view waits for the transcript to load; once loaded, a miss closes it for good.
         LaunchedEffect(text == null, state.loaded) { if (text == null && state.loaded) selectKey = null }
         if (text != null) {

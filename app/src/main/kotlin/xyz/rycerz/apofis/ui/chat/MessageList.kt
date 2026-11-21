@@ -929,8 +929,7 @@ internal fun MessageList(
     modifier: Modifier = Modifier,
     onLink: (String) -> Unit = {},
     onSelect: (String) -> Unit = {},
-    justFinishedKey: String? = null,
-    currentItems: (() -> List<ChatItem>)? = null,
+    current: (() -> Shown)? = null,
 ) {
     val builder = remember(zone) { ChatRows(zone) }
     val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
@@ -942,8 +941,9 @@ internal fun MessageList(
     val rows = builder.rows(items).let { if (gone) Joined(it, listOf(GoneRow)) else it }
     // Copy and Select check the transcript as it is at action time: the owner's current state when given.
     val onSelectNow by rememberUpdatedState(onSelect)
-    val currentNow by rememberUpdatedState(currentItems)
-    val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
+    val currentNow by rememberUpdatedState(current)
+    val liveNow by rememberUpdatedState(live)
+    val rowActions = remember { RowActions({ currentNow?.invoke() ?: Shown(latest, liveNow?.runId) }, { onSelectNow(it) }) }
     // Replies stored as part of the running turn are not history yet: once per transcript or run, not per token.
     @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
     val active = remember(stored, live?.runId) { activeReplies(stored, live?.runId) }
@@ -973,7 +973,7 @@ internal fun MessageList(
                         }
                         is FooterRow -> ReplyFooter(
                             row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
-                            rowActions, finishedNow = row.reply.key == justFinishedKey, active = row.reply.key in active,
+                            rowActions, active = row.reply.key in active,
                         )
                         is NoticeRow -> NoticeLine(row.notice.text)
                         GoneRow -> Notice(R.string.chat_answer_gone)

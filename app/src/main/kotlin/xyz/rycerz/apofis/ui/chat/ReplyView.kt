@@ -128,7 +128,7 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
 
 /**
  * Under a reply: the live indicators, the pending request, the outcome notice and, once its run is over (not live,
- * not [active], see [activeReplies]), Copy and Select ([finishedNow]: see [MessageActionRow]). A CHANGED note shows
+ * not [active], see [activeReplies]), Copy and Select ([MessageActionRow]). A CHANGED note shows
  * inside the block of the request that replaced the answered one, and only while that request is drawn (GONE notes:
  * [GoneRow]).
  */
@@ -140,7 +140,6 @@ internal fun ReplyFooter(
     answering: Boolean,
     actions: ChatActions,
     rowActions: RowActions? = null,
-    finishedNow: Boolean = false,
     active: Boolean = false,
 ) {
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
@@ -170,7 +169,7 @@ internal fun ReplyFooter(
         }
         // The first icon lines up with the 20 dp text inset (a 16 dp icon centred in its 48 dp target).
         if (rowActions != null && !reply.live && !active && reply.text.isNotBlank()) {
-            MessageActionRow(reply, rowActions, Modifier.padding(start = 4.dp), finishedNow = finishedNow)
+            MessageActionRow(reply, rowActions, Modifier.padding(start = 4.dp))
         }
     }
 }

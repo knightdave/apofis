@@ -15,9 +15,15 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
@@ -31,13 +37,19 @@ import xyz.rycerz.apofis.ui.theme.scaled
 
 /**
  * A message's raw text (line endings LF), selectable, on its own page: selection across lazy list rows is unreliable.
- * Any length: the text is shown in bounded pieces ([textPages]), one lazy item each, and selection works within a
- * piece. The pieces concatenate to the text exactly.
+ * Any length: the text is shown in [pieceEnd] pieces, one lazy item each, found as the reader reaches the last one
+ * (opening reads one piece, never the whole message); selection works within a piece, and the shown pieces
+ * concatenate to the text exactly. How many pieces were found is saved, so a deep scroll position survives recreation.
  */
 @Composable
 fun SelectTextScreen(text: String, onBack: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
-    val ends = remember(text) { textPages(text) }
+    val ends = remember(text) { ArrayList<Int>() } // a cache of piece ends, filled in order as pieces are shown
+    var found by rememberSaveable(text) { mutableIntStateOf(1) }
+    fun end(i: Int): Int {
+        while (ends.size <= i) ends += pieceEnd(text, ends.lastOrNull() ?: 0)
+        return ends[i]
+    }
     Column(Modifier.fillMaxSize().background(scheme.surface)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(start = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             ApofisIconButton(onClick = onBack, contentDescription = stringResource(R.string.back)) {
@@ -46,21 +58,14 @@ fun SelectTextScreen(text: String, onBack: () -> Unit) {
             Text(stringResource(R.string.select_title), Modifier.padding(start = 8.dp), style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Medium), color = scheme.onSurface)
         }
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 20.dp)) {
-            items(ends.size, key = { it }) { i ->
-                val piece = remember(text, i) { selectPiece(text, ends, i) }
+            items(found, key = { it }) { i ->
+                val e = end(i)
+                if (i == found - 1 && e < text.length) LaunchedEffect(i) { found = i + 2 } // the next piece, once this one is shown
+                val piece = remember(text, i) { lf(text.substring(if (i == 0) 0 else end(i - 1), e)) }
                 SelectionContainer {
-                    Text(piece, Modifier.fillMaxWidth(), style = scaled(ChatText.assistant), color = scheme.onSurface)
+                    Text(piece, Modifier.fillMaxWidth().testTag("select.piece:$i"), style = scaled(ChatText.assistant), color = scheme.onSurface)
                 }
             }
         }
     }
-}
-
-/**
- * Piece [i] of [text] as shown: LF line endings, and without the line break a piece after it begins with (the next
- * lazy item starts on a new line already, so it would show as an extra empty line).
- */
-internal fun selectPiece(text: String, ends: IntArray, i: Int): String {
-    val piece = lf(text.substring(if (i == 0) 0 else ends[i - 1], ends[i]))
-    return if (i < ends.size - 1) piece.removeSuffix("\n") else piece
 }

@@ -241,7 +241,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                     val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
                     LaunchedEffect(vm) { drawer.reopened.drop(1).filterNotNull().filter { it.key == sessionKey }.collect { vm.onOpened() } }
                     val state by vm.state.collectAsState()
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentItems = { vm.state.value.items })
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value })
                 }
             }
         }

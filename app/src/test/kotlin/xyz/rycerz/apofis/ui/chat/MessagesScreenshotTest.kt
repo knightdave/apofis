@@ -51,7 +51,7 @@ class MessagesScreenshotTest {
     private val options = RoborazziOptions(compareOptions = RoborazziOptions.CompareOptions(changeThreshold = 0.01f))
     private val question = UserMessage("u1", "How do I find the largest files in my home directory?", steered = false, timestamp = FIXED_NOW)
     private val answer = AssistantReply("r2", emptyList(), "Use du and sort. The biggest entry is your Downloads folder, at 4 GB.", FIXED_NOW)
-    private val actions = RowActions({ listOf(question, answer) }, {})
+    private val actions = RowActions({ Shown(listOf(question, answer), null) }, {})
 
     private fun component(content: @Composable () -> Unit) {
         rule.mainClock.autoAdvance = false
@@ -97,7 +97,7 @@ class MessagesScreenshotTest {
     @Test
     fun user_bubble_collapsed() {
         val message = UserMessage("u1", (1..20).joinToString("\n") { "Line $it of a long pasted log" }, steered = false, timestamp = FIXED_NOW)
-        component { UserBubble(message, onRetry = {}, onCancel = {}, actions = RowActions({ listOf(message) }, {})) }
+        component { UserBubble(message, onRetry = {}, onCancel = {}, actions = RowActions({ Shown(listOf(message), null) }, {})) }
         assertGlyphsDrawn(2)
         rule.onNodeWithTag("component").captureRoboImage("src/test/screenshots/user_bubble_collapsed.png", options)
     }
