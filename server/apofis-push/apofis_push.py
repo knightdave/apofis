@@ -121,7 +121,7 @@ def parse_args(argv: list[str]) -> dict:
             if not m or int(m.group(1)) > 65535:
                 raise Usage
             o["http_origins"].append(v)
-        elif a in o:
+        elif a in o or (a == "--log" and v != "-"):  # the log location is fixed; only stdout is selectable
             raise Usage
         else:
             o[a] = v
@@ -159,8 +159,7 @@ def state_dir(home: str) -> str:
 
 
 def log_path(o: dict, home: str) -> str:
-    path = o.get("--log") or os.path.join(state_dir(home), "apofis-push.log")
-    return path if path == "-" else os.path.abspath(path)
+    return o.get("--log") or os.path.join(state_dir(home), "apofis-push.log")
 
 
 def db_ids(db: str) -> set:
@@ -185,16 +184,12 @@ def private_ok(st, bad) -> bool:
 
 
 def open_private(dfd: int, name: str, flags: int, bad=frozenset()) -> int:
-    """`name` in the directory `dfd`: a regular file we own with one link and no database identity;
-    never follows a symlink, never truncates on open, never blocks on a FIFO; mode 0600."""
+    """`name` in the directory `dfd`, checked before any write: a regular file we own with one link and
+    no database identity; never follows a symlink, never truncates on open, never blocks on a FIFO."""
     fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=dfd)
-    try:
-        if not private_ok(os.fstat(fd), bad):
-            raise OSError("refused file")
-        os.fchmod(fd, 0o600)
-    except BaseException:
+    if not private_ok(os.fstat(fd), bad):
         os.close(fd)
-        raise
+        raise OSError("refused file")
     return fd
 
 
@@ -237,8 +232,7 @@ def reserve_slot(home: str, lock) -> int | None:
             except OSError:
                 os.close(fd)
                 continue
-            os.ftruncate(fd, 0)  # no stale pid survives into the new child's slot
-            return fd
+            return fd  # unchanged here: only the child, after its identity checks, writes to it
         return None
     finally:
         os.close(dfd)
@@ -271,6 +265,15 @@ def run_hook(o: dict, home: str, stdin, env, spawn, lock) -> int:
 
 # --- Database (child only) ------------------------------------------------------------------------
 
+def connect_ro(db: str) -> sqlite3.Connection:
+    """The only way the script opens the database: read-only URI (never creates, never writable), and
+    query_only on top."""
+    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db), uri=True, timeout=DB_BUSY,
+                           isolation_level=None)
+    conn.execute("PRAGMA query_only=1")
+    return conn
+
+
 def snapshot(db: str, work, monotonic, on_progress=None):
     """One read transaction with a plain read-only connection (`mode=ro`, query_only, short busy
     timeout) inside a monotonic budget, checked by SQLite's progress handler and before the result is
@@ -281,11 +284,9 @@ def snapshot(db: str, work, monotonic, on_progress=None):
         if on_progress:
             on_progress()
         return 1 if monotonic() > end else 0
-    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db), uri=True, timeout=DB_BUSY,
-                           isolation_level=None)
+    conn = connect_ro(db)
     try:
         conn.set_progress_handler(progress, 1000)
-        conn.execute("PRAGMA query_only=1")
         conn.execute("BEGIN")
         result = work(conn)
         conn.execute("COMMIT")
@@ -478,6 +479,7 @@ def write_log(path: str, line: str, bad=frozenset(), lock=fcntl.flock, monotonic
                     return
                 sleep(0.01)
         fd = open_private(dfd, name, os.O_RDWR | os.O_CREAT | os.O_APPEND, bad)
+        os.fchmod(fd, 0o600)
         os.write(fd, (line + "\n").encode())
         size = os.fstat(fd).st_size
         if size > LOG_MAX:
@@ -603,7 +605,8 @@ def run_send(o: dict, home: str, now, monotonic, sleep, opener) -> int:
 # --- check ----------------------------------------------------------------------------------------
 
 def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
-    """Prints nothing until the whole report is built; any failure or interruption exits 3."""
+    """The summary prints nothing until it is built; --ids streams a capped listing. Any failure or
+    interruption exits 3."""
     lines = ["python %s" % sys.version.split()[0],
              "SSL_CERT_FILE %s" % ("set" if env.get("SSL_CERT_FILE") else "unset"),
              "origins %s" % (" ".join(o["origins"] + o["http_origins"]) or "none")]
@@ -611,10 +614,18 @@ def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
     if o["--ids"]:
         prefix = "apofis-push-%s-" % o["--only-install"]
 
-        def work(conn):
-            return [[str(c) for c in r] for r in conn.execute(
-                "SELECT id, title, source, hidden FROM sessions WHERE id >= ? AND id < ? ORDER BY id",
-                (prefix, prefix[:-1] + ".")).fetchall()]
+        def work(conn):  # streamed, at most MAX_REGS rows, every field bounded in SQL
+            out.write("\n".join(lines + ["db opened read-only"]) + "\n")
+            n = 0
+            for row in conn.execute("SELECT substr(id, 1, 64), substr(title, 1, 200), substr(source, 1, 32), hidden "
+                                    "FROM sessions WHERE id >= ? AND id < ? ORDER BY id LIMIT ?",
+                                    (prefix, prefix[:-1] + ".", MAX_REGS + 1)):
+                n += 1
+                if n > MAX_REGS:
+                    out.write("truncated after %d rows\n" % MAX_REGS)
+                    break
+                out.write("\t".join(re.sub(r"[\x00-\x1f\x7f]", "?", str(c)) for c in row) + "\n")
+            out.flush()
     else:
         def work(conn):
             return registration_rows(conn, now_s, o.get("--only-install"))
@@ -622,20 +633,19 @@ def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
     if status != "ok":
         out.write("\n".join(lines + ["skipped " + status]) + "\n")
         return 3
-    lines.append("db opened read-only")
     if o["--ids"]:
-        lines += ["\t".join(re.sub(r"[\x00-\x1f\x7f]", "?", c) for c in row) for row in result]
-    else:
-        rows, more = result
-        for rid, started, endpoint in rows:
-            m = RECORD_RE.fullmatch(rid)
-            if not m:
-                continue
-            v = validate_endpoint(endpoint, o["origins"], o["http_origins"]) if endpoint is not None else "prompt"
-            state = "refused %s" % v if isinstance(v, str) else "valid %s" % v[0]
-            lines.append("apofis-push-%s...-%s %s age=%dd" % (m.group(1)[:8], m.group(2), state,
-                                                              max(0, now_s - started) // 86400))
-        lines.append("regs=%d%s" % (len(rows), "+" if more else ""))
+        return 0
+    lines.append("db opened read-only")
+    rows, more = result
+    for rid, started, endpoint in rows:
+        m = RECORD_RE.fullmatch(rid)
+        if not m:
+            continue
+        v = validate_endpoint(endpoint, o["origins"], o["http_origins"]) if endpoint is not None else "prompt"
+        state = "refused %s" % v if isinstance(v, str) else "valid %s" % v[0]
+        lines.append("apofis-push-%s...-%s %s age=%dd" % (m.group(1)[:8], m.group(2), state,
+                                                          max(0, now_s - started) // 86400))
+    lines.append("regs=%d%s" % (len(rows), "+" if more else ""))
     out.write("\n".join(lines) + "\n")
     out.flush()
     return 0

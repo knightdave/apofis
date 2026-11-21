@@ -253,6 +253,7 @@ class Server:
         self.entered = threading.Event()
         self.latch = threading.Event()
         self.hold = hold
+        self.quarantined = False
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
@@ -283,6 +284,8 @@ class Server:
 
     def stop(self):
         self.latch.set()
+        if self.quarantined:  # a child may still send here: keep the port reserved
+            return
         self.httpd.shutdown()
         self.httpd.server_close()
 
@@ -591,7 +594,7 @@ class HookParentTest(unittest.TestCase):
         self.assertEqual(len(kw["pass_fds"]), 1)
         self.assertEqual(seen["fd_target"], fx.slot_path(0))
         self.assertTrue(seen["held"])
-        self.assertEqual(seen["content"], "", "stale identity cleared on reservation")
+        self.assertEqual(seen["content"], "424242", "the parent never writes a slot; the child replaces it")
         self.assertEqual(set(kw["env"]), {"HERMES_HOME", "PATH", "SSL_CERT_FILE", "LANG"})
         self.assertEqual(kw["env"]["HERMES_HOME"], fx.home)
         self.assertTrue(slot_free(fx.slot_path(0)), "parent must close its copy of the slot")
@@ -651,24 +654,6 @@ class HookParentTest(unittest.TestCase):
             _fx, spawn = self.hook(data, fx=fx)
         self.assertEqual(spawn.calls, [])
 
-    def test_slot_that_is_the_database_refused(self):
-        fx = Fixture(self)
-        dbslot = fx.slot_path(0)
-        c = sqlite3.connect(dbslot)
-        c.execute("CREATE TABLE sessions (id TEXT)")
-        c.commit()
-        c.close()
-        with open(dbslot, "rb") as f:
-            before = f.read()
-        fd = os.open(dbslot, os.O_RDWR)
-        opener = FakeOpener()
-        fx.run(["send", "--session", APP, "--kind", "finished", "--state-db", dbslot, "--slot-fd", str(fd), *ORIGIN],
-               opener=opener, now=lambda: NOW)
-        self.assertIn("skipped slot", fx.log_text())
-        with open(dbslot, "rb") as f:
-            self.assertTrue(f.read() == before, "database bytes changed")
-
-
 class RealChildMixin:
     """Every real child is accounted for by `account`, registered before the spawn."""
 
@@ -680,10 +665,10 @@ class RealChildMixin:
         self.addCleanup(self.account, fx, server)  # runs before the fixture and server teardown
         return fx, server
 
-    def run_parent(self, fx, server, data=None, **kw):
+    def run_parent(self, fx, server, data=None, db=None, **kw):
         return subprocess.run(
             [sys.executable, "-I", SCRIPT, "hook", "--allow-http-origin", server.origin, "--delay", "0",
-             "--state-db", fx.db, "--only-install", INSTALL],
+             "--state-db", db or fx.db, "--only-install", INSTALL],
             input=data or payload("on_session_end", APP, **FINISHED), capture_output=True, env=fx.env(),
             timeout=WATCHDOG, **kw)
 
@@ -695,8 +680,8 @@ class RealChildMixin:
             server.release()
         try:
             return account(self.slots(fx), SCRIPT, watchdog)
-        except Quarantine:
-            fx.quarantined = True
+        except BaseException:  # unresolved accounting: release nothing a child may still use
+            fx.quarantined = server.quarantined = True
             raise
 
     def wait_pid(self, fx):
@@ -757,6 +742,39 @@ class ContainmentTest(RealChildMixin, unittest.TestCase):
         self.assertEqual(os.getpgid(pid), pid, "child leads its own process group")
         self.assertEqual(self.account(fx, server, release=False, watchdog=0.3), "killed")
         self.assert_gone(pid)
+
+    def test_failed_accounting_keeps_fixture_and_port(self):
+        fx, server = self.real_fixture(hold=True)
+        self.assertEqual(self.run_parent(fx, server).returncode, 0)
+        self.assertTrue(server.entered.wait(WATCHDOG))
+        with mock.patch.object(signal, "pidfd_send_signal", side_effect=OSError("signal failed")):
+            with self.assertRaises(OSError):
+                self.account(fx, server, release=False, watchdog=0.3)
+        server.stop()  # the rest of the cleanup order, as unittest runs it
+        fx.remove()
+        self.assertTrue(os.path.isdir(fx.dir), "fixture kept")
+        socket.create_connection(("127.0.0.1", server.port), timeout=WATCHDOG).close()  # port still reserved
+        fx.quarantined = server.quarantined = False  # now account for the child for real
+        self.assertIn(self.account(fx, server, release=False), ("ended", "killed"))  # stop() freed the request
+
+    def test_database_at_our_file_names_never_written(self):
+        for i, name in enumerate(("apofis-push.slot0.lock", "apofis-push.log")):
+            with self.subTest(case=i):
+                fx, server = self.real_fixture(hold=False)
+                target = os.path.join(fx.state, name)
+                c = sqlite3.connect(target)  # a rollback-journal database (also a non-WAL read for the log case)
+                c.executescript(SCHEMA)
+                c.close()
+                os.chmod(target, 0o644)
+                with open(target, "rb") as f:
+                    before = f.read()
+                self.assertEqual(self.run_parent(fx, server, db=target).returncode, 0)
+                self.assertEqual(self.account(fx, server), "ended")
+                with open(target, "rb") as f:
+                    self.assertTrue(f.read() == before, "database bytes changed")
+                self.assertEqual(os.stat(target).st_mode & 0o777, 0o644)
+                self.assertLessEqual(set(os.listdir(fx.state)), {"apofis-push.slot0.lock", "apofis-push.slot1.lock",
+                                                                 "apofis-push.log", "apofis-push.log.lock"})
 
     def test_cleanup_never_signals_unverified_pid(self):
         fx = Fixture(self)
@@ -1073,6 +1091,37 @@ class SnapshotTest(unittest.TestCase):
                opener=FakeOpener(), now=lambda: NOW, sleep=sleep)
         self.assertEqual(slept, [])
 
+    def test_connection_is_read_only(self):
+        fx = Fixture(self)
+        conn = ap.connect_ro(fx.db)
+        try:
+            self.assertEqual(conn.execute("PRAGMA query_only").fetchone()[0], 1)
+            for query_only in ("1", "0"):  # refused by query_only, and still by the read-only open itself
+                conn.execute("PRAGMA query_only=" + query_only)
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute("INSERT INTO messages (session_id, content) VALUES ('x', 'x')")
+        finally:
+            conn.close()
+
+    def test_missing_database_not_created(self):
+        fx = Fixture(self)
+        missing = os.path.join(fx.dbdir, "missing.db")
+        with self.assertRaises(sqlite3.OperationalError):
+            ap.connect_ro(missing)
+        opener = FakeOpener()
+        fx.run(["send", "--session", APP, "--kind", "finished", "--state-db", missing, *ORIGIN], opener=opener)
+        self.assertEqual(fx.run(["check", "--state-db", missing])[0], 3)
+        self.assertEqual(opener.calls, [])
+        self.assertFalse(os.path.exists(missing))
+
+    def test_reads_after_last_writer_closed(self):
+        fx = Fixture(self)
+        fx.app()
+        fx.record()
+        fx.close()
+        code, opener = fx.send()
+        self.assertEqual(len(opener.calls), 1)
+
     def test_busy_timeout_logged_as_busy(self):
         fx = Fixture(self)
         fx.app()
@@ -1311,63 +1360,37 @@ class SendTest(unittest.TestCase):
             self.assertEqual(f.read(), "keep")
 
 
-HARNESS = """
-import fcntl, os, sys, time
-sys.path.insert(0, %(here)r)
-import signal
-import apofis_push as a
-a.CHILD_HARD = %(hard)d
-a.SOFT_DEADLINE = %(soft)r
-signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})  # an inherited blocked mask
-a.arm_hard_deadline()
-%(patch)s
-fd = os.open(%(slot)r, os.O_RDWR | os.O_CREAT, 0o600)
-fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-sys.exit(a.main(sys.argv[1:] + ["--slot-fd", str(fd)], sys.stdin.buffer, {"HERMES_HOME": %(home)r}))
-"""
-
-
 class DeadlineTest(unittest.TestCase):
-    """The child's deadlines in a disposable subprocess: a stuck request ends at the soft deadline with a
-    'deadline' line; a stuck request plus a stuck diagnostic still ends by the kernel's default SIGALRM
-    action, and the slot is released either way."""
-
-    def run_child(self, hard, soft, patch=""):
+    def test_hard_deadline_from_production_entry_point(self):
+        """The real CLI, from a copy whose only change is a shorter CHILD_HARD, under an inherited blocked
+        SIGALRM mask; the test arms no alarm. A request held forever ends in death by SIGALRM with the slot
+        released; without the production arm the child would run to the soft deadline and exit 0."""
         fx = Fixture(self)
         server = Server(self, hold=True)
         fx.app(started=time.time())
         fx.record(endpoint=server.endpoint, started=time.time())
-        code = HARNESS % {"here": HERE, "hard": hard, "soft": soft, "patch": patch, "slot": fx.slot_path(0),
-                          "home": fx.home}
-        p = subprocess.Popen([sys.executable, "-I", "-c", code, "send", "--session", APP, "--kind", "finished",
-                              "--state-db", fx.db, "--delay", "0", "--allow-http-origin", server.origin,
-                              "--only-install", INSTALL],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                             start_new_session=True)
-        self.addCleanup(self.reap, p)
-        start = time.monotonic()
-        rc = p.wait(WATCHDOG)
-        return fx, rc, time.monotonic() - start, server
-
-    def reap(self, p):
-        if p.poll() is None:
-            os.killpg(p.pid, signal.SIGKILL)
-            p.wait(WATCHDOG)
-        p.stderr.close()
-
-    def test_soft_deadline_reports(self):
-        fx, rc, elapsed, server = self.run_child(hard=10, soft=0.5)
-        self.assertEqual(rc, 0)
-        self.assertLess(elapsed, 10)
+        with open(SCRIPT) as f:
+            text = f.read()
+        self.assertEqual(text.count("\nCHILD_HARD = 25 "), 1)
+        copy = os.path.join(fx.state, "apofis_push.py")
+        with open(copy, "w") as f:
+            f.write(text.replace("\nCHILD_HARD = 25 ", "\nCHILD_HARD = 2 "))
+        fd = fx.hold(fx.slot_path(0))
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})  # inherited by the child
+        try:
+            start = time.monotonic()
+            p = subprocess.Popen([sys.executable, "-I", copy, "send", "--session", APP, "--kind", "finished",
+                                  "--state-db", fx.db, "--delay", "0", "--allow-http-origin", server.origin,
+                                  "--only-install", INSTALL, "--slot-fd", str(fd)],
+                                 env=fx.env(), pass_fds=(fd,), start_new_session=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+            os.close(fd)
+        self.addCleanup(lambda: p.poll() is None and (os.killpg(p.pid, signal.SIGKILL), p.wait(WATCHDOG)))
+        self.assertEqual(p.wait(WATCHDOG), -signal.SIGALRM)
+        self.assertLess(time.monotonic() - start, ap.SOFT_DEADLINE)
         self.assertTrue(server.entered.is_set())
-        self.assertRegex(fx.log_text(), r"on_session_end deadline regs=1\n$")
-        self.assertTrue(slot_free(fx.slot_path(0)))
-
-    def test_hard_deadline_needs_no_python(self):
-        stuck = "a.write_log = lambda *x, **k: time.sleep(1000)"  # the diagnostic never returns
-        fx, rc, elapsed, server = self.run_child(hard=2, soft=0.5, patch=stuck)
-        self.assertEqual(rc, -signal.SIGALRM)
-        self.assertLess(elapsed, 2 + 5)
         self.assertTrue(slot_free(fx.slot_path(0)))
 
 
@@ -1396,23 +1419,17 @@ class LogTest(unittest.TestCase):
         ap.write_log(fx.log, "line", self.bad(fx))
         self.assertEqual(os.stat(fx.log).st_mode & 0o777, 0o600)
 
-    def test_log_never_touches_database(self):
+    def test_log_destination_fixed(self):
         fx = Fixture(self)
-        fx.app()
-        fx.record()
-        for i in range(2000):  # well over LOG_MAX, so a write would also rotate (truncate)
-            fx.session("filler-%d" % i, system_prompt="x" * 200)
-        fx.w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        before = fx.digest()
-        link = os.path.join(fx.state, "linked.log")
-        os.link(fx.db, link)
-        sym = os.path.join(fx.state, "sym.log")
-        os.symlink(fx.db, sym)
-        for i, path in enumerate((fx.db, fx.db + "-wal", link, sym)):
-            with self.subTest(case=i):
-                code, opener = fx.send(extra=["--log", path])
-                self.assertEqual(len(opener.calls), 1)
-                self.assertEqual(fx.digest(), before)
+        config = os.path.join(fx.dir, "config.yaml")
+        with open(config, "w") as f:
+            f.write("keep")
+        for cmd in (["hook", *ORIGIN], ["send", "--session", APP, "--kind", "finished", *ORIGIN], ["check"]):
+            self.assertEqual(fx.run(cmd + ["--log", config], opener=FakeOpener())[0], 2)
+        with open(config) as f:
+            self.assertEqual(f.read(), "keep")
+        self.assertEqual(sorted(os.listdir(fx.dir)), ["config.yaml", "db", "home"])
+        self.assertEqual(os.listdir(fx.state), [])
 
     def test_fifo_log_refused(self):
         fx = Fixture(self)
@@ -1607,6 +1624,18 @@ class CheckTest(unittest.TestCase):
             ["apofis-push-%s-1" % INSTALL, "apofis-push-%s-1 op-0123456789abcdef" % INSTALL, "api_server", "0"],
             ["apofis-push-%s-2" % INSTALL, "t?x?y", "cli", "0"],
         ])
+
+    def test_ids_listing_capped(self):
+        fx = Fixture(self)
+        for s in range(1, 41):
+            fx.record(seq=str(s))
+        fx.w.execute("UPDATE sessions SET title = ? WHERE id = ?", ("t" * 10000, "apofis-push-%s-1" % INSTALL))
+        code, out = fx.run(["check", "--only-install", INSTALL, "--ids", "--state-db", fx.db])
+        self.assertEqual(code, 0)
+        rows = [line for line in out.splitlines() if line.startswith("apofis-push-")]
+        self.assertEqual(len(rows), 32)
+        self.assertTrue(out.endswith("truncated after 32 rows\n"))
+        self.assertLessEqual(max(len(r) for r in rows), 64 + 200 + 32 + 10)
 
     def test_ids_requires_install(self):
         fx = Fixture(self)
