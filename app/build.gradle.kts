@@ -1,3 +1,5 @@
+import com.android.build.api.variant.HostTestBuilder
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -67,6 +69,15 @@ android {
     }
 }
 
+// AGP 9 builds unit tests for debug only. Release runs exactly ReleasePolicyTest (CI and the task commands filter to it):
+// the rest of the suite needs the debug-only Compose test host.
+androidComponents {
+    beforeVariants(selector().withBuildType("release")) { it.hostTests[HostTestBuilder.UNIT_TEST_TYPE]?.enable = true }
+}
+
+// The connector's Web Push key manager is never used (PushReceiver and every call pass PlainKeyManager): no tink.
+configurations.all { exclude(group = "com.google.crypto.tink") }
+
 room {
     schemaDirectory("$projectDir/schemas")
 }
@@ -87,6 +98,7 @@ dependencies {
     implementation(libs.commonmark.ext.gfm.tables)
     implementation(libs.commonmark.ext.gfm.strikethrough)
     implementation(libs.commonmark.ext.task.list.items)
+    implementation(libs.unifiedpush.connector)
 
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

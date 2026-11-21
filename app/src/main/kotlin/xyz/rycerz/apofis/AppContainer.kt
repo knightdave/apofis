@@ -9,6 +9,7 @@ import androidx.room.Room
 import androidx.work.WorkManager
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -27,10 +28,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.MIGRATION_1_2
+import xyz.rycerz.apofis.push.HermesRecordApi
+import xyz.rycerz.apofis.push.PushRegistrar
+import xyz.rycerz.apofis.push.TestPush
+import xyz.rycerz.apofis.push.pushPolicy
+import xyz.rycerz.apofis.push.pushPrefs
+import xyz.rycerz.apofis.push.validateEndpoint
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
@@ -142,6 +150,16 @@ class AppContainer(
     private val published = MutableStateFlow<Connected?>(null)
     private val switchLock = Mutex()
 
+    // Incremented when a switch starts: push work begun on the old connection stops at its next step.
+    private val connectionGeneration = AtomicLong()
+
+    /** Push registration on the current server; its records live there, revocation debt per server. */
+    val push by lazy {
+        PushRegistrar(app, pushPrefs(app), api = { connected()?.let { HermesRecordApi(it.credentials.baseUrl, it.api) } },
+            connectionGeneration = connectionGeneration::get, clock = System::currentTimeMillis, scope = scope)
+    }
+    val testPush by lazy { TestPush(System::currentTimeMillis, OkHttpClient()) { validateEndpoint(it, pushPolicy.origins(app), pushPolicy.loopbackOrigin(app)) } }
+
     /**
      * Drafts, sends being stored and unsent text of the cached chats: shared by every connection, emptied only in the
      * step that clears the cached tables. Its own scope, so closing a connection does not cancel a send being stored.
@@ -216,7 +234,10 @@ class AppContainer(
                     switching = true
                     current
                 }
+                connectionGeneration.incrementAndGet()
                 beforeSwitch()
+                // Before the old client closes: its record becomes debt there, the registration instance rotates.
+                runCatching { push.forgetServer(old?.let { HermesRecordApi(it.credentials.baseUrl, it.api) }) }.onFailure(::logFailure)
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)

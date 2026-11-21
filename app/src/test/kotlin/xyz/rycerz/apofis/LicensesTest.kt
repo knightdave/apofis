@@ -12,6 +12,7 @@ import java.security.MessageDigest
 import xyz.rycerz.apofis.ui.COMMONMARK_LICENSE_ASSET
 import xyz.rycerz.apofis.ui.COMMONMARK_NOTICE_ASSET
 import xyz.rycerz.apofis.ui.LUCIDE_LICENSE_ASSET
+import xyz.rycerz.apofis.ui.UNIFIEDPUSH_LICENSE_ASSET
 
 @RunWith(RobolectricTestRunner::class)
 class LicensesTest {
@@ -46,5 +47,17 @@ class LicensesTest {
         val inJars = ClassLoader.getSystemClassLoader().getResources("META-INF/LICENSE.txt").toList().filter { "/org.commonmark/" in it.toString() }
         assertEquals(inJars.toString(), 4, inJars.size)
         for (url in inJars) assertTrue("$url carries another notice", url.openStream().use { it.readBytes() }.contentEquals(shipped))
+    }
+
+    @Test
+    fun unifiedPushLicenseIsPinned() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val shipped = context.assets.open(UNIFIEDPUSH_LICENSE_ASSET).use { it.readBytes() }
+        val file = File("../licenses/UNIFIEDPUSH-CONNECTOR-LICENSE").readBytes()
+        assertTrue(shipped.contentEquals(file))
+        // LICENSE of UnifiedPush/android-connector at tag 3.3.6, as recorded in the Milestone 3 Task 2 qualification.
+        val sha = MessageDigest.getInstance("SHA-256").digest(file).joinToString("") { "%02x".format(it) }
+        assertEquals("65e7ce63d83ef0a5aa7b8a568f0524b7d0943179257f4ba086c4a126d57f08fa", sha)
+        assertTrue(context.getString(R.string.licenses_unifiedpush).contains("Apache"))
     }
 }
