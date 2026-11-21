@@ -849,8 +849,12 @@ class PushRegistrarTest {
             epoch++ // the marker commit advances the epoch
             current = apiB
             r.publishPending()
-            assertEquals(1L, registrationOf(prefs)?.epoch) // registered again under the new epoch
-            assertTrue("the receiver now accepts its token", currentRegistration(prefs, NTFY_ONLY, epoch) != null)
+            assertEquals(1L, registrationOf(prefs)?.epoch)
+            assertEquals("a new instance, never the old token under the new epoch", "g3", registrationOf(prefs)?.instance)
+            assertEquals(PushState.Registering, r.ui.value.state)
+            endpointFor(VALID3)
+            r.publishPending()
+            assertTrue("the receiver accepts its token", currentRegistration(prefs, NTFY_ONLY, epoch) != null)
             assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
         }
         with(World()) { // without re-registration it would never show On
@@ -858,6 +862,39 @@ class PushRegistrarTest {
             turnedOn(r)
             epoch++
             assertEquals(PushState.Registering, registrar().ui.value.state)
+        }
+    }
+
+    // Fix round 5.
+
+    @Test
+    fun theOldServerNeverLearnsTheNewConnectionsTopic() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            connection++
+            r.prepareSwitch()
+            // A queued worker takes the mutex right after the rotation, with server A still reachable: it registers g2
+            // under A's epoch, its endpoint arrives, and it publishes it to A.
+            r.publishPending()
+            endpointFor(VALID2)
+            r.publishPending()
+            val toldA = a.created.map { it.second }
+            // connect resumes: A is gone, the marker advances the epoch, the local job runs, then B's connection.
+            current = null
+            epoch++
+            r.reconcileLocal()
+            current = apiB
+            endpointFor(VALID3)
+            r.publishPending()
+            val bToken = currentRegistration(prefs, NTFY_ONLY, epoch)?.token!!
+            assertTrue("B's topic is a new one", "tok-g2" != bToken)
+            assertTrue("A never received B's endpoint", toldA.none { VALID3 in it } && a.created.none { VALID3 in it.second })
+            assertTrue("the topic A may know is unsubscribed", "tok-g2" !in port.subscribed)
+            assertEquals(listOf("""{"v":1,"endpoint":"$VALID3"}"""), b.created.map { it.second })
+            assertEquals(b.created.single().first, prefs.getString(Keys.RECORD, null))
+            assertTrue(bToken in port.subscribed)
+            assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
         }
     }
 }

@@ -95,8 +95,12 @@ private class Journaling(base: Context, private val journal: (String, String) ->
 /** The connection changed during an operation: it ends without another request or result. */
 private class Stale : Exception()
 
-/** Every call checks [live] before it starts and before its result, value or error, is used. */
-private class Guarded(private val a: RecordApi, private val live: () -> Boolean) : RecordApi {
+/**
+ * Every call checks [live] (connection and connection epoch unchanged) under the push lock, so atomically with the
+ * epoch's advance, right before it starts and before its result, value or error, is used.
+ */
+private class Guarded(private val a: RecordApi, live: () -> Boolean) : RecordApi {
+    private val live = { PushStore.locked(live) }
     override val server get() = a.server
     private suspend fun <T> g(block: suspend () -> T): T {
         if (!live()) throw Stale()
@@ -238,9 +242,10 @@ class PushRegistrar(
     private suspend fun <T> op(block: suspend (RecordApi?) -> T): T? {
         val start = connectionGeneration() // at admission: an operation queued across a switch belongs to the old connection
         return withContext(Dispatchers.IO) {
+            val startEpoch = epoch() // the connection epoch it was admitted under: a request goes only to that epoch's server
             mutex.withLock {
                 failed = false // every operation derives the outcome afresh
-                live = { connectionGeneration() == start }
+                live = { connectionGeneration() == start && epoch() == startEpoch }
                 try {
                     flushOrThrow()
                     block(api()?.let { a -> Guarded(a, live) })
@@ -299,8 +304,10 @@ class PushRegistrar(
         }
         if (!enabled()) return
         val r = registrationOf(prefs)
-        if (r?.instance == currentInstance() && r.distributor !in policy.distributors(context)) {
-            rotate(off = false) // journaled by a build with another policy: revoke it, register with an allowed distributor
+        if (r?.instance == currentInstance() && (r.distributor !in policy.distributors(context) || r.epoch != epoch())) {
+            // Journaled by a build with another policy, or under another connection epoch (its topic may be known to that
+            // epoch's server): revoke it and register a new instance, with a new token and topic.
+            rotate(off = false)
         } else if (!registeredThisProcess || confirmed() == null) {
             // Once per process, and until the distributor confirms: an endpoint update lost to a failed commit is resent.
             register()
@@ -308,6 +315,9 @@ class PushRegistrar(
     }
 
     private fun register() {
+        val r = registrationOf(prefs)
+        // A registration of another connection epoch is never carried into this one, not even its token.
+        if (r != null && r.instance == currentInstance() && r.epoch != epoch()) return rotate(off = false)
         val d = allowed().firstOrNull() ?: return
         val instance = currentInstance()
         port.save(context, d)
@@ -315,7 +325,9 @@ class PushRegistrar(
             check(distributor in policy.distributors(context)) { "distributor not allowed" }
             commitLive {
                 // A token this replaces may still be subscribed: it is revoked, in the same commit.
-                val displaced = registrationOf(prefs)?.takeIf { it.token != null && it.token != token }
+                val held = registrationOf(prefs)
+                check(held == null || held.instance != instance || held.token != token || held.epoch == epoch()) { "token of another epoch" }
+                val displaced = held?.takeIf { it.token != null && it.token != token }
                 if (displaced != null) putString(Keys.REVOKE, (revocationsOf(prefs) + displaced).joinToString("\n") { it.encode() })
                 putString(Keys.REGISTRATION, Registration(instance, distributor, token, epoch()).encode())
             }

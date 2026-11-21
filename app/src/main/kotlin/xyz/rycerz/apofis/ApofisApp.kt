@@ -16,7 +16,8 @@ class ApofisApp : Application(), SendQueueProvider, PushSinkProvider {
     override fun onCreate() {
         super.onCreate()
         // Push work and wake demand left by the last process.
-        runCatching { recoverPush(this, pushSink) }.onFailure { Log.w("Apofis", "Push recovery failed: ${it.javaClass.name}") }
+        // Off the main thread: it reads preferences, and with push Off and nothing persisted it only does that.
+        Thread { runCatching { recoverPush(this, pushSink) }.onFailure { Log.w("Apofis", "Push recovery failed: ${it.javaClass.name}") } }.start()
     }
 
     override val sendQueue: SendQueue? get() = container.connected()?.sendQueue

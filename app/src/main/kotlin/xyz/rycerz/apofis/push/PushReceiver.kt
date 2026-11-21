@@ -8,7 +8,6 @@ import java.io.IOException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import xyz.rycerz.apofis.connectionEpoch
 import org.unifiedpush.android.connector.FailedReason
 import org.unifiedpush.android.connector.MessagingReceiver
@@ -50,7 +49,7 @@ interface PushSinkProvider {
     val pushRegistrar: PushRegistrar? get() = null
 }
 
-/** Process start: push work left by the last process, then the sink's own. */
+/** Process start: push work left by the last process, then the sink's own. Called off the main thread. */
 internal fun recoverPush(context: Context, sink: PushSink?) {
     PublishWorker.recover(context)
     sink?.recover(context)
@@ -61,21 +60,41 @@ private val events = Executors.newSingleThreadExecutor()
 private val deadlines = Executors.newSingleThreadScheduledExecutor()
 
 /**
- * Runs [work] on [lane] and finishes the broadcast exactly once, at the latest [BUDGET_MS] after receipt. [work] calls
- * its claim function right before the event's first durable commit. When the deadline comes before that claim, the
- * event is abandoned: the claim fails, nothing is committed, handled or ACKed, and the distributor delivers again. When
- * the claim came first, the deadline only finishes the broadcast while the hand-off completes.
+ * Runs [work] on [lane] and finishes the broadcast exactly once. [work] claims the event right before its own first
+ * durable write and reports [Handoff.done] when that write returned. When the [BUDGET_MS] deadline after receipt comes
+ * before the claim, the event is abandoned: the claim fails, nothing is committed, handled or ACKed, and the distributor
+ * delivers again. When it comes between the claim and the end of that write, the broadcast is finished as soon as the
+ * write returned; after that, at the deadline at the latest.
  */
-internal fun admit(lane: Executor, deadline: (Runnable) -> Unit, finish: () -> Unit, work: (finish: () -> Unit, claim: () -> Boolean) -> Unit) {
-    val finished = AtomicBoolean()
-    val claimed = AtomicBoolean()
-    val finishOnce = { if (finished.compareAndSet(false, true)) finish() }
-    val claim = { claimed.compareAndSet(false, true) }
-    deadline {
-        if (claim()) Log.w(TAG, "PushReceiver: event lost, late")
-        finishOnce()
+internal class Handoff(private val finish: () -> Unit) {
+    private var claimed = false
+    private var done = false
+    private var late = false
+    private var finished = false
+
+    @Synchronized fun claim(): Boolean = (!claimed && !late).also { if (it) claimed = true }
+    @Synchronized fun done() {
+        done = true
+        if (late) finishOnce()
     }
-    lane.execute { if (!finished.get()) work(finishOnce, claim) }
+    @Synchronized fun deadline() {
+        late = true
+        if (!claimed) Log.w(TAG, "PushReceiver: event lost, late")
+        if (!claimed || done) finishOnce()
+    }
+    @Synchronized fun finishOnce() {
+        if (!finished) {
+            finished = true
+            finish()
+        }
+    }
+    @Synchronized fun abandoned() = late && !claimed
+}
+
+internal fun admit(lane: Executor, deadline: (Runnable) -> Unit, finish: () -> Unit, work: (Handoff) -> Unit) {
+    val h = Handoff(finish)
+    deadline { h.deadline() }
+    lane.execute { if (!h.abandoned()) work(h) }
 }
 
 /** The deadline came before the event's first durable commit: it is not handled (and so not ACKed). */
@@ -97,31 +116,32 @@ class PushReceiver : MessagingReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         val pending = goAsync()
-        admit(events, { deadlines.schedule(it, BUDGET_MS, TimeUnit.MILLISECONDS) }, { pending?.finish() }) { finish, claim ->
-            receive(context, intent, finish, claim = claim)
+        admit(events, { deadlines.schedule(it, BUDGET_MS, TimeUnit.MILLISECONDS) }, { pending?.finish() }) { h ->
+            receive(context, intent, h::finishOnce, handoff = h)
         }
     }
 
-    private var claim: () -> Boolean = { true }
+    private var handoff: Handoff? = null
 
     internal fun receive(
         context: Context,
         intent: Intent,
         finish: () -> Unit,
         schedule: (Context) -> Unit = PublishWorker::schedule,
-        claim: () -> Boolean = { true },
+        handoff: Handoff? = null,
     ) {
-        this.claim = claim
+        this.handoff = handoff
         try {
             val prefs = pushPrefs(context)
-            val wasDirty = PushStore.isDirty(prefs)
-            if (!PushStore.flush(prefs)) return lost("prefs not written") // a lost write may sit in memory: touch nothing
-            if (wasDirty) changed = true // what failed before is on disk now: the registrar acts on it
             token = runCatching { intent.getStringExtra(EXTRA_TOKEN) }.getOrNull()
             // A distributor's revocation is committed before anything else is done with it (the connector would drop the
-            // registration), and only once claimed: past the deadline it is left for redelivery.
+            // registration). Under one lock: an earlier unwritten change is flushed first, then the event is claimed, and
+            // the next disk write is the event's own. Past the deadline it is left unclaimed, for redelivery.
             val trusted = PushStore.locked {
-                trusted(context) && (intent.action !in REVOCATIONS || (claimed() && commit(prefs) { putString(Keys.UNREGISTERED_INSTANCE, instanceOf(prefs)) }))
+                val wasDirty = PushStore.isDirty(prefs)
+                if (!PushStore.flush(prefs)) throw IOException("push prefs not written") // touch nothing on a lost write
+                if (wasDirty) changed = true // what failed before is on disk now: the registrar acts on it
+                trusted(context) && (intent.action !in REVOCATIONS || durably(prefs) { putString(Keys.UNREGISTERED_INSTANCE, instanceOf(prefs)) })
             }
             if (!trusted) return
             if (intent.action in REVOCATIONS) changed = true
@@ -152,8 +172,15 @@ class PushReceiver : MessagingReceiver() {
         return r != null && token != null && token == r.token
     }
 
-    /** Claims the event right before its first durable commit; past the deadline it throws, so the connector sends no ACK. */
-    private fun claimed() = claim() || throw Abandoned()
+    /**
+     * The event's own first durable write, under the push lock: claimed right before it (past the deadline the claim fails
+     * and this throws, so the connector sends no ACK), reported done when it returned.
+     */
+    private fun durably(prefs: android.content.SharedPreferences, edit: android.content.SharedPreferences.Editor.() -> Unit): Boolean {
+        if (!PushStore.flush(prefs)) throw IOException("push prefs not written") // nothing unrelated after the claim
+        if (handoff?.claim() == false) throw Abandoned()
+        return commit(prefs, edit).also { handoff?.done() }
+    }
 
     private fun commit(prefs: android.content.SharedPreferences, edit: android.content.SharedPreferences.Editor.() -> Unit): Boolean =
         PushStore.commit(prefs, edit) || throw IOException("push prefs not written")
@@ -162,9 +189,8 @@ class PushReceiver : MessagingReceiver() {
         val prefs = pushPrefs(context)
         PushStore.locked {
             if (!trusted(context) || instance != instanceOf(prefs)) return@locked
-            claimed()
             // A failed commit throws: the connector then sends no ACK, and the registration is not confirmed.
-            commit(prefs) { putString(Keys.ENDPOINT_NEW, endpoint.url).putString(Keys.ENDPOINT_NEW_TOKEN, token) }
+            durably(prefs) { putString(Keys.ENDPOINT_NEW, endpoint.url).putString(Keys.ENDPOINT_NEW_TOKEN, token) }
             changed = true
         }
     }
@@ -179,18 +205,22 @@ class PushReceiver : MessagingReceiver() {
         // Under the push lock: no generation or connection change can fall between this check and the wake's commit.
         PushStore.locked {
             if (!trusted(context) || instance != instanceOf(pushPrefs(context))) return@locked
-            claimed()
-            app.testPush?.onWake()
-            val sink = app.pushSink ?: return@locked
-            val handedOff = try {
-                sink.onPush(context, connectionEpoch(context))
-            } catch (e: Exception) {
-                false
-            }
-            if (!handedOff) {
-                lost("wake lost")
-                val wake = context.getSharedPreferences(WAKE_PREFS, Context.MODE_PRIVATE)
-                if (!wake.edit().putLong(WAKE_LOST, wake.getLong(WAKE_LOST, 0) + 1).commit()) lost("loss count not written")
+            if (handoff?.claim() == false) throw Abandoned() // the sink's commit is the event's own first write
+            try {
+                app.testPush?.onWake()
+                val sink = app.pushSink ?: return@locked
+                val handedOff = try {
+                    sink.onPush(context, connectionEpoch(context))
+                } catch (e: Exception) {
+                    false
+                }
+                if (!handedOff) {
+                    lost("wake lost")
+                    val wake = context.getSharedPreferences(WAKE_PREFS, Context.MODE_PRIVATE)
+                    if (!wake.edit().putLong(WAKE_LOST, wake.getLong(WAKE_LOST, 0) + 1).commit()) lost("loss count not written")
+                }
+            } finally {
+                handoff?.done()
             }
         }
     }

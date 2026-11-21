@@ -11,7 +11,6 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
-import xyz.rycerz.apofis.connectionEpoch
 import java.util.concurrent.TimeUnit
 
 /** Runs [PushRegistrar.publishPending] until it reports nothing left; retries (with backoff) whenever it could not act. */
@@ -37,7 +36,12 @@ class PublishWorker(context: Context, params: WorkerParameters) : CoroutineWorke
          * registration is confirmed again once per process (an endpoint update lost to a failed commit is resent).
          */
         fun recover(context: Context, prefs: SharedPreferences = pushPrefs(context)) {
-            if (needsWork(prefs, pushPolicy.distributors(context), connectionEpoch(context)) || prefs.getBoolean(Keys.ENABLED, false)) schedule(context)
+            // Any persisted push state schedules the job, which decides the rest (it reads the connection epoch, not this).
+            if (prefs.getBoolean(Keys.ENABLED, false) || prefs.contains(Keys.REVOKE) || prefs.contains(Keys.UNREGISTERED_INSTANCE) ||
+                prefs.contains(Keys.PENDING_ID)
+            ) {
+                schedule(context)
+            }
             // Revocation is a local broadcast: it runs without waiting for a network.
             if (prefs.contains(Keys.REVOKE)) {
                 WorkManager.getInstance(context).enqueueUniqueWork(LOCAL_NAME, ExistingWorkPolicy.REPLACE, request(local = true))

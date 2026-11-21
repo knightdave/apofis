@@ -142,6 +142,7 @@ class PushReceiverTest {
         deliver(intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)); putExtra("id", "m4") })
         assertTrue(sinkCalls.isEmpty())
         assertTrue(ctx.sent.isEmpty())
+        scheduled.clear() // each failed write asks for recovery again
         // The disk recovers: the next event writes the whole map first and hands the endpoint on for publishing.
         commitsSucceed = true
         deliver(intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) })
@@ -263,22 +264,31 @@ class PushReceiverTest {
         val deadline = mutableListOf<Runnable>()
         var finishes = 0
         var worked = 0
-        admit({ lane += it }, { deadline += it }, { finishes++ }) { _, _ -> worked++ }
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { worked++ }
         deadline.single().run() // the budget runs out while the event still waits for the lane
         assertEquals(1, finishes)
         lane.single().run() // the lane frees up: the abandoned event is not handled (no commit, no ACK)
         assertEquals(0, worked)
         assertEquals(1, finishes)
-        // Started, but the deadline comes before its first durable commit: its claim fails, it commits nothing.
+        // Started, but the deadline comes before its claim: the claim fails, it commits nothing.
         lane.clear(); deadline.clear(); finishes = 0
         var committed = false
-        admit({ lane += it }, { deadline += it }, { finishes++ }) { finish, claim -> deadline.single().run(); if (claim()) committed = true; finish() }
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { h -> deadline.single().run(); if (h.claim()) committed = true; h.finishOnce() }
         lane.single().run()
         assertFalse(committed)
         assertEquals(1, finishes)
-        // Claimed first: the deadline finishes the broadcast on time, the hand-off completes, no second finish.
+        // Claimed, and the deadline comes during its own write: the broadcast is finished only once that write returned.
         lane.clear(); deadline.clear(); finishes = 0
-        admit({ lane += it }, { deadline += it }, { finishes++ }) { finish, claim -> if (claim()) { deadline.single().run(); committed = true }; finish() }
+        admit({ lane += it }, { deadline += it }, { finishes++ }) { h ->
+            if (h.claim()) {
+                deadline.single().run()
+                assertEquals("not finished while its write is in progress", 0, finishes)
+                committed = true
+                h.done()
+                assertEquals(1, finishes)
+            }
+            h.finishOnce()
+        }
         lane.single().run()
         assertTrue(committed)
         assertEquals(1, finishes)
@@ -448,7 +458,8 @@ class PushReceiverTest {
     fun aRevocationPastTheDeadlineIsLeftForRedelivery() = runTest {
         val (r, token) = enabled()
         log.events.clear(); ctx.sent.clear()
-        PushReceiver().receive(ctx, intent("UNREGISTERED", token), finish = { log.step("finish") }, schedule = schedule, claim = { false })
+        val late = Handoff {}.also { it.deadline() } // the deadline came first
+        PushReceiver().receive(ctx, intent("UNREGISTERED", token), finish = { log.step("finish") }, schedule = schedule, handoff = late)
         assertNull(prefs.disk[Keys.UNREGISTERED_INSTANCE])
         assertEquals("not handed to the connector: the registration is intact", listOf("finish"), log.events)
         deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID) })
@@ -467,6 +478,53 @@ class PushReceiverTest {
         restarted.publishPending()
         assertTrue("no REGISTER for the revoked instance", ctx.sent.none { it.action == "org.unifiedpush.android.distributor.REGISTER" })
         assertEquals(PushState.Off, restarted.ui.value.state)
+    }
+
+    // Fix round 5.
+
+    @Test
+    fun anEarlierUnwrittenChangeIsFlushedBeforeTheRevocationIsClaimed() = runTest {
+        val (_, token) = enabled()
+        lateinit var h: Handoff
+        var finished = 0
+        h = Handoff { finished++ }
+        var failNext = false
+        prefs.onCommit = { keys ->
+            log.step("commit ${keys.sorted()}")
+            if (Keys.FLUSH in keys) h.deadline() // the deadline comes while an earlier unwritten change is flushed
+            !failNext.also { failNext = false }
+        }
+        // Once the event is being handled, an unrelated registrar write fails: memory holds it, the disk does not.
+        val revocation = object : Intent("org.unifiedpush.android.connector.UNREGISTERED") {
+            var dirtied = false
+            override fun getStringExtra(name: String): String? {
+                if (name == "token" && !dirtied) {
+                    dirtied = true
+                    failNext = true
+                    assertFalse(PushStore.commit(prefs) { putString(Keys.PENDING_ID, "apofis-push-x-1") })
+                }
+                return super.getStringExtra(name)
+            }
+        }.apply { setPackage(app.packageName); putExtra("token", token) }
+        PushReceiver().receive(ctx, revocation, finish = { h.finishOnce() }, schedule = schedule, handoff = h)
+        assertTrue("the event was never claimed: left for redelivery", h.abandoned())
+        assertNull(prefs.disk[Keys.UNREGISTERED_INSTANCE])
+        assertTrue("not handed to the connector", ctx.sent.none { it.action == "org.unifiedpush.android.distributor.UNREGISTER" })
+        assertEquals(1, finished)
+    }
+
+    @Test
+    fun startupWithPushOffReadsNothingButThePushPrefs() {
+        val read = mutableListOf<String>()
+        val counting = object : android.content.ContextWrapper(app) {
+            override fun getApplicationContext() = this
+            override fun getSharedPreferences(name: String, mode: Int): android.content.SharedPreferences {
+                read += name
+                return super.getSharedPreferences(name, mode)
+            }
+        }
+        recoverPush(counting, null)
+        assertEquals("no connection epoch read at start", listOf(PUSH_PREFS), read)
     }
 }
 
