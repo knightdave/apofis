@@ -20,12 +20,15 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.NonSkippableComposable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.graphics.Color
+import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -61,21 +64,41 @@ private const val MIN_SHOWN_DURATION_S = 0.1
 // The sheet shows the whole value; the end-to-end suite only reads short previews, which pass unchanged.
 private const val ONE_LINE_MAX = 1000
 
-/** The steps a card shows: [shown] with their indices in the reply, after [hidden] earlier ones. */
-internal data class VisibleSteps(val hidden: Int, val shown: List<IndexedValue<Step>>)
+/** An expanded card shows at most this many steps at a time, with Earlier and Later rows to move through the rest. */
+internal const val STEP_PAGE = 40
 
-/** More than two steps and not [expanded]: the last two, the rest hidden. Builds only the shown entries. */
-internal fun visibleSteps(steps: List<Step>, expanded: Boolean): VisibleSteps {
-    val hidden = if (expanded || steps.size <= 2) 0 else steps.size - 2
-    return VisibleSteps(hidden, List(steps.size - hidden) { IndexedValue(hidden + it, steps[hidden + it]) })
+/** Long text (reasoning, a tool's arguments or result) is laid out one page at a time: at most this many characters... */
+internal const val TEXT_PAGE_CHARS = 1500
+
+/** ...and at most this many line breaks. */
+internal const val TEXT_PAGE_LINES = 24
+
+/**
+ * The steps a card shows: [shown] with their indices in the reply, after [hidden] earlier ones and before [later] ones
+ * (only on an expanded card paged back from the newest steps).
+ */
+internal data class VisibleSteps(val hidden: Int, val shown: List<IndexedValue<Step>>, val later: Int = 0)
+
+/**
+ * More than two steps and not [expanded]: the last two, the rest hidden. Expanded: one page of at most [STEP_PAGE]
+ * steps, [page] 0 being the newest. Reads and builds only the shown entries.
+ */
+internal fun visibleSteps(steps: List<Step>, expanded: Boolean, page: Int = 0): VisibleSteps {
+    val size = steps.size
+    val back = minOf(page.coerceAtLeast(0).toLong() * STEP_PAGE, size.toLong()).toInt() // steps after the page
+    val end = if (expanded) maxOf(minOf(size, STEP_PAGE), size - back) else size
+    val start = if (expanded) maxOf(0, end - STEP_PAGE) else if (size <= 2) 0 else size - 2
+    return VisibleSteps(start, List(end - start) { IndexedValue(start + it, steps[start + it]) }, size - end)
 }
 
 /**
  * The reply's reasoning and tool steps on a tinted card with a rail. More than two steps fold to the last two below a
- * "Show N more steps" row. Tool step i is tagged "[tag]:i:<tool name>", a reasoning step "[tag]:i" (indices in
- * [AssistantReply.steps], also while folded). [onStep] gets a tapped tool step's index; reasoning opens in place.
- * Expanded and open states are saved by reply key, so the stored reply that replaces a live one keeps them.
+ * "Show N more steps" row; expanded, a long run is paged ([STEP_PAGE]). Tool step i is tagged "[tag]:i:<tool name>", a
+ * reasoning step "[tag]:i" (indices in [AssistantReply.steps], also while folded). [onStep] gets a tapped tool step's
+ * index; reasoning opens in place. Expanded, page and open states are saved by reply key, so the stored reply that
+ * replaces a live one keeps them.
  */
+@NonSkippableComposable // comparing two replies would compare their steps one by one; the body below is constant work
 @Composable
 internal fun TimelineCard(
     reply: AssistantReply,
@@ -86,13 +109,22 @@ internal fun TimelineCard(
 ) {
     val click by rememberUpdatedState(onStep)
     val open = remember { { i: Int -> click(i) } } // stable, so streamed text recomposes no step row
-    Steps(reply.key, reply.steps, tag, open, initiallyExpanded, initiallyOpenReasoning)
+    val last = remember { arrayOfNulls<StepsRef>(1) }
+    val ref = last[0]?.takeIf { it.steps === reply.steps } ?: StepsRef(reply.steps).also { last[0] = it }
+    Steps(reply.key, ref, tag, open, initiallyExpanded, initiallyOpenReasoning)
 }
 
+/** A steps list compared by identity: a new list is a new value, found without visiting its steps. */
+private class StepsRef(val steps: List<Step>)
+
 @Composable
-private fun Steps(replyKey: String, steps: List<Step>, tag: String, onStep: (Int) -> Unit, initiallyExpanded: Boolean, initiallyOpenReasoning: Set<Int>) {
+private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) -> Unit, initiallyExpanded: Boolean, initiallyOpenReasoning: Set<Int>) {
+    val steps = ref.steps
     var expanded by rememberSaveable(replyKey) { mutableStateOf(initiallyExpanded) }
-    val visible = remember(steps, expanded) { visibleSteps(steps, expanded) }
+    var page by rememberSaveable(replyKey) { mutableIntStateOf(0) }
+    // Card scope, so folding the card does not forget which reasoning steps were open (indices only, never text).
+    var opened by rememberSaveable(replyKey) { mutableStateOf(initiallyOpenReasoning.sorted()) }
+    val visible = visibleSteps(steps, expanded, page)
     Column(
         Modifier
             .padding(horizontal = 16.dp, vertical = 6.dp)
@@ -101,17 +133,43 @@ private fun Steps(replyKey: String, steps: List<Step>, tag: String, onStep: (Int
             .animateContentSize(tween(Motion.TIMELINE_SIZE, easing = EaseOutCubic))
             .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
-        if (steps.size > 2) ExpandRow(expanded, steps.size - 2) { expanded = !expanded }
+        if (steps.size > 2) {
+            ExpandRow(expanded, steps.size - 2) {
+                expanded = !expanded
+                page = 0
+            }
+        }
+        if (expanded && visible.hidden > 0) PageRow(stringResource(R.string.steps_earlier, visible.hidden)) { page++ }
         val last = visible.shown.lastIndex
         visible.shown.forEachIndexed { position, (i, step) ->
-            key(i) {
+            // Keyed by what the row shows: another call at the same index is a new row, so a press on the old one ends.
+            key(i, subjectKey(step)) {
                 val rail = Rail(above = position > 0, below = position < last)
                 when (step) {
                     is ToolStep -> ToolRow(step, rail, Modifier.testTag("$tag:$i:${step.name}")) { onStep(i) }
-                    is ReasoningStep -> ReasoningRow(step, rail, replyKey, i, i in initiallyOpenReasoning, Modifier.testTag("$tag:$i"))
+                    is ReasoningStep -> ReasoningRow(step, rail, i, i in opened, Modifier.testTag("$tag:$i")) {
+                        opened = if (i in opened) opened - i else opened + i
+                    }
                 }
             }
         }
+        if (expanded && visible.later > 0) PageRow(stringResource(R.string.steps_later, visible.later)) { page = (page - 1).coerceAtLeast(0) }
+    }
+}
+
+private fun subjectKey(step: Step): String = when (step) {
+    is ToolStep -> step.callId.ifEmpty { "#" + step.name }
+    is ReasoningStep -> "reasoning"
+}
+
+@Composable
+private fun PageRow(label: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onClick),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.width(32.dp))
+        Text(label, style = MaterialTheme.typography.labelLarge, color = ApofisTheme.colors.timelineStrong)
     }
 }
 
@@ -188,20 +246,23 @@ private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, onClick: () 
 }
 
 @Composable
-private fun ReasoningRow(step: ReasoningStep, rail: Rail, replyKey: String, index: Int, initiallyOpen: Boolean, modifier: Modifier) {
+private fun ReasoningRow(step: ReasoningStep, rail: Rail, index: Int, open: Boolean, modifier: Modifier, onToggle: () -> Unit) {
     val colors = ApofisTheme.colors
-    var open by rememberSaveable(replyKey, index) { mutableStateOf(initiallyOpen) }
     val state = stringResource(if (open) R.string.state_expanded else R.string.state_collapsed)
     val rotation by animateFloatAsState(if (open) 90f else 0f, tween(Motion.CHEVRON, easing = EaseOutCubic), label = "reasoning")
     StepRow(
         rail,
-        modifier.clickable(role = Role.Button) { open = !open }.semantics(mergeDescendants = true) { stateDescription = state },
+        modifier.clickable(role = Role.Button, onClick = onToggle).semantics(mergeDescendants = true) { stateDescription = state },
         icon = { Icon(painterResource(R.drawable.lucide_lightbulb), null, Modifier.size(18.dp), tint = colors.timelineStrong) },
         trailing = {
             Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.padding(start = 4.dp).size(16.dp).rotate(rotation), tint = colors.timelineMuted)
         },
         body = if (open && step.text.isNotEmpty()) {
-            { Text(step.text, style = MaterialTheme.typography.bodySmall, color = colors.timelineBody) }
+            {
+                PagedText(step.text, "reasoning:$index", colors.timelineMuted) { part, m ->
+                    Text(part, m, style = MaterialTheme.typography.bodySmall, color = colors.timelineBody)
+                }
+            }
         } else {
             null
         },
@@ -260,8 +321,60 @@ internal fun MiniDots(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * [text] one page at a time ([textPages]), with Previous and Next buttons and "Part k of n" when there is more than one.
+ * [page] draws a page's text with the modifier it is given (tagged "[tag].page"); the pager is tagged [tag].
+ */
+@Composable
+internal fun PagedText(text: String, tag: String, labelColor: Color, page: @Composable (String, Modifier) -> Unit) {
+    val starts = remember(text) { textPages(text) }
+    var index by rememberSaveable(tag) { mutableIntStateOf(0) }
+    val i = index.coerceIn(0, starts.lastIndex)
+    Column(Modifier.testTag(tag)) {
+        page(text.substring(starts[i], starts.getOrElse(i + 1) { text.length }), Modifier.testTag("$tag.page"))
+        if (starts.size > 1) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                ApofisIconButton({ index = i - 1 }, stringResource(R.string.page_previous), enabled = i > 0, visualSize = 24.dp) {
+                    Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(16.dp).rotate(180f), tint = labelColor)
+                }
+                Text(stringResource(R.string.page_of, i + 1, starts.size), style = MaterialTheme.typography.labelSmall, color = labelColor)
+                ApofisIconButton({ index = i + 1 }, stringResource(R.string.page_next), enabled = i < starts.lastIndex, visualSize = 24.dp) {
+                    Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(16.dp), tint = labelColor)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Where each page of [text] starts: pages of at most [TEXT_PAGE_CHARS] characters and [TEXT_PAGE_LINES] line breaks,
+ * cut after a line break when one is in reach, never between the halves of a surrogate pair. Together the pages are
+ * exactly [text]. One forward pass.
+ */
+internal fun textPages(text: String): List<Int> {
+    val starts = arrayListOf(0)
+    var s = 0
+    while (true) {
+        var e = s
+        var lines = 0
+        var lastBreak = -1
+        while (e < text.length && e - s < TEXT_PAGE_CHARS && lines < TEXT_PAGE_LINES) {
+            if (text[e] == '\n') {
+                lines++
+                lastBreak = e + 1
+            }
+            e++
+        }
+        if (e >= text.length) return starts
+        var cut = if (lines >= TEXT_PAGE_LINES || lastBreak <= s) e else lastBreak
+        if (Character.isLowSurrogate(text[cut]) && cut - 1 > s) cut--
+        starts += cut
+        s = cut
+    }
+}
+
 /** At most [ONE_LINE_MAX] characters, never ending on half a surrogate pair. */
-private fun oneLine(text: String): String {
+internal fun oneLine(text: String): String {
     if (text.length <= ONE_LINE_MAX) return text
     val end = if (Character.isHighSurrogate(text[ONE_LINE_MAX - 1])) ONE_LINE_MAX - 1 else ONE_LINE_MAX
     return text.substring(0, end)

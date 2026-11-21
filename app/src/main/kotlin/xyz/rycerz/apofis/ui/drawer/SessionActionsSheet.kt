@@ -5,6 +5,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import xyz.rycerz.apofis.ui.theme.wash
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
@@ -54,30 +56,38 @@ fun PromptHost(prompt: Prompt, actions: PromptActions) {
 @Composable
 fun SessionActionsSheet(prompt: Prompt, actions: PromptActions) {
     val token = prompt.token
-    ApofisSheet(onDismiss = { actions.dismiss(token) }) {
-        Text(
-            prompt.title.ifEmpty { stringResource(R.string.chat_new_title) },
-            Modifier.padding(start = 14.dp, bottom = 8.dp),
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        val enabled = !prompt.busy
-        if (prompt.archived) {
-            SheetRow(R.drawable.lucide_archive_arrow_up, stringResource(R.string.drawer_unarchive), { actions.archive(token, false) }, enabled = enabled)
-        } else {
-            SheetRow(R.drawable.lucide_pencil, stringResource(R.string.drawer_rename), { actions.openRename(token) }, enabled = enabled)
-            if (prompt.pinned) {
-                SheetRow(R.drawable.lucide_pin_off, stringResource(R.string.drawer_unpin), { actions.pin(token, false) }, enabled = enabled)
-            } else {
-                SheetRow(R.drawable.lucide_pin, stringResource(R.string.drawer_pin), { actions.pin(token, true) }, enabled = enabled)
-            }
-            SheetRow(R.drawable.lucide_archive, stringResource(R.string.drawer_archive), { actions.archive(token, true) }, enabled = enabled)
-        }
-        SheetRow(R.drawable.lucide_trash, stringResource(R.string.drawer_delete), { actions.openDelete(token) }, enabled = enabled, color = MaterialTheme.colorScheme.error)
-        ErrorLine(prompt.error, Modifier.padding(start = 14.dp, top = 8.dp))
+    // Busy: an action is running and its failure shows here, so the sheet cannot be dismissed until it ends.
+    // The body scrolls, so the last action stays reachable in a short window.
+    ApofisSheet(onDismiss = { actions.dismiss(token) }, dismissible = !prompt.busy) {
+        Column(Modifier.verticalScroll(rememberScrollState())) { SessionActions(prompt, actions) }
     }
+}
+
+@Composable
+private fun SessionActions(prompt: Prompt, actions: PromptActions) {
+    val token = prompt.token
+    Text(
+        prompt.title.ifEmpty { stringResource(R.string.chat_new_title) },
+        Modifier.padding(start = 14.dp, bottom = 8.dp),
+        style = MaterialTheme.typography.titleMedium,
+        color = MaterialTheme.colorScheme.onSurface,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+    val enabled = !prompt.busy
+    if (prompt.archived) {
+        SheetRow(R.drawable.lucide_archive_arrow_up, stringResource(R.string.drawer_unarchive), { actions.archive(token, false) }, enabled = enabled)
+    } else {
+        SheetRow(R.drawable.lucide_pencil, stringResource(R.string.drawer_rename), { actions.openRename(token) }, enabled = enabled)
+        if (prompt.pinned) {
+            SheetRow(R.drawable.lucide_pin_off, stringResource(R.string.drawer_unpin), { actions.pin(token, false) }, enabled = enabled)
+        } else {
+            SheetRow(R.drawable.lucide_pin, stringResource(R.string.drawer_pin), { actions.pin(token, true) }, enabled = enabled)
+        }
+        SheetRow(R.drawable.lucide_archive, stringResource(R.string.drawer_archive), { actions.archive(token, true) }, enabled = enabled)
+    }
+    SheetRow(R.drawable.lucide_trash, stringResource(R.string.drawer_delete), { actions.openDelete(token) }, enabled = enabled, color = MaterialTheme.colorScheme.error)
+    ErrorLine(prompt.error, Modifier.padding(start = 14.dp, top = 8.dp))
 }
 
 @Composable

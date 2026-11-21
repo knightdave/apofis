@@ -26,6 +26,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalViewConfiguration
+import android.os.SystemClock
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -144,11 +147,17 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Req
             if (live.connection == Connection.RECONNECTING) Label(R.string.chat_reconnecting)
             if (pending != null) {
                 val changed = showsChanged(notes, pending)
+                // An answer needs a request the user has seen: one just shown or replaced ignores taps for a double-tap
+                // interval, so the second tap of a double tap never answers the request that appeared between the taps.
+                val clock = LocalAnswerClock.current
+                val shownAt = remember(pending.requestId, pending.executionGeneration) { clock() }
+                val settle = LocalViewConfiguration.current.doubleTapTimeoutMillis
+                val seen = { clock() - shownAt >= settle }
                 // A request with another id or generation is a new block: an open menu or typed answer never carries over.
                 key(pending.requestId, pending.executionGeneration) {
                     when (pending.kind) {
-                        "approval" -> ApprovalBlock(pending, changed, answering, actions::onApproval)
-                        "clarify" -> ClarifyBlock(pending, changed, answering, actions::onClarify)
+                        "approval" -> ApprovalBlock(pending, changed, answering) { id, gen, choice -> if (seen()) actions.onApproval(id, gen, choice) }
+                        "clarify" -> ClarifyBlock(pending, changed, answering) { id, gen, answer -> if (seen()) actions.onClarify(id, gen, answer) }
                         else -> UnsupportedBlock()
                     }
                 }
@@ -163,6 +172,9 @@ internal fun ReplyFooter(reply: AssistantReply, live: LiveReply?, notes: Map<Req
         }
     }
 }
+
+/** Monotonic milliseconds for the answer guard in [ReplyFooter]; tests provide their manual clock. */
+internal val LocalAnswerClock = staticCompositionLocalOf<() -> Long> { SystemClock::uptimeMillis }
 
 /** True when [pending] is the request that replaced an answered one (same id with a new generation included). */
 internal fun showsChanged(notes: Map<RequestRef, AnswerNote>, pending: PendingControl): Boolean {

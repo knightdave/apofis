@@ -19,6 +19,8 @@ import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Step
 import xyz.rycerz.apofis.chat.ToolStep
+import xyz.rycerz.apofis.chat.TOOL_RESULT_DISPLAY_LIMIT
+import androidx.compose.ui.text.style.TextOverflow
 import xyz.rycerz.apofis.ui.theme.ApofisSheet
 import xyz.rycerz.apofis.ui.theme.ChatText
 
@@ -77,32 +79,40 @@ internal class StepIndex {
     }
 }
 
-/** A tool step in full: name, arguments and the (display-truncated) result. [live]: from the reply still running. */
+/**
+ * A tool step in full: name, arguments and the (display-truncated) result. [live]: from the reply still running. Live
+ * previews have no limit of their own, so they are cut to the stored display limit here (with the shortened hint), and
+ * every long text is laid out one page at a time.
+ */
 @Composable
 internal fun ToolDetailSheet(step: ToolStep, live: Boolean, onDismiss: () -> Unit) {
     ApofisSheet(onDismiss) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
             Text(
-                step.name,
+                oneLine(step.name),
                 Modifier.semantics { heading() },
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
             )
             if (step.args.isNotEmpty()) {
-                Section(stringResource(R.string.tool_arguments), step.args)
+                Section(stringResource(R.string.tool_arguments), step.args, "sheet.args")
                 if (step.argsTruncated) Hint(stringResource(R.string.tool_args_truncated))
             } else {
                 // Live steps carry only the server's short preview; the stored transcript has the full arguments.
-                Section(stringResource(R.string.tool_arguments), step.argsPreview)
+                Section(stringResource(R.string.tool_arguments), step.argsPreview.take(TOOL_RESULT_DISPLAY_LIMIT), "sheet.args")
+                if (step.argsPreview.length > TOOL_RESULT_DISPLAY_LIMIT) Hint(stringResource(R.string.tool_args_truncated))
                 if (live) Hint(stringResource(R.string.tool_args_later))
             }
             val result = step.result
             Section(
                 stringResource(R.string.tool_result),
-                result ?: stringResource(if (step.running) R.string.chat_tool_running else R.string.tool_no_result),
+                result?.take(TOOL_RESULT_DISPLAY_LIMIT) ?: stringResource(if (step.running) R.string.chat_tool_running else R.string.tool_no_result),
+                "sheet.result",
                 code = result != null,
             )
-            if (step.resultTruncated) Hint(stringResource(R.string.tool_truncated))
+            if (step.resultTruncated || (result?.length ?: 0) > TOOL_RESULT_DISPLAY_LIMIT) Hint(stringResource(R.string.tool_truncated))
         }
     }
 }
@@ -113,24 +123,27 @@ private fun Hint(text: String) {
 }
 
 @Composable
-private fun Section(title: String, body: String, code: Boolean = true) {
+private fun Section(title: String, body: String, tag: String, code: Boolean = true) {
     Text(
         title,
         Modifier.padding(top = 16.dp, bottom = 6.dp).semantics { heading() },
         style = MaterialTheme.typography.labelLarge,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
     if (!code || body.isEmpty()) {
-        Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+        PagedText(body, tag, muted) { part, m -> Text(part, m, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface) }
         return
     }
-    CodeSurface {
-        Text(
-            body,
-            Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
-            style = ChatText.code,
-            color = MaterialTheme.colorScheme.onSurface,
-            softWrap = false,
-        )
+    PagedText(body, tag, muted) { part, m ->
+        CodeSurface {
+            Text(
+                part,
+                m.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+                style = ChatText.code,
+                color = MaterialTheme.colorScheme.onSurface,
+                softWrap = false,
+            )
+        }
     }
 }

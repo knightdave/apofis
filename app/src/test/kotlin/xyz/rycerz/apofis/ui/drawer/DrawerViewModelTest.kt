@@ -513,4 +513,44 @@ class DrawerViewModelTest {
         assertFalse(chats.getValue("apofis-b").running)
         assertFalse(chats.getValue("apofis-c").running || chats.getValue("apofis-c").needsInput)
     }
+
+    @Test
+    fun anActionsSheetClosesWhenARefreshRemovesItsChat() = runTest {
+        addSession("apofis-a", "Gone on the server")
+        addSession("apofis-b", "Still there", active = clock.get() / 1000.0 - 60)
+        routes["GET /api/sessions"] = listing("apofis-b")
+        val vm = vm()
+        vm.rows.await { it.chats().size == 2 }
+        vm.onLongPress("apofis-a")
+        assertEquals("apofis-a", vm.prompt.value!!.key)
+        vm.onOpen()
+        vm.prompt.await { it == null }
+    }
+
+    @Test
+    fun aRefreshLeavesTheSheetOfAChatThatIsStillThere() = runTest {
+        addSession("apofis-a", "Gone on the server")
+        addSession("apofis-b", "Still there", active = clock.get() / 1000.0 - 60)
+        routes["GET /api/sessions"] = listing("apofis-b")
+        val vm = vm()
+        vm.rows.await { it.chats().size == 2 }
+        vm.onLongPress("apofis-b")
+        val forB = vm.prompt.value!!
+        vm.onOpen()
+        vm.rows.await { it.chats().none { c -> c.key == "apofis-a" } }
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.selected.value == "apofis-a") delay(5) } }
+        assertEquals(forB, vm.prompt.value)
+    }
+
+    @Test
+    fun archivingTheChatOfAnOpenSheetDoesNotCloseIt() = runTest {
+        addSession("apofis-a", "Kept")
+        val vm = vm()
+        vm.rows.await { it.chats().size == 1 }
+        vm.onLongPress("apofis-a")
+        val prompt = vm.prompt.value!!
+        db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(archived = true)) // archived elsewhere: still here
+        vm.rows.await { it.chats().isEmpty() }
+        assertEquals(prompt, vm.prompt.value)
+    }
 }

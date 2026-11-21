@@ -85,6 +85,10 @@ class ThemeTokensTest {
             floor("actionIcon", c.actionIcon, page, 3.0)
             floor("warning", c.warning, page, 3.0)
             floor("warning on cardFill", c.warning, c.cardFill, 3.0)
+            floor("warning on timelineFill", c.warning, c.timelineFill, 3.0) // the approval card
+            floor("handle over the sheet", c.handle.compositeOver(page), page, 3.0)
+            floor("error on timelineFill", scheme.error, c.timelineFill, 4.5) // a failed step's title
+            floor("onSurfaceVariant on timelineFill", scheme.onSurfaceVariant, c.timelineFill, 4.5) // control card text
         }
         assertEquals(emptyList<String>(), failures)
     }

@@ -177,7 +177,10 @@ class DrawerViewModel(
             }
             refreshing = false
             refreshFailedFlow.value = failed
-            if (!failed) reconcile()
+            if (!failed) {
+                reconcile()
+                closeGonePrompt()
+            }
         }
     }
 
@@ -317,6 +320,21 @@ class DrawerViewModel(
                 val current = selectedFlow.value ?: return@withLock
                 if (!usable(current)) openNew()
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // closed by a server switch: this view model is about to go away
+        }
+    }
+
+    /**
+     * After a refresh: an idle prompt whose chat is gone from this phone (removed, not archived) closes, only that
+     * prompt, by token. A busy one stays, so its outcome still shows.
+     */
+    private suspend fun closeGonePrompt() {
+        try {
+            val gone = promptFlow.value?.takeIf { !it.busy && !usable(it.key) } ?: return
+            promptFlow.update { if (it?.token == gone.token && !it.busy) null else it }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {

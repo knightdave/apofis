@@ -1,6 +1,9 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -61,7 +64,12 @@ class ControlBlockTest {
 
     @Composable
     private fun Themed(content: @Composable () -> Unit) =
-        ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false, content = content)
+        ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+            CompositionLocalProvider(LocalAnswerClock provides { rule.mainClock.currentTime }, content = content)
+        }
+
+    /** Past the answer guard: the request on screen has been seen. */
+    private fun seen() = rule.mainClock.advanceTimeBy(400)
 
     private fun same(a: ImageBitmap, b: ImageBitmap) = a.toPixelMap().buffer.contentEquals(b.toPixelMap().buffer)
 
@@ -70,6 +78,7 @@ class ControlBlockTest {
         var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "rm -rf ~/old", null))
         rule.setContent { Themed { ReplyFooter(reply, live(pending), emptyMap(), answering = false, actions) } }
         rule.onNodeWithText("Hermes wants to run a command").assert(isHeading())
+        seen()
         rule.onNodeWithText("Allow once").performClick()
         assertEquals(Triple("ctl_1", 1L, ApprovalChoice.ONCE), choices.last())
 
@@ -79,11 +88,13 @@ class ControlBlockTest {
         rule.waitForIdle()
         assertEquals("an open menu never carries over to a new request", 0, rule.onAllNodesWithTextCount("Always allow"))
         rule.onNodeWithText("rm -rf ~/older").assertExists()
+        seen()
         rule.onNodeWithText("Deny").performClick()
         assertEquals(Triple("ctl_1", 2L, ApprovalChoice.DENY), choices.last())
 
         pending = PendingControl("approval", "ctl_2", 2, "ls", null)
         rule.waitForIdle()
+        seen()
         rule.onNodeWithContentDescription("More approval options").performClick()
         rule.onNodeWithText("Allow for this chat").performClick()
         assertEquals(Triple("ctl_2", 2L, ApprovalChoice.SESSION), choices.last())
@@ -135,6 +146,103 @@ class ControlBlockTest {
             rule.onNodeWithContentDescription("More approval options").requestFocus() // move focus off before the next pill
             rule.mainClock.advanceTimeBy(320)
         }
+        assertTrue(choices.isEmpty())
+    }
+
+    // ---- fix round 1: an answer needs a request the user has seen ----
+
+    private fun guarded(pending: () -> PendingControl?, answering: () -> Boolean = { false }) = rule.setContent {
+        Themed { ReplyFooter(reply, live(pending()), emptyMap(), answering(), actions) }
+    }
+
+    private fun advance(ms: Long) {
+        Snapshot.sendApplyNotifications()
+        rule.mainClock.advanceTimeBy(ms)
+    }
+
+    @Test
+    fun aSuccessorDoesNotTakeTheSecondTapOfADoubleTap() {
+        rule.mainClock.autoAdvance = false
+        var pending by mutableStateOf(PendingControl("approval", "ctl_a", 1, "rm a", null))
+        guarded({ pending })
+        advance(1000)
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(listOf(Triple("ctl_a", 1L, ApprovalChoice.ONCE)), choices)
+
+        pending = PendingControl("approval", "ctl_b", 1, "rm b", null) // appears between the two taps
+        advance(16)
+        rule.onNodeWithText("rm b").assertExists()
+        advance(100)
+        rule.onNodeWithText("Allow once").performClick() // the trailing tap: answers nothing
+        rule.onNodeWithText("Deny").performClick()
+        rule.onNodeWithContentDescription("More approval options").performClick()
+        advance(16)
+        rule.onNodeWithText("Always allow").performClick()
+        advance(16)
+        assertEquals(1, choices.size)
+
+        advance(400) // seen long enough: a deliberate tap answers the successor, once
+        rule.onNodeWithText("Allow once").performClick()
+        advance(16)
+        assertEquals(listOf(Triple("ctl_a", 1L, ApprovalChoice.ONCE), Triple("ctl_b", 1L, ApprovalChoice.ONCE)), choices)
+    }
+
+    @Test
+    fun aNewGenerationAlsoWaitsAndMenuOptionsAnswerAfterTheInterval() {
+        rule.mainClock.autoAdvance = false
+        var pending by mutableStateOf(PendingControl("approval", "ctl_a", 1, "rm a", null))
+        guarded({ pending })
+        advance(16)
+        rule.onNodeWithText("Deny").performClick() // just shown: nothing
+        advance(16)
+        assertTrue(choices.isEmpty())
+        advance(1000)
+        pending = pending.copy(executionGeneration = 2)
+        advance(16)
+        rule.onNodeWithContentDescription("More approval options").performClick()
+        advance(16)
+        rule.onNodeWithText("Allow for this chat").performClick()
+        advance(16)
+        assertTrue("a replaced generation is a new request", choices.isEmpty())
+        advance(1000)
+        rule.onNodeWithContentDescription("More approval options").performClick()
+        advance(16)
+        rule.onNodeWithText("Always allow").performClick()
+        advance(16)
+        assertEquals(listOf(Triple("ctl_a", 2L, ApprovalChoice.ALWAYS)), choices)
+    }
+
+    @Test
+    fun aPressThatBeganBeforeTheSuccessorNeverAnswersIt() {
+        rule.mainClock.autoAdvance = false
+        var n = 0
+        var pending by mutableStateOf(PendingControl("approval", "ctl_0", 1, "rm 0", null))
+        guarded({ pending })
+        advance(1000)
+        for (label in listOf("Deny", "Allow once", "Allow for this chat", "Always allow")) {
+            val inMenu = label.startsWith("Allow f") || label.startsWith("Always")
+            if (inMenu) {
+                rule.onNodeWithContentDescription("More approval options").performClick()
+                advance(16)
+            }
+            rule.onNodeWithText(label).performTouchInput { down(center) }
+            advance(16)
+            pending = PendingControl("approval", "ctl_${++n}", 1, "rm $n", null)
+            advance(1000) // even long after the successor appeared
+            // A pill's finger lifts on the same window; a menu's window is gone with the old request.
+            if (!inMenu) rule.onRoot().performTouchInput { up() }
+            advance(16)
+            assertTrue("$label answered the successor", choices.isEmpty())
+            assertEquals("the old menu is closed", 0, rule.onAllNodesWithTextCount("Always allow"))
+        }
+    }
+
+    @Test
+    fun answeringDisablesEveryChoice() {
+        var pending by mutableStateOf(PendingControl("approval", "ctl_a", 1, "rm a", null))
+        guarded({ pending }, answering = { true })
+        for (label in listOf("Deny", "Allow once")) rule.onNodeWithText(label).assertIsNotEnabled().performClick()
+        rule.onNodeWithContentDescription("More approval options").assertIsNotEnabled()
         assertTrue(choices.isEmpty())
     }
 }

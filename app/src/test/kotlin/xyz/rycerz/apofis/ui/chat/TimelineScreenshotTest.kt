@@ -7,6 +7,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.hasText
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -45,7 +46,7 @@ class TimelineScreenshotTest {
         FIXED_NOW,
     )
 
-    private fun card(name: String, expanded: Boolean = false, open: Set<Int> = emptySet()) = shot(name) {
+    private fun card(name: String, expanded: Boolean = false, open: Set<Int> = emptySet()) = rule.shot(name) {
         Column(Modifier.width(360.dp).background(MaterialTheme.colorScheme.surface)) {
             TimelineCard(reply, "step:r2", onStep = {}, initiallyExpanded = expanded, initiallyOpenReasoning = open)
         }
@@ -61,5 +62,5 @@ class TimelineScreenshotTest {
     fun timeline_reasoning_open() = card("timeline_reasoning_open", expanded = true, open = setOf(0))
 
     @Test
-    fun tool_detail_sheet() = rule.windowShot("tool_detail_sheet") { ToolDetailSheet(du, live = false, onDismiss = {}) }
+    fun tool_detail_sheet() = rule.windowShot("tool_detail_sheet", hasText("Arguments")) { ToolDetailSheet(du, live = false, onDismiss = {}) }
 }
