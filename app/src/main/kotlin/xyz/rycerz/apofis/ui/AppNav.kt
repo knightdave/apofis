@@ -186,11 +186,9 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         }
     }
     val drawerButton: @Composable () -> Unit = {
-        ApofisIconButton(onClick = {
+        DrawerButton {
             keyboard?.hide()
             scope.launch { drawerState.open() }
-        }, contentDescription = stringResource(R.string.drawer_open)) {
-            Icon(painterResource(R.drawable.lucide_menu), contentDescription = null, Modifier.size(20.dp))
         }
     }
     val newChatButton: @Composable RowScope.() -> Unit = {
@@ -247,4 +245,12 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         }
     }
     prompt?.let { PromptHost(it, drawer) }
+}
+
+/** The chat bar's drawer button: a 20 dp glyph in a 40 dp box, 48 dp target. */
+@Composable
+internal fun DrawerButton(onClick: () -> Unit) {
+    ApofisIconButton(onClick, contentDescription = stringResource(R.string.drawer_open), visualSize = 40.dp) {
+        Icon(painterResource(R.drawable.lucide_menu), contentDescription = null, Modifier.size(20.dp))
+    }
 }

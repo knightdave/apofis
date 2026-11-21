@@ -23,10 +23,13 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             tools:node="remove" />
         <!-- singleTask: a second instance would take over the app-wide Back target the Connect screen uses. -->
+        <!-- adjustResize: the system does not pan the window for the keyboard; the chat applies the keyboard inset itself
+             (imePadding), once. With the default the window was panned as well and the composer moved up twice. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

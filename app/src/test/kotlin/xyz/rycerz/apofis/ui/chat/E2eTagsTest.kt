@@ -32,6 +32,7 @@ import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.ui.FIXED_NOW
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.FIXED_TODAY
+import xyz.rycerz.apofis.ui.DrawerButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
 /** The tags and states the end-to-end suite (e2e/src) reads, on the unmerged tree as the accessibility service sees them. */
@@ -107,5 +108,23 @@ class E2eTagsTest {
             useUnmergedTree = true,
         ).fetchSemanticsNodes()
         assertEquals(1, replyActions.size)
+    }
+
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test
+    fun chromeTags() {
+        val state = ChatUiState("apofis-1", "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, "", "hermes.example")
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                Box(Modifier.semantics { testTagsAsResourceId = true }) {
+                    ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, navigationIcon = { DrawerButton {} }, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+                }
+            }
+        }
+        assertEquals(1, count("chat.key:apofis-1"))
+        assertEquals(1, count("chat.title"))
+        assertEquals(1, rule.onAllNodes(hasTestTag("chat.title") and hasText("New chat"), useUnmergedTree = true).fetchSemanticsNodes().size)
+        assertEquals(1, count("status.line"))
+        assertEquals(1, rule.onAllNodes(hasContentDescription("Open chat list"), useUnmergedTree = true).fetchSemanticsNodes().size)
     }
 }

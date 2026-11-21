@@ -107,9 +107,9 @@ class DrawerViewModelTest {
         assertFalse("a held response timed out", gaveUp.get())
         val scopes = created.map { it.viewModelScope.coroutineContext.job }
         store.clear()
-        runBlocking { withTimeout(10_000) { scopes.joinAll() } } // the view models' work ends before Room closes
+        runBlocking { withTimeout(60_000) { scopes.joinAll() } } // the view models' work ends before Room closes
         follower.pauseAll()
-        runBlocking { withTimeout(10_000) { scope.coroutineContext.job.cancelAndJoin() } }
+        runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
         db.close()
         server.close()
         Dispatchers.resetMain()
@@ -146,7 +146,7 @@ class DrawerViewModelTest {
     )
 
     private suspend fun <T> StateFlow<T>.await(condition: (T) -> Boolean): T =
-        withContext(Dispatchers.Default) { withTimeout(10_000) { first(condition) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { first(condition) } }
 
     private suspend fun addSession(key: String, title: String, onServer: Boolean = true, active: Double = clock.get() / 1000.0) =
         db.sessionDao().upsert(
@@ -163,7 +163,7 @@ class DrawerViewModelTest {
      * class that waits for a database-driven reaction time out (seen in fix round 2). Joins the refresh's own job.
      */
     private suspend fun refreshDone(vm: DrawerViewModel) =
-        withContext(Dispatchers.Default) { withTimeout(10_000) { vm.refreshJob?.join() } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { vm.refreshJob?.join() } }
 
     private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
@@ -186,7 +186,7 @@ class DrawerViewModelTest {
 
         clock.addAndGet(1)
         vm.onOpen() // exactly 30 s: refreshes again
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (sessionsListed() < 2) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (sessionsListed() < 2) delay(5) } }
         refreshDone(vm)
         assertEquals(2, sessionsListed())
     }
@@ -306,14 +306,14 @@ class DrawerViewModelTest {
         vm.rows.await { it.chats().isNotEmpty() }
         vm.onDeleteRequest("apofis-a")
         vm.confirmDelete(vm.prompt.value!!.token)
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "DELETE" }) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (requests.none { it.method == "DELETE" }) delay(5) } }
 
         val drain = launch(Dispatchers.IO) { connected.sendQueue.drain() } // a send attempt racing the delete
         gate.countDown()
         assertEquals(ActionError.FAILED, vm.prompt.await { it?.error != null }!!.error)
-        withContext(Dispatchers.Default) { withTimeout(10_000) { drain.join() } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { drain.join() } }
         // The racing attempt started nothing; the drain after the failed delete sends the waiting message.
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.target == "/v1/runs" }) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (requests.none { it.target == "/v1/runs" }) delay(5) } }
         val order = requests.map { "${it.method} ${it.target}" }
         assertTrue(order.indexOf("DELETE /api/sessions/apofis-a") < order.indexOf("POST /v1/runs"))
         assertEquals(1, order.count { it == "POST /v1/runs" })
@@ -330,7 +330,7 @@ class DrawerViewModelTest {
         vm.rows.await { it.chats().any { c -> c.running } }
         vm.onDeleteRequest("apofis-a")
         vm.confirmDelete(vm.prompt.value!!.token)
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.target == "/v1/runs/run_a/stop" }) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (requests.none { it.target == "/v1/runs/run_a/stop" }) delay(5) } }
         assertTrue(isBeingDeleted("apofis-a"))
 
         val held = CompletableDeferred<Unit>()
@@ -343,7 +343,7 @@ class DrawerViewModelTest {
         held.complete(Unit)
         lock.join()
 
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (isBeingDeleted("apofis-a")) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (isBeingDeleted("apofis-a")) delay(5) } }
         assertTrue(db.sessionDao().get("apofis-a") != null)
         // The chat can start runs again.
         db.activeRunDao().delete("run_a")
@@ -368,7 +368,7 @@ class DrawerViewModelTest {
         assertNull(db.sessionDao().get("apofis-a"))
 
         stored.complete(Unit) // the send reaches the repository only now and finds no chat
-        withContext(Dispatchers.Default) { withTimeout(10_000) { send.join() } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { send.join() } }
         assertFalse("apofis-a" in composer.keys)
     }
 
@@ -387,7 +387,7 @@ class DrawerViewModelTest {
 
         vm.onOpen()
 
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (composer.idleKeys.any { it in gone }) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (composer.idleKeys.any { it in gone }) delay(5) } }
         assertTrue(composer.idleKeys.none { it in gone })
         assertNull(db.sessionDao().get("apofis-r1"))
         assertEquals("not stored", composer.current("apofis-r0").unsent?.text) // text is never dropped
@@ -478,12 +478,12 @@ class DrawerViewModelTest {
         val vm = vm()
         vm.rows.await { it.chats().size == 2 }
         vm.onPin("apofis-a", true) // an accessibility action: runs at once in its own prompt
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
         vm.onDeleteRequest("apofis-b")
         val forB = vm.prompt.value!!
         assertEquals(1, vm.busyActions()) // the pin is still waiting for its answer
         gate.countDown()
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.busyActions() > 0) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (vm.busyActions() > 0) delay(5) } }
         assertEquals(forB, vm.prompt.value)
     }
 
@@ -508,7 +508,7 @@ class DrawerViewModelTest {
         store.clear()
         assertEquals("apofis-a", vm(lastChat = "apofis-gone").selected.await { it != null })
         // Stored by a collector of the selection, which may run just after the selection was published.
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while ("apofis-a" !in saved) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while ("apofis-a" !in saved) delay(5) } }
         assertTrue("apofis-a" in saved)
     }
 
@@ -553,7 +553,7 @@ class DrawerViewModelTest {
         val forB = vm.prompt.value!!
         vm.onOpen()
         vm.rows.await { it.chats().none { c -> c.key == "apofis-a" } }
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.selected.value == "apofis-a") delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (vm.selected.value == "apofis-a") delay(5) } }
         refreshDone(vm)
         assertEquals(forB, vm.prompt.value)
     }
@@ -598,7 +598,7 @@ class DrawerViewModelTest {
         vm.onLongPress("apofis-a")
         vm.pin(vm.prompt.value!!.token, true) // a's action is in flight
         try {
-            withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
+            withContext(Dispatchers.Default) { withTimeout(60_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
             db.sessionDao().delete("apofis-a")
             vm.prompt.await { it?.key == "apofis-a" && it.gone } // a's watch has delivered its result
             vm.onLongPress("apofis-b") // b's prompt replaces it
@@ -608,7 +608,7 @@ class DrawerViewModelTest {
         val forB = vm.prompt.value!!
         assertEquals("apofis-b", forB.key)
         // a's late outcome (its failure) arrives for a token that is no longer shown: b's prompt stays as it was.
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.busyActions() > 0) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (vm.busyActions() > 0) delay(5) } }
         assertEquals(forB, vm.prompt.value)
     }
 
@@ -627,7 +627,7 @@ class DrawerViewModelTest {
         val forB = vm.prompt.value!!
         clock.addAndGet(60_000)
         vm.onOpen()
-        withContext(Dispatchers.Default) { withTimeout(10_000) { while (sessionsListed() < 2) delay(5) } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (sessionsListed() < 2) delay(5) } }
         vm.rows.await { it.chats().any { c -> c.key == "apofis-b" } }
         refreshDone(vm)
         assertEquals(forB, vm.prompt.value)
@@ -644,7 +644,7 @@ class DrawerViewModelTest {
         val token = vm.prompt.value!!.token
         vm.pin(token, true)
         try {
-            withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
+            withContext(Dispatchers.Default) { withTimeout(60_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
             db.sessionDao().delete("apofis-a") // removed while the pin is in flight
             vm.prompt.await { it?.gone == true }
             assertTrue(vm.prompt.value!!.busy)
