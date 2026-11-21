@@ -95,13 +95,24 @@ private fun hasText(text: String) = text.length > PAGE_CHARS || text.isNotBlank(
  * One reverse pass per call: there is no key index, and this runs once per tap or per transcript change.
  */
 internal fun actionable(items: List<ChatItem>, key: String, fullMessage: Boolean = false, running: Boolean = false): String? {
-    val item = items.lastOrNull { it.key == key } ?: return null
-    return when (item) {
-        is UserMessage -> item.text.takeIf { fullMessage || item.state == SendState.SENT }
-        is AssistantReply -> item.text.takeIf { !item.live && hasText(it) && !running && !unsettled(items) }
-        else -> null
+    // One traversal finds the item and, for a reply, checks the whole chat for a live or unsettled run.
+    var found: AssistantReply? = null
+    var open = running
+    for (i in items.indices.reversed()) {
+        val item = items[i]
+        if (found == null && item.key == key) {
+            when (item) {
+                is UserMessage -> return item.text.takeIf { fullMessage || item.state == SendState.SENT }
+                is AssistantReply -> if (item.live || !hasText(item.text)) return null else found = item
+                else -> return null
+            }
+        }
+        open = open || isOpen(item)
     }
+    return found?.text?.takeIf { !open }
 }
+
+private fun isOpen(item: ChatItem) = (item is AssistantReply && item.live) || (item is UserMessage && item.runId != null)
 
 /**
  * Whether the chat has a run that is live (a live reply is shown) or not yet settled (a user message still carries the
@@ -110,7 +121,7 @@ internal fun actionable(items: List<ChatItem>, key: String, fullMessage: Boolean
  * one check over the whole chat cannot misattribute. One pass, once per transcript change or tap.
  */
 internal fun unsettled(items: List<ChatItem>): Boolean =
-    items.any { (it is AssistantReply && it.live) || (it is UserMessage && it.runId != null) }
+    items.any(::isOpen)
 
 /** The Select key prefix of the full-message reader (Show full message); item keys never contain a colon. */
 internal const val FULL = "full:"

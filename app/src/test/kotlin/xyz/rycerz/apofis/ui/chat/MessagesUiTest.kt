@@ -666,6 +666,24 @@ class MessagesUiTest {
         assertNull("a live run blocks it too", actionable(history, "r2", running = true))
     }
 
+    /** Counts every item read. */
+    private class CountingList(private val items: List<ChatItem>) : AbstractList<ChatItem>() {
+        var visits = 0
+        override val size get() = items.size
+        override fun get(index: Int): ChatItem = items[index].also { visits++ }
+    }
+
+    @Test
+    fun aTapVisitsEachItemAtMostOnce() {
+        val n = 1000
+        val history = CountingList((0 until n).map { if (it % 2 == 0) reply("r$it", "answer $it") else UserMessage("u$it", "q $it", false, FIXED_NOW) })
+        assertEquals("answer 0", actionable(history, "r0"))
+        assertTrue("visited ${history.visits} of $n items", history.visits <= n)
+        history.visits = 0
+        assertNull(actionable(history, "missing"))
+        assertTrue(history.visits <= n)
+    }
+
     @Test
     fun aMismatchedSendKeepsTheFooterCopyAndSelectOff() {
         rule.mainClock.autoAdvance = false
