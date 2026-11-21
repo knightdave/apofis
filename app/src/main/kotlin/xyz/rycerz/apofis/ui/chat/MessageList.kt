@@ -906,7 +906,7 @@ internal class ChatRows(private val zone: ZoneId) {
             is AssistantReply -> buildList {
                 if (item.steps.isNotEmpty()) add(StepsRow(item))
                 addAll(replyRows(item.key, item.text, closeFences = !item.live))
-                if (item.live || item.outcome != null) add(FooterRow(item))
+                add(FooterRow(item)) // every reply: live indicators, notices, Copy and Select
             }
         }
     }
@@ -928,6 +928,8 @@ internal fun MessageList(
     today: LocalDate,
     modifier: Modifier = Modifier,
     onLink: (String) -> Unit = {},
+    onSelect: (String) -> Unit = {},
+    justFinishedKey: String? = null,
 ) {
     val builder = remember(zone) { ChatRows(zone) }
     val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
@@ -948,7 +950,7 @@ internal fun MessageList(
                 Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
                     when (row) {
                         is DateRow -> DateSeparator(row.day, today)
-                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
+                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, onSelect = onSelect, textOf = { actionText(latest, it) })
                         is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
                             // Read at tap time: a step that has since changed kind or gone opens nothing.
                             (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
@@ -961,7 +963,10 @@ internal fun MessageList(
                                 TextBlock(row, onLink, source = source)
                             }
                         }
-                        is FooterRow -> ReplyFooter(row.reply, live.takeIf { row.reply.live }, notes, answering, actions)
+                        is FooterRow -> ReplyFooter(
+                            row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
+                            onSelect, { actionText(latest, it) }, finishedNow = row.reply.key == justFinishedKey,
+                        )
                         is NoticeRow -> NoticeLine(row.notice.text)
                         GoneRow -> Notice(R.string.chat_answer_gone)
                     }

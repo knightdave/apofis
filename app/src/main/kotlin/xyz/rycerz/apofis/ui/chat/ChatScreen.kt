@@ -56,6 +56,10 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.key
 import xyz.rycerz.apofis.chat.SendState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import xyz.rycerz.apofis.chat.ChatItem
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.ComposeError
@@ -92,6 +96,9 @@ fun ChatScreen(
     val steps = remember { StepIndex() }
     val uriHandler = LocalUriHandler.current
     var linkFailed by remember { mutableStateOf(false) } // shown until the next send or the next link that opens
+    // The reply that was live on this screen when its run ended: its action row enters once. Advanced on every state.
+    val justFinished = rememberSaveable(saver = FinishHolder.Saver) { FinishHolder() }.update(state.live != null, state.items)
+    var selectKey by rememberSaveable { mutableStateOf<String?>(null) } // the Select view's item; never its text
     // The request sits at the bottom; a same-id request with a new generation is a new request and is revealed again.
     val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
@@ -148,6 +155,8 @@ fun ChatScreen(
                 zone = zone,
                 today = today,
                 onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
+                onSelect = { selectKey = it },
+                justFinishedKey = justFinished,
             )
             val away by remember { derivedStateOf { listState.canScrollBackward } }
             if (away) {
@@ -224,6 +233,18 @@ fun ChatScreen(
         val found = steps.find(state.items, subject)
         LaunchedEffect(found == null) { if (found == null) detail = null }
         found?.let { ToolDetailSheet(it.step, it.live, onDismiss = { detail = null }) }
+    }
+    selectKey?.let { key ->
+        // Only the stored part is searched (a live merge appends just the live reply, which has no Select), once per
+        // transcript change, not per streamed token. Closes once the key no longer resolves.
+        @Suppress("UNCHECKED_CAST") val stored = (state.items as? Joined<ChatItem>)?.head ?: state.items
+        val text = remember(stored, key) { actionText(stored, key) }
+        LaunchedEffect(text == null) { if (text == null) selectKey = null }
+        if (text != null) {
+            Dialog(onDismissRequest = { selectKey = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+                SelectTextScreen(text, onBack = { selectKey = null })
+            }
+        }
     }
 }
 
