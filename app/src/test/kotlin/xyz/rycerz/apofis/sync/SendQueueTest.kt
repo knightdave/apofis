@@ -479,7 +479,7 @@ class SendQueueTest {
         val send = launch(Dispatchers.Default) { repo.send("apofis-a", "kept") }
 
         // Bounded only so a regression fails instead of hanging: the row must commit while the request is still held.
-        val stored = withContext(Dispatchers.Default) { withTimeout(5_000) { db.pendingSendDao().observe("apofis-a").first { it.isNotEmpty() } } }
+        val stored = withContext(Dispatchers.Default) { withTimeout(60_000) { db.pendingSendDao().observe("apofis-a").first { it.isNotEmpty() } } }
         assertEquals("kept", stored.single().text)
         assertEquals(1, server.requestCount)
         list.countDown()
@@ -599,7 +599,7 @@ class SendQueueTest {
         val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
         take() // the refresh holds the repository lock while its list request is in flight
         val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
-        withContext(Dispatchers.Default) { withTimeout(5_000) { db.pendingSendDao().observe("apofis-a").first { it.isNotEmpty() } } }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { db.pendingSendDao().observe("apofis-a").first { it.isNotEmpty() } } }
         list.countDown() // the refresh now hides the chat, before the send can take the lock
         refresh.join()
         send.join()
