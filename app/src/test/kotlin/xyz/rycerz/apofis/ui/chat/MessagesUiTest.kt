@@ -65,9 +65,8 @@ import xyz.rycerz.apofis.ui.FIXED_TODAY
 import xyz.rycerz.apofis.ui.markdown.COPY_NOTE_MS
 import xyz.rycerz.apofis.ui.markdown.MAX_CLIP_CHARS
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
-import xyz.rycerz.apofis.ui.theme.Motion
 
-/** Action rows, the user bubble collapse, the Select view and the "just finished" entry. */
+/** Action rows, the user bubble collapse and the Select view. */
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
@@ -93,7 +92,7 @@ class MessagesUiTest {
         }
 
     @Composable
-    private fun List(items: List<ChatItem>, onSelect: (String) -> Unit = {}, current: (() -> Shown)? = null, live: LiveReply? = null) = MessageList(
+    private fun List(items: List<ChatItem>, onSelect: (String) -> Unit = {}, current: (() -> List<ChatItem>)? = null, live: LiveReply? = null) = MessageList(
         items, live, emptyMap(), answering = false, actions = object : ChatActions {}, onCancel = {}, onStep = {},
         listState = rememberLazyListState(), contentPadding = PaddingValues(), zone = ZoneOffset.UTC, today = FIXED_TODAY,
         onSelect = onSelect, current = current,
@@ -250,7 +249,7 @@ class MessagesUiTest {
             assertTrue(text.startsWith(page) && page.length < text.length)
             assertEquals("no second Show more", 0, rule.onAllNodes(hasText("Show more")).fetchSemanticsNodes().size)
             rule.onNodeWithText("Show full message").performClick()
-            assertEquals("u1", selected.removeLast())
+            assertEquals("the reader, not a row action", "full:u1", selected.removeLast())
             rule.onNodeWithText("Show less").performClick()
             rule.waitForIdle()
         }
@@ -271,13 +270,13 @@ class MessagesUiTest {
         val odd = listOf("", " ", "\uD800", "a\uDC00b", "‮evil‬", "a\r\nb\rc", "‏\n\n\n")
         for (text in odd) {
             assertTrue(text.startsWith(collapsedPrefix(text)))
-            assertEquals(text.takeIf { it.isNotBlank() }, actionable(listOf(reply("r1", text)), null, "r1"))
-            assertEquals(text, actionable(listOf(UserMessage("u1", text, false, FIXED_NOW)), null, "u1"))
+            assertEquals(text.takeIf { it.isNotBlank() }, actionable(listOf(reply("r1", text)), "r1"))
+            assertEquals(text, actionable(listOf(UserMessage("u1", text, false, FIXED_NOW)), "u1"))
             assertEquals(CopyPlan.Write(lf(text)), copyPlan(text, text))
             assertEquals(text, pieces(text).joinToString(""))
         }
-        assertNull(actionable(listOf(AssistantReply("r1", emptyList(), "x", FIXED_NOW, live = true)), null, "r1"))
-        assertNull(actionable(listOf(reply("r1", "x")), null, "r2"))
+        assertNull(actionable(listOf(AssistantReply("r1", emptyList(), "x", FIXED_NOW, live = true)), "r1"))
+        assertNull(actionable(listOf(reply("r1", "x")), "r2"))
         assertEquals("pressed on another text", CopyPlan.Skip, copyPlan("new", "old"))
         assertEquals(CopyPlan.Skip, copyPlan(null, "old"))
     }
@@ -344,6 +343,11 @@ class MessagesUiTest {
         inputs += "x".repeat(PAGE_CHARS - 1) + "\r\n" + "y"
         inputs += "\n".repeat(50_000)
         inputs += "w".repeat(100_000)
+        // A cluster longer than the slack whose last code point is a surrogate pair at the window's edge (the review's
+        // case), swept across that edge, and long clusters starting well before the cap.
+        for (marks in GRAPHEME_SLACK - 8..GRAPHEME_SLACK + 8) inputs += "x".repeat(PAGE_CHARS - 1) + "a" + "\u0301".repeat(marks) + "\uDB40\uDD00" + "tail"
+        for (marks in listOf(100, 1500, 3000)) inputs += "x".repeat(PAGE_CHARS - 900) + "a" + "\u0301".repeat(marks) + "tail"
+        for (shift in 0..2) inputs += "x".repeat(PAGE_CHARS + GRAPHEME_SLACK - shift - 1) + "\uD83D\uDE00".repeat(4) + "y"
         for (text in inputs) {
             val parts = pieces(text)
             assertEquals(text, parts.joinToString(""))
@@ -354,9 +358,11 @@ class MessagesUiTest {
                 end += part.length
                 assertTrue("piece $i has ${part.length} chars", part.isNotEmpty() && part.length <= PAGE_CHARS + GRAPHEME_SLACK)
                 if (end < text.length) {
-                    assertTrue("cut $end is a grapheme boundary of the whole text", bi.isBoundary(end))
+                    assertTrue("cut $end splits a surrogate pair", !(text[end - 1].isHighSurrogate() && text[end].isLowSurrogate()))
+                    val fallback = part.length in PAGE_CHARS..PAGE_CHARS + 1 && bi.following(start + PAGE_CHARS - 1) - start > PAGE_CHARS + GRAPHEME_SLACK - 2
+                    assertTrue("cut $end is a grapheme boundary of the whole text (or the documented fallback)", bi.isBoundary(end) || fallback)
                     // At most the cap plus the one grapheme that straddles it.
-                    assertTrue("piece $i overshoots", part.length == PAGE_CHARS || bi.preceding(end) < start + PAGE_CHARS)
+                    assertTrue("piece $i overshoots", fallback || part.length == PAGE_CHARS || bi.preceding(end) < start + PAGE_CHARS)
                 }
             }
         }
@@ -389,7 +395,7 @@ class MessagesUiTest {
         assertEquals(CopyPlan.TooLarge, ("\r\n".repeat(MAX_CLIP_CHARS) + "\n").let { copyPlan(it, it) })
         // A huge blank-looking reply is found by its length, not by scanning it for text.
         val spaces = " ".repeat(1_000_000) + "x"
-        assertEquals(spaces, actionable(listOf(reply("r1", spaces)), null, "r1"))
+        assertEquals(spaces, actionable(listOf(reply("r1", spaces)), "r1"))
     }
 
     @Test
@@ -398,7 +404,7 @@ class MessagesUiTest {
         val clipboard = FakeClipboard()
         val drawn = listOf<ChatItem>(reply("r1", "old"))
         var now: List<ChatItem> = drawn // the owner's state, changed without a new frame
-        rule.setContent { Themed(clipboard = clipboard) { List(drawn, current = { Shown(now, null) }) } }
+        rule.setContent { Themed(clipboard = clipboard) { List(drawn, current = { now }) } }
         rule.mainClock.advanceTimeByFrame()
         val copy = rule.onNodeWithContentDescription("Copy")
         for (changed in listOf(emptyList(), listOf(reply("r1", "new")), listOf(AssistantReply("r1", emptyList(), "old", FIXED_NOW, live = true)))) {
@@ -491,7 +497,7 @@ class MessagesUiTest {
     }
 
     @Test
-    fun aDeepScrollPositionSurvivesRecreation() {
+    fun aRecreatedSelectViewStartsAtTheTop() {
         val tester = StateRestorationTester(rule)
         val text = (0 until 12).joinToString("") { "piece$it ".padEnd(PAGE_CHARS, '.') }
         tester.setContent { Themed { SelectTextScreen(text) {} } }
@@ -503,7 +509,31 @@ class MessagesUiTest {
         rule.onNode(hasText("piece7", substring = true)).assertIsDisplayed()
         tester.emulateSavedInstanceStateRestore()
         rule.waitForIdle()
-        rule.onNode(hasText("piece7", substring = true)).assertIsDisplayed()
+        rule.onNode(hasText("piece0", substring = true)).assertIsDisplayed()
+        val found = rule.onNode(hasScrollToIndexAction()).fetchSemanticsNode().config[SemanticsProperties.CollectionInfo].rowCount
+        assertTrue("nothing restored: only the pieces at the top found ($found)", found in 1..2)
+    }
+
+    @Test
+    fun aRestoredSelectViewOnAShortenedMessageShowsItWhole() {
+        val tester = StateRestorationTester(rule)
+        val long = (0 until 12).joinToString("") { "piece$it ".padEnd(PAGE_CHARS, '.') }
+        var state by mutableStateOf(state(listOf(reply("r1", long))))
+        tester.setContent { Themed { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
+        rule.onNodeWithContentDescription("Select text").performClick()
+        val list = rule.onNode(hasScrollToIndexAction() and hasAnyAncestor(isDialog()))
+        for (i in 0..7) {
+            list.performScrollToIndex(i)
+            rule.waitForIdle()
+        }
+        state = ChatUiState("s", "Chat", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, "", loaded = false)
+        tester.emulateSavedInstanceStateRestore()
+        rule.waitForIdle()
+        state = state(listOf(reply("r1", "word")))
+        rule.waitForIdle()
+        rule.onNode(hasText("word") and hasAnyAncestor(isDialog())).assertIsDisplayed()
+        val items = rule.onNode(hasScrollToIndexAction() and hasAnyAncestor(isDialog())).fetchSemanticsNode().config[SemanticsProperties.CollectionInfo].rowCount
+        assertEquals(1, items)
     }
 
     @Test
@@ -539,22 +569,26 @@ class MessagesUiTest {
     }
 
     @Test
-    fun aPolledRunningTurnHasNoActionsUntilTheRunEnds() {
+    fun aRunsTurnHasNoActionsUntilItsFinalTranscriptIsPublished() {
         val r1 = reply("r1", "Earlier answer")
-        val asked = UserMessage("u2", "Next?", false, FIXED_NOW, runId = "A")
+        val asked = UserMessage("u2", "Next?", false, FIXED_NOW, runId = "A") // its pending send is not settled yet
         val partial = reply("r3", "Half of the")
         val polling = LiveReply("A", "running", "", emptyList(), null, Connection.POLLING)
         var state by mutableStateOf(state(listOf(r1, asked, partial), polling))
         rule.setContent { Themed { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
         rule.waitForIdle()
         assertEquals("only the history reply r1", 1, replyRows().size)
-        // The run ends before Room delivers the final body: the stored partial is what the transcript holds now.
+        // The run's end reaches the screen before the transcript that settled it: the turn is still pending.
         state = state(listOf(r1, asked, partial))
         rule.waitForIdle()
-        assertEquals(2, replyRows().size)
-        state = state(listOf(r1, asked, reply("r3", "Half of the answer, now whole.")))
+        assertEquals(1, replyRows().size)
+        assertNull(actionable(listOf(r1, asked, partial), "r3"))
+        // The final transcript: the send settled (no run id) and the final body stored.
+        val settled = listOf(r1, asked.copy(runId = null), reply("r3", "Half of the answer, now whole."))
+        state = state(settled)
         rule.waitForIdle()
         assertEquals(2, replyRows().size)
+        assertEquals("Half of the answer, now whole.", actionable(settled, "r3"))
     }
 
     /** The action button of the last message on screen. */
@@ -568,32 +602,61 @@ class MessagesUiTest {
         val clipboard = FakeClipboard()
         val selected = ArrayList<String>()
         val r1 = reply("r1", "Earlier answer")
-        val asked = UserMessage("u2", "Next?", false, FIXED_NOW, runId = "A")
+        val asked = UserMessage("u2", "Next?", false, FIXED_NOW)
         val r3 = reply("r3", "Stored so far")
         val drawn = listOf<ChatItem>(r1, asked, r3)
-        var now = Shown(drawn, null)
+        var now = drawn
         rule.setContent { Themed(clipboard = clipboard) { List(drawn, onSelect = { selected += it }, current = { now }) } }
         rule.mainClock.advanceTimeByFrame()
-        now = Shown(drawn, "A") // run A is followed again before the next frame: r3 is part of its turn
+        now = listOf(r1, asked.copy(runId = "A"), r3) // a run for that turn is pending again before the next frame
         bottomMost("Copy").performClick()
         bottomMost("Select text").performClick()
         rule.mainClock.advanceTimeBy(5 * frame)
         assertTrue(clipboard.writes.isEmpty())
         assertTrue(selected.isEmpty())
-        assertNull(actionable(drawn, "A", "r3"))
-        assertEquals("history stays actionable", "Earlier answer", actionable(drawn, "A", "r1"))
+        assertEquals("history stays actionable", "Earlier answer", actionable(now, "r1"))
     }
 
     @Test
-    fun anOpenSelectViewClosesWhenItsReplyBecomesPartOfARunningTurn() {
+    fun aSentMessageThatFailedBeforeTheRedrawHasNoActions() {
+        rule.mainClock.autoAdvance = false
+        val clipboard = FakeClipboard()
+        val selected = ArrayList<String>()
+        val sent = UserMessage("p1", "Remember the milk", false, FIXED_NOW, SendState.SENT, idempotencyKey = "k")
+        var now = listOf<ChatItem>(sent)
+        rule.setContent { Themed(clipboard = clipboard) { List(listOf(sent), onSelect = { selected += it }, current = { now }) } }
+        rule.mainClock.advanceTimeByFrame()
+        now = listOf(sent.copy(state = SendState.FAILED)) // same key and body, an unconfirmed finish
+        rule.onNodeWithContentDescription("Copy").performClick()
+        rule.onNodeWithContentDescription("Select text").performClick()
+        rule.mainClock.advanceTimeBy(5 * frame)
+        assertTrue(clipboard.writes.isEmpty())
+        assertTrue(selected.isEmpty())
+        assertNull(actionable(now, "p1"))
+        assertEquals("the full-message reader still opens it", "Remember the milk", actionable(now, "p1", fullMessage = true))
+    }
+
+    @Test
+    fun theFullMessageReaderOpensAFailedMessage() {
+        val failed = UserMessage("p1", "w".repeat(20_000), false, FIXED_NOW, SendState.FAILED, idempotencyKey = "k")
+        rule.setContent { Themed { ChatScreen(state(listOf(failed)), object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
+        rule.onNodeWithText("Show more").performClick()
+        rule.onNodeWithText("Show full message").performClick()
+        rule.waitForIdle()
+        assertEquals(1, rule.onAllNodes(isDialog()).fetchSemanticsNodes().size)
+        rule.onNode(hasText("Select text") and hasAnyAncestor(isDialog())).assertIsDisplayed()
+    }
+
+    @Test
+    fun anOpenSelectViewClosesWhenItsReplyBecomesPartOfAPendingTurn() {
         val r1 = reply("r1", "Earlier answer")
-        val asked = UserMessage("u2", "Next?", false, FIXED_NOW, runId = "A")
+        val asked = UserMessage("u2", "Next?", false, FIXED_NOW)
         val r3 = reply("r3", "Stored so far")
         var state by mutableStateOf(state(listOf(r1, asked, r3)))
         rule.setContent { Themed { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
         bottomMost("Select text").performClick()
         assertEquals(1, rule.onAllNodes(isDialog()).fetchSemanticsNodes().size)
-        state = state(listOf(r1, asked, r3), LiveReply("A", "running", "", emptyList(), null, Connection.POLLING))
+        state = state(listOf(r1, asked.copy(runId = "A"), r3), LiveReply("A", "running", "", emptyList(), null, Connection.POLLING))
         rule.waitForIdle()
         assertEquals(0, rule.onAllNodes(isDialog()).fetchSemanticsNodes().size)
     }
@@ -628,7 +691,7 @@ class MessagesUiTest {
         val message = UserMessage("u1", "word ".repeat(30).trim(), false, FIXED_NOW)
         rule.setContent {
             Themed {
-                Box(Modifier.width(width)) { UserBubble(message, onRetry = {}, onCancel = {}, actions = RowActions({ Shown(listOf(message), null) }, {})) }
+                Box(Modifier.width(width)) { UserBubble(message, onRetry = {}, onCancel = {}, actions = RowActions({ listOf(message) }, {})) }
             }
         }
         rule.onNodeWithText("Show more").assertExists()

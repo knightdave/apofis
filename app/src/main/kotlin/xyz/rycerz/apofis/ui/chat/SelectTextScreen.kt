@@ -10,16 +10,18 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,17 +41,11 @@ import xyz.rycerz.apofis.ui.theme.scaled
  * A message's raw text (line endings LF), selectable, on its own page: selection across lazy list rows is unreliable.
  * Any length: the text is shown in [pieceEnd] pieces, one lazy item each, found as the reader reaches the last one
  * (opening reads one piece, never the whole message); selection works within a piece, and the shown pieces
- * concatenate to the text exactly. How many pieces were found is saved, so a deep scroll position survives recreation.
+ * concatenate to the text exactly. Nothing is saved: a reopened or recreated view starts at the top.
  */
 @Composable
 fun SelectTextScreen(text: String, onBack: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
-    val ends = remember(text) { ArrayList<Int>() } // a cache of piece ends, filled in order as pieces are shown
-    var found by rememberSaveable(text) { mutableIntStateOf(1) }
-    fun end(i: Int): Int {
-        while (ends.size <= i) ends += pieceEnd(text, ends.lastOrNull() ?: 0)
-        return ends[i]
-    }
     Column(Modifier.fillMaxSize().background(scheme.surface)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(start = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             ApofisIconButton(onClick = onBack, contentDescription = stringResource(R.string.back)) {
@@ -57,14 +53,28 @@ fun SelectTextScreen(text: String, onBack: () -> Unit) {
             }
             Text(stringResource(R.string.select_title), Modifier.padding(start = 8.dp), style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.Medium), color = scheme.onSurface)
         }
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 20.dp)) {
-            items(found, key = { it }) { i ->
-                val e = end(i)
-                if (i == found - 1 && e < text.length) LaunchedEffect(i) { found = i + 2 } // the next piece, once this one is shown
-                val piece = remember(text, i) { lf(text.substring(if (i == 0) 0 else end(i - 1), e)) }
-                SelectionContainer {
-                    Text(piece, Modifier.fillMaxWidth().testTag("select.piece:$i"), style = scaled(ChatText.assistant), color = scheme.onSurface)
-                }
+        key(text) { Pieces(text) } // another text is a new list from its top
+    }
+}
+
+@Composable
+private fun Pieces(text: String) {
+    val ends = remember { ArrayList<Int>() } // a cache of piece ends, filled in order as pieces are shown
+    var found by remember { mutableIntStateOf(1) }
+    val listState = remember { LazyListState() } // not saved: see above
+    fun end(i: Int): Int {
+        while (ends.size <= i) ends += pieceEnd(text, ends.lastOrNull() ?: 0)
+        return ends[i]
+    }
+    // The next piece once the last found one is on screen (laid out, not merely prefetched).
+    val atEnd by remember { derivedStateOf { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index == found - 1 } }
+    if (atEnd && end(found - 1) < text.length) LaunchedEffect(found) { found++ }
+    LazyColumn(Modifier.fillMaxSize(), listState, contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 20.dp)) {
+        items(found, key = { it }) { i ->
+            val e = end(i)
+            val piece = remember { lf(text.substring(if (i == 0) 0 else end(i - 1), e)) }
+            SelectionContainer {
+                Text(piece, Modifier.fillMaxWidth().testTag("select.piece:$i"), style = scaled(ChatText.assistant), color = MaterialTheme.colorScheme.onSurface)
             }
         }
     }

@@ -44,6 +44,7 @@ import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.ui.markdown.COPY_NOTE_MS
 import xyz.rycerz.apofis.ui.markdown.CopyResult
@@ -65,11 +66,14 @@ internal const val GRAPHEME_SLACK = 1024
  * The one cutting function: the end of the piece of [text] starting at [start] (a grapheme boundary), at the first
  * grapheme boundary at or after [start] + [cap]. Segmentation runs over a window that begins at [start], so flag
  * pairs, ZWJ sequences, combining marks and CRLF stay together; it reads at most [cap] + [GRAPHEME_SLACK] characters.
- * Shortcut: a single grapheme longer than [GRAPHEME_SLACK] is cut at the cap (on a code point boundary).
+ * The window ends on a code point boundary; its end counts as a boundary only at the end of [text]. Shortcut: when no
+ * boundary is found in the window (a grapheme longer than [GRAPHEME_SLACK]), the cut is at the cap, on a code point
+ * boundary.
  */
 internal fun pieceEnd(text: CharSequence, start: Int, cap: Int = PAGE_CHARS): Int {
     if (text.length - start <= cap) return text.length
-    val windowEnd = minOf(text.length, start + cap + GRAPHEME_SLACK)
+    var windowEnd = minOf(text.length, start + cap + GRAPHEME_SLACK)
+    if (windowEnd < text.length && text[windowEnd - 1].isHighSurrogate() && text[windowEnd].isLowSurrogate()) windowEnd++ // whole code points only
     val bi = BreakIterator.getCharacterInstance().apply { setText(text.subSequence(start, windowEnd).toString()) }
     val b = bi.following(cap - 1)
     if (b != BreakIterator.DONE && (start + b < windowEnd || windowEnd == text.length)) return start + b
@@ -83,33 +87,38 @@ internal fun pieceEnd(text: CharSequence, start: Int, cap: Int = PAGE_CHARS): In
 private fun hasText(text: String) = text.length > PAGE_CHARS || text.isNotBlank()
 
 /**
- * The one eligibility rule for Copy and Select, at action time and for an open Select view: the raw text of item
- * [key] in [items] when it is a user message, or a reply that is finished (not live), has text and is not part of
- * the turn of the running run [runId] (stored early by polling); else null. One pass from the end per call: there is
- * no key index, and this runs once per tap or per transcript change, never per frame.
+ * The one eligibility rule, at draw time and at action time, from the transcript as it is now: the raw text of item
+ * [key] in [items] if it is a sent user message (any user message when [fullMessage]: the reader opened by Show full
+ * message), or a reply that is finished (not live), has text, and is not in a turn whose run is still pending. A run
+ * is pending while its user message carries a run id: the pending send that gives it one is settled in the same
+ * transaction that stores the run's final transcript, so until that transcript is published the turn's stored
+ * replies may be partial. Else null. One reverse pass per call: there is no key index, and this runs once per tap or
+ * per transcript change, never per frame.
  */
-internal fun actionable(items: List<ChatItem>, runId: String?, key: String): String? {
+internal fun actionable(items: List<ChatItem>, key: String, fullMessage: Boolean = false): String? {
     var found: AssistantReply? = null
     for (i in items.indices.reversed()) {
         val item = items[i]
         if (found == null) {
             if (item.key != key) continue
             when (item) {
-                is UserMessage -> return item.text
-                is AssistantReply -> if (item.live || !hasText(item.text)) return null else if (runId == null) return item.text else found = item
+                is UserMessage -> return item.text.takeIf { fullMessage || item.state == SendState.SENT }
+                is AssistantReply -> if (item.live || !hasText(item.text)) return null else found = item
                 else -> return null
             }
-        } else if (item is UserMessage && item.runId == runId) {
-            return null // after the running turn's user message
+        } else if (item is UserMessage && item.runId != null) {
+            return null // in a turn whose run is still pending
         }
     }
     return found?.text
 }
 
-/** The replies after the running run's user message: no actions yet (the row's form of [actionable]'s turn rule). */
-internal fun activeReplies(items: List<ChatItem>, runId: String?): Set<String> {
-    if (runId == null) return emptySet()
-    val turn = items.indexOfLast { it is UserMessage && it.runId == runId }
+/** The Select key prefix of the full-message reader (Show full message); item keys never contain a colon. */
+internal const val FULL = "full:"
+
+/** The row's form of [actionable]'s turn rule: the replies after the first user message that carries a run id. */
+internal fun pendingReplies(items: List<ChatItem>): Set<String> {
+    val turn = items.indexOfFirst { it is UserMessage && it.runId != null }
     if (turn < 0) return emptySet()
     return (turn + 1 until items.size).mapNotNullTo(HashSet()) { (items[it] as? AssistantReply)?.key }
 }
@@ -165,11 +174,8 @@ internal class TapGuard(
     }
 }
 
-/** The transcript and run as the owner holds them now (read at action time). */
-internal data class Shown(val items: List<ChatItem>, val runId: String?)
-
-/** What the action rows of one list need; the guard lives here, not in a button a refresh can replace. */
-internal class RowActions(val current: () -> Shown, val onSelect: (String) -> Unit, val guard: TapGuard = TapGuard())
+/** What the action rows of one list need: the transcript as the owner holds it now (read at action time), Select and the guard. */
+internal class RowActions(val current: () -> List<ChatItem>, val onSelect: (String) -> Unit, val guard: TapGuard = TapGuard())
 
 // ---- the row
 
@@ -193,8 +199,7 @@ internal fun MessageActionRow(drawn: ChatItem, actions: RowActions, modifier: Mo
             ActionButton(R.drawable.lucide_copy, R.string.chat_copy, drawn) { item ->
                 val id = "copy:${item.key}"
                 if (!actions.guard.allows(id)) return@ActionButton
-                val shown = actions.current()
-                val plan = copyPlan(actionable(shown.items, shown.runId, item.key), textOf(item))
+                val plan = copyPlan(actionable(actions.current(), item.key), textOf(item))
                 if (plan == CopyPlan.Skip) return@ActionButton
                 actions.guard.ran(id)
                 scope.launch {
@@ -205,8 +210,7 @@ internal fun MessageActionRow(drawn: ChatItem, actions: RowActions, modifier: Mo
             ActionButton(R.drawable.lucide_text_select, R.string.chat_select, drawn) { item ->
                 val id = "select:${item.key}"
                 if (!actions.guard.allows(id)) return@ActionButton
-                val shown = actions.current()
-                if (actionable(shown.items, shown.runId, item.key) == null) return@ActionButton
+                if (actionable(actions.current(), item.key) == null) return@ActionButton
                 actions.guard.ran(id)
                 actions.onSelect(item.key)
             }

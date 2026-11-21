@@ -112,7 +112,7 @@ internal fun UserBubble(
         if (long) {
             Row {
                 if (expanded) SmallTextButton(R.string.chat_show_less, { expanded = false })
-                if (more) SmallTextButton(R.string.chat_show_full, { actions.onSelect(message.key) })
+                if (more) SmallTextButton(R.string.chat_show_full, { actions.onSelect(FULL + message.key) })
                 if (!expanded) SmallTextButton(R.string.chat_show_more, { expanded = true })
             }
         }

@@ -929,7 +929,7 @@ internal fun MessageList(
     modifier: Modifier = Modifier,
     onLink: (String) -> Unit = {},
     onSelect: (String) -> Unit = {},
-    current: (() -> Shown)? = null,
+    current: (() -> List<ChatItem>)? = null,
 ) {
     val builder = remember(zone) { ChatRows(zone) }
     val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
@@ -942,11 +942,10 @@ internal fun MessageList(
     // Copy and Select check the transcript as it is at action time: the owner's current state when given.
     val onSelectNow by rememberUpdatedState(onSelect)
     val currentNow by rememberUpdatedState(current)
-    val liveNow by rememberUpdatedState(live)
-    val rowActions = remember { RowActions({ currentNow?.invoke() ?: Shown(latest, liveNow?.runId) }, { onSelectNow(it) }) }
-    // Replies stored as part of the running turn are not history yet: once per transcript or run, not per token.
+    val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
+    // Replies of a turn whose run is still pending are not history yet: once per transcript, not per token.
     @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
-    val active = remember(stored, live?.runId) { activeReplies(stored, live?.runId) }
+    val active = remember(stored) { pendingReplies(stored) }
     LazyColumn(modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
         items(
             count = rows.size,
