@@ -591,15 +591,24 @@ class DrawerViewModelTest {
     fun aNewerSheetIsNotClosedForTheChatOfAnOlderOne() = runTest {
         addSession("apofis-a", "Old sheet")
         addSession("apofis-b", "New sheet", active = clock.get() / 1000.0 - 60)
+        val gate = CountDownLatch(1)
+        routes["PATCH /api/sessions/apofis-a"] = { gate.hold(); MockResponse.Builder().code(500).build() }
         val vm = vm()
         vm.rows.await { it.chats().size == 2 }
         vm.onLongPress("apofis-a")
-        vm.onLongPress("apofis-b") // replaces the prompt before a's removal is seen
+        vm.pin(vm.prompt.value!!.token, true) // a's action is in flight
+        try {
+            withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
+            db.sessionDao().delete("apofis-a")
+            vm.prompt.await { it?.key == "apofis-a" && it.gone } // a's watch has delivered its result
+            vm.onLongPress("apofis-b") // b's prompt replaces it
+        } finally {
+            gate.countDown()
+        }
         val forB = vm.prompt.value!!
-        db.sessionDao().delete("apofis-a")
-        vm.rows.await { it.chats().none { c -> c.key == "apofis-a" } }
-        // The older prompt's watch was cancelled when the newer prompt replaced it (collectLatest, synchronously), so
-        // the removal reached no watcher of a's: nothing can close b's prompt later.
+        assertEquals("apofis-b", forB.key)
+        // a's late outcome (its failure) arrives for a token that is no longer shown: b's prompt stays as it was.
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.busyActions() > 0) delay(5) } }
         assertEquals(forB, vm.prompt.value)
     }
 
