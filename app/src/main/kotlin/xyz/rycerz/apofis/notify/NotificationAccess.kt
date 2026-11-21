@@ -14,6 +14,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -39,26 +40,41 @@ private fun runtime(context: Context, prefs: SharedPreferences): Runtime = when 
 }
 
 private val askLock = Any()
+private var askInFlight = false // a dialog is about to be launched by some UI; guarded by [askLock]
 
 /**
- * The first accepted send's one chance, decided off the main thread: on API 33+ it is used up by the first call
- * whatever the state, so a permission granted then and revoked later is never asked for again. The mark is committed
- * before the answer, so a death or a failed write never leads to a second automatic ask; serialized, so repeated sends
- * ask at most once. True when the caller should launch the permission dialog now.
+ * The first accepted send's one chance, decided off the main thread. On API 33+: already granted uses the chance up
+ * (committed now), so a later revocation is never asked about; otherwise true, and the caller launches the dialog and
+ * then calls [askLaunched], which uses the chance up. A UI that goes away before launching calls [askAbandoned]
+ * instead, leaving the chance for the next accepted send. Serialized, so repeated sends launch at most once.
  */
-@SuppressLint("UseKtx") // commit()'s result is checked; androidx.core is not a direct dependency
-internal fun askNotificationsOnce(context: Context, prefs: SharedPreferences): Boolean = synchronized(askLock) {
-    if (Build.VERSION.SDK_INT < 33 || prefs.getBoolean(ASKED, false)) return false
-    val granted = runtime(context, prefs) == Runtime.GRANTED
-    if (!prefs.edit().putBoolean(ASKED, true).commit()) return false
-    !granted
+@SuppressLint("UseKtx", "ApplySharedPref") // on IO, and durable before the answer; androidx.core is not a direct dependency
+internal fun shouldAskNotifications(context: Context, prefs: SharedPreferences): Boolean = synchronized(askLock) {
+    if (Build.VERSION.SDK_INT < 33 || askInFlight || prefs.getBoolean(ASKED, false)) return false
+    if (runtime(context, prefs) == Runtime.GRANTED) {
+        prefs.edit().putBoolean(ASKED, true).commit()
+        return false
+    }
+    askInFlight = true
+    true
 }
+
+/** The dialog was launched: the chance is used up (on IO; durable before the next decision). */
+@SuppressLint("UseKtx", "ApplySharedPref") // on IO, and durable before the next decision
+internal fun askLaunched(prefs: SharedPreferences) = synchronized(askLock) {
+    prefs.edit().putBoolean(ASKED, true).commit()
+    askInFlight = false
+}
+
+/** The UI went away before launching: the next accepted send may ask. */
+internal fun askAbandoned() = synchronized(askLock) { askInFlight = false }
 
 /**
  * For the first accepted send (and an explicit Settings tap): asks once ever, on API 33+, while never asked. The
- * decision runs on IO; only the dialog launch runs here, through this composition's own launcher.
+ * decision and the mark run on IO; only the dialog launch runs here, through this composition's own launcher, and
+ * the chance is used up only once that launch happened.
  */
-@SuppressLint("InlinedApi") // launched only after askNotificationsOnce, which is API 33+
+@SuppressLint("InlinedApi") // launched only after shouldAskNotifications, which is API 33+
 @Composable
 fun rememberAskNotificationsOnce(prefs: SharedPreferences): () -> Unit {
     val context = LocalContext.current
@@ -67,7 +83,16 @@ fun rememberAskNotificationsOnce(prefs: SharedPreferences): () -> Unit {
     return remember(launcher, prefs) {
         {
             scope.launch {
-                if (withContext(Dispatchers.IO) { askNotificationsOnce(context, prefs) }) launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                var asking = false // set inside the IO block, so a cancellation at its return still reaches the finally
+                var launched = false
+                try {
+                    withContext(Dispatchers.IO) { asking = shouldAskNotifications(context, prefs) }
+                    if (!asking) return@launch
+                    launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    launched = true
+                } finally {
+                    if (asking) withContext(NonCancellable + Dispatchers.IO) { if (launched) askLaunched(prefs) else askAbandoned() }
+                }
             }
         }
     }

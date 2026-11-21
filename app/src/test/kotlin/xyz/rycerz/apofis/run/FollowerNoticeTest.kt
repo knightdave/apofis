@@ -8,6 +8,13 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import org.junit.Assert.fail
+import kotlinx.coroutines.launch
+import xyz.rycerz.apofis.notify.NoticeReceipts
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import mockwebserver3.Dispatcher
@@ -52,7 +59,7 @@ class FollowerNoticeTest {
     private lateinit var repo: ChatRepository
     private val routes = ConcurrentHashMap<String, (RecordedRequest) -> MockResponse>()
     private val sent = CopyOnWriteArrayList<Sent>()
-    private val cleared = CopyOnWriteArrayList<Pair<String, String>>()
+    private val cleared = CopyOnWriteArrayList<List<Any?>>() // key, run, retired request, ended
     private val lockedAtHandOver = CopyOnWriteArrayList<Boolean>()
     private var follower: RunFollower? = null
     private val sink = NoticeSink { k, r, s, n, e, g, replay ->
@@ -81,7 +88,7 @@ class FollowerNoticeTest {
 
     private fun TestScope.follower(done: CompletableDeferred<Unit>? = null) = RunFollower(
         api, db, repo, backgroundScope, delayMs = {}, onRunFinished = { done?.complete(Unit) },
-        onNotice = sink, onControlsCleared = { k, r -> cleared += k to r }, generation = { GEN },
+        onNotice = sink, onControlsCleared = { k, r, q, ended -> cleared += listOf(k, r, q, ended) }, generation = { GEN },
     ).also { follower = it }
 
     private fun on(path: String, vararg responses: () -> MockResponse) {
@@ -216,7 +223,7 @@ class FollowerNoticeTest {
         f.settle(RUN)
 
         assertEquals(listOf(true), lockedAtHandOver) // a newer read cannot overtake: it waits for the lock
-        assertEquals(listOf(KEY to RUN), cleared)
+        assertEquals(listOf(listOf(KEY, RUN, "p1", false)), cleared) // the read began after p1 was handed over
     }
 
     @Test
@@ -235,47 +242,44 @@ class FollowerNoticeTest {
         f.settle(RUN) // the older read, showing the approval, is not applied
 
         assertTrue(sent.isEmpty())
-        assertEquals(listOf(KEY to RUN), cleared) // only the newer read's (no control)
+        assertEquals(listOf(listOf(KEY, RUN, null, false)), cleared) // only the newer read's (no control)
     }
 
+    /** A sink that hands each notice's receipt ([outcome]) to the check it belongs to, as the notifier does. */
+    private fun TestScope.receiptFollower(outcome: () -> CompletableDeferred<Unit>) = RunFollower(
+        api, db, repo, backgroundScope, delayMs = {},
+        onNotice = { _, _, _, _, _, _, _ -> currentCoroutineContext()[NoticeReceipts]!!.add(outcome().also { handed += it }) },
+        generation = { GEN },
+    )
+
     @Test
-    fun settleReturnsOnlyAfterDelivery() = runTest {
-        val log = CopyOnWriteArrayList<String>()
-        val f = RunFollower(
-            api, db, repo, backgroundScope, delayMs = {},
-            onNotice = object : NoticeSink {
-                override suspend fun notice(sessionKey: String, runId: String, runStartedAt: Long, notice: Notice, eventId: String, generation: Long, replay: Boolean) {
-                    log += "handed over"
-                }
-
-                override fun mark(): Long = 41
-
-                override suspend fun delivered(since: Long) {
-                    log += "delivered after $since"
-                }
-            },
-            generation = { GEN },
-        )
+    fun settleWaitsForItsOwnReceipt() = runTest {
+        val receipt = CompletableDeferred<Unit>()
+        val f = receiptFollower { receipt }
         stored()
         on(STATUS, status("waiting_for_approval", control("approval", "p1")))
-        f.settle(RUN)
-        log += "returned"
+        val settle = async(Dispatchers.IO) { f.settle(RUN) }
+        spinUntil { receipt in handed }
+        assertTrue(settle.isActive) // not done while its own notice is not
 
-        assertEquals(listOf("handed over", "delivered after 41", "returned"), log)
+        receipt.complete(Unit)
+        assertEquals("waiting_for_approval", settle.await())
+    }
+
+    private val handed = CopyOnWriteArrayList<CompletableDeferred<Unit>>()
+
+    /** Waits in real time for another thread; a 10 s watchdog only. */
+    private suspend fun spinUntil(condition: () -> Boolean) = withContext(Dispatchers.IO) {
+        repeat(2000) {
+            if (condition()) return@withContext
+            Thread.sleep(5)
+        }
+        fail("condition not met within 10 s")
     }
 
     @Test
     fun undeliveredNoticeMakesTheWorkerRetry() = runTest {
-        lateinit var f: RunFollower
-        f = RunFollower(
-            api, db, repo, backgroundScope, delayMs = {},
-            onNotice = object : NoticeSink {
-                override suspend fun notice(sessionKey: String, runId: String, runStartedAt: Long, notice: Notice, eventId: String, generation: Long, replay: Boolean) = Unit
-
-                override suspend fun delivered(since: Long) = throw NoticeNotDelivered()
-            },
-            generation = { GEN },
-        )
+        val f = receiptFollower { CompletableDeferred<Unit>().apply { completeExceptionally(NoticeNotDelivered()) } }
         messages()
         on(STATUS, status("completed"))
         on("/v1/runs", json("""{"run_id":"run_2","status":"started","replayed":false}""", 202))
@@ -283,10 +287,38 @@ class FollowerNoticeTest {
         val queue = SendQueue(api, db, f, System::currentTimeMillis, settle = { f.settle(it) })
         queue.enqueue(KEY, "second")
 
-        assertFalse(queue.drainSettlingRuns()) // the run settled and the next message went out, yet the notice did not
+        assertFalse(queue.drainSettlingRuns()) // the run settled and the next message went out, yet a notice did not
 
         assertNull(db.activeRunDao().get(RUN))
         assertEquals("run_2", db.activeRunDao().forSession(KEY)!!.runId)
+    }
+
+    @Test
+    fun clearRetiresOnlyTheRequestPendingWhenItsReadBegan() = runTest {
+        val f = follower()
+        stored()
+        on(STATUS, status("waiting_for_approval", control("approval", "pA")))
+        f.settle(RUN) // A handed over
+        // Read L starts, then read H; L answers B and is applied first; H's older, empty snapshot is applied last.
+        on(STATUS, status("waiting_for_approval", control("approval", "pB")), status("running"))
+        val release = CompletableDeferred<Unit>()
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        var h: kotlinx.coroutines.Job? = null
+        f.beforeStatusApply = {
+            when (calls.incrementAndGet()) {
+                1 -> { // L, before its publish: H takes its ticket and reads now
+                    h = backgroundScope.launch(Dispatchers.IO) { settle(RUN) }
+                    spinUntil { calls.get() >= 2 }
+                }
+                2 -> release.await() // H waits until L is applied
+            }
+        }
+        f.settle(RUN)
+        release.complete(Unit)
+        h!!.join()
+
+        assertEquals(listOf("req:$RUN:pA:$GEN", "req:$RUN:pB:$GEN"), sent.map { it.eventId })
+        assertEquals(listOf(listOf(KEY, RUN, "pA", false)), cleared) // it retires A, the request current when it began, never B
     }
 
     @Test
@@ -296,7 +328,7 @@ class FollowerNoticeTest {
         on(STATUS, status("running"))
         f.settle(RUN)
 
-        assertEquals(listOf(KEY to RUN), cleared)
+        assertEquals(listOf(listOf(KEY, RUN, null, false)), cleared)
     }
 
     @Test
@@ -310,7 +342,7 @@ class FollowerNoticeTest {
         on(STATUS, json("""{"error":{"code":"run_not_found"}}""", 404))
         f.settle(RUN)
 
-        assertEquals(listOf(KEY to RUN, KEY to RUN), cleared)
+        assertEquals(listOf(listOf(KEY, RUN, null, true), listOf(KEY, RUN, null, true)), cleared)
         assertTrue(sent.isEmpty())
         assertTrue(outbox().isEmpty())
     }
@@ -328,7 +360,7 @@ class FollowerNoticeTest {
         assertNull(db.activeRunDao().get("bad/id")) // still cleaned up
         assertTrue(outbox().none { it.runId == "bad/id" })
         assertTrue(sent.none { it.runId == "bad/id" })
-        assertTrue(KEY to "bad/id" in cleared)
+        assertTrue(listOf(KEY, "bad/id", null, true) in cleared)
     }
 
     @Test

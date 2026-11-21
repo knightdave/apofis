@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -177,6 +178,18 @@ class AppContainer(
 
     fun chatOpened(request: Pair<Long, String>) {
         chatRequest.compareAndSet(request, null)
+    }
+
+    /**
+     * The one consumer of taps for [conn]: each request is selected through [select] (checked against this live graph
+     * in the same step), and only then acknowledged, in one step; [opened] runs when a selection happened.
+     */
+    suspend fun consumeTaps(conn: Connected, select: suspend (key: String, current: () -> Boolean) -> Boolean, opened: () -> Unit) {
+        chatRequest.filterNotNull().collect { request ->
+            val selected = select(request.second) { tapTarget(request, conn) != null }
+            chatOpened(request)
+            if (selected) opened()
+        }
     }
 
     /** The key a tap [request] may open in [conn], checked at the moment of navigation; null: stale, ignore it. */
@@ -397,8 +410,8 @@ class AppContainer(
                 queue.drain()
                 runScope.launch { refreshQuietly(repo, composer) } // not on the follower's own, non-cancellable path
             }
-        }, active = open::get, onNotice = notifier, onControlsCleared = { key, run ->
-            notifier.clearNeedsAnswer(key, run, generation)
+        }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, request, ended ->
+            notifier.clearNeedsAnswer(key, run, request, generation, ended)
         }, generation = { generation })
         return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation)
     }

@@ -10,6 +10,11 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertNotNull
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -124,6 +129,33 @@ class OpenChatIntentTest {
         assertNull(container.tapTarget(g to "apofis-a", conn)) // the old graph, closed
         assertNull(container.tapTarget(g to "apofis-a", container.connected())) // the new graph: another epoch
         assertNull(container.tapTarget(g + 1 to "apofis-a", null)) // no connection: no screen change
+    }
+
+    @Test
+    fun tapIsAcknowledgedOnlyAfterItsSelection() = runTest {
+        container.connect(Credentials("https://a.example/", "key-a"))
+        session("apofis-a")
+        val conn = container.connected()!!
+        val selecting = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var opened = 0
+        val consumer = backgroundScope.launch {
+            container.consumeTaps(conn, { _, current ->
+                selecting.complete(Unit)
+                release.await() // the drawer's lock is held meanwhile
+                current()
+            }) { opened++ }
+        }
+        assertTrue(container.openChat(view(chatUri(container.epoch(), "apofis-a"))))
+        selecting.await()
+
+        assertNotNull(container.chatToOpen.value) // not acknowledged while its selection runs, so nothing cancels it
+        release.complete(Unit)
+        withContext(Dispatchers.IO) { repeat(2000) { if (opened == 1) return@withContext; Thread.sleep(5) } }
+
+        assertEquals(1, opened)
+        assertNull(container.chatToOpen.value)
+        consumer.cancel()
     }
 
     @Test

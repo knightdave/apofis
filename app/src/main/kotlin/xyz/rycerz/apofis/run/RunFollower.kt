@@ -38,6 +38,7 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.NoticeOutboxEntity
 import xyz.rycerz.apofis.db.ReplyOutcomeEntity
 import xyz.rycerz.apofis.notify.Notice
+import xyz.rycerz.apofis.notify.NoticeReceipts
 import xyz.rycerz.apofis.notify.NoticeSink
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.PendingState
@@ -92,7 +93,9 @@ class RunFollower(
     private val onRunFinished: suspend (sessionKey: String) -> Unit = {},
     private val active: () -> Boolean = { true }, // false once this follower's connection is closed
     private val onNotice: NoticeSink = NoticeSink { _, _, _, _, _, _, _ -> },
-    private val onControlsCleared: (key: String, runId: String) -> Unit = { _, _ -> }, // no answer pending for the run any more
+    // No answer pending for the run any more: [requestId] is the request this read retires (pending when it started);
+    // [ended]: the run ended without a finish notice.
+    private val onControlsCleared: suspend (key: String, runId: String, requestId: String?, ended: Boolean) -> Unit = { _, _, _, _ -> },
     private val generation: () -> Long = { 0 }, // this follower's connection, captured into every notice it hands on
 ) : RunStarter {
     private val lives = ConcurrentHashMap<String, MutableStateFlow<LiveReply?>>()
@@ -165,17 +168,20 @@ class RunFollower(
      */
     suspend fun settle(runId: String): String? {
         if (foreground) return null // a follower owns it
-        val since = onNotice.mark()
         val run = db.activeRunDao().get(runId) ?: return null
-        val status = try {
-            refresher(run).read().status
-        } catch (_: ApiError.NotFound) {
-            null
+        val receipts = NoticeReceipts()
+        val status = withContext(receipts) {
+            val status = try {
+                refresher(run).read().status
+            } catch (_: ApiError.NotFound) {
+                null
+            }
+            if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
+            status
         }
-        if (status == null || status in TERMINAL) Follow(run, Next.Finish(status)).finish(status)
-        // Outside every lock: a background check reports done only once its notices are posted or durably decided;
-        // NoticeNotDelivered otherwise, so its caller retries.
-        onNotice.delivered(since)
+        // Outside every lock: done only once this check's own approvals and clears are posted or decided (its finish
+        // is durable in the outbox already); NoticeNotDelivered otherwise, so its caller retries with backoff.
+        receipts.await()
         return status
     }
 
@@ -264,6 +270,8 @@ class RunFollower(
         private val applying = Mutex()
         val locked: Boolean get() = applying.isLocked
         private var applied = 0L // guarded by [applying]
+        // The last request handed over and not yet retired by a read that started after it; written under [applying].
+        @Volatile private var handedRequest: String? = null
         private val stopping = Mutex() // guards the two fields below and orders the stop intent's writes
         private var stopsInFlight = 0
         private var stopAccepted = false // by the server, for this run; also true for an intent stored before a restart
@@ -273,13 +281,14 @@ class RunFollower(
         /** One status read; returns its own result even when a newer one has already been applied. */
         suspend fun read(): RunStatus {
             val ticket = tickets.incrementAndGet()
+            val retiring = handedRequest // the request this read can show has ended: the one handed over before it began
             val s = io(run.runId) { api.runStatus(run.runId) }
             val pending = s.pendingControls.firstOrNull()
             // A terminal status is published before anything that can be cancelled: the send queue must never steer into it.
             // A publish that fails to store is not lost: the next read tries again.
             if (s.status in TERMINAL && !publish(s.status, pending, ticket)) request(retry = true)
             beforeStatusApply()
-            if (s.status !in TERMINAL && !publish(s.status, pending, ticket)) request(retry = true)
+            if (s.status !in TERMINAL && !publish(s.status, pending, ticket, retiring)) request(retry = true)
             // Only now: a read cancelled before its result was applied leaves the request standing.
             synchronized(this) { if (ticket > owedAfter) owedAfter = -1L }
             return s
@@ -292,7 +301,7 @@ class RunFollower(
          * shows no reply). A non-terminal status from an older read ([ticket]) than one already applied is ignored; a
          * stream event passes no ticket. False when the database failed: nothing was shown and the caller retries.
          */
-        suspend fun publish(status: String, pending: PendingControl?, ticket: Long? = null): Boolean = withContext(NonCancellable) {
+        suspend fun publish(status: String, pending: PendingControl?, ticket: Long? = null, retiring: String? = null): Boolean = withContext(NonCancellable) {
             try {
                 beforeStatusStore(status)
                 applying.withLock {
@@ -306,7 +315,7 @@ class RunFollower(
                         val accepted = held == stored(status)
                         edit(run) { it.copy(status = held, pending = if (accepted) pending else null) }
                         // Handed over under the lock, so the notifier gets accepted reads in the order they were accepted.
-                        if (accepted && status !in TERMINAL) handOverControls(pending)
+                        if (accepted && status !in TERMINAL) handOverControls(pending, retiring)
                     }
                 }
                 true
@@ -320,13 +329,20 @@ class RunFollower(
          * NEEDS_ANSWER notice (not stored: the next accepted read derives it again, the notifier drops a repeat); no
          * pending control clears the run's request notification. Both only hand over; nothing here waits for the OS.
          */
-        private suspend fun handOverControls(pending: PendingControl?) {
+        private suspend fun handOverControls(pending: PendingControl?, retiring: String?) {
             val request = pending?.takeIf { it.kind == "approval" || it.kind == "clarify" }?.requestId
             val gen = generation()
             try {
                 when {
-                    request != null -> onNotice.notice(run.sessionKey, run.runId, run.startedAt, Notice.NEEDS_ANSWER, "req:${run.runId}:$request:$gen", gen, false)
-                    pending == null -> onControlsCleared(run.sessionKey, run.runId)
+                    request != null -> {
+                        handedRequest = request
+                        onNotice.notice(run.sessionKey, run.runId, run.startedAt, Notice.NEEDS_ANSWER, "req:${run.runId}:$request:$gen", gen, false)
+                    }
+                    pending == null -> {
+                        // A read that began before a request was handed over cannot retire it; the next one will.
+                        if (retiring == handedRequest) handedRequest = null
+                        onControlsCleared(run.sessionKey, run.runId, retiring, false)
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -771,7 +787,7 @@ class RunFollower(
             try {
                 // A finish replaces the run's request; a stop, a gone run or a local failure only retires it.
                 if (row != null) onNotice.notice(key, id, row.runStartedAt, Notice.valueOf(row.notice), row.eventId, row.generation, false)
-                else onControlsCleared(key, id)
+                else onControlsCleared(key, id, null, true)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {

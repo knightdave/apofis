@@ -30,7 +30,13 @@ class NotificationAccessTest {
     }
 
     private fun access() = notificationAccess(app, prefs)
-    private fun ask() = askNotificationsOnce(app, prefs).also { if (it) asks += Manifest.permission.POST_NOTIFICATIONS }
+    /** The first send's decision; a true one is launched (the UI's part), which uses the chance up. */
+    private fun ask() = shouldAskNotifications(app, prefs).also {
+        if (it) {
+            asks += Manifest.permission.POST_NOTIFICATIONS
+            askLaunched(prefs)
+        }
+    }
 
     @Test
     @Config(sdk = [31])
@@ -70,6 +76,21 @@ class NotificationAccessTest {
         assertEquals(Runtime.DENIED, access().runtime)
         assertFalse(ask())
         assertTrue(asks.isEmpty())
+    }
+
+    @Test
+    @Config(sdk = [37])
+    fun chanceIsUsedOnlyByALaunch() {
+        shadowOf(app).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
+        assertTrue(shouldAskNotifications(app, prefs)) // decided, not yet launched
+        assertEquals(Runtime.NEVER_ASKED, access().runtime) // nothing used up yet
+        assertFalse(shouldAskNotifications(app, prefs)) // a second send meanwhile does not ask twice
+
+        askAbandoned() // the activity went away before the launch
+        assertTrue(shouldAskNotifications(app, prefs)) // the next accepted send may still ask
+        askLaunched(prefs)
+        assertEquals(Runtime.DENIED, access().runtime)
+        assertFalse(shouldAskNotifications(app, prefs))
     }
 
     @Test

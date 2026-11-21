@@ -83,7 +83,6 @@ fun AppNav(container: AppContainer) {
         return
     }
     val conn = connection
-    val toOpen by container.chatToOpen.collectAsState()
     var taps by remember(conn) { mutableIntStateOf(0) } // taps this graph selected, for the chat route to show
     // Without a connection only Connect makes sense; a failed reconnect that ended disconnected stays on its screen.
     val screen = when {
@@ -98,10 +97,9 @@ fun AppNav(container: AppContainer) {
     // only a selection that happened changes the screen, so a stale tap changes nothing.
     if (conn != null) {
         val drawer = drawerOf(container, conn, chatOwner)
-        LaunchedEffect(toOpen, drawer) {
-            val request = toOpen ?: return@LaunchedEffect
-            container.chatOpened(request)
-            if (drawer.selectTapped(request.second) { container.tapTarget(request, conn) != null }) {
+        // Keyed by the drawer only: acknowledging a tap must not cancel the selection it is making.
+        LaunchedEffect(drawer) {
+            container.consumeTaps(conn, drawer::selectTapped) {
                 taps++
                 chosen = Screen.CHAT
             }

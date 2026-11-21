@@ -90,8 +90,8 @@ class NotifierTest {
         notifier.idle()
     }
 
-    private suspend fun clear(key: String, run: String, generation: Long = gen) {
-        notifier.clearNeedsAnswer(key, run, generation)
+    private suspend fun clear(key: String, run: String, request: String?, generation: Long = gen, ended: Boolean = false) {
+        notifier.clearNeedsAnswer(key, run, request, generation, ended)
         notifier.idle()
     }
 
@@ -140,13 +140,13 @@ class NotifierTest {
         gen = 6
         ask(A, "run_a", 1, "r1")
 
-        clear(A, "run_a", generation = 5)
+        clear(A, "run_a", "r1", generation = 5)
         assertEquals(str(R.string.notif_needs_answer), text(A))
 
-        clear(A, "run_b") // another run's clear
+        clear(A, "run_b", "r1") // another run's clear
         assertEquals(str(R.string.notif_needs_answer), text(A))
 
-        clear(A, "run_a")
+        clear(A, "run_a", "r1")
         assertNull(shown(A))
     }
 
@@ -372,7 +372,7 @@ class NotifierTest {
         val returned = CountDownLatch(1)
         Thread {
             notifier.cancel(A, gen)
-            notifier.clearNeedsAnswer(A, "run_a", gen)
+            kotlinx.coroutines.runBlocking { notifier.clearNeedsAnswer(A, "run_a", null, gen) } // only hands over
             returned.countDown()
         }.start()
         val handedOver = withContext(Dispatchers.IO) { returned.await(5, TimeUnit.SECONDS) } // a watchdog: these only hand over
@@ -526,16 +526,15 @@ class NotifierTest {
     }
 
     @Test
-    fun approvalDeathBeforePostIsRetriedSilently() = runTest {
+    fun approvalDeathBeforePostIsRetried() = runTest {
         start()
         notifier.beforePost = { error("process death before the OS post") }
         ask(A, "run_a", 1, "p1")
         assertNull(shown(A))
 
         start().also { it.beforePost = {} }
-        ask(A, "run_a", 1, "p1") // the next accepted read derives it again
-        assertNotNull(shown(A))
-        assertTrue(!loud(A))
+        ask(A, "run_a", 1, "p1") // the next accepted read derives it again: never posted, so it alerts
+        assertTrue(loud(A))
     }
 
     @Test
@@ -554,7 +553,7 @@ class NotifierTest {
         ask(A, "run_a", 1, "p1")
         db.noticeStateDao().clear() // its order never written (a death), or lost
 
-        clear(A, "run_a")
+        clear(A, "run_a", "p1")
 
         assertNull(shown(A))
     }
@@ -563,7 +562,7 @@ class NotifierTest {
     fun lateRequestAfterSettlementIsDropped() = runTest {
         start()
         db.activeRunDao().upsert(ActiveRunEntity("run_a", A, null, "running", 1))
-        clear(A, "run_a") // a 404 settled the run and retired its request
+        clear(A, "run_a", null, ended = true) // a 404 settled the run and retired its request
         db.activeRunDao().delete("run_a")
 
         notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) // handed over late
@@ -609,51 +608,102 @@ class NotifierTest {
     }
 
     @Test
-    fun laneHoldsOneControlPerChat() = runTest {
+    fun laneHoldsOneControlStepPerChat() = runTest {
         start()
-        val release = CountDownLatch(1)
-        notifier.beforeAck = { release.await(10, TimeUnit.SECONDS) }
-        notifier.notice(B, "run_b", 1, Notice.FINISHED, "run:run_b", gen, replay = false) // holds the lane
-        repeat(100) { notifier.clearNeedsAnswer(A, "run_a", gen) } // the same state read again and again
-        repeat(100) { notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) }
-        assertTrue("pending ${notifier.pending}", notifier.pending <= 3) // the held finish, one clear, one request
-        release.countDown()
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", A, null, "waiting_for_approval", 1))
+        var posts = 0
+        notifier.beforePost = { posts++ }
+        val hold = holdLane()
+        repeat(100) {
+            notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p$it:$gen", gen, replay = false)
+            notifier.clearNeedsAnswer(A, "run_a", "p$it", gen) // each request resolved again before delivery
+        }
+        assertTrue("pending ${notifier.pending}", notifier.pending <= 2) // the held finish, one step for the chat
+        hold.complete(Unit)
         notifier.idle()
+
+        assertEquals(1, posts) // only the held finish of chat B reached the OS
+        assertNull(shown(A))
     }
 
     @Test
-    fun deliveredReportsAFailedDecision() = runTest {
+    fun receiptReportsItsOwnFailedHandOver() = runTest {
         start()
-        val since = notifier.mark()
-        notifier.beforePost = { error("the post failed") }
         db.activeRunDao().upsert(ActiveRunEntity("run_a", A, null, "waiting_for_approval", 1))
-        notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false)
+        notifier.beforePost = { error("the post failed") }
+        val mine = NoticeReceipts()
+        withContext(mine) { notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) }
+        assertTrue(runCatching { mine.await() }.exceptionOrNull() is NoticeNotDelivered)
 
-        try {
-            notifier.delivered(since)
-            fail("a failed hand-off was reported as delivered")
-        } catch (_: NoticeNotDelivered) {
-        }
+        // Another chat's failure is not this check's.
         notifier.beforePost = {}
-        notifier.delivered(notifier.mark()) // later work is judged on its own
+        db.activeRunDao().upsert(ActiveRunEntity("run_b", B, null, "waiting_for_approval", 1))
+        val other = NoticeReceipts()
+        withContext(other) { notifier.notice(B, "run_b", 1, Notice.NEEDS_ANSWER, "req:run_b:q1:$gen", gen, replay = false) }
+        other.await()
+        assertNotNull(shown(B))
     }
 
     @Test
     fun stoppedLaneFailsWaitersInsteadOfHanging() = runTest {
         val lane = CoroutineScope(Job())
         notifier = Notifier(app, prefs, db, { gen }, { visible }, lane)
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", A, null, "waiting_for_approval", 1))
         val hold = CompletableDeferred<Unit>()
-        notifier.beforeAck = { hold.await() }
-        val since = notifier.mark()
-        notifier.notice(A, "run_a", 1, Notice.FINISHED, "run:run_a", gen, replay = false)
-        val waiter = async(Dispatchers.IO) { runCatching { notifier.delivered(since) } }
+        notifier.beforePost = { hold.await() }
+        val mine = NoticeReceipts()
+        withContext(mine) { notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) }
+        val waiter = async(Dispatchers.IO) { runCatching { mine.await() } }
         awaitUntilPending(1)
 
         lane.cancel() // the lane's scope ends while the item is held
 
         val outcome = withContext(Dispatchers.IO) { withTimeout(10_000) { waiter.await() } } // a watchdog
         assertTrue(outcome.exceptionOrNull() is NoticeNotDelivered)
-        assertTrue(runCatching { notifier.delivered(notifier.mark()) }.exceptionOrNull() is NoticeNotDelivered) // and later ones
+        val later = NoticeReceipts()
+        withContext(later) { notifier.clearNeedsAnswer(A, "run_a", "p1", gen) }
+        assertTrue(runCatching { later.await() }.exceptionOrNull() is NoticeNotDelivered) // and later ones, at once
+    }
+
+    @Test
+    fun resolvedBeforeDeliveryIsNeverPosted() = runTest {
+        start()
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", A, null, "waiting_for_approval", 1))
+        var posts = 0
+        notifier.beforePost = { posts++ }
+        val hold = holdLane()
+        notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false)
+        notifier.clearNeedsAnswer(A, "run_a", "p1", gen) // answered before the lane got to it
+        hold.complete(Unit)
+        notifier.idle()
+
+        assertEquals(1, posts) // the held finish of chat B only: A never reached the OS
+    }
+
+    @Test
+    fun clearRemovesOnlyItsOwnRequest() = runTest {
+        start()
+        ask(A, "run_a", 1, "pB") // B is shown
+
+        clear(A, "run_a", "pA") // a delayed read that began while A was current
+
+        assertEquals("req:run_a:pB:$gen", shown(A)?.extras?.getString("xyz.rycerz.apofis.event"))
+    }
+
+    @Test
+    fun failedApprovalPostIsTriedAgain() = runTest {
+        start()
+        var fails = true
+        notifier.beforePost = { if (fails) { fails = false; error("the post failed") } }
+        ask(A, "run_a", 1, "p1")
+        assertNull(shown(A))
+
+        ask(A, "run_a", 1, "p1") // the next observation of the same, still pending request
+        assertTrue(loud(A))
+
+        nm.cancel(A, active().single().id) // dismissed after a real post
+        ask(A, "run_a", 1, "p1")
+        assertNull(shown(A))
     }
 
     private suspend fun awaitUntilPending(n: Int) = withContext(Dispatchers.IO) {
@@ -680,7 +730,7 @@ class NotifierTest {
         db.activeRunDao().upsert(ActiveRunEntity("run_new", A, null, "waiting_for_approval", 2))
         val hold = holdLane()
         notifier.notice(A, "run_new", 2, Notice.NEEDS_ANSWER, "req:run_new:p1:$gen", gen, replay = false)
-        notifier.clearNeedsAnswer(A, "run_old", gen) // a late retirement of the previous run
+        notifier.clearNeedsAnswer(A, "run_old", "p0", gen) // a late retirement of the previous run
         hold.complete(Unit)
         notifier.idle()
 
@@ -692,7 +742,7 @@ class NotifierTest {
         start()
         ask(A, "run_a", 1, "p1")
         val hold = holdLane()
-        notifier.clearNeedsAnswer(A, "run_a", gen) // a 404 settled the run
+        notifier.clearNeedsAnswer(A, "run_a", null, gen, ended = true) // a 404 settled the run
         db.activeRunDao().delete("run_a")
         notifier.notice(A, "run_a", 1, Notice.NEEDS_ANSWER, "req:run_a:p1:$gen", gen, replay = false) // accepted earlier, handed over late
         hold.complete(Unit)
