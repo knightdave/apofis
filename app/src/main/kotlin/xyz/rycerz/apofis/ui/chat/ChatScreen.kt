@@ -32,6 +32,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -135,6 +136,9 @@ fun ChatScreen(
                 }
                 return@Box
             }
+            // A sheet or dialog over the chat: requests below it cannot be answered (their guard restarts once uncovered).
+            val covered = LocalObscured.current || detail != null || state.confirmCancel != null || state.confirmDiscard != null || state.confirmRetry != null
+            CompositionLocalProvider(LocalObscured provides covered) {
             MessageList(
                 state.items,
                 state.live,
@@ -149,6 +153,7 @@ fun ChatScreen(
                 today = today,
                 onLink = { url -> linkFailed = runCatching { uriHandler.openUri(url) }.isFailure },
             )
+            }
             val away by remember { derivedStateOf { listState.canScrollBackward } }
             if (away) {
                 ApofisIconButton(

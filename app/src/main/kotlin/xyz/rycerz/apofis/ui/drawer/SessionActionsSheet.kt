@@ -74,7 +74,7 @@ private fun SessionActions(prompt: Prompt, actions: PromptActions) {
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
     )
-    val enabled = !prompt.busy
+    val enabled = !prompt.busy && !prompt.gone
     if (prompt.archived) {
         SheetRow(R.drawable.lucide_archive_arrow_up, stringResource(R.string.drawer_unarchive), { actions.archive(token, false) }, enabled = enabled)
     } else {
@@ -109,7 +109,7 @@ private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            DialogButton({ actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy) {
+            DialogButton({ actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy && !prompt.gone) {
                 Text(stringResource(R.string.drawer_save))
             }
         },
@@ -131,7 +131,7 @@ private fun DeleteDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            DialogButton({ actions.confirmDelete(prompt.token) }, enabled = !prompt.busy) {
+            DialogButton({ actions.confirmDelete(prompt.token) }, enabled = !prompt.busy && !prompt.gone) {
                 Text(stringResource(R.string.drawer_delete), color = if (prompt.busy) Color.Unspecified else scheme.error)
             }
         },

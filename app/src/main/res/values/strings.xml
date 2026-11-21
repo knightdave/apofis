@@ -107,7 +107,7 @@
     <string name="steps_later">Later steps (%d)</string>
     <string name="page_previous">Previous part</string>
     <string name="page_next">Next part</string>
-    <string name="page_of">Part %1$d of %2$d</string>
+    <string name="page_part">Part %1$d</string>
     <string name="chat_tool_running">Running</string>
     <string name="chat_tool_failed">Failed</string>
     <string name="tool_arguments">Arguments</string>

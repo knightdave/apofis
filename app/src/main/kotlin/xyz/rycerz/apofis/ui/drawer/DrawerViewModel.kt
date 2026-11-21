@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -49,6 +51,7 @@ data class Prompt(
     val token: Long,
     val error: ActionError? = null,
     val busy: Boolean = false,
+    val gone: Boolean = false, // the chat is gone from this phone; kept only to show a running action's outcome
 )
 
 /** A run started after the delete dialog opened: the dialog now says so and needs confirming again. */
@@ -130,6 +133,25 @@ class DrawerViewModel(
         viewModelScope.launch { selectedFlow.filterNotNull().collect { onSelected(it) } }
         // A chat removed from this phone (a refresh, another screen) must not stay open.
         viewModelScope.launch { sessions.drop(1).collect { reconcile() } }
+        // Nor may a prompt for it, whoever refreshed: it watches its own chat's row (gone: missing or hidden; an
+        // archived chat is still here). An idle prompt closes; a busy one, or one showing a failure, stays to show its
+        // outcome but offers nothing more. Scoped by token, so a newer prompt is never closed for an older one's chat.
+        viewModelScope.launch {
+            promptFlow.map { it?.let { p -> p.token to p.key } }.distinctUntilChanged().collectLatest { subject ->
+                val (token, key) = subject ?: return@collectLatest
+                repo.session(key).collect { row ->
+                    if (row == null || row.hidden) {
+                        promptFlow.update { p ->
+                            when {
+                                p?.token != token -> p
+                                p.busy || p.error != null -> p.copy(gone = true)
+                                else -> null
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fun retryLoad() = load()
@@ -177,10 +199,7 @@ class DrawerViewModel(
             }
             refreshing = false
             refreshFailedFlow.value = failed
-            if (!failed) {
-                reconcile()
-                closeGonePrompt()
-            }
+            if (!failed) reconcile()
         }
     }
 
@@ -310,6 +329,9 @@ class DrawerViewModel(
     /** For tests: actions started and not yet applied. */
     internal fun busyActions(): Int = inFlight.get()
 
+    /** For tests: a drawer refresh is still running. */
+    internal fun refreshInFlight(): Boolean = refreshing
+
     /** Under [ops]: a new local chat, opened. */
     private suspend fun openNew(): String = repo.createLocalSession().also { selectedFlow.value = it }
 
@@ -327,21 +349,6 @@ class DrawerViewModel(
         }
     }
 
-    /**
-     * After a refresh: an idle prompt whose chat is gone from this phone (removed, not archived) closes, only that
-     * prompt, by token. A busy one stays, so its outcome still shows.
-     */
-    private suspend fun closeGonePrompt() {
-        try {
-            val gone = promptFlow.value?.takeIf { !it.busy && !usable(it.key) } ?: return
-            promptFlow.update { if (it?.token == gone.token && !it.busy) null else it }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            // closed by a server switch: this view model is about to go away
-        }
-    }
-
     private fun open(kind: PromptKind, key: String): Long? {
         val prompt = promptFor(kind, key) ?: return null
         promptFlow.value = prompt
@@ -350,7 +357,7 @@ class DrawerViewModel(
 
     /** From the sheet to a dialog for the same chat, as a new prompt. */
     private fun reopen(token: Long, kind: PromptKind) {
-        promptFlow.update { p -> if (p?.token == token && !p.busy) promptFor(kind, p.key) ?: p else p }
+        promptFlow.update { p -> if (p?.token == token && !p.busy && !p.gone) promptFor(kind, p.key) ?: p else p }
     }
 
     private fun promptFor(kind: PromptKind, key: String): Prompt? {
@@ -366,7 +373,7 @@ class DrawerViewModel(
     private fun act(token: Long, kind: PromptKind, block: suspend (Prompt) -> Unit) {
         var started: Prompt? = null
         promptFlow.update { p ->
-            if (p != null && p.token == token && p.kind == kind && !p.busy) p.copy(busy = true, error = null).also { started = it } else p
+            if (p != null && p.token == token && p.kind == kind && !p.busy && !p.gone) p.copy(busy = true, error = null).also { started = it } else p
         }
         val prompt = started ?: return
         inFlight.incrementAndGet()

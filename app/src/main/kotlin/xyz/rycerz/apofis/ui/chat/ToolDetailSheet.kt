@@ -101,14 +101,14 @@ internal fun ToolDetailSheet(step: ToolStep, live: Boolean, onDismiss: () -> Uni
                 if (step.argsTruncated) Hint(stringResource(R.string.tool_args_truncated))
             } else {
                 // Live steps carry only the server's short preview; the stored transcript has the full arguments.
-                Section(stringResource(R.string.tool_arguments), step.argsPreview.take(TOOL_RESULT_DISPLAY_LIMIT), "sheet.args")
+                Section(stringResource(R.string.tool_arguments), displayPrefix(step.argsPreview, TOOL_RESULT_DISPLAY_LIMIT), "sheet.args")
                 if (step.argsPreview.length > TOOL_RESULT_DISPLAY_LIMIT) Hint(stringResource(R.string.tool_args_truncated))
                 if (live) Hint(stringResource(R.string.tool_args_later))
             }
             val result = step.result
             Section(
                 stringResource(R.string.tool_result),
-                result?.take(TOOL_RESULT_DISPLAY_LIMIT) ?: stringResource(if (step.running) R.string.chat_tool_running else R.string.tool_no_result),
+                result?.let { displayPrefix(it, TOOL_RESULT_DISPLAY_LIMIT) } ?: stringResource(if (step.running) R.string.chat_tool_running else R.string.tool_no_result),
                 "sheet.result",
                 code = result != null,
             )

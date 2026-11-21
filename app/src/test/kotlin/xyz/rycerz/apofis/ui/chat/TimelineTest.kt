@@ -28,6 +28,9 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.onNodeWithContentDescription
 import org.junit.Assert.assertFalse
+import android.icu.text.BreakIterator
+import androidx.compose.ui.test.hasClickAction
+import xyz.rycerz.apofis.chat.TOOL_RESULT_DISPLAY_LIMIT
 import androidx.compose.ui.unit.dp
 import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
@@ -285,21 +288,41 @@ class TimelineTest {
         assertTrue("visited ${reads[0]}", reads[0] <= STEP_PAGE + 2)
         assertTrue("composed ${Work.timelineRows}", Work.timelineRows <= 3)
 
-        // Earlier pages reach the first step; later pages come back; nothing is skipped.
+        // Earlier pages partition the run without overlap, newest first, the oldest page short; Later walks back.
         rule.mainClock.autoAdvance = true // scrolling to the rows below needs frames
-        seen.clear()
-        page()
-        repeat(10) {
-            val earlier = rule.onAllNodes(hasText("Earlier steps", substring = true)).fetchSemanticsNodes()
-            if (earlier.isEmpty()) return@repeat
+        val pages = mutableListOf(page())
+        while (rule.onAllNodes(hasText("Earlier steps", substring = true)).fetchSemanticsNodes().isNotEmpty()) {
             rule.onNodeWithText("Earlier steps", substring = true).performScrollTo().performClick()
-            frame()
-            page()
+            pages += page()
+            assertTrue(pages.size < 20)
         }
-        assertEquals((0..300).map { "step:r1:$it:terminal" }.toSet(), seen)
+        fun range(r: IntRange) = r.map { "step:r1:$it:terminal" }
+        val expected = listOf(range(261..300)) + (5 downTo 0).map { range(21 + it * 40 until 61 + it * 40) } + listOf(range(0 until 21))
+        assertEquals(expected, pages)
         rule.onNodeWithText("Later steps", substring = true).performScrollTo().performClick()
-        frame()
-        assertTrue(page().contains("step:r1:40:terminal"))
+        assertEquals(range(21 until 61), page())
+    }
+
+    @Test
+    fun anOlderPageStaysPutAsStepsArriveAndOneTapAlwaysMoves() {
+        val all = tools(200)
+        var reply by mutableStateOf(AssistantReply("r1", all, "", 0.0, live = true), referentialEqualityPolicy())
+        rule.setContent { Themed { Scrolling { TimelineCard(reply, "step:r1", onStep = {}) } } }
+        rule.onNodeWithText("Show 198 more steps").performClick()
+        repeat(4) { rule.onNodeWithText("Earlier steps", substring = true).performScrollTo().performClick() }
+        fun page() = nodes("step:r1:").map { it.config[SemanticsProperties.TestTag] }
+        fun range(r: IntRange) = r.map { "step:r1:$it:terminal" }
+        assertEquals(range(0 until 40), page())
+        reply = reply.copy(steps = all + tools(5).map { (it as ToolStep).copy(callId = "n${it.callId}") }) // new steps arrive
+        rule.waitForIdle()
+        assertEquals("an older page is anchored, it does not slide", range(0 until 40), page())
+        // The stored reply has fewer steps than the page the reader was on: one Later tap still changes the page.
+        reply = AssistantReply("r1", tools(41), "done", 0.0)
+        rule.waitForIdle()
+        val before = page()
+        rule.onNodeWithText("Later steps", substring = true).performScrollTo().performClick()
+        assertTrue("one tap on Later moved nothing: $before", page() != before)
+        assertEquals(range(1 until 41), page())
     }
 
     @Test
@@ -319,22 +342,108 @@ class TimelineTest {
         }
         assertEquals("the pages together are the whole trace", text, parts.toString())
         rule.onNodeWithContentDescription("Previous part").performScrollTo().performClick()
-        rule.onNodeWithText("Part ${guard} of ${guard + 1}", substring = true).assertExists()
+        rule.onNodeWithText("Part $guard", substring = true).assertExists()
+        // What TalkBack navigates: the merged step node carries the whole current part; the paging buttons are
+        // labelled actions of their own.
+        val merged = rule.onNodeWithTag("step:r1:0").fetchSemanticsNode().config[SemanticsProperties.Text].joinToString("")
+        val part = rule.onNodeWithTag("reasoning:0.page", useUnmergedTree = true).fetchSemanticsNode().config[SemanticsProperties.Text].joinToString("")
+        assertTrue(merged.contains(part))
+        rule.onNodeWithContentDescription("Previous part").assert(hasClickAction())
+        rule.onNodeWithContentDescription("Next part").assert(hasClickAction())
+    }
+
+    private fun pagesOf(text: CharSequence): List<String> {
+        val out = ArrayList<String>()
+        var start = 0
+        while (true) {
+            val end = pageEnd(text, start)
+            out += text.substring(start, end)
+            if (end >= text.length) return out
+            assertTrue("no progress at $start", end > start)
+            start = end
+            assertTrue(out.size < 100_000)
+        }
+    }
+
+    private fun boundaries(text: String): Set<Int> {
+        val it = BreakIterator.getCharacterInstance()
+        it.setText(text)
+        val out = HashSet<Int>()
+        var b = it.first()
+        while (b != BreakIterator.DONE) { out += b; b = it.next() }
+        return out
+    }
+
+    private fun breaks(page: String): Int {
+        var n = 0
+        var i = 0
+        while (i < page.length) {
+            if (page[i] == '\r') { n++; if (i + 1 < page.length && page[i + 1] == '\n') i++ } else if (page[i] == '\n') n++
+            i++
+        }
+        return n
     }
 
     @Test
-    fun pagesAreBoundedExactAndNeverSplitASurrogatePair() {
-        val inputs = listOf("", "a", "\n".repeat(5000), "x".repeat(100_000), "😀".repeat(3000), (1..100).joinToString("\n") { "l$it" }, "a\n" + "😀".repeat(1500))
+    fun pagesCutOnlyBetweenGraphemesAndCountEveryKindOfLineBreak() {
+        val pad = { n: Int -> "a".repeat(n) }
+        val inputs = listOf(
+            "", "a", "\n".repeat(5000), "q\r".repeat(500), "q\r\n".repeat(500), "x".repeat(100_000), "😀".repeat(3000),
+            pad(1499) + "e\u0301z" + pad(10), pad(1498) + "👩\u200D💻" + pad(10), pad(1499) + "🇵🇱🇩🇪🇺🇦" + pad(10),
+            pad(1498) + "🇵🇱🇩🇪🇺🇦" + pad(10), pad(1499) + "\r\n" + pad(10), (1..23).joinToString("") { "l\n" } + "l\r\nz",
+            "a\n" + "😀".repeat(1500), "🇵🇱".repeat(2000),
+        )
         for (text in inputs) {
-            val starts = textPages(text)
-            val pages = starts.indices.map { text.substring(starts[it], starts.getOrElse(it + 1) { text.length }) }
+            val pages = pagesOf(text)
             assertEquals(text, pages.joinToString(""))
+            val cuts = pages.runningFold(0) { at, page -> at + page.length }
+            val ok = boundaries(text)
+            for (cut in cuts) assertTrue("cut at $cut inside a grapheme of ${text.take(40)}", cut in ok)
             for (page in pages) {
                 assertTrue(page.length <= TEXT_PAGE_CHARS)
-                assertTrue(page.count { it == '\n' } <= TEXT_PAGE_LINES)
-                if (page.isNotEmpty()) assertFalse(Character.isLowSurrogate(page.first()))
+                assertTrue("${breaks(page)} breaks", breaks(page) <= TEXT_PAGE_LINES)
             }
         }
+    }
+
+    @Test
+    fun anOversizedGraphemeIsSplitOnlyAtACodePointAndPagingEnds() {
+        val text = "e" + "\u0301".repeat(5000) + "z"
+        val pages = pagesOf(text)
+        assertEquals(text, pages.joinToString(""))
+        for (page in pages) {
+            assertTrue(page.length <= TEXT_PAGE_CHARS + GRAPHEME_WINDOW)
+            assertFalse(Character.isLowSurrogate(page.first()))
+            assertFalse(Character.isHighSurrogate(page.last()))
+        }
+    }
+
+    @Test
+    fun thePageOnScreenIsFoundWithoutReadingTheWholeText() {
+        val text = "word ".repeat(200_000) // 1,000,000 characters, no line break
+        var reads = 0
+        val counted = object : CharSequence {
+            override val length get() = text.length
+            override fun get(index: Int): Char = text[index].also { reads++ }
+            override fun subSequence(startIndex: Int, endIndex: Int): CharSequence = text.subSequence(startIndex, endIndex).also { reads += endIndex - startIndex }
+            override fun toString() = text
+        }
+        val end = pageEnd(counted, 0)
+        assertTrue(end in 1..TEXT_PAGE_CHARS)
+        assertTrue("read $reads characters for one page", reads < 4 * TEXT_PAGE_CHARS)
+    }
+
+    @Test
+    fun theLivePreviewCapNeverEndsInsideAGrapheme() {
+        val pad = "a".repeat(TOOL_RESULT_DISPLAY_LIMIT - 1)
+        for (tail in listOf("😀", "e\u0301", "👩\u200D💻", "🇵🇱", "\r\n")) {
+            val text = pad + tail + "after"
+            val shown = displayPrefix(text, TOOL_RESULT_DISPLAY_LIMIT)
+            assertTrue(text.startsWith(shown))
+            assertTrue(shown.length <= TOOL_RESULT_DISPLAY_LIMIT)
+            assertTrue("cut inside ${tail.length}-unit grapheme", shown.length in boundaries(text))
+        }
+        assertEquals("short", displayPrefix("short", TOOL_RESULT_DISPLAY_LIMIT))
     }
 
     @Test
@@ -370,5 +479,50 @@ class TimelineTest {
         assertTrue("opened $opened", opened.isEmpty())
         rule.onNodeWithTag("step:r2:0:terminal").performClick()
         assertEquals(listOf(StepSubject("r2", 0, "c7", "terminal")), opened)
+    }
+
+    @Test
+    fun aCallIdNeverCollidesWithTheKeyOfAStepWithoutOne() {
+        val opened = ArrayList<StepSubject>()
+        val noId = ToolStep("", "terminal", "command=ls", null, false, error = false, running = true)
+        var items by mutableStateOf<List<ChatItem>>(Joined(emptyList(), listOf(AssistantReply("r2", listOf(noId), "", 0.0, live = true))))
+        rule.setContent { Themed { MessageList(items, null, emptyMap(), answering = false, actions = object : ChatActions {}, onCancel = {}, onStep = { opened += it }, listState = rememberLazyListState(), contentPadding = PaddingValues(), zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
+        rule.onNodeWithTag("step:r2:0:terminal").performTouchInput { down(center) }
+        items = listOf(AssistantReply("r2", listOf(noId.copy(callId = "#terminal", running = false)), "done", 0.0)) // a real id spelled like the fallback
+        rule.waitForIdle()
+        rule.onNodeWithTag("step:r2:0:terminal").performTouchInput { up() }
+        rule.waitForIdle()
+        assertTrue("opened $opened", opened.isEmpty())
+    }
+
+    // ---- fix round 2: the list's own delivery path reads no step on a step update ----
+
+    @Test
+    fun aStepUpdateThroughTheFoldedListReadsNoHiddenStep() = stepUpdatesThroughTheList(expanded = false)
+
+    @Test
+    fun aStepUpdateThroughTheExpandedListReadsOnlyItsPage() = stepUpdatesThroughTheList(expanded = true)
+
+    private fun stepUpdatesThroughTheList(expanded: Boolean) {
+        val reads = IntArray(1)
+        val all = tools(300)
+        // Referential policy in the test's own holder, so only MessageList's delivery path is measured.
+        var items by mutableStateOf<List<ChatItem>>(Joined(emptyList(), listOf(AssistantReply("r1", counting(all, reads), "", 0.0, live = true))), referentialEqualityPolicy())
+        rule.setContent { Themed { Messages(items) } }
+        rule.waitForIdle()
+        if (expanded) rule.onNodeWithText("Show 298 more steps").performClick()
+        rule.waitForIdle()
+        for ((label, steps) in listOf(
+            "same steps, more text" to null,
+            "last step completes" to all.dropLast(1) + (all.last() as ToolStep).copy(result = "done"),
+            "a step starts" to all + tool(300),
+        )) {
+            reads[0] = 0
+            val old = items.last() as AssistantReply
+            items = Joined(emptyList(), listOf(old.copy(steps = steps?.let { counting(it, reads) } ?: old.steps, text = old.text + "x")))
+            rule.waitForIdle()
+            val bound = if (expanded) STEP_PAGE + 2 else 4
+            assertTrue("expanded=$expanded, $label: read ${reads[0]} steps", reads[0] <= bound)
+        }
     }
 }

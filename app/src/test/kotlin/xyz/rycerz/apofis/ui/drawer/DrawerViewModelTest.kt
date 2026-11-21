@@ -152,6 +152,14 @@ class DrawerViewModelTest {
 
     private fun List<DrawerRow>.chats() = filterIsInstance<DrawerRow.Chat>()
 
+    /**
+     * A test must not end while the drawer's refresh still runs: tearing down under it made every later test in this
+     * class that waits for a database-driven reaction time out (seen in fix round 2; the shared resource behind it was
+     * not identified).
+     */
+    private suspend fun refreshDone(vm: DrawerViewModel) =
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.refreshInFlight()) delay(5) } }
+
     private fun Composer.edit(key: String, text: String) = edit(key, text, current(key).revision)
 
     private fun sessionsListed() = requests.count { it.target.startsWith("/api/sessions?") }
@@ -525,6 +533,7 @@ class DrawerViewModelTest {
         assertEquals("apofis-a", vm.prompt.value!!.key)
         vm.onOpen()
         vm.prompt.await { it == null }
+        refreshDone(vm)
     }
 
     @Test
@@ -539,6 +548,7 @@ class DrawerViewModelTest {
         vm.onOpen()
         vm.rows.await { it.chats().none { c -> c.key == "apofis-a" } }
         withContext(Dispatchers.Default) { withTimeout(10_000) { while (vm.selected.value == "apofis-a") delay(5) } }
+        refreshDone(vm)
         assertEquals(forB, vm.prompt.value)
     }
 
@@ -552,5 +562,82 @@ class DrawerViewModelTest {
         db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(archived = true)) // archived elsewhere: still here
         vm.rows.await { it.chats().isEmpty() }
         assertEquals(prompt, vm.prompt.value)
+    }
+
+    // ---- fix round 2: any removal closes an idle sheet, whoever refreshed ----
+
+    @Test
+    fun aSheetClosesWhenItsChatIsRemovedWithoutTheDrawerRefreshing() = runTest {
+        addSession("apofis-a", "Removed by a refresh elsewhere")
+        addSession("apofis-b", "Open", active = clock.get() / 1000.0 - 60)
+        val vm = vm()
+        vm.rows.await { it.chats().size == 2 }
+        vm.onLongPress("apofis-a")
+        db.sessionDao().delete("apofis-a") // a run-completion or foreground refresh removed it; onOpen is never called
+        vm.prompt.await { it == null }
+        // Hidden counts as gone too.
+        vm.onLongPress("apofis-b")
+        db.sessionDao().upsert(db.sessionDao().get("apofis-b")!!.copy(hidden = true))
+        vm.prompt.await { it == null }
+    }
+
+    @Test
+    fun aNewerSheetIsNotClosedForTheChatOfAnOlderOne() = runTest {
+        addSession("apofis-a", "Old sheet")
+        addSession("apofis-b", "New sheet", active = clock.get() / 1000.0 - 60)
+        val vm = vm()
+        vm.rows.await { it.chats().size == 2 }
+        vm.onLongPress("apofis-a")
+        vm.onLongPress("apofis-b") // replaces the prompt before a's removal is seen
+        val forB = vm.prompt.value!!
+        db.sessionDao().delete("apofis-a")
+        vm.rows.await { it.chats().none { c -> c.key == "apofis-a" } }
+        withContext(Dispatchers.Default) { delay(200) } // give a wrong close the chance to happen
+        assertEquals(forB, vm.prompt.value)
+    }
+
+    @Test
+    fun aRefreshLeavesTheNewerSheetOpenAfterClosingTheOld() = runTest {
+        addSession("apofis-a", "Gone on the server")
+        addSession("apofis-b", "Still there", active = clock.get() / 1000.0 - 60)
+        routes["GET /api/sessions"] = listing("apofis-b")
+        val vm = vm()
+        vm.rows.await { it.chats().size == 2 }
+        vm.onLongPress("apofis-a")
+        vm.onOpen()
+        vm.prompt.await { it == null }
+        // A newer prompt for a chat that is still there stays open through the next refresh.
+        vm.onLongPress("apofis-b")
+        val forB = vm.prompt.value!!
+        clock.addAndGet(60_000)
+        vm.onOpen()
+        withContext(Dispatchers.Default) { withTimeout(10_000) { while (sessionsListed() < 2) delay(5) } }
+        vm.rows.await { it.chats().any { c -> c.key == "apofis-b" } }
+        refreshDone(vm)
+        assertEquals(forB, vm.prompt.value)
+    }
+
+    @Test
+    fun aBusySheetWhoseChatGoesAwayKeepsItsOutcomeButOffersNothingMore() = runTest {
+        addSession("apofis-a", "Pinned while removed")
+        val gate = CountDownLatch(1)
+        routes["PATCH /api/sessions/apofis-a"] = { gate.hold(); MockResponse.Builder().code(500).build() }
+        val vm = vm()
+        vm.rows.await { it.chats().size == 1 }
+        vm.onLongPress("apofis-a")
+        val token = vm.prompt.value!!.token
+        vm.pin(token, true)
+        try {
+            withContext(Dispatchers.Default) { withTimeout(10_000) { while (requests.none { it.method == "PATCH" }) delay(5) } }
+            db.sessionDao().delete("apofis-a") // removed while the pin is in flight
+            vm.prompt.await { it?.gone == true }
+            assertTrue(vm.prompt.value!!.busy)
+        } finally {
+            gate.countDown()
+        }
+        val shown = vm.prompt.await { it != null && !it.busy && it.error != null }!!
+        assertTrue("the failure stays visible, with nothing more to do", shown.gone)
+        vm.archive(token, true) // offers nothing more: ignored
+        assertEquals(shown, vm.prompt.value)
     }
 }

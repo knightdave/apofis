@@ -26,7 +26,9 @@ import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
 import xyz.rycerz.apofis.ui.drawer.PromptHost
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import xyz.rycerz.apofis.ui.chat.LocalObscured
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -223,6 +225,9 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
             },
             drawerState = drawerState,
         ) {
+            // The drawer over the chat (open, opening or a prompt from it): pending requests cannot be answered.
+            val covered = drawerState.currentValue != DrawerValue.Closed || drawerState.targetValue != DrawerValue.Closed || prompt != null
+            CompositionLocalProvider(LocalObscured provides covered) {
             val sessionKey = selected
             if (sessionKey == null) {
                 ChatScreen(
@@ -243,6 +248,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                     val state by vm.state.collectAsState()
                     ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton)
                 }
+            }
             }
         }
     }
