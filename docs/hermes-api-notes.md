@@ -338,8 +338,15 @@ Source-derived at `a8fed44bbe`, not observed live (the owner's handoff checks it
   Timeouts and non-zero exits of observer hooks are only logged (`:554-610`). Consent is the exact
   `(event, command)` pair in `~/.hermes/shell-hooks-allowlist.json` (`:305-325`); the gateway
   re-reads configuration and allowlist about every 30 s (`sync_from_config`, `:180-234`).
-  `hermes hooks test` and `doctor` execute allowed hooks with sample payloads (`platform: "cli"`
-  for `on_session_end`, no `kind` for `on_human_input_request`; `hermes_cli/hooks.py:100-130`).
+  `hermes hooks test <event>` runs every hook configured for that event without checking consent,
+  with sample or custom payloads (`hermes_cli/hooks.py:179-221`); `doctor` runs approved hooks only
+  (`:309-325`). Samples: `platform: "cli"` for `on_session_end`, no `kind` for
+  `on_human_input_request` (`:100-130`).
+- **SQLite read-only opens create sidecars.** A `mode=ro` connection opens `-shm` with
+  `O_RDWR|O_CREAT` and `-wal` with READWRITE|CREATE before falling back to read-only (sqlite3.c
+  3.53: `unixOpenSharedMemory`, `sqlite3WalOpen`, `unixOpen`). On a WAL database whose last writer
+  has closed (sidecars deleted), such a reader creates both files in a writable directory (checked on
+  a private fixture). The hook's reader therefore runs under Landlock with no write rights.
 - **Stdin.** `{hook_event_name, tool_name, tool_input, session_id, cwd, profile, extra}`;
   `session_id` is top level, every other keyword argument is under `extra` (`shell_hooks.py:49,87-102`).
 - **`on_session_end`** (`agent/turn_finalizer.py:794-812`): `extra` has `task_id, turn_id, completed,

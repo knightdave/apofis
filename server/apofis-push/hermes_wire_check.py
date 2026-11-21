@@ -2,19 +2,27 @@
 through Hermes' own shell-hook runner (agent.shell_hooks.run_once) for both events.
 
 Run on the Hermes host only, never in CI:
-  /home/hermes/.hermes/hermes-agent/venv/bin/python -I -B server/apofis-push/hermes_wire_check.py
+  /home/hermes/.hermes/hermes-agent/venv/bin/python -I -B server/apofis-push/hermes_wire_check.py [--keep]
 
 It never touches the real Hermes home: a fresh HOME and HERMES_HOME under ~/tmp, a private WAL
-database, a loopback fake ntfy, and a check that no file of the Hermes install tree changed.
+database, a loopback fake ntfy (records name only the loopback origin and the run's install id).
+It checks, by stat only, that no file changed under the Hermes install tree
+(/home/hermes/.hermes/hermes-agent, recursively), under /home/hermes/.hermes/agent-hooks
+(recursively) and the two hook configuration files (config.yaml, shell-hooks-allowlist.json). It does
+not cover the rest of /home/hermes/.hermes, which the running gateway writes to. Every hook child is
+accounted for before the throwaway home is removed (kept only with --keep).
 """
 import sys
 
 sys.dont_write_bytecode = True
 
+import fcntl  # noqa: E402
 import http.server  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 import shutil  # noqa: E402
+import signal  # noqa: E402
 import sqlite3  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
@@ -28,6 +36,8 @@ PY = AGENT + "/venv/bin/python"
 GATEWAY_PATH = ("/home/hermes/.local/bin:/home/hermes/.nix-profile/bin:/etc/profiles/per-user/hermes/bin:"
                 "/run/wrappers/bin:/run/current-system/sw/bin")
 HERE = os.path.dirname(os.path.abspath(__file__))
+INSTALLED = "/home/hermes/.hermes/agent-hooks/apofis_push.py"
+RELEASE_OPTS = "--allow-origin https://ntfy.sh"
 APP = "apofis-1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 INSTALL = "0f8fad5b-d9cb-469f-a165-70867728950e"
 WATCHDOG = 30.0
@@ -50,21 +60,35 @@ EVENTS = [
 ]
 
 
+def readme_command():
+    """The one command the README installs: identical in all four places (two hooks, two approvals)."""
+    with open(os.path.join(HERE, "README.md"), encoding="utf-8") as f:
+        text = f.read()
+    yaml_cmds = re.findall(r'- command: "([^"]+)"', text)
+    json_cmds = re.findall(r'"command": "([^"]+)"', text)
+    assert len(yaml_cmds) == 2 and len(json_cmds) == 2 and len(set(yaml_cmds + json_cmds)) == 1, \
+        (yaml_cmds, json_cmds)
+    cmd = yaml_cmds[0]
+    assert cmd == "python3 -I %s hook %s" % (INSTALLED, RELEASE_OPTS), cmd
+    return cmd
+
+
 def tree_state():
-    """(path -> (mtime_ns, size)) for the install tree and the hook configuration files; stat only."""
+    """(path -> (mtime_ns, size, inode)) for the scope in the module docstring; stat only."""
     state = {}
-    for root, dirs, files in os.walk(AGENT):
-        for name in dirs + files:
-            p = os.path.join(root, name)
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
-            state[p] = (st.st_mtime_ns, st.st_size)
+    for top in (AGENT, HERMES + "/agent-hooks"):
+        for root, dirs, files in os.walk(top):
+            for name in dirs + files:
+                p = os.path.join(root, name)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                state[p] = (st.st_mtime_ns, st.st_size, st.st_ino)
     for p in (HERMES + "/config.yaml", HERMES + "/shell-hooks-allowlist.json", HERMES + "/agent-hooks"):
         try:
             st = os.lstat(p)
-            state[p] = (st.st_mtime_ns, st.st_size)
+            state[p] = (st.st_mtime_ns, st.st_size, st.st_ino)
         except FileNotFoundError:
             state[p] = None
     return state
@@ -92,7 +116,6 @@ class Fake:
 
 
 def free(path):
-    import fcntl
     try:
         fd = os.open(path, os.O_RDWR)
     except FileNotFoundError:
@@ -106,6 +129,31 @@ def free(path):
         os.close(fd)
 
 
+def account(slots, script):
+    """Wait until both slots are free; on the watchdog kill only a verified child (its cmdline names
+    the throwaway script and it holds the slot), then confirm the slot is released."""
+    end = time.monotonic() + WATCHDOG
+    while time.monotonic() < end:
+        if all(free(p) for p in slots):
+            return "ended"
+        time.sleep(0.02)
+    for path in slots:
+        try:
+            pid = int(open(path).read().strip())
+            cmd = open("/proc/%d/cmdline" % pid, "rb").read().split(b"\0")
+            fds = [os.readlink("/proc/%d/fd/%s" % (pid, n)) for n in os.listdir("/proc/%d/fd" % pid)]
+        except (OSError, ValueError):
+            continue
+        if script.encode() in cmd and path in fds:
+            os.killpg(pid, signal.SIGKILL)
+    end = time.monotonic() + WATCHDOG
+    while time.monotonic() < end:
+        if all(free(p) for p in slots):
+            return "killed"
+        time.sleep(0.02)
+    raise SystemExit("FAIL: a hook child could not be accounted for")
+
+
 def wait(cond, what):
     end = time.monotonic() + WATCHDOG
     while time.monotonic() < end:
@@ -116,78 +164,95 @@ def wait(cond, what):
 
 
 def main():
+    keep = "--keep" in sys.argv[1:]
+    readme = readme_command()
     before = tree_state()
     base = os.path.expanduser("~/tmp")
     os.makedirs(base, exist_ok=True)
     t = tempfile.mkdtemp(prefix="apofis-wire-", dir=base)
     home = os.path.join(t, ".hermes")
-    os.makedirs(os.path.join(home, "agent-hooks"))
-    script = os.path.join(home, "agent-hooks", "apofis_push.py")
+    state = os.path.join(home, "agent-hooks")
+    os.makedirs(state)
+    script = os.path.join(state, "apofis_push.py")
+    slots = [os.path.join(state, "apofis-push.slot%d.lock" % i) for i in (0, 1)]
     shutil.copy(os.path.join(HERE, "apofis_push.py"), script)
     os.chmod(script, 0o755)
     fake = Fake()
     origin = "http://127.0.0.1:%d" % fake.port
     db = sqlite3.connect(os.path.join(home, "state.db"), isolation_level=None)  # held open: -wal and -shm exist
-    db.execute("PRAGMA journal_mode=WAL")
-    db.executescript("""
-        CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL);
-        CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, title TEXT, model_config TEXT,
-            system_prompt TEXT, system_prompt_hash TEXT, parent_session_id TEXT, started_at REAL NOT NULL,
-            ended_at REAL, end_reason TEXT, archived INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0);
-    """)
-    now = time.time()
-    rid = "apofis-push-%s-1" % INSTALL
-    db.execute("INSERT INTO sessions (id, source, started_at) VALUES (?, 'api_server', ?)", (APP, now))
-    db.execute("INSERT INTO sessions (id, source, hidden, title, system_prompt, started_at) "
-               "VALUES (?, 'api_server', 1, ?, ?, ?)",
-               (rid, rid + " op-0123456789abcdef",
-                json.dumps({"v": 1, "endpoint": origin + "/upWIRECHECK012?up=1"}), now))
-    env = {"HOME": t, "HERMES_HOME": home, "PATH": GATEWAY_PATH}
-    command = "python3 -I %s hook --allow-http-origin %s --delay 0" % (script, origin)
-    print("throwaway home:", t)
-    print("rendered command:", command.replace(t, "<T>"))
+    ok = False
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.executescript("""
+            CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL);
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, title TEXT, model_config TEXT,
+                system_prompt TEXT, system_prompt_hash TEXT, parent_session_id TEXT, started_at REAL NOT NULL,
+                ended_at REAL, end_reason TEXT, archived INTEGER NOT NULL DEFAULT 0,
+                hidden INTEGER NOT NULL DEFAULT 0);
+        """)
+        now = time.time()
+        rid = "apofis-push-%s-1" % INSTALL
+        db.execute("INSERT INTO sessions (id, source, started_at) VALUES (?, 'api_server', ?)", (APP, now))
+        db.execute("INSERT INTO sessions (id, source, hidden, title, system_prompt, started_at) "
+                   "VALUES (?, 'api_server', 1, ?, ?, ?)",
+                   (rid, rid + " op-0123456789abcdef",
+                    json.dumps({"v": 1, "endpoint": origin + "/upWIRECHECK012?up=1"}), now))
+        env = {"HOME": t, "HERMES_HOME": home, "PATH": GATEWAY_PATH}
+        # The README command with only the fixture path and the agent-run options substituted.
+        command = readme.replace(INSTALLED, script).replace(
+            RELEASE_OPTS, "--allow-http-origin %s --delay 0 --only-install %s" % (origin, INSTALL))
+        print("throwaway home:", t)
+        print("README command:", readme)
+        print("rendered command:", command.replace(t, "<T>").replace(origin, "http://127.0.0.1:<port>"))
 
-    def run_once(event, command, kwargs):
-        p = subprocess.run([PY, "-I", "-B", "-c", CHILD, event, command, json.dumps(kwargs)], env=env, cwd=t,
-                           capture_output=True, text=True, timeout=120)
-        lines = [ln for ln in p.stdout.splitlines() if ln.startswith("WIRE:")]
-        if p.returncode != 0 or not lines:
-            raise SystemExit("FALLBACK: Hermes could not be imported in isolation (exit %d): %s"
-                             % (p.returncode, p.stderr[-2000:]))
-        return json.loads(lines[-1][5:])
+        def run_once(event, command, kwargs):
+            p = subprocess.run([PY, "-I", "-B", "-c", CHILD, event, command, json.dumps(kwargs)], env=env, cwd=t,
+                               capture_output=True, text=True, timeout=120)
+            lines = [ln for ln in p.stdout.splitlines() if ln.startswith("WIRE:")]
+            if p.returncode != 0 or not lines:
+                raise SystemExit("FALLBACK: Hermes could not be imported in isolation (exit %d): %s"
+                                 % (p.returncode, p.stderr[-2000:]))
+            return json.loads(lines[-1][5:])
 
-    for event, kwargs, kind in EVENTS:
+        for event, kwargs, kind in EVENTS:
+            n = len(fake.requests)
+            r = run_once(event, command, kwargs)
+            print(event, r)
+            assert r == {"returncode": 0, "timed_out": False, "error": None, "stdout": "", "stderr": ""}, r
+            wait(lambda: len(fake.requests) > n, "the POST for " + event)
+            assert account(slots, script) == "ended"
+            assert len(fake.requests) == n + 1, fake.requests
+            path, headers, body = fake.requests[-1]
+            assert path == "/upWIRECHECK012?up=1", path
+            assert headers.get("x-unifiedpush") == "1", headers
+            assert body == json.dumps({"session_id": APP, "kind": kind}, separators=(",", ":")).encode(), body
+            print("  POST ok:", body.decode())
+
+        # The ~/.hermes/... form: Hermes expands only a leading ~, so after "python3 -I" it stays literal;
+        # Python cannot open the script, so no hook process and no child exist (slots untouched).
         n = len(fake.requests)
-        r = run_once(event, command, kwargs)
-        print(event, r)
-        assert r == {"returncode": 0, "timed_out": False, "error": None, "stdout": "", "stderr": ""}, r
-        wait(lambda: len(fake.requests) > n, "the POST for " + event)
-        wait(lambda: free(os.path.join(home, "apofis-push.slot0.lock"))
-             and free(os.path.join(home, "apofis-push.slot1.lock")), "the child to end")
-        assert len(fake.requests) == n + 1, fake.requests
-        path, headers, body = fake.requests[-1]
-        assert path == "/upWIRECHECK012?up=1", path
-        assert headers.get("x-unifiedpush") == "1", headers
-        assert body == json.dumps({"session_id": APP, "kind": kind}, separators=(",", ":")).encode(), body
-        print("  POST ok:", body.decode())
+        slot_state = {e.name: e.stat().st_mtime_ns for e in os.scandir(state)}
+        tilde = command.replace(script, "~/.hermes/agent-hooks/apofis_push.py")
+        r = run_once(EVENTS[0][0], tilde, EVENTS[0][1])
+        print("tilde form:", {k: r[k] for k in ("returncode", "timed_out", "error")}, r["stderr"].strip()[:120])
+        assert r["returncode"] == 2 and not r["timed_out"] and "can't open file" in r["stderr"], r
+        assert {e.name: e.stat().st_mtime_ns for e in os.scandir(state)} == slot_state and len(fake.requests) == n
 
-    # The ~/.hermes/... form: Hermes expands only a leading ~, so after "python3 -I" it stays literal.
-    n = len(fake.requests)
-    tilde = "python3 -I ~/.hermes/agent-hooks/apofis_push.py hook --allow-http-origin %s --delay 0" % origin
-    r = run_once(EVENTS[0][0], tilde, EVENTS[0][1])
-    print("tilde form:", {k: r[k] for k in ("returncode", "timed_out", "error")}, r["stderr"].strip()[:120])
-    assert r["returncode"] not in (0, None) and not r["timed_out"], r
-    time.sleep(1.0)
-    assert len(fake.requests) == n, "the tilde form must not post"
-
-    with open(os.path.join(home, "apofis-push.log")) as f:
-        print("hook log:\n" + f.read().replace(origin, "http://127.0.0.1:<port>"), end="")
-    db.close()
+        with open(os.path.join(state, "apofis-push.log")) as f:
+            print("hook log:\n" + f.read().replace(origin, "http://127.0.0.1:<port>"), end="")
+        ok = True
+    finally:
+        account(slots, script)
+        db.close()
+        fake.httpd.shutdown()
+        if ok and not keep:
+            shutil.rmtree(t)
     after = tree_state()
     changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
     assert not changed, "Hermes install tree changed: %s" % changed[:20]
-    print("Hermes install tree unchanged (%d entries)" % len(after))
-    print("PASS")
+    print("unchanged by stat: %s (recursive), %s/agent-hooks (recursive), config.yaml, "
+          "shell-hooks-allowlist.json (%d entries)" % (AGENT, HERMES, len(after)))
+    print("PASS" + ("" if keep else " (throwaway home removed)"))
 
 
 if __name__ == "__main__":

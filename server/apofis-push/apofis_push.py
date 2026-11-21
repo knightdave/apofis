@@ -2,9 +2,10 @@
 """Apofis push hook for Hermes: a contentless UnifiedPush wake through ntfy. See README.md.
 
 `hook` (run by Hermes from its hooks: block) reserves one of two slots, spawns one detached `send`
-child and returns at once. The child reads the app's registration records from Hermes' state
-database read-only, closes it, and POSTs {"session_id","kind"} to each validated endpoint.
-`check` reports configuration and records without any network. Python 3.9+ standard library.
+child and returns at once. The child forks a reader that drops every filesystem write right
+(Landlock) before it opens Hermes' state database read-only; the reader returns the registrations
+and exits (killed at a hard limit). The child then POSTs {"session_id","kind"} to each validated
+endpoint. `check` reports configuration and records without any network. Python 3.9+ stdlib, Linux.
 """
 from __future__ import annotations
 
@@ -12,10 +13,13 @@ import fcntl
 import json
 import os
 import re
+import resource
+import select
 import signal
 import socket
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -39,9 +43,14 @@ TTL = 90 * 86400
 MAX_REGS = 32
 MAX_URL = 512
 MAX_PROMPT = 1024
+MAX_MODEL_CONFIG = 65536
+MAX_SESSION_ID = 256
 STDIN_MAX = 1 << 20
-CHILD_DEADLINE = 25
-DB_BUDGET = 1.5
+CHILD_HARD = 25  # default-action SIGALRM: the kernel ends the child, no Python code has to run
+SOFT_DEADLINE = 20  # the child stops waiting for requests and reports "deadline"
+DB_BUDGET = 1.5  # SQLite progress budget inside the reader
+DB_HARD = 3.0  # the reader is SIGKILLed after this, whatever a single operation does
+READER_MEM = 256 << 20
 LOG_MAX = 256 * 1024
 LOG_KEEP = 128 * 1024
 LOG_LOCK_WAIT = 1.0
@@ -51,8 +60,8 @@ VALUE_OPTS = {"--allow-origin", "--allow-http-origin", "--state-db", "--log", "-
               "--only-install", "--cafile", "--session", "--kind", "--slot-fd"}
 SEND_ONLY = {"--session", "--kind", "--slot-fd"}
 
-# Narrow ranking over the primary-key range; canonical ids are checked before ranking so invalid rows
-# never take a slot. LIMIT 33 (not 32) only so the log can say "regs=32+".
+# Narrow ranking over the primary-key range; canonical ids (byte length, so no embedded NUL) are
+# checked before ranking so invalid rows never take a slot. LIMIT 33 only so the log can say "32+".
 RANK_SQL = """
 SELECT id, started_at FROM (
   SELECT id, started_at, ROW_NUMBER() OVER (PARTITION BY substr(id, 13, 36)
@@ -60,23 +69,21 @@ SELECT id, started_at FROM (
   FROM (SELECT id, started_at FROM sessions
         WHERE id >= 'apofis-push-' AND id < 'apofis-push.'
           AND source = 'api_server' AND hidden = 1 AND started_at >= :cutoff
-          AND length(id) BETWEEN 50 AND 55 AND substr(id, 49, 1) = '-'
+          AND length(CAST(id AS BLOB)) BETWEEN 50 AND 55 AND length(id) = length(CAST(id AS BLOB))
+          AND substr(id, 49, 1) = '-'
           AND substr(id, 13, 36) GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
           AND substr(id, 50) GLOB '[1-9]*' AND substr(id, 50) NOT GLOB '*[^0-9]*'
           AND (:install IS NULL OR substr(id, 13, 36) = :install)
         ORDER BY started_at DESC LIMIT 4096))
 WHERE rn = 1 ORDER BY started_at DESC LIMIT 33
 """
-PROMPT_SQL = ("SELECT s.id, substr(COALESCE(sp.prompt, s.system_prompt), 1, 1025) FROM sessions s "
+PROMPT_SQL = ("SELECT s.id, substr(CAST(COALESCE(sp.prompt, s.system_prompt) AS BLOB), 1, 1025) FROM sessions s "
               "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id IN (%s)")
-ROW_SQL = "SELECT id, source, hidden, parent_session_id, end_reason, model_config FROM sessions WHERE id = ?"
+ROW_SQL = ("SELECT id, source, hidden, parent_session_id, end_reason, "
+           "substr(CAST(model_config AS BLOB), 1, %d) FROM sessions WHERE id = ?" % (MAX_MODEL_CONFIG + 1))
 
 
 class Usage(Exception):
-    pass
-
-
-class NoDb(Exception):
     pass
 
 
@@ -118,7 +125,8 @@ def parse_args(argv: list[str]) -> dict:
     if "--only-install" in o and not UUID_RE.fullmatch(o["--only-install"]):
         raise Usage
     if o["cmd"] == "send":
-        if o.get("--kind") not in HOOKS or "--session" not in o:
+        # Only bodies inside the contract: an anonymous wake exists only for needs_input.
+        if o.get("--kind") not in HOOKS or "--session" not in o or (o["--kind"] == "finished" and not o["--session"]):
             raise Usage
         o["slot_fd"] = int(o["--slot-fd"]) if "--slot-fd" in o else None
     elif SEND_ONLY & set(o):
@@ -128,10 +136,60 @@ def parse_args(argv: list[str]) -> dict:
     return o
 
 
+# --- Paths: nothing is ever written in the database's directory -----------------------------------
+
+def db_path(o: dict, home: str) -> str:
+    return os.path.abspath(o.get("--state-db") or os.path.join(home, "state.db"))
+
+
+def state_dir(home: str) -> str:
+    """Slots and log live in $HERMES_HOME/agent-hooks (created by the owner's install), never next to
+    the database."""
+    return os.path.join(home, "agent-hooks")
+
+
+def log_path(o: dict, home: str) -> str:
+    return o.get("--log") or os.path.join(state_dir(home), "apofis-push.log")
+
+
+def forbidden(db: str) -> dict:
+    """The database directory and the identities of the database and its sidecars (hard links too)."""
+    ids = set()
+    for p in (db, db + "-wal", db + "-shm", db + "-journal"):
+        try:
+            st = os.stat(p)
+            ids.add((st.st_dev, st.st_ino))
+        except OSError:
+            pass
+    return {"dir": os.path.realpath(os.path.dirname(db)), "ids": ids}
+
+
+def usable_dir(path: str, bad: dict) -> bool:
+    return os.path.isdir(path) and os.path.realpath(path) != bad["dir"]
+
+
+def open_private(path: str, flags: int, bad: dict) -> int:
+    """Open a private regular file without following symlinks or blocking on a FIFO; refuse anything in
+    the database directory, any non-regular or hard-linked file and any database identity."""
+    if not usable_dir(os.path.dirname(os.path.abspath(path)), bad):
+        raise OSError("refused directory")
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (st.st_dev, st.st_ino) in bad["ids"]:
+        os.close(fd)
+        raise OSError("refused file")
+    return fd
+
+
+def slot_paths(home: str) -> list[str]:
+    return [os.path.join(state_dir(home), "apofis-push.slot%d.lock" % i) for i in (0, 1)]
+
+
 # --- Parent: Hermes' hook -------------------------------------------------------------------------
 
 def hook_target(event: dict) -> tuple[str, str] | None:
-    """(session id or "" for an anonymous approval, kind) to push, or None."""
+    """(session id or "" for an anonymous approval, kind) to push, or None. A present but invalid
+    session id drops the event; only an absent or empty one can become an anonymous approval."""
     if not isinstance(event, dict):
         return None
     extra = event.get("extra")
@@ -141,7 +199,10 @@ def hook_target(event: dict) -> tuple[str, str] | None:
     if platform and platform != "api_server":
         return None
     sid = event.get("session_id")
-    sid = sid if isinstance(sid, str) and len(sid) <= 256 else ""
+    if sid is None:
+        sid = ""
+    if not isinstance(sid, str) or len(sid) > MAX_SESSION_ID or "\x00" in sid:
+        return None
     name = event.get("hook_event_name")
     if name == "on_session_end":
         if sid and (extra.get("completed") is True or extra.get("failed") is True):
@@ -155,14 +216,16 @@ def hook_target(event: dict) -> tuple[str, str] | None:
     return None
 
 
-def reserve_slot(home: str, lock) -> int | None:
-    for i in (0, 1):
-        fd = os.open(os.path.join(home, "apofis-push.slot%d.lock" % i), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+def reserve_slot(home: str, lock, bad: dict) -> int | None:
+    for path in slot_paths(home):
+        fd = open_private(path, os.O_RDWR | os.O_CREAT, bad)
         try:
             lock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
         except OSError:
             os.close(fd)
+            continue
+        os.ftruncate(fd, 0)  # no stale pid survives into the new child's slot
+        return fd
     return None
 
 
@@ -174,7 +237,7 @@ def run_hook(o: dict, home: str, stdin, env, spawn, lock) -> int:
         target = hook_target(json.loads(data))
         if target is None:
             return 0
-        fd = reserve_slot(home, lock)
+        fd = reserve_slot(home, lock, forbidden(db_path(o, home)))
         if fd is None:
             return 0
         try:
@@ -191,30 +254,135 @@ def run_hook(o: dict, home: str, stdin, env, spawn, lock) -> int:
     return 0
 
 
-# --- Database (read-only snapshot) ----------------------------------------------------------------
+# --- Database: a sandboxed, hard-limited reader ---------------------------------------------------
 
-def open_ro(db: str, monotonic) -> sqlite3.Connection:
-    """Read-only, query_only, with a monotonic progress budget. Refuses when the WAL sidecars are
-    missing, so the open never creates files (Hermes holds them while it runs)."""
-    if not (os.path.exists(db + "-wal") and os.path.exists(db + "-shm")):
-        raise NoDb
-    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(db)), uri=True, timeout=2,
+def sandbox() -> None:
+    """Drop every filesystem write, create, remove, rename and truncate right of this process for good
+    (Landlock); reads stay allowed. Raises when Landlock is unavailable."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    abi = libc.syscall(ctypes.c_long(444), None, ctypes.c_size_t(0), ctypes.c_uint32(1))
+    if abi < 1:
+        raise OSError("landlock unavailable")
+    access = 0x1FF2  # WRITE_FILE, REMOVE_DIR, REMOVE_FILE, MAKE_CHAR..MAKE_SYM
+    access |= (1 << 13 if abi >= 2 else 0) | (1 << 14 if abi >= 3 else 0)  # REFER, TRUNCATE
+    attr = ctypes.c_uint64(access)
+    fd = libc.syscall(ctypes.c_long(444), ctypes.byref(attr), ctypes.c_size_t(8), ctypes.c_uint32(0))
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "landlock ruleset")
+    try:
+        if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+            raise OSError(ctypes.get_errno(), "no_new_privs")
+        if libc.syscall(ctypes.c_long(446), ctypes.c_int(fd), ctypes.c_uint32(0)) != 0:
+            raise OSError(ctypes.get_errno(), "landlock restrict")
+    finally:
+        os.close(fd)
+
+
+def snapshot(db: str, work, monotonic, on_progress=None):
+    """One read transaction on a WAL database, read-only, query_only, in-memory temp store, inside a
+    monotonic budget checked by SQLite's progress handler and again before the result is accepted."""
+    with open(db, "rb") as f:
+        header = f.read(100)
+    if len(header) < 100 or header[18] != 2 or header[19] != 2:
+        raise OSError("not a WAL database")
+    end = monotonic() + DB_BUDGET
+
+    def progress():
+        if on_progress:
+            on_progress()
+        return 1 if monotonic() > end else 0
+    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db), uri=True, timeout=DB_BUDGET,
                            isolation_level=None)
     try:
-        end = monotonic() + DB_BUDGET
-        conn.set_progress_handler(lambda: 1 if monotonic() > end else 0, 1000)
+        conn.set_progress_handler(progress, 1000)
         conn.execute("PRAGMA query_only=1")
-    except BaseException:
-        conn.close()
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("BEGIN")
+        result = work(conn)
+        conn.execute("COMMIT")
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e):
+            raise Budget
         raise
-    return conn
+    finally:
+        conn.close()
+    if monotonic() > end:
+        raise Budget
+    return result
 
 
-def _markers(model_config) -> tuple:
+def read_db(db: str, work, monotonic) -> tuple[str, object]:
+    """Run `work` in a forked reader under the sandbox. ("ok", result) or (reason, None) with reason
+    "budget", "db" or "sandbox". The reader is SIGKILLed after DB_HARD seconds."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # reader
+        out = {"err": "db"}
+        try:
+            os.close(r)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.alarm(int(DB_HARD) + 2)
+            try:
+                sandbox()
+            except Exception:
+                out = {"err": "sandbox"}
+                raise
+            with open("/proc/self/statm") as f:  # cap growth: current size plus READER_MEM
+                cap = int(f.read().split()[0]) * resource.getpagesize() + READER_MEM
+            resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+            out = {"ok": snapshot(db, work, monotonic)}
+        except Budget:
+            out = {"err": "budget"}
+        except BaseException:
+            pass
+        try:
+            data = json.dumps(out).encode()
+            while data:
+                data = data[os.write(w, data):]
+        finally:
+            os._exit(0)
+    os.close(w)
+    chunks: list = []
+    end = time.monotonic() + DB_HARD
+    done = False
     try:
-        cfg = json.loads(model_config) if isinstance(model_config, str) else None
+        while not done:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            if select.select([r], [], [], left)[0]:
+                b = os.read(r, 65536)
+                chunks.append(b)
+                done = not b
+    finally:
+        os.close(r)
+        if not done:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        os.waitpid(pid, 0)
+    if not done:
+        return "budget", None
+    try:
+        out = json.loads(b"".join(chunks))
     except ValueError:
-        cfg = None  # Hermes treats unparsable model_config as no fork markers
+        return "db", None
+    return ("ok", out["ok"]) if "ok" in out else (out.get("err", "db"), None)
+
+
+def _markers(model_config) -> tuple | None:
+    """Fork markers, () for none, None when the value is too large to judge (fail closed)."""
+    if model_config is None:
+        return ()
+    if len(model_config) > MAX_MODEL_CONFIG:
+        return None
+    try:
+        cfg = json.loads(model_config.decode("utf-8"))
+    except ValueError:
+        return ()  # Hermes treats unparsable model_config as no fork markers
     return tuple(cfg.get(k) for k in FORK_MARKERS) if isinstance(cfg, dict) else ()
 
 
@@ -230,17 +398,23 @@ def resolve_app_session(conn, session_id: str, cap: int = 1000) -> str | None:
             return None
         seen.add(rid)
         parent = conn.execute(ROW_SQL, (parent_id,)).fetchone() if parent_id else None
-        if parent is None or parent[4] != "compression" or parent[0] in _markers(row[5]):
+        if parent is None or parent[4] != "compression":
+            return rid if ROOT_RE.fullmatch(rid) else None
+        markers = _markers(row[5])
+        if markers is None:
+            return None
+        if parent[0] in markers:
             return rid if ROOT_RE.fullmatch(rid) else None
         row = parent
     return None
 
 
-def parse_prompt(text) -> str | None:
-    if not isinstance(text, str) or len(text) > MAX_PROMPT:
+def parse_prompt(raw) -> str | None:
+    """Endpoint from the whole stored prompt (bytes, at most MAX_PROMPT, strict UTF-8, exact shape)."""
+    if not isinstance(raw, bytes) or len(raw) > MAX_PROMPT:
         return None
     try:
-        obj = json.loads(text)
+        obj = json.loads(raw.decode("utf-8"))
     except ValueError:
         return None
     if (isinstance(obj, dict) and set(obj) == {"v", "endpoint"} and type(obj["v"]) is int and obj["v"] == 1
@@ -339,14 +513,14 @@ def post(url: str, body: bytes, timeout: float, opener) -> str:
 
 # --- Log ------------------------------------------------------------------------------------------
 
-def write_log(path: str, line: str, lock=fcntl.flock, monotonic=time.monotonic, sleep=time.sleep) -> None:
+def write_log(path: str, line: str, bad: dict, lock=fcntl.flock, monotonic=time.monotonic, sleep=time.sleep) -> None:
     """Append one line under <log>.lock (non-blocking polls, 1 s cap: skipped on timeout); rotate over
-    LOG_MAX keeping the last LOG_KEEP bytes. Never raises."""
+    LOG_MAX keeping the last LOG_KEEP bytes. Private regular files only (see open_private). Never raises."""
     if path == "-":
         sys.stdout.write(line + "\n")
         return
     try:
-        lfd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        lfd = open_private(path + ".lock", os.O_RDWR | os.O_CREAT, bad)
     except OSError:
         return
     try:
@@ -359,7 +533,7 @@ def write_log(path: str, line: str, lock=fcntl.flock, monotonic=time.monotonic, 
                 if monotonic() >= end:
                     return
                 sleep(0.01)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC, 0o600)
+        fd = open_private(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, bad)
         try:
             os.fchmod(fd, 0o600)
             os.write(fd, (line + "\n").encode())
@@ -378,38 +552,53 @@ def write_log(path: str, line: str, lock=fcntl.flock, monotonic=time.monotonic, 
         os.close(lfd)
 
 
-def deadline_handler(log: str, hook: str, exit=os._exit):
-    def handler(signum, frame):
-        write_log(log, "%s %s deadline" % (utc(time.time()), hook))
-        exit(0)
-    return handler
-
-
 def utc(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
+def arm_hard_deadline() -> None:
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(CHILD_HARD)
+
+
 # --- Child: send ----------------------------------------------------------------------------------
 
-def deliver(o: dict, home: str, now, monotonic, sleep, opener) -> str:
-    db = o.get("--state-db") or os.path.join(home, "state.db")
-    session = o["--session"] or None
+def own_slot(fd: int, home: str) -> bool:
+    """The inherited descriptor is one of this home's slot files (regular, single link, no symlink)."""
     try:
-        conn = open_ro(db, monotonic)
-        try:
-            conn.execute("BEGIN")
-            app = resolve_app_session(conn, session) if session else None
-            rows, more = registration_rows(conn, now(), o.get("--only-install")) if app or not session else ([], 0)
-        finally:
-            conn.close()  # before the delay and before any network
-    except sqlite3.OperationalError as e:
-        return "skipped db-budget" if "interrupt" in str(e) else "skipped db"
-    except Exception:
-        return "skipped db"
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return False
+        for path in slot_paths(home):
+            try:
+                lst = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(lst.st_mode) and (lst.st_dev, lst.st_ino) == (st.st_dev, st.st_ino):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def deliver(o: dict, home: str, now, monotonic, sleep, opener, soft_end: float) -> str:
+    db = db_path(o, home)
+    session = o["--session"] or None
+    install = o.get("--only-install")
+    now_s = now()
+
+    def work(conn):
+        app = resolve_app_session(conn, session) if session else None
+        rows, more = registration_rows(conn, now_s, install) if app or not session else ([], False)
+        return [app, rows, more]
+    status, result = read_db(db, work, monotonic)
+    if status != "ok":
+        return "skipped " + {"budget": "db-budget", "sandbox": "sandbox"}.get(status, "db")
+    app, rows, more = result
     if session and not app:
         return "skipped session"
     if o["--kind"] == "finished" and o["delay"]:
-        sleep(o["delay"])
+        sleep(max(0.0, min(o["delay"], soft_end - monotonic())))
     try:
         opener = opener or build_opener(o.get("--cafile"))
     except Exception:
@@ -423,39 +612,46 @@ def deliver(o: dict, home: str, now, monotonic, sleep, opener) -> str:
             results[i] = "refused:%s=skipped" % v
             continue
 
-        def work(i=i, label=v[0], url=v[1]):
+        def work_send(i=i, label=v[0], url=v[1]):
             results[i] = "%s=%s" % (label, post(url, body, o["timeout"], opener))
-        t = threading.Thread(target=work, daemon=True)
+        t = threading.Thread(target=work_send, daemon=True)
         t.start()
         threads.append(t)
     for t in threads:
-        t.join()
+        t.join(max(0.0, soft_end - monotonic()))
+    if any(t.is_alive() for t in threads):
+        return "deadline regs=%d" % len(rows)
     return " ".join(["matched regs=%d%s" % (len(rows), "+" if more else "")] + [r or "error" for r in results])
 
 
-def run_send(o: dict, home: str, now, monotonic, sleep, opener) -> int:
-    log = o.get("--log") or os.path.join(home, "apofis-push.log")
+def run_send(o: dict, home: str, now, monotonic, sleep, opener, arm) -> int:
+    arm()  # hard stop first, so nothing below can outlive CHILD_HARD
+    soft_end = monotonic() + SOFT_DEADLINE
     hook = HOOKS[o["--kind"]]
-    old = signal.signal(signal.SIGALRM, deadline_handler(log, hook))
-    signal.alarm(CHILD_DEADLINE)
+    fd = o["slot_fd"]
+    bad = forbidden(db_path(o, home))
     try:
-        if o["slot_fd"] is not None:
+        if fd is None:
+            line = deliver(o, home, now, monotonic, sleep, opener, soft_end)
+        elif not own_slot(fd, home):
+            line = "skipped slot"
+        else:
             try:
-                os.ftruncate(o["slot_fd"], 0)
-                os.pwrite(o["slot_fd"], str(os.getpid()).encode(), 0)
+                os.ftruncate(fd, 0)
+                pid = str(os.getpid()).encode()
+                published = os.pwrite(fd, pid, 0) == len(pid)
             except OSError:
-                pass
-        try:
-            line = deliver(o, home, now, monotonic, sleep, opener)
-        except Exception:
-            line = "skipped error"
-        write_log(log, "%s %s %s" % (utc(now()), hook, line), monotonic=monotonic, sleep=sleep)
+                published = False
+            # A child that cannot publish its identity cannot be accounted for: it sends nothing.
+            line = deliver(o, home, now, monotonic, sleep, opener, soft_end) if published else "skipped slot"
+    except Exception:
+        line = "skipped error"
+    try:
+        write_log(log_path(o, home), "%s %s %s" % (utc(now()), hook, line), bad, monotonic=monotonic, sleep=sleep)
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old)
-        if o["slot_fd"] is not None:
+        if fd is not None:
             try:
-                os.close(o["slot_fd"])  # releases the slot
+                os.close(fd)  # releases the slot
             except OSError:
                 pass
     return 0
@@ -464,46 +660,46 @@ def run_send(o: dict, home: str, now, monotonic, sleep, opener) -> int:
 # --- check ----------------------------------------------------------------------------------------
 
 def run_check(o: dict, home: str, env, now, monotonic, out) -> int:
-    def p(s):
-        out.write(s + "\n")
-    p("python %s" % sys.version.split()[0])
-    p("SSL_CERT_FILE %s" % ("set" if env.get("SSL_CERT_FILE") else "unset"))
-    p("origins %s" % (" ".join(o["origins"] + o["http_origins"]) or "none"))
-    db = o.get("--state-db") or os.path.join(home, "state.db")
-    try:
-        conn = open_ro(db, monotonic)
-    except Exception:
-        p("skipped db")
-        return 3
-    try:
-        conn.execute("BEGIN")
-        if o["--ids"]:
-            prefix = "apofis-push-%s-" % o["--only-install"]
-            rows = conn.execute("SELECT id, title, source, hidden FROM sessions WHERE id >= ? AND id < ? ORDER BY id",
-                                (prefix, prefix[:-1] + ".")).fetchall()
-        else:
-            rows, more = registration_rows(conn, now(), o.get("--only-install"))
-    except Exception:
-        p("skipped db")
-        return 3
-    finally:
-        conn.close()
-    p("db opened read-only")
+    """Prints nothing until the whole report is built; any failure or interruption exits 3."""
+    lines = ["python %s" % sys.version.split()[0],
+             "SSL_CERT_FILE %s" % ("set" if env.get("SSL_CERT_FILE") else "unset"),
+             "origins %s" % (" ".join(o["origins"] + o["http_origins"]) or "none")]
+    now_s = now()
     if o["--ids"]:
-        for row in rows:
-            p("\t".join(re.sub(r"[\x00-\x1f\x7f]", "?", str(c)) for c in row))
-        return 0
-    for rid, started, endpoint in rows:
-        m = RECORD_RE.fullmatch(rid)
-        v = validate_endpoint(endpoint, o["origins"], o["http_origins"]) if endpoint is not None else "prompt"
-        state = "refused %s" % v if isinstance(v, str) else "valid %s" % v[0]
-        p("apofis-push-%s...-%s %s age=%dd" % (m.group(1)[:8], m.group(2), state, max(0, now() - started) // 86400))
-    p("regs=%d%s" % (len(rows), "+" if more else ""))
+        prefix = "apofis-push-%s-" % o["--only-install"]
+
+        def work(conn):
+            return [[str(c) for c in r] for r in conn.execute(
+                "SELECT id, title, source, hidden FROM sessions WHERE id >= ? AND id < ? ORDER BY id",
+                (prefix, prefix[:-1] + ".")).fetchall()]
+    else:
+        def work(conn):
+            return list(registration_rows(conn, now_s, o.get("--only-install")))
+    status, result = read_db(db_path(o, home), work, monotonic)
+    if status != "ok":
+        out.write("\n".join(lines + ["skipped " + {"budget": "db-budget", "sandbox": "sandbox"}.get(status, "db")]) + "\n")
+        return 3
+    lines.append("db opened read-only")
+    if o["--ids"]:
+        lines += ["\t".join(re.sub(r"[\x00-\x1f\x7f]", "?", c) for c in row) for row in result]
+    else:
+        rows, more = result
+        for rid, started, endpoint in rows:
+            m = RECORD_RE.fullmatch(rid)
+            if not m:
+                continue
+            v = validate_endpoint(endpoint, o["origins"], o["http_origins"]) if endpoint is not None else "prompt"
+            state = "refused %s" % v if isinstance(v, str) else "valid %s" % v[0]
+            lines.append("apofis-push-%s...-%s %s age=%dd" % (m.group(1)[:8], m.group(2), state,
+                                                              max(0, now_s - started) // 86400))
+        lines.append("regs=%d%s" % (len(rows), "+" if more else ""))
+    out.write("\n".join(lines) + "\n")
+    out.flush()
     return 0
 
 
 def main(argv, stdin, env, now=time.time, spawn=subprocess.Popen, opener=None, lock=fcntl.flock,
-         monotonic=time.monotonic, sleep=time.sleep, stdout=None) -> int:
+         monotonic=time.monotonic, sleep=time.sleep, stdout=None, arm=arm_hard_deadline) -> int:
     try:
         o = parse_args(list(argv))
     except Exception:
@@ -512,13 +708,19 @@ def main(argv, stdin, env, now=time.time, spawn=subprocess.Popen, opener=None, l
     if o["cmd"] == "hook":
         return run_hook(o, home, stdin, env, spawn, lock)
     if o["cmd"] == "send":
-        return run_send(o, home, now, monotonic, sleep, opener)
-    return run_check(o, home, env, now, monotonic, stdout or sys.stdout)
+        return run_send(o, home, now, monotonic, sleep, opener, arm)
+    try:
+        return run_check(o, home, env, now, monotonic, stdout or sys.stdout)
+    except BaseException:  # interruption or output failure: never a status that reads as complete
+        return 3
 
 
 if __name__ == "__main__":
+    observer = len(sys.argv) > 1 and sys.argv[1] in ("hook", "send")
     try:
         code = main(sys.argv[1:], sys.stdin.buffer, os.environ)
     except BaseException:
-        code = 0
+        code = 0 if observer else 3
+    if observer:
+        os._exit(code)  # no interpreter teardown waiting on stuck daemon threads
     sys.exit(code)
