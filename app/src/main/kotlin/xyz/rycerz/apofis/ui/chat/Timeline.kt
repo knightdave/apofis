@@ -58,6 +58,9 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.EaseOutCubic
 import xyz.rycerz.apofis.ui.theme.Motion
+import xyz.rycerz.apofis.ui.theme.dotWave
+import xyz.rycerz.apofis.ui.theme.rememberTimeMs
+import androidx.compose.ui.graphics.graphicsLayer
 
 private const val MIN_SHOWN_DURATION_S = 0.1
 
@@ -322,12 +325,29 @@ private fun StepRow(
     }
 }
 
-/** Three 3 dp dots in [MaterialTheme.colorScheme.primary]: a running tool step. Static here. */
+/**
+ * Three 3 dp dots in [MaterialTheme.colorScheme.primary]: a running tool step, in the [dotWave] of the reply's dots.
+ * Under reduced motion all three are solid, as in milestone 1 (so its goldens keep their pixels).
+ */
 @Composable
 internal fun MiniDots(modifier: Modifier = Modifier) {
     val primary = MaterialTheme.colorScheme.primary
+    val reduce = ApofisTheme.reduceMotion
+    val time = rememberTimeMs(Motion.DOTS_PERIOD)
     Row(modifier, horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
-        repeat(3) { Box(Modifier.size(3.dp).background(primary, CircleShape)) }
+        repeat(3) { i ->
+            val motion = if (reduce) {
+                Modifier
+            } else {
+                Modifier.graphicsLayer { // read here only: a frame redraws the dot and recomposes nothing
+                    val f = dotWave(time.value, i)
+                    scaleX = f.scale
+                    scaleY = f.scale
+                    alpha = f.alpha
+                }
+            }
+            Box(Modifier.size(3.dp).then(motion).background(primary, CircleShape))
+        }
     }
 }
 

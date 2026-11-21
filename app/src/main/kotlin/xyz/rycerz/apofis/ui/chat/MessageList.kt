@@ -12,6 +12,11 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import kotlinx.coroutines.delay
+import xyz.rycerz.apofis.run.Connection
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -846,7 +851,8 @@ internal class ChatRows(private val zone: ZoneId) {
     var mapped = 0
         private set
 
-    fun rows(items: List<ChatItem>): List<Row> {
+    /** [liveText]: the live reply's text as shown (see [rememberSmoothedText]), a prefix of its text; null: all of it. */
+    fun rows(items: List<ChatItem>, liveText: String? = null): List<Row> {
         val joined = items as? Joined<*>
         @Suppress("UNCHECKED_CAST")
         val stored = joined?.head as List<ChatItem>? ?: items
@@ -877,7 +883,7 @@ internal class ChatRows(private val zone: ZoneId) {
             if (item is AssistantReply && item.live) {
                 if (item.steps.isNotEmpty()) out += StepsRow(item)
                 parts += out
-                parts += live.update(item.key, item.text)
+                parts += live.update(item.key, liveText ?: item.text)
                 out = arrayListOf<Row>(FooterRow(item))
             } else {
                 val rows = tailCache[item] ?: cache[item] ?: rowsOf(item)
@@ -933,6 +939,7 @@ internal fun MessageList(
     onLink: (String) -> Unit = {},
     onSelect: (String) -> Unit = {},
     current: (() -> List<ChatItem>)? = null,
+    onRevealGrew: () -> Unit = {}, // the live reply's shown text got longer (a smoothing tick or a token); after the change is applied
 ) {
     val builder = remember(zone) { ChatRows(zone) }
     // Copy reads the reply as it is when tapped. Referential: comparing the items would compare a live reply's steps.
@@ -944,7 +951,25 @@ internal fun MessageList(
     val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     // An answer that came too late shows under the reply, live or stored, unless that request is somehow drawn again.
     val gone = notes.any { (ref, note) -> note.result == AnswerResult.GONE && ref != pendingId }
-    val rows = builder.rows(items).let { if (gone) Joined(it, listOf(GoneRow)) else it }
+    // Only the live tail is smoothed: the stored head goes through unchanged and by identity, controls read the canonical reply.
+    @Suppress("UNCHECKED_CAST")
+    val liveItem = if (live == null) null else (items as? Joined<ChatItem>)?.tail?.firstOrNull { it is AssistantReply && it.live } as AssistantReply?
+    val liveText = if (live != null && liveItem != null) {
+        rememberSmoothedText(live.runId, liveItem.text, snap = ApofisTheme.reduceMotion || live.connection == Connection.POLLING)
+    } else {
+        null
+    }
+    val revealed = remember { longArrayOf(-1) }
+    val shownLength = liveText?.length?.toLong() ?: -1L
+    val grewNow by rememberUpdatedState(onRevealGrew)
+    SideEffect {
+        if (shownLength > revealed[0] && revealed[0] >= 0) grewNow()
+        revealed[0] = shownLength
+    }
+    val announcing = rememberRunEndAnnouncement(live != null)
+    val rows = builder.rows(items, liveText).let { if (gone) Joined(it, listOf(GoneRow)) else it }
+    // The newest reply's footer says once that the run ended (looked up only then: a few rows from the end).
+    val announceRow = if (announcing) rows.lastOrNull { it is FooterRow }?.key else null
     // Copy and Select check the transcript as it is at action time: the owner's current state when given.
     val onSelectNow by rememberUpdatedState(onSelect)
     val currentNow by rememberUpdatedState(current)
@@ -979,6 +1004,8 @@ internal fun MessageList(
                         is FooterRow -> ReplyFooter(
                             row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
                             rowActions, active = active,
+                            shownText = if (row.reply.live && liveText != null) liveText else row.reply.text,
+                            announce = row.key == announceRow,
                         )
                         is NoticeRow -> NoticeLine(row.notice.text)
                         GoneRow -> Notice(R.string.chat_answer_gone)
@@ -987,6 +1014,29 @@ internal fun MessageList(
             }
         }
     }
+}
+
+/** How long the run-end announcement stays on its node: past Compose's 100 ms accessibility batching and TalkBack's read. */
+internal const val ANNOUNCE_MS = 1000L
+
+/**
+ * True for [ANNOUNCE_MS] after the chat's live run went from present to absent while this list was shown. Exact from
+ * the state: no reply identity is needed, and a first composition (opening, rotation, process recreation) never
+ * announces. Streamed text itself is not a live region, so TalkBack hears one line per run, not every token.
+ */
+@Composable
+private fun rememberRunEndAnnouncement(running: Boolean): Boolean {
+    val was = remember { booleanArrayOf(running) }
+    val on = remember { mutableStateOf(false) }
+    LaunchedEffect(running) {
+        val ended = was[0] && !running
+        was[0] = running
+        on.value = ended
+        if (!ended) return@LaunchedEffect
+        delay(ANNOUNCE_MS)
+        on.value = false
+    }
+    return on.value
 }
 
 /** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [TimelineCard]). */

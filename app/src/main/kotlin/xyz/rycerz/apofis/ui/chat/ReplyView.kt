@@ -31,6 +31,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.platform.LocalViewConfiguration
 import android.os.SystemClock
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
@@ -40,6 +41,7 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
@@ -63,6 +65,9 @@ import xyz.rycerz.apofis.ui.markdown.styled
 import xyz.rycerz.apofis.ui.markdown.syntaxColors
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
+import xyz.rycerz.apofis.ui.theme.Motion
+import xyz.rycerz.apofis.ui.theme.dotWave
+import xyz.rycerz.apofis.ui.theme.rememberTimeMs
 import xyz.rycerz.apofis.ui.theme.scaled
 
 /**
@@ -148,12 +153,23 @@ internal fun ReplyFooter(
     actions: ChatActions,
     rowActions: RowActions? = null,
     active: Boolean = false,
+    shownText: String = reply.text, // the live text as revealed (see [rememberSmoothedText]): the dots stay until it shows
+    announce: Boolean = false, // the chat's run just ended: say so once, from this visible node (see [MessageList])
 ) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+    val finished = stringResource(R.string.chat_reply_finished)
+    val announcing = if (announce) {
+        Modifier.semantics {
+            liveRegion = LiveRegionMode.Polite
+            stateDescription = finished
+        }
+    } else {
+        Modifier
+    }
+    Column(Modifier.fillMaxWidth().then(announcing).padding(vertical = 4.dp)) {
         if (live != null) {
             val polling = live.connection == Connection.POLLING
             val pending = live.pending
-            if ((reply.text.isEmpty() && pending == null) || polling) Dots(if (polling) R.string.chat_catching_up else null)
+            if ((shownText.isEmpty() && pending == null) || polling) Dots(if (polling) R.string.chat_catching_up else null)
             if (live.connection == Connection.RECONNECTING) Label(R.string.chat_reconnecting)
             if (pending != null) {
                 val changed = showsChanged(notes, pending)
@@ -196,9 +212,9 @@ internal fun showsChanged(notes: Map<RequestRef, AnswerNote>, pending: PendingCo
     return notes.any { (answered, note) -> note.result == AnswerResult.CHANGED && note.successor == shown && answered != shown }
 }
 
-/** The static three-dot indicator (motion comes later); [label] is shown beside it. */
+/** The three-dot wave ([dotWave]; static under reduced motion); [label] is shown beside it. Not a live region. */
 @Composable
-private fun Dots(@StringRes label: Int?) {
+internal fun Dots(@StringRes label: Int?) {
     val description = stringResource(label ?: R.string.chat_replying)
     Row(
         Modifier.padding(horizontal = 20.dp, vertical = 12.dp).semantics(mergeDescendants = true) { contentDescription = description },
@@ -206,7 +222,21 @@ private fun Dots(@StringRes label: Int?) {
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         val primary = MaterialTheme.colorScheme.primary
-        for (alpha in listOf(0.45f, 0.68f, 0.9f)) Box(Modifier.size(9.dp).alpha(alpha).background(primary, CircleShape))
+        val reduce = ApofisTheme.reduceMotion
+        val time = rememberTimeMs(Motion.DOTS_PERIOD)
+        listOf(0.45f, 0.68f, 0.9f).forEachIndexed { i, alpha ->
+            val motion = if (reduce) {
+                Modifier.alpha(alpha)
+            } else {
+                Modifier.graphicsLayer { // read here only: a frame redraws the dot and recomposes nothing
+                    val f = dotWave(time.value, i)
+                    scaleX = f.scale
+                    scaleY = f.scale
+                    this.alpha = f.alpha
+                }
+            }
+            Box(Modifier.size(9.dp).then(motion).background(primary, CircleShape))
+        }
         if (label != null) {
             Box(Modifier.width(2.dp))
             Text(stringResource(label), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
