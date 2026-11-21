@@ -6,8 +6,13 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
-/** [TextSmoother] stepped tick by tick: no clock, every boundary exact. */
+/** [TextSmoother] stepped tick by tick: no clock, every boundary exact. Robolectric for the platform's ICU (in [cutAt]). */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [37])
 class TextSmootherTest {
     @Test
     fun firstTextShownAtOnce() {
@@ -68,15 +73,81 @@ class TextSmootherTest {
         val forced = TextSmoother("abc")
         val long = "abc" + "z".repeat(500)
         assertEquals(long, forced.step(long, snap = true))
-        // A rewrite of the part not yet shown is a correction too: the new target shows at once.
+        // A rewrite of the part not yet shown keeps what is shown (still a prefix) and reveals the new text from there.
         val hidden = TextSmoother("")
         val first = "q".repeat(600)
         hidden.step(first)
-        assertTrue(hidden.visible.length < first.length)
+        val shown = hidden.visible
+        assertEquals(150, shown.length)
         val rewritten = "q".repeat(300) + "R".repeat(400)
-        assertTrue(hidden.corrects(rewritten))
-        assertEquals(rewritten, hidden.step(rewritten))
-        assertFalse(hidden.corrects(rewritten + "more"))
+        hidden.accept(rewritten, snap = false)
+        assertEquals(shown, hidden.visible)
+        hidden.step()
+        assertTrue(rewritten.startsWith(hidden.visible) && hidden.visible.length > shown.length)
+        // A rewrite of what is shown shows the new text at once, whatever the timer.
+        val r2 = "q".repeat(100) + "Z".repeat(10)
+        hidden.accept(r2, snap = false)
+        assertEquals(r2, hidden.visible)
+        // A snap is committed: turning it off again never takes back what was shown.
+        val s = TextSmoother("")
+        val t = "s".repeat(800)
+        s.accept(t, snap = true)
+        assertEquals(t, s.visible)
+        s.accept(t + "more", snap = false)
+        assertEquals(t, s.visible)
+    }
+
+    @Test
+    fun theMeanEvictsTheOldestAndASnapClearsIt() {
+        // Ten slices of 2, then a backlog of 1000 (raw 240): mean of the last ten = (9 x 2 + 240) / 10 = 25.8 -> 26.
+        // Without eviction it would be (10 x 2 + 240) / 11 -> 24; with the cap also applied after a slice of 2, 3.
+        val s = TextSmoother("")
+        for (i in 1..10) assertEquals(2 * i, s.step("x".repeat(2 * i)).length)
+        assertEquals(20 + 26, s.step("x".repeat(1020)).length)
+        // After a snap the history is empty: a backlog of 12 then shows its own raw slice, 3.
+        s.accept("x".repeat(1100), snap = true)
+        assertEquals(1100 + 3, s.step("x".repeat(1112)).length)
+    }
+
+    @Test
+    fun longShownTextIsNoLongerSmoothed() {
+        // Up to SMOOTH_MAX_SHOWN shown characters a new target keeps the shown length; past it every update shows all.
+        for ((n, kept) in listOf(19_999 to true, 20_000 to true, 20_001 to false)) {
+            val s = TextSmoother("y".repeat(n))
+            val next = "y".repeat(n) + "z".repeat(600)
+            s.accept(next, snap = false)
+            assertEquals("$n", if (kept) n else next.length, s.shown)
+        }
+        // A tick never copies more than SMOOTH_MAX_SHOWN: a cut past it shows the target itself.
+        val s = TextSmoother("y".repeat(19_999))
+        val next = "y".repeat(19_999) + "z".repeat(600)
+        s.step(next)
+        assertSame(next, s.visible)
+    }
+
+    @Test
+    fun appendedTextNeverLeavesACutInsideAGrapheme() {
+        // Caught up on one regional indicator, then five more arrive: the old end is now inside a flag.
+        val ri = "\uD83C\uDDF5"
+        val s = TextSmoother(ri)
+        val next = ri.repeat(6)
+        s.accept(next, snap = false)
+        val whole = BreakIterator.getCharacterInstance().apply { setText(next) }
+        assertTrue("clamped to ${s.shown}", whole.isBoundary(s.shown))
+        // Every step and every new target of a growing mixed text ends on a boundary of that text.
+        val unit = "\uD83C\uDDF5\uD83C\uDDF1e\u0301\u0301\uD83D\uDC68\u200D\uD83D\uDC69\r\nab"
+        val full = unit.repeat(40)
+        val g = TextSmoother("")
+        var end = 1
+        while (end <= full.length) {
+            val target = full.substring(0, end)
+            g.accept(target, snap = false)
+            val b = BreakIterator.getCharacterInstance().apply { setText(target) }
+            assertTrue("accept $end -> ${g.shown}", b.isBoundary(g.shown))
+            g.step()
+            assertTrue("step $end -> ${g.shown}", b.isBoundary(g.shown))
+            end += 3
+        }
     }
 
     @Test

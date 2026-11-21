@@ -60,7 +60,7 @@ import xyz.rycerz.apofis.ui.theme.EaseOutCubic
 import xyz.rycerz.apofis.ui.theme.Motion
 import xyz.rycerz.apofis.ui.theme.dotWave
 import xyz.rycerz.apofis.ui.theme.rememberTimeMs
-import androidx.compose.ui.graphics.graphicsLayer
+import xyz.rycerz.apofis.ui.theme.waveDot
 
 private const val MIN_SHOWN_DURATION_S = 0.1
 
@@ -128,14 +128,14 @@ internal fun TimelineCard(
     val open = remember { { i: Int -> click(i) } } // stable, so streamed text recomposes no step row
     val last = remember { arrayOfNulls<StepsRef>(1) }
     val ref = last[0]?.takeIf { it.steps === reply.steps } ?: StepsRef(reply.steps).also { last[0] = it }
-    Steps(reply.key, ref, tag, open, initiallyExpanded, initiallyOpenReasoning)
+    Steps(reply.key, ref, tag, open, initiallyExpanded, initiallyOpenReasoning, reply.live)
 }
 
 /** A steps list compared by identity: a new list is a new value, found without visiting its steps. */
 private class StepsRef(val steps: List<Step>)
 
 @Composable
-private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) -> Unit, initiallyExpanded: Boolean, initiallyOpenReasoning: Set<Int>) {
+private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) -> Unit, initiallyExpanded: Boolean, initiallyOpenReasoning: Set<Int>, live: Boolean) {
     val steps = ref.steps
     var expanded by rememberSaveable(replyKey) { mutableStateOf(initiallyExpanded) }
     var page by rememberSaveable(replyKey) { mutableIntStateOf(NEWEST) } // the one saved paging state
@@ -164,7 +164,7 @@ private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) ->
             key(i, step is ReasoningStep, (step as? ToolStep)?.callId, (step as? ToolStep)?.takeIf { it.callId.isEmpty() }?.name) {
                 val rail = Rail(above = position > 0, below = position < last)
                 when (step) {
-                    is ToolStep -> ToolRow(step, rail, Modifier.testTag("$tag:$i:${step.name}")) { onStep(i) }
+                    is ToolStep -> ToolRow(step, rail, Modifier.testTag("$tag:$i:${step.name}"), live) { onStep(i) }
                     is ReasoningStep -> ReasoningRow(step, rail, i, i in opened, Modifier.testTag("$tag:$i")) {
                         opened = if (i in opened) opened - i else opened + i
                     }
@@ -215,7 +215,7 @@ private fun ExpandRow(expanded: Boolean, more: Int, onToggle: () -> Unit) {
 }
 
 @Composable
-private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, onClick: () -> Unit) {
+private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, live: Boolean, onClick: () -> Unit) {
     val colors = ApofisTheme.colors
     val scheme = MaterialTheme.colorScheme
     val state = when {
@@ -229,7 +229,7 @@ private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, onClick: () 
         modifier.clickable(onClick = onClick).semantics(mergeDescendants = true) { if (state != null) stateDescription = state },
         icon = {
             when {
-                step.running -> MiniDots()
+                step.running -> MiniDots(animate = live) // only a step of the live run is the active one
                 step.error -> Icon(painterResource(R.drawable.lucide_triangle_exclamation_point), null, Modifier.size(18.dp), tint = scheme.error)
                 else -> Icon(painterResource(R.drawable.lucide_wrench), null, Modifier.size(18.dp), tint = colors.timelineStrong)
             }
@@ -326,27 +326,23 @@ private fun StepRow(
 }
 
 /**
- * Three 3 dp dots in [MaterialTheme.colorScheme.primary]: a running tool step, in the [dotWave] of the reply's dots.
- * Under reduced motion all three are solid, as in milestone 1 (so its goldens keep their pixels).
+ * Three 3 dp dots in [MaterialTheme.colorScheme.primary]: a running tool step, in the [dotWave] of the reply's dots
+ * while [animate] (the step belongs to the live run). Otherwise, and under reduced motion, all three are solid, as in
+ * milestone 1 (so its goldens keep their pixels): a stored call without a result in an idle chat stays still.
  */
 @Composable
-internal fun MiniDots(modifier: Modifier = Modifier) {
+internal fun MiniDots(modifier: Modifier = Modifier, animate: Boolean = true) {
     val primary = MaterialTheme.colorScheme.primary
-    val reduce = ApofisTheme.reduceMotion
-    val time = rememberTimeMs(Motion.DOTS_PERIOD)
+    val still = ApofisTheme.reduceMotion || !animate
+    val time = rememberTimeMs(Motion.DOTS_PERIOD, active = animate)
     Row(modifier, horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
         repeat(3) { i ->
-            val motion = if (reduce) {
-                Modifier
+            val dot = if (still) {
+                Modifier.background(primary, CircleShape)
             } else {
-                Modifier.graphicsLayer { // read here only: a frame redraws the dot and recomposes nothing
-                    val f = dotWave(time.value, i)
-                    scaleX = f.scale
-                    scaleY = f.scale
-                    alpha = f.alpha
-                }
+                Modifier.drawBehind { waveDot(primary, dotWave(time.value, i)) } // read in the draw phase only
             }
-            Box(Modifier.size(3.dp).then(motion).background(primary, CircleShape))
+            Box(Modifier.size(3.dp).then(dot))
         }
     }
 }
@@ -450,9 +446,10 @@ internal fun pageEnd(text: CharSequence, start: Int): Int {
  * The one cut for every cap in this task: the last grapheme boundary of [text] at or before [cap], so a cap is never
  * exceeded. [from] must be a grapheme boundary (0 or an earlier cut): ICU's character BreakIterator reads only from
  * [from] to one code point past [cap], so flags, ZWJ sequences, combining marks and CRLF stay whole. When no boundary
- * lies after [from] (one cluster longer than the window), the cut is the last code point boundary at or before [cap].
+ * lies after [from] (one cluster longer than the window), the cut is the last code point boundary at or before [cap],
+ * or [from] itself when [orFrom] (a caller that may show nothing more rather than half a grapheme).
  */
-internal fun cutAt(text: CharSequence, from: Int, cap: Int): Int {
+internal fun cutAt(text: CharSequence, from: Int, cap: Int, orFrom: Boolean = false): Int {
     if (cap >= text.length) return text.length
     if (cap <= from) return from
     val after = cap + if (Character.isHighSurrogate(text[cap]) && cap + 1 < text.length) 2 else 1 // what follows the cap
@@ -460,6 +457,7 @@ internal fun cutAt(text: CharSequence, from: Int, cap: Int): Int {
     graphemes.setText(text.subSequence(from, after).toString())
     val boundary = graphemes.preceding(cap - from + 1)
     if (boundary != BreakIterator.DONE && boundary > 0) return from + boundary
+    if (orFrom) return from
     return if (Character.isLowSurrogate(text[cap]) && Character.isHighSurrogate(text[cap - 1])) cap - 1 else cap
 }
 

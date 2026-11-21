@@ -24,6 +24,12 @@ import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.graphics.PixelMap
+import androidx.compose.ui.graphics.toPixelMap
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -101,11 +107,6 @@ class StreamingUiTest {
         SemanticsMatcher("rows of $key") { it.config.getOrElseNullable(SemanticsProperties.TestTag) { null }?.startsWith("reply:$key/") == true },
         useUnmergedTree = true,
     ).fetchSemanticsNodes().sortedBy { it.positionInRoot.y }.joinToString("") { it.allText() }
-
-    private fun announcements() = rule.onAllNodes(
-        SemanticsMatcher("announces") { it.config.getOrElseNullable(SemanticsProperties.StateDescription) { null } == finished },
-        useUnmergedTree = true,
-    ).fetchSemanticsNodes()
 
     private fun liveRegions() = rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.LiveRegion), useUnmergedTree = true).fetchSemanticsNodes()
 
@@ -267,7 +268,7 @@ class StreamingUiTest {
         generation++
         frame()
         assertEquals(long, shown("live"))
-        assertEquals(0, announcements().size)
+        assertEquals("", said())
     }
 
     @Test
@@ -298,51 +299,153 @@ class StreamingUiTest {
 
     // ---- the run-end announcement ----
 
+    /** The one persistent announcer: a polite live region with a state description, outside every row. */
+    private fun announcer(): SemanticsNode = rule.onAllNodes(
+        SemanticsMatcher.keyIsDefined(SemanticsProperties.LiveRegion) and SemanticsMatcher.keyIsDefined(SemanticsProperties.StateDescription),
+        useUnmergedTree = true,
+    ).fetchSemanticsNodes().single()
+
+    private fun said() = announcer().config[SemanticsProperties.StateDescription]
+
     @Test
-    fun announcesOncePerRun() {
+    fun announcesOnceWhenARunEnds() {
         val user = UserMessage("u1", "hi", false, FIXED_NOW)
         var items by mutableStateOf(liveItems("", listOf(user)))
         var live by mutableStateOf<LiveReply?>(run("A", ""))
         rule.setContent { Themed { Messages(items, live) } }
         frame()
+        val node = announcer()
+        assertTrue("present and visible", node.size.width > 0 && node.size.height > 0)
+        assertEquals(LiveRegionMode.Polite, node.config[SemanticsProperties.LiveRegion])
+        assertEquals("", said())
         var text = ""
         repeat(30) {
             text += letters
             items = liveItems(text, listOf(user))
             live = run("A", text)
             frame()
-            assertEquals("streaming announces nothing", 0, announcements().size)
-            assertEquals("streamed text is not a live region", 0, liveRegions().size)
+            assertEquals("streaming announces nothing", "", said())
+            assertEquals("streamed text is not a live region: only the announcer is", 1, liveRegions().size)
         }
         items = listOf(user, AssistantReply("r1", emptyList(), text, FIXED_NOW))
         live = null
-        frame(2)
-        val node = announcements().single()
-        assertTrue("visible", node.size.width > 0 && node.size.height > 0)
-        assertEquals(LiveRegionMode.Polite, node.config[SemanticsProperties.LiveRegion])
-        rule.mainClock.advanceTimeBy(ANNOUNCE_MS)
+        frame(3)
+        assertEquals(finished, said())
+        assertEquals("the same node, which existed all along", node.id, announcer().id)
+        rule.mainClock.advanceTimeBy(ANNOUNCE_MS - 5 * 16, ignoreFrameDuration = true)
         frame()
-        assertEquals(0, announcements().size)
-        // Later updates of the same chat (a refresh, a notice) never repeat it.
+        assertEquals("held for ANNOUNCE_MS", finished, said())
+        rule.mainClock.advanceTimeBy(6 * 16, ignoreFrameDuration = true)
+        frame()
+        assertEquals("", said())
+        // Later updates of the same chat (a refresh, an edit) never repeat it.
         items = listOf(user, AssistantReply("r1", emptyList(), text + " edited", FIXED_NOW))
         frame(3)
-        assertEquals(0, announcements().size)
-        // The next run ends: once more.
-        live = run("B", "")
-        items = liveItems("", items)
-        frame(3)
-        assertEquals(0, announcements().size)
-        live = null
-        items = listOf(user, AssistantReply("r1", emptyList(), text, FIXED_NOW), AssistantReply("r2", emptyList(), "again", FIXED_NOW))
-        frame(2)
-        assertEquals(1, announcements().size)
+        assertEquals("", said())
+    }
+
+    /** Counts the frames in which the announcer turned to "Reply finished", over [frames] frames. */
+    private fun announcementsOver(frames: Int): Int {
+        var count = 0
+        var before = said()
+        repeat(frames) {
+            frame()
+            val now = said()
+            if (now == finished && before != finished) count++
+            before = now
+        }
+        return count
     }
 
     @Test
-    fun openingAChatAnnouncesNothing() {
-        rule.setContent { Themed { Messages(listOf(AssistantReply("r1", emptyList(), "done", FIXED_NOW)), null) } }
+    fun runAThenRunBDirectlyAnnouncesA() {
+        var items by mutableStateOf(liveItems("a"))
+        var live by mutableStateOf<LiveReply?>(run("A", "a"))
+        rule.setContent { Themed { Messages(items, live) } }
+        frame(2)
+        items = liveItems("b")
+        live = run("B", "b") // no frame without a run in between
+        assertEquals(1, announcementsOver(5))
+        // B starting inside an announcement window does not cut it short, and B ending announces again.
+        live = null
+        items = listOf(AssistantReply("r1", emptyList(), "b", FIXED_NOW))
         frame(3)
-        assertEquals(0, announcements().size)
+        live = run("C", "")
+        items = liveItems("", items)
+        frame(3)
+        assertEquals(finished, said())
+        // C ends after the window: announced again. (An end inside a running window only extends it: one line.)
+        rule.mainClock.advanceTimeBy(ANNOUNCE_MS, ignoreFrameDuration = true)
+        frame()
+        assertEquals("", said())
+        live = null
+        items = listOf(AssistantReply("r1", emptyList(), "b", FIXED_NOW))
+        assertEquals(1, announcementsOver(5))
+    }
+
+    @Test
+    fun openingOrRecreatingAnnouncesNothing() {
+        var generation by mutableStateOf(0)
+        var live by mutableStateOf<LiveReply?>(run("B", "x"))
+        rule.setContent { Themed { key(generation) { Messages(if (live == null) listOf(AssistantReply("r1", emptyList(), "done", FIXED_NOW)) else liveItems("x"), live) } } }
+        assertEquals(0, announcementsOver(3))
+        generation++ // recreated while B runs
+        assertEquals(0, announcementsOver(3))
+        live = null
+        generation++ // recreated with B gone: nothing is remembered, so nothing ended
+        assertEquals(0, announcementsOver(3))
+    }
+
+    @Test
+    fun aPollingOnlyRunAndARunWithoutAReplyAnnounce() {
+        val user = UserMessage("u1", "hi", false, FIXED_NOW, runId = "A")
+        // As the merger polls: the stored transcript as it is plus an empty live item.
+        var live by mutableStateOf<LiveReply?>(run("A", "", Connection.POLLING))
+        var items by mutableStateOf(withLive(listOf(user), live) { FIXED_NOW })
+        rule.setContent { Themed { Messages(items, live) } }
+        frame(2)
+        live = null
+        items = listOf(user) // the run stored no reply
+        assertEquals(1, announcementsOver(5))
+    }
+
+    @Test
+    fun aStoredReplyArrivingAfterTheRunClearedAnnouncesOnce() {
+        val older = AssistantReply("r0", emptyList(), "older", FIXED_NOW)
+        val user = UserMessage("u1", "hi", false, FIXED_NOW, runId = "A")
+        var items by mutableStateOf(liveItems("streamed", listOf(older, user)))
+        var live by mutableStateOf<LiveReply?>(run("A", "streamed"))
+        rule.setContent { Themed { Messages(items, live) } }
+        frame(2)
+        live = null
+        items = listOf(older, user) // the run cleared before the final transcript arrived
+        frame()
+        items = listOf(older, user.copy(runId = null), AssistantReply("r1", emptyList(), "final", FIXED_NOW))
+        assertEquals(1, announcementsOver(10))
+    }
+
+    @Test
+    fun theNewestReplyOffScreenIsStillAnnounced() {
+        val history: List<ChatItem> = List(40) { i ->
+            if (i % 2 == 0) UserMessage("u$i", "question $i", false, FIXED_NOW) else AssistantReply("r$i", emptyList(), "answer $i\n\nmore $i", FIXED_NOW)
+        }
+        var items by mutableStateOf(liveItems("streamed", history))
+        var live by mutableStateOf<LiveReply?>(run("A", "streamed"))
+        var scope: CoroutineScope? = null
+        lateinit var state: LazyListState
+        rule.setContent {
+            Themed {
+                scope = rememberCoroutineScope()
+                state = rememberLazyListState()
+                Messages(items, live, state)
+            }
+        }
+        frame(2)
+        scope!!.launch { state.scrollToItem(60) } // far up the history
+        frame(3)
+        live = null
+        items = history + AssistantReply("live", emptyList(), "streamed", FIXED_NOW)
+        assertEquals(1, announcementsOver(5))
     }
 
     // ---- infinite indicators ----
@@ -470,5 +573,213 @@ class StreamingUiTest {
         val after = PulseProbe.frames
         frame(10)
         assertTrue("only the reply dots remain", PulseProbe.frames - after in 8L..10L)
+    }
+
+    // ---- fix round 1 ----
+
+    @Test
+    fun theTickIsEvery50ms() {
+        var target by mutableStateOf("abc")
+        var shownNow = ""
+        rule.setContent { Themed { shownNow = rememberSmoothedText("r1", target, snap = false) } }
+        frame()
+        target = "abc" + letters.repeat(60)
+        frame()
+        var grewOn = 0
+        var before = shownNow.length
+        repeat(12) {
+            frame()
+            if (shownNow.length > before) grewOn++
+            before = shownNow.length
+        }
+        assertEquals("12 frames of 16 ms hold 3 ticks of 50 ms", 3, grewOn)
+    }
+
+    @Test
+    fun everyInputFrameIsCheckedBetweenTicks() {
+        val base = letters.repeat(5)
+        var target by mutableStateOf(base)
+        var shownNow = ""
+        rule.setContent { Themed { shownNow = rememberSmoothedText("r1", target, snap = false) } }
+        frame(2)
+        // Caught up on base; "bad" arrives and is revealed, then is rewritten one frame later, before the next tick.
+        target = base + "bad"
+        frame(3)
+        assertEquals("one slice of 2", base + "ba", shownNow)
+        target = base + "fixed" + letters.repeat(40)
+        frame()
+        assertEquals("the shown text was no longer a prefix: all of it at once", target, shownNow)
+        // Rewrites of the unrevealed part keep what is shown and stay a prefix on every frame.
+        target = target + letters.repeat(60)
+        frame(2)
+        for (k in 0 until 6) {
+            target = target.substring(0, target.length - 30) + "Q".repeat(30 + k)
+            frame()
+            assertTrue("frame $k", target.startsWith(shownNow))
+        }
+    }
+
+    @Test
+    fun aCaughtUpSmootherGoesIdle() {
+        var target by mutableStateOf("abc")
+        var shownNow = ""
+        rule.setContent { Themed { shownNow = rememberSmoothedText("r1", target, snap = false) } }
+        frame()
+        target = "abc" + letters.repeat(60)
+        frame(3)
+        // A new string instance with exactly the shown content: caught up by length and content.
+        target = String(shownNow.toCharArray())
+        frame(3)
+        val woke = Work.smoothFrames
+        frame(20)
+        assertEquals("no frames requested once caught up", woke, Work.smoothFrames)
+        assertEquals(target, shownNow)
+    }
+
+    @Test
+    fun aTerminalRunShowsAllAtOnce() {
+        var items by mutableStateOf(liveItems("Start"))
+        var live by mutableStateOf<LiveReply?>(run("A", "Start"))
+        rule.setContent { Themed { Messages(items, live) } }
+        frame()
+        val long = "Start" + letters.repeat(80)
+        items = liveItems(long)
+        live = run("A", long)
+        frame(5)
+        assertTrue(shown("live").length < long.length)
+        // Failed while the run is still present (before the final transcript): the buffered text shows whole, no reveal.
+        live = LiveReply("A", "failed", long, emptyList(), null, Connection.LIVE)
+        frame()
+        assertEquals(long, shown("live"))
+    }
+
+    @Test
+    fun anOffScreenLiveReplyIsNotRevealed() {
+        val history: List<ChatItem> = List(40) { i ->
+            if (i % 2 == 0) UserMessage("u$i", "question $i", false, FIXED_NOW) else AssistantReply("r$i", emptyList(), "answer $i\n\nmore $i", FIXED_NOW)
+        }
+        var items by mutableStateOf(liveItems("Go", history))
+        var live by mutableStateOf<LiveReply?>(run("A", "Go"))
+        var scope: CoroutineScope? = null
+        lateinit var state: LazyListState
+        rule.setContent {
+            Themed {
+                scope = rememberCoroutineScope()
+                state = rememberLazyListState()
+                Messages(items, live, state)
+            }
+        }
+        frame(2)
+        scope!!.launch { state.scrollToItem(60) }
+        frame(3)
+        val woke = Work.smoothFrames
+        val long = "Go" + letters.repeat(80)
+        items = liveItems(long, history)
+        live = run("A", long)
+        frame(10)
+        assertEquals("no ticks while off screen", woke, Work.smoothFrames)
+        scope!!.launch { state.scrollToItem(0) }
+        frame(2)
+        assertEquals("back on screen: all of it, no replay", long, shown("live"))
+    }
+
+    @Test
+    fun aStoredUnfinishedToolCallIsStill() {
+        val stuck = AssistantReply("r1", listOf(ToolStep("c1", "terminal", "ls", null, false, false, running = true)), "partial", FIXED_NOW)
+        var live by mutableStateOf<LiveReply?>(null)
+        var items by mutableStateOf<List<ChatItem>>(listOf(stuck))
+        rule.setContent { Themed { Messages(items, live) } }
+        frame(12)
+        assertEquals("an idle chat animates nothing", 0L, PulseProbe.frames)
+        // Another run going on (with text, so no reply dots) does not wake the old call either.
+        live = run("B", "working")
+        items = liveItems("working", listOf(stuck))
+        frame(12)
+        assertEquals(0L, PulseProbe.frames)
+    }
+
+    @Test
+    fun theDotsStayUntilTextShows() {
+        var items by mutableStateOf(liveItems(""))
+        var live by mutableStateOf<LiveReply?>(run("A", ""))
+        rule.setContent { Themed { Messages(items, live) } }
+        frame(2)
+        items = liveItems("Hello there, a reply")
+        live = run("A", "Hello there, a reply")
+        frame()
+        assertEquals("", shown("live"))
+        assertEquals(1, rule.onAllNodes(hasContentDescription("Hermes is replying"), useUnmergedTree = true).fetchSemanticsNodes().size)
+        frame(3)
+        assertTrue(shown("live").isNotEmpty())
+        assertEquals(0, rule.onAllNodes(hasContentDescription("Hermes is replying"), useUnmergedTree = true).fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun growthIsPerRunAndCoversPolling() {
+        val user = UserMessage("u1", "hi", false, FIXED_NOW, runId = "A")
+        var live by mutableStateOf<LiveReply?>(run("A", "", Connection.POLLING))
+        var transcript by mutableStateOf<List<ChatItem>>(listOf(user))
+        var grew = 0
+        rule.setContent { Themed { Messages(withLive(transcript, live) { FIXED_NOW }, live, onRevealGrew = { grew++ }) } }
+        frame(2)
+        // Polling: the live tail is empty; the stored transcript grows.
+        transcript = listOf(user, AssistantReply("r1", emptyList(), "part", FIXED_NOW))
+        frame(2)
+        assertEquals(1, grew)
+        transcript = listOf(user, AssistantReply("r1", emptyList(), "part and more", FIXED_NOW))
+        frame(2)
+        assertEquals(2, grew)
+        // Another run with more to show is not growth of the first.
+        live = run("B", letters.repeat(30))
+        frame(2)
+        assertEquals(2, grew)
+    }
+
+    /** The indicator under [tag] captured now. */
+    private fun capture(tag: String) = rule.onNodeWithTag(tag, useUnmergedTree = true).captureToImage().toPixelMap()
+
+    private fun differs(a: PixelMap, b: PixelMap): Int {
+        var n = 0
+        for (y in 0 until a.height) for (x in 0 until a.width) if (a[x, y] != b[x, y]) n++
+        return n
+    }
+
+    private fun motionShows(reduceMotion: Boolean): List<Int> {
+        rule.setContent {
+            Themed(reduceMotion) {
+                Column {
+                    Box(Modifier.testTag("dots")) { Dots(null) }
+                    Box(Modifier.testTag("mini")) { MiniDots() }
+                    Messages(listOf(UserMessage("p1", "hi", false, FIXED_NOW, SendState.SENDING, idempotencyKey = "k")), null)
+                }
+            }
+        }
+        frame(2)
+        val first = listOf(capture("dots"), capture("mini"), capture("user:p1"))
+        frame(16) // a quarter of a second: the wave and the spinner have moved
+        val second = listOf(capture("dots"), capture("mini"), capture("user:p1"))
+        if (reduceMotion) {
+            // The static versions are drawn: every dot's centre is painted (the page shows through elsewhere).
+            val dots = first[0]
+            val mini = first[1]
+            for (i in 0..2) {
+                assertNotEquals("dot $i", dots[2, 2], dots[49 + 30 * i, 33])
+                assertNotEquals("mini dot $i", Color.Transparent, mini[3 + 10 * i, 3])
+            }
+        }
+        return first.indices.map { differs(first[it], second[it]) }
+    }
+
+    @Test
+    fun theIndicatorsVisiblyMove() {
+        val changed = motionShows(reduceMotion = false)
+        assertTrue("dots $changed", changed[0] > 0)
+        assertTrue("mini dots $changed", changed[1] > 0)
+        assertTrue("spinner $changed", changed[2] > 0)
+    }
+
+    @Test
+    fun theStaticIndicatorsStayStill() {
+        assertEquals(listOf(0, 0, 0), motionShows(reduceMotion = true))
     }
 }

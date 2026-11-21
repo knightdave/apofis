@@ -40,7 +40,8 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.Motion
 import xyz.rycerz.apofis.ui.theme.rememberTimeMs
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.rotate
 import xyz.rycerz.apofis.ui.theme.scaled
 
 private val bubbleShape = RoundedCornerShape(16.dp)
@@ -131,9 +132,10 @@ internal fun UserBubble(
                 CancelButton(R.string.chat_cancel_send) { onCancel(message) }
             }
             SendState.SENDING -> Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                // One linear turn per SPINNER_PERIOD, read in the layer only; static under reduced motion.
+                // One linear turn per SPINNER_PERIOD while this message sends (its own active state), read in the draw phase only;
+                // static under reduced motion.
                 val time = rememberTimeMs(Motion.SPINNER_PERIOD)
-                val spin = if (ApofisTheme.reduceMotion) Modifier else Modifier.graphicsLayer { rotationZ = time.value * 360f / Motion.SPINNER_PERIOD }
+                val spin = if (ApofisTheme.reduceMotion) Modifier else Modifier.drawWithContent { rotate(time.value * 360f / Motion.SPINNER_PERIOD) { this@drawWithContent.drawContent() } }
                 Icon(painterResource(R.drawable.lucide_loader_circle), null, Modifier.size(14.dp).then(spin), tint = scheme.primary)
                 Box(Modifier.width(6.dp))
                 Caption(if (message.steered) R.string.chat_steering else R.string.chat_sending, padded = false)

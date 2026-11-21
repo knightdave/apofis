@@ -4,7 +4,6 @@ import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -47,8 +46,8 @@ internal fun shouldPin(state: FollowState, contentGrew: Boolean, atBottom: Boole
 }
 
 /**
- * The chat's follow and scroll-button state. Nothing here reads the transcript: each update costs a comparison of the
- * live tail's size, and scrolling costs a few O(1) reads of the list state.
+ * The chat's follow and scroll-button state. Nothing here reads the transcript: growth arrives from [MessageList]
+ * ([Follower.onGrew]), and scrolling costs a few O(1) reads of the list state.
  */
 @Stable
 internal class Follower(private val list: LazyListState, internal var wasLive: Boolean) {
@@ -58,7 +57,6 @@ internal class Follower(private val list: LazyListState, internal var wasLive: B
     internal var measured = false
     internal var dragging = false
     internal var frameMs = 0L // the latest frame time an effect saw; the hold is judged against it
-    internal var tail = -1L // the live tail's size last seen, -1 without a live reply
     internal var recentlyScrolled by mutableStateOf(false)
     internal var dismissed by mutableStateOf(false) // tapped: hidden until the next scroll settles
     val buttonVisible by derivedStateOf {
@@ -74,6 +72,18 @@ internal class Follower(private val list: LazyListState, internal var wasLive: B
     fun onSend() {
         state = state.copy(following = true)
         measured = true
+    }
+
+    /**
+     * What the run shows at the bottom grew ([MessageList]'s `onRevealGrew`: revealed text, steps, a pending request, or
+     * the stored transcript while polling), reported after the change is applied and before the list measures it, so a
+     * follower stays pinned with no frame of lag. Never against a scroll someone else owns; a reader is left alone.
+     */
+    fun onGrew() {
+        if (measured && free() && shouldPin(state, contentGrew = true, atBottom = atBottom(), nowMs = frameMs)) {
+            ChromeProbe.pins++
+            list.requestScrollToItem(0)
+        }
     }
 
     /** A pin may move the list only when no one else scrolls it: a drag owns it through [state], any other scroll (TalkBack, keyboard, the button's animation) by being in progress. */
@@ -119,19 +129,6 @@ internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
             follower.dismissed = false
             if (list.canScrollBackward) delay(Motion.SCROLL_BUTTON_HIDE.toLong()) // one timeout, cancelled by the next scroll
             follower.recentlyScrolled = false
-        }
-    }
-    // After the change is applied and before the list measures it: a follower stays pinned with no frame of lag. Only
-    // growth of the live tail pins (not any new list of items), and never against a scroll someone else owns.
-    val tail = live?.let { it.text.length.toLong() + it.steps.size + (if (it.pending != null) 1 else 0) } ?: -1L
-    SideEffect {
-        val grew = tail >= 0 && follower.tail in 0 until tail
-        follower.tail = tail
-        if (grew && follower.measured && follower.free() &&
-            shouldPin(follower.state, contentGrew = true, atBottom = follower.atBottom(), nowMs = follower.frameMs)
-        ) {
-            ChromeProbe.pins++
-            list.requestScrollToItem(0)
         }
     }
     LaunchedEffect(live != null) {

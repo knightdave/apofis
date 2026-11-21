@@ -31,7 +31,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.platform.LocalViewConfiguration
 import android.os.SystemClock
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
@@ -41,7 +41,6 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
@@ -68,6 +67,7 @@ import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.Motion
 import xyz.rycerz.apofis.ui.theme.dotWave
 import xyz.rycerz.apofis.ui.theme.rememberTimeMs
+import xyz.rycerz.apofis.ui.theme.waveDot
 import xyz.rycerz.apofis.ui.theme.scaled
 
 /**
@@ -154,18 +154,8 @@ internal fun ReplyFooter(
     rowActions: RowActions? = null,
     active: Boolean = false,
     shownText: String = reply.text, // the live text as revealed (see [rememberSmoothedText]): the dots stay until it shows
-    announce: Boolean = false, // the chat's run just ended: say so once, from this visible node (see [MessageList])
 ) {
-    val finished = stringResource(R.string.chat_reply_finished)
-    val announcing = if (announce) {
-        Modifier.semantics {
-            liveRegion = LiveRegionMode.Polite
-            stateDescription = finished
-        }
-    } else {
-        Modifier
-    }
-    Column(Modifier.fillMaxWidth().then(announcing).padding(vertical = 4.dp)) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         if (live != null) {
             val polling = live.connection == Connection.POLLING
             val pending = live.pending
@@ -225,17 +215,12 @@ internal fun Dots(@StringRes label: Int?) {
         val reduce = ApofisTheme.reduceMotion
         val time = rememberTimeMs(Motion.DOTS_PERIOD)
         listOf(0.45f, 0.68f, 0.9f).forEachIndexed { i, alpha ->
-            val motion = if (reduce) {
-                Modifier.alpha(alpha)
+            val dot = if (reduce) {
+                Modifier.alpha(alpha).background(primary, CircleShape)
             } else {
-                Modifier.graphicsLayer { // read here only: a frame redraws the dot and recomposes nothing
-                    val f = dotWave(time.value, i)
-                    scaleX = f.scale
-                    scaleY = f.scale
-                    this.alpha = f.alpha
-                }
+                Modifier.drawBehind { waveDot(primary, dotWave(time.value, i)) } // read in the draw phase only: no layout, no recomposition
             }
-            Box(Modifier.size(9.dp).then(motion).background(primary, CircleShape))
+            Box(Modifier.size(9.dp).then(dot))
         }
         if (label != null) {
             Box(Modifier.width(2.dp))

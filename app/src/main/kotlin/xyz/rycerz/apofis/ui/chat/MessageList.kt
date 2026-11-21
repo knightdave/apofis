@@ -14,6 +14,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.stateDescription
 import kotlinx.coroutines.delay
 import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
@@ -465,6 +473,7 @@ internal object Work {
     var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
     var timelineRows = 0L // timeline step rows composed
     var pageEnds = 0L // text pages measured
+    var smoothFrames = 0L // frames the text smoother's loop woke for
 }
 
 /**
@@ -939,7 +948,7 @@ internal fun MessageList(
     onLink: (String) -> Unit = {},
     onSelect: (String) -> Unit = {},
     current: (() -> List<ChatItem>)? = null,
-    onRevealGrew: () -> Unit = {}, // the live reply's shown text got longer (a smoothing tick or a token); after the change is applied
+    onRevealGrew: () -> Unit = {}, // what the run shows at the bottom grew (see below); called after the change is applied
 ) {
     val builder = remember(zone) { ChatRows(zone) }
     // Copy reads the reply as it is when tapped. Referential: comparing the items would compare a live reply's steps.
@@ -954,89 +963,123 @@ internal fun MessageList(
     // Only the live tail is smoothed: the stored head goes through unchanged and by identity, controls read the canonical reply.
     @Suppress("UNCHECKED_CAST")
     val liveItem = if (live == null) null else (items as? Joined<ChatItem>)?.tail?.firstOrNull { it is AssistantReply && it.live } as AssistantReply?
+    // The reveal runs only while a row of the live reply is on screen: off screen, or once the run is known to be over,
+    // the whole text shows at once (no replay when the reader scrolls back). Read through derivedStateOf: a scroll
+    // recomposes nothing unless that changes.
+    val liveKey = liveItem?.key
+    val liveOnScreen by remember(listState, liveKey) {
+        derivedStateOf { liveKey != null && listState.layoutInfo.visibleItemsInfo.any { isRowOf(it.key, liveKey) } }
+    }
     val liveText = if (live != null && liveItem != null) {
-        rememberSmoothedText(live.runId, liveItem.text, snap = ApofisTheme.reduceMotion || live.connection == Connection.POLLING)
+        val snap = ApofisTheme.reduceMotion || live.connection == Connection.POLLING || live.status in TERMINAL_STATUSES || !liveOnScreen
+        rememberSmoothedText(live.runId, liveItem.text, snap)
     } else {
         null
     }
-    val revealed = remember { longArrayOf(-1) }
-    val shownLength = liveText?.length?.toLong() ?: -1L
+    // Growth at the bottom for the follow rules, per run: the live tail as shown (text, steps, a pending request) or,
+    // while polling (an empty tail), the stored transcript (items, and the newest reply's text and steps).
+    @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
+    val size = when {
+        live == null -> -1L
+        live.connection == Connection.POLLING -> (stored.lastOrNull { it is AssistantReply } as AssistantReply?)
+            .let { stored.size.toLong() + (it?.text?.length ?: 0) + (it?.steps?.size ?: 0) }
+        else -> (liveText?.length ?: 0).toLong() + (liveItem?.steps?.size ?: 0) + (if (live.pending != null) 1 else 0)
+    }
+    val grown = remember { arrayOf<Any?>(null, -1L) } // the run and its size at the last applied composition
     val grewNow by rememberUpdatedState(onRevealGrew)
     SideEffect {
-        if (shownLength > revealed[0] && revealed[0] >= 0) grewNow()
-        revealed[0] = shownLength
+        if (live != null && grown[0] == live.runId && size > grown[1] as Long) grewNow()
+        grown[0] = live?.runId
+        grown[1] = size
     }
-    val announcing = rememberRunEndAnnouncement(live != null)
     val rows = builder.rows(items, liveText).let { if (gone) Joined(it, listOf(GoneRow)) else it }
-    // The newest reply's footer says once that the run ended (looked up only then: a few rows from the end).
-    val announceRow = if (announcing) rows.lastOrNull { it is FooterRow }?.key else null
     // Copy and Select check the transcript as it is at action time: the owner's current state when given.
     val onSelectNow by rememberUpdatedState(onSelect)
     val currentNow by rememberUpdatedState(current)
     val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
     // No reply has actions while a run is live or unsettled: once per transcript, not per token.
-    @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
     val active = live != null || remember(stored) { unsettled(stored) }
-    LazyColumn(modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
-        items(
-            count = rows.size,
-            key = { rows[rows.size - 1 - it].key },
-            contentType = { rows[rows.size - 1 - it]::class },
-        ) { index ->
-            val row = rows[rows.size - 1 - index]
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
-                Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
-                    when (row) {
-                        is DateRow -> DateSeparator(row.day, today)
-                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, actions = rowActions)
-                        is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
-                            // Read at tap time: a step that has since changed kind or gone opens nothing.
-                            (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
-                        })
-                        is TextRow -> {
-                            val source = { copySource(latest, row.key) }
-                            if (row.kind == BlockKind.TABLE) {
-                                TextBlock(row, onLink, tableScrolls.getOrPut(row.key.substringBeforeLast("/c")) { ScrollState(0) }, source)
-                            } else {
-                                TextBlock(row, onLink, source = source)
+    Box(modifier.fillMaxSize()) {
+        LazyColumn(Modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
+            items(
+                count = rows.size,
+                key = { rows[rows.size - 1 - it].key },
+                contentType = { rows[rows.size - 1 - it]::class },
+            ) { index ->
+                val row = rows[rows.size - 1 - index]
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                    Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
+                        when (row) {
+                            is DateRow -> DateSeparator(row.day, today)
+                            is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, actions = rowActions)
+                            is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
+                                // Read at tap time: a step that has since changed kind or gone opens nothing.
+                                (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
+                            })
+                            is TextRow -> {
+                                val source = { copySource(latest, row.key) }
+                                if (row.kind == BlockKind.TABLE) {
+                                    TextBlock(row, onLink, tableScrolls.getOrPut(row.key.substringBeforeLast("/c")) { ScrollState(0) }, source)
+                                } else {
+                                    TextBlock(row, onLink, source = source)
+                                }
                             }
+                            is FooterRow -> ReplyFooter(
+                                row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
+                                rowActions, active = active,
+                                shownText = if (row.reply.live && liveText != null) liveText else row.reply.text,
+                            )
+                            is NoticeRow -> NoticeLine(row.notice.text)
+                            GoneRow -> Notice(R.string.chat_answer_gone)
                         }
-                        is FooterRow -> ReplyFooter(
-                            row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
-                            rowActions, active = active,
-                            shownText = if (row.reply.live && liveText != null) liveText else row.reply.text,
-                            announce = row.key == announceRow,
-                        )
-                        is NoticeRow -> NoticeLine(row.notice.text)
-                        GoneRow -> Notice(R.string.chat_answer_gone)
                     }
                 }
             }
         }
+        RunEndAnnouncer(live?.runId)
     }
 }
 
-/** How long the run-end announcement stays on its node: past Compose's 100 ms accessibility batching and TalkBack's read. */
+/** Whether lazy item key [key] is a row of reply [reply]: its steps, a text row or its footer. */
+private fun isRowOf(key: Any, reply: String): Boolean =
+    key is String && (key == reply || key == "$reply/end" || key.startsWith("$reply/b"))
+
+/** Run statuses after which nothing more streams (the follower's terminal set). */
+private val TERMINAL_STATUSES = setOf("completed", "failed", "cancelled", "interrupted")
+
+/** How long "Reply finished" stays on the announcer: past Compose's 100 ms accessibility batching and TalkBack's read. */
 internal const val ANNOUNCE_MS = 1000L
 
 /**
- * True for [ANNOUNCE_MS] after the chat's live run went from present to absent while this list was shown. Exact from
- * the state: no reply identity is needed, and a first composition (opening, rotation, process recreation) never
- * announces. Streamed text itself is not a live region, so TalkBack hears one line per run, not every token.
+ * One persistent, invisible 1 dp node in the middle of the list (clear of the bars that hide what is under them), a
+ * polite live region whose state description is empty, and "Reply finished" for [ANNOUNCE_MS] after a run ended. Ended
+ * means the live run id was set and is now another one or none, so run A followed directly by run B still announces A.
+ * The previous id is remembered, never saved: a first composition (opening, rotation, process recreation) announces
+ * nothing. Streamed text is not a live region, so TalkBack hears one line per run, not every token. The node exists the
+ * whole time and only its state description changes, so Compose sends the change from this node itself.
  */
 @Composable
-private fun rememberRunEndAnnouncement(running: Boolean): Boolean {
-    val was = remember { booleanArrayOf(running) }
-    val on = remember { mutableStateOf(false) }
-    LaunchedEffect(running) {
-        val ended = was[0] && !running
-        was[0] = running
-        on.value = ended
-        if (!ended) return@LaunchedEffect
-        delay(ANNOUNCE_MS)
-        on.value = false
+private fun BoxScope.RunEndAnnouncer(runId: String?) {
+    val finished = stringResource(R.string.chat_reply_finished)
+    val previous = remember { arrayOf(runId) }
+    var ends by remember { mutableIntStateOf(0) }
+    var said by remember { mutableStateOf("") }
+    SideEffect {
+        if (previous[0] != null && previous[0] != runId) ends++
+        previous[0] = runId
     }
-    return on.value
+    LaunchedEffect(ends) { // a new run starting does not cut the hold short; another end restarts it
+        if (ends == 0) return@LaunchedEffect
+        said = finished
+        delay(ANNOUNCE_MS)
+        said = ""
+    }
+    Box(
+        Modifier.align(Alignment.Center).size(1.dp).semantics {
+            liveRegion = LiveRegionMode.Polite
+            stateDescription = said
+        },
+    )
 }
 
 /** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [TimelineCard]). */
