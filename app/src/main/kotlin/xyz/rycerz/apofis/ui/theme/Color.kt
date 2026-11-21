@@ -150,14 +150,15 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
     val timelineBody = scheme.secondary.at(if (dark) 0.7f else 0.9f, timelineFill)
     val codeHeaderFill = scheme.surfaceContainerHighest.at(0.8f, page)
     val cardFill = White.at(if (dark) 0.10f else 0.96f, page)
-    // The warning glyph is a non-text icon: shifted toward onSurface until it reaches 3:1 on the page and on cards.
+    // The warning glyph is a non-text icon: shifted toward onSurface until it reaches 3:1 on the page, cards and the
+    // timeline fill (the approval card).
     val warning = if (dark) Color(0xFFFFB74D) else Color(0xFFF57C00)
     return ApofisColors(
         cardFill = cardFill,
         hairline = if (dark) White.at(0.08f, page) else Black.at(0.06f, page),
         hairlineStrong = if (dark) White.at(0.26f, page) else Black.at(0.38f, page),
         success = if (dark) Color(0xFF81C784) else Color(0xFF2E7D32),
-        warning = readableOn(readableOn(warning, page, on, 3.0), cardFill, on, 3.0),
+        warning = readableOn(readableOn(readableOn(warning, page, on, 3.0), cardFill, on, 3.0), timelineFill, on, 3.0),
         muted = muted,
         subtitle = muted,
         sectionTitle = on.at(0.8f, page),
@@ -187,7 +188,8 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
         glassButtonBorder = if (dark) on.copy(alpha = 0.12f) else scheme.outline.copy(alpha = 0.20f),
         scrim = on.copy(alpha = 0.12f),
         pressWash = on.copy(alpha = if (dark) 0.14f else 0.12f),
-        handle = on.copy(alpha = 0.2f),
+        // The sheet handle is a non-text cue: the UI map's 0.2, raised in 0.05 steps until it reaches 3:1 over the page.
+        handle = on.copy(alpha = (4..20).map { it * 0.05f }.first { contrastRatio(on.at(it, page), page) >= 3.0 || it >= 1f }),
     )
 }
 

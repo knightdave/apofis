@@ -14,7 +14,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.referentialEqualityPolicy
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -456,6 +457,8 @@ internal object Work {
     var highlightSteps = 0L // characters the highlighter looked at
     var largestHighlight = 0 // the longest code handed to the highlighter
     var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
+    var timelineRows = 0L // timeline step rows composed
+    var pageEnds = 0L // text pages measured
 }
 
 /**
@@ -929,7 +932,10 @@ internal fun MessageList(
     onLink: (String) -> Unit = {},
 ) {
     val builder = remember(zone) { ChatRows(zone) }
-    val latest by rememberUpdatedState(items) // Copy reads the reply as it is when tapped
+    // Copy reads the reply as it is when tapped. Referential: comparing the items would compare a live reply's steps.
+    val latestHolder = remember { mutableStateOf(items, referentialEqualityPolicy()) }
+    latestHolder.value = items
+    val latest by latestHolder
     // One sideways scroll per table, shared by its slices (separate list items), by "<reply>/b<index>".
     val tableScrolls = remember { HashMap<String, ScrollState>() }
     val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
@@ -948,10 +954,10 @@ internal fun MessageList(
                     when (row) {
                         is DateRow -> DateSeparator(row.day, today)
                         is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel)
-                        is StepsRow -> StepList(row.reply.steps, tag = "step:${row.reply.key}") { i ->
-                            val step = row.reply.steps[i] as ToolStep
-                            onStep(StepSubject(row.reply.key, i, step.callId.ifEmpty { null }, step.name))
-                        }
+                        is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
+                            // Read at tap time: a step that has since changed kind or gone opens nothing.
+                            (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
+                        })
                         is TextRow -> {
                             val source = { copySource(latest, row.key) }
                             if (row.kind == BlockKind.TABLE) {
@@ -970,7 +976,7 @@ internal fun MessageList(
     }
 }
 
-/** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [StepList]). */
+/** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [TimelineCard]). */
 private fun rowTag(row: Row): Modifier = when (row) {
     is UserRow -> Modifier.testTag("user:${row.key}")
     is TextRow -> Modifier.testTag("reply:${row.key}")

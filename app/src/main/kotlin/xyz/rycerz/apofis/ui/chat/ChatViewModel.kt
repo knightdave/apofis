@@ -377,14 +377,22 @@ internal class LiveMerger(private val now: () -> Double = { System.currentTimeMi
 internal fun withLive(transcript: List<ChatItem>, live: LiveReply?, now: () -> Double = { System.currentTimeMillis() / 1000.0 }): List<ChatItem> =
     LiveMerger(now).merge(transcript, live)
 
-/** A read-only view of [head] followed by [tail]. Equal views with the same [head] compare only their tails. */
+/**
+ * A read-only view of [head] followed by [tail]. Two views with the same [head] are equal when their tails hold the
+ * same item instances: this equality gates UI updates (state flows, Compose state), and comparing a live reply's
+ * content would visit every one of its steps on each update. A rebuilt live item is a new instance, so it is a change.
+ */
 internal class Joined<T>(val head: List<T>, val tail: List<T>) : AbstractList<T>() {
     override val size get() = head.size + tail.size
 
     override fun get(index: Int): T = if (index < head.size) head[index] else tail[index - head.size]
 
     override fun equals(other: Any?): Boolean =
-        if (other is Joined<*> && other.head === head) other.tail == tail else super.equals(other)
+        if (other is Joined<*> && other.head === head) {
+            other.tail.size == tail.size && tail.indices.all { other.tail[it] === tail[it] }
+        } else {
+            super.equals(other)
+        }
 
     override fun hashCode() = super.hashCode()
 }

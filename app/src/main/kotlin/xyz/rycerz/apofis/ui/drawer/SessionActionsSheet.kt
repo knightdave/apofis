@@ -4,21 +4,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import xyz.rycerz.apofis.ui.theme.wash
-import androidx.annotation.DrawableRes
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -27,15 +20,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.ui.theme.ApofisSheet
+import xyz.rycerz.apofis.ui.theme.SheetRow
 
 /** What the prompts can ask for, each bound to the prompt's token; [DrawerViewModel] implements it. */
 interface PromptActions {
@@ -64,48 +56,38 @@ fun PromptHost(prompt: Prompt, actions: PromptActions) {
 @Composable
 fun SessionActionsSheet(prompt: Prompt, actions: PromptActions) {
     val token = prompt.token
-    ModalBottomSheet(onDismissRequest = { actions.dismiss(token) }, containerColor = MaterialTheme.colorScheme.surface) {
-        Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp).navigationBarsPadding()) {
-            Text(
-                prompt.title.ifEmpty { stringResource(R.string.chat_new_title) },
-                Modifier.padding(start = 14.dp, bottom = 8.dp),
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            val enabled = !prompt.busy
-            if (prompt.archived) {
-                SheetRow(R.drawable.lucide_archive_arrow_up, R.string.drawer_unarchive, enabled) { actions.archive(token, false) }
-            } else {
-                SheetRow(R.drawable.lucide_pencil, R.string.drawer_rename, enabled) { actions.openRename(token) }
-                if (prompt.pinned) {
-                    SheetRow(R.drawable.lucide_pin_off, R.string.drawer_unpin, enabled) { actions.pin(token, false) }
-                } else {
-                    SheetRow(R.drawable.lucide_pin, R.string.drawer_pin, enabled) { actions.pin(token, true) }
-                }
-                SheetRow(R.drawable.lucide_archive, R.string.drawer_archive, enabled) { actions.archive(token, true) }
-            }
-            SheetRow(R.drawable.lucide_trash, R.string.drawer_delete, enabled, MaterialTheme.colorScheme.error) { actions.openDelete(token) }
-            ErrorLine(prompt.error, Modifier.padding(start = 14.dp, top = 8.dp))
-        }
+    // Busy: an action is running and its failure shows here, so the sheet cannot be dismissed until it ends.
+    // The body scrolls, so the last action stays reachable in a short window.
+    ApofisSheet(onDismiss = { actions.dismiss(token) }, dismissible = !prompt.busy) {
+        Column(Modifier.verticalScroll(rememberScrollState())) { SessionActions(prompt, actions) }
     }
 }
 
 @Composable
-private fun SheetRow(@DrawableRes icon: Int, label: Int, enabled: Boolean, color: Color = MaterialTheme.colorScheme.onSurface, onClick: () -> Unit) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .heightIn(min = 48.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(painterResource(icon), null, Modifier.size(20.dp), tint = color)
-        Text(stringResource(label), Modifier.padding(start = 14.dp), style = MaterialTheme.typography.bodyLarge, color = color)
+private fun SessionActions(prompt: Prompt, actions: PromptActions) {
+    val token = prompt.token
+    Text(
+        prompt.title.ifEmpty { stringResource(R.string.chat_new_title) },
+        Modifier.padding(start = 14.dp, bottom = 8.dp),
+        style = MaterialTheme.typography.titleMedium,
+        color = MaterialTheme.colorScheme.onSurface,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+    val enabled = !prompt.busy && !prompt.gone
+    if (prompt.archived) {
+        SheetRow(R.drawable.lucide_archive_arrow_up, stringResource(R.string.drawer_unarchive), { actions.archive(token, false) }, enabled = enabled)
+    } else {
+        SheetRow(R.drawable.lucide_pencil, stringResource(R.string.drawer_rename), { actions.openRename(token) }, enabled = enabled)
+        if (prompt.pinned) {
+            SheetRow(R.drawable.lucide_pin_off, stringResource(R.string.drawer_unpin), { actions.pin(token, false) }, enabled = enabled)
+        } else {
+            SheetRow(R.drawable.lucide_pin, stringResource(R.string.drawer_pin), { actions.pin(token, true) }, enabled = enabled)
+        }
+        SheetRow(R.drawable.lucide_archive, stringResource(R.string.drawer_archive), { actions.archive(token, true) }, enabled = enabled)
     }
+    SheetRow(R.drawable.lucide_trash, stringResource(R.string.drawer_delete), { actions.openDelete(token) }, enabled = enabled, color = MaterialTheme.colorScheme.error)
+    ErrorLine(prompt.error, Modifier.padding(start = 14.dp, top = 8.dp))
 }
 
 @Composable
@@ -127,7 +109,7 @@ private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            DialogButton({ actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy) {
+            DialogButton({ actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy && !prompt.gone) {
                 Text(stringResource(R.string.drawer_save))
             }
         },
@@ -149,7 +131,7 @@ private fun DeleteDialog(prompt: Prompt, actions: PromptActions) {
             }
         },
         confirmButton = {
-            DialogButton({ actions.confirmDelete(prompt.token) }, enabled = !prompt.busy) {
+            DialogButton({ actions.confirmDelete(prompt.token) }, enabled = !prompt.busy && !prompt.gone) {
                 Text(stringResource(R.string.drawer_delete), color = if (prompt.busy) Color.Unspecified else scheme.error)
             }
         },
