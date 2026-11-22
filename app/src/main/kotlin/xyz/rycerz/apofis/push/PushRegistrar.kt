@@ -190,7 +190,7 @@ class PushRegistrar(
     }
 
     /** Finishes persisted intents and publishes. True when nothing is left for this connection to retry. */
-    suspend fun publishPending(): Boolean = op { a ->
+    suspend fun publishPending(): Boolean = op(server = true) { a ->
         reconcile(a)
         if (a == null) return@op !failed && !needsServer()
         if (enabled()) publish(a, force = false)
@@ -207,9 +207,12 @@ class PushRegistrar(
      * [verify] without scheduling work: the network job runs it itself. True when the verification succeeded or was not
      * due; false when a required server read or repair failed (then it is not stamped, and the job retries).
      */
-    internal suspend fun verifyNow(force: Boolean): Boolean = op { a ->
+    internal suspend fun verifyNow(force: Boolean): Boolean = op(server = true) { a ->
         val last = prefs.getLong(Keys.VERIFIED_AT, 0)
-        if (!force && prefs.contains(Keys.VERIFIED_AT) && clock() - last in 0 until VERIFY_EVERY_MS) return@op true
+        if (!force && prefs.contains(Keys.VERIFIED_AT) && clock() - last in 0 until VERIFY_EVERY_MS) {
+            recordThis = false // not due: it proved nothing, so it leaves the outcome as it was
+            return@op true
+        }
         val registered = reconcile(a)
         if (enabled()) {
             if (allowed().isEmpty()) {
@@ -257,31 +260,54 @@ class PushRegistrar(
         state.value = compute()
     }
 
-    private suspend fun <T> op(block: suspend (RecordApi?) -> T): T? {
+    /** [server]: a server-facing operation (verify, publish), whose outcome it records in [Keys.SERVER_UNDONE]. */
+    private suspend fun <T> op(server: Boolean = false, block: suspend (RecordApi?) -> T): T? {
         val start = connectionGeneration() // at admission: an operation queued across a switch belongs to the old connection
         return withContext(Dispatchers.IO) {
             val startEpoch = epoch() // the connection epoch it was admitted under: a request goes only to that epoch's server
             mutex.withLock {
-                failed = false // every operation derives the outcome afresh
+                failed = false // every operation derives the outcome afresh; it decides only what the worker returns
+                recordThis = true
                 live = { connectionGeneration() == start && epoch() == startEpoch }
+                var error: Exception? = null
+                var stale = false
+                val a = api()?.let { a -> Guarded(a, live) }
                 try {
                     flushOrThrow()
-                    block(api()?.let { a -> Guarded(a, live) })
+                    block(a)
                 } catch (_: Stale) {
+                    stale = true
                     null
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     logFailure(e)
                     failed = true
+                    error = e
                     null
                 } finally {
                     live = { true }
+                    if (server && !stale && recordThis) runCatching { recordOutcome(a != null, error) }.onFailure(::logFailure)
                     state.value = compute()
                 }
             }
         }
     }
+
+    /**
+     * The one place [Keys.SERVER_UNDONE] is written: set when a server-facing operation failed, except when the server was
+     * only unreachable while the proof stands (that proves nothing); removed when it had an API and did not fail.
+     */
+    private fun recordOutcome(hadApi: Boolean, error: Exception?) {
+        val unreachable = error is ApiError.Network || error is ApiError.Unavailable || error is IOException
+        when {
+            failed && unreachable && prefs.contains(Keys.VERIFIED_AT) -> Unit
+            failed -> if (!prefs.contains(Keys.SERVER_UNDONE)) PushStore.commit(prefs) { putBoolean(Keys.SERVER_UNDONE, true) }
+            hadApi -> if (prefs.contains(Keys.SERVER_UNDONE)) PushStore.commit(prefs) { remove(Keys.SERVER_UNDONE) }
+        }
+    }
+
+    private var recordThis = true
 
     // The running operation's connection check; applying any result commits only while it holds.
     private var live: () -> Boolean = { true }
@@ -298,7 +324,11 @@ class PushRegistrar(
 
     private fun confirmed() = confirmedEndpoint(prefs, policy.distributors(context), epoch())
 
-    private fun needsServer() = prefs.contains(Keys.PENDING_ID) || (enabled() && confirmed().let { it != null && it != prefs.getString(Keys.ENDPOINT, null) })
+    private fun needsServer() = prefs.contains(Keys.PENDING_ID) || prefs.contains(Keys.SERVER_UNDONE) ||
+        (enabled() && confirmed().let { it != null && (it != prefs.getString(Keys.ENDPOINT, null) || unproven()) })
+
+    /** A record without the server's proof. */
+    private fun unproven() = prefs.contains(Keys.RECORD) && !prefs.contains(Keys.VERIFIED_AT)
 
     private fun flushOrThrow() {
         if (!PushStore.flush(prefs)) throw IOException("push prefs not written")
@@ -369,7 +399,7 @@ class PushRegistrar(
         putString(Keys.REVOKE, (revocationsOf(prefs) + revoke).joinToString("\n") { it.encode() })
         putLong(Keys.GENERATION, generation() + 1)
         if (off || prefs.getString(Keys.UNREGISTERED_INSTANCE, null) == currentInstance()) putBoolean(Keys.ENABLED, false)
-        for (k in listOf(Keys.VERIFIED_AT, Keys.REGISTRATION, Keys.RECORD, Keys.RECORD_TITLE, Keys.ENDPOINT, Keys.PUBLISHED_AT, Keys.PENDING_ID,
+        for (k in listOf(Keys.VERIFIED_AT, Keys.SERVER_UNDONE, Keys.REGISTRATION, Keys.RECORD, Keys.RECORD_TITLE, Keys.ENDPOINT, Keys.PUBLISHED_AT, Keys.PENDING_ID,
             Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE, Keys.ENDPOINT_NEW, Keys.ENDPOINT_NEW_TOKEN, Keys.UNREGISTERED_INSTANCE)) remove(k)
     }
 
@@ -474,11 +504,13 @@ class PushRegistrar(
         val s = when {
             PushStore.isDirty(prefs) || prefs.contains(Keys.REVOKE) -> PushState.Registering // not on disk, or not yet handed to the distributor
             !enabled() -> if (allowed().isEmpty()) PushState.NoDistributor else PushState.Off
-            // From stored values only: the record holds the endpoint the distributor confirmed for the current token, and
-            // the server's last answer about that record was good. A transport failure does not change a proven On.
-            matchingRecord() && prefs.contains(Keys.VERIFIED_AT) -> PushState.On(distributor)
-            matchingRecord() -> PushState.ServerError(distributor) // the server last said this record is not usable
-            failed -> PushState.ServerError(distributor)
+            // From stored values and the running policy only (never the in-memory failure).
+            prefs.contains(Keys.SERVER_UNDONE) -> PushState.ServerError(distributor) // the last server step left work undone
+            unproven() -> PushState.ServerError(distributor) // the server last said this record is not usable
+            // The record holds the endpoint the distributor confirmed for the current token, the server proved it, and the
+            // running policy accepts it. A transport failure does not change a proven On.
+            matchingRecord() && accepted() -> PushState.On(distributor)
+            matchingRecord() -> PushState.ServerError(distributor) // the running policy refuses the stored endpoint
             else -> PushState.Registering
         }
         return PushUi(s)
@@ -486,6 +518,8 @@ class PushRegistrar(
 
     private fun matchingRecord() = prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) &&
         confirmed().let { it != null && it == prefs.getString(Keys.ENDPOINT, null) }
+
+    private fun accepted() = validateEndpoint(prefs.getString(Keys.ENDPOINT, null)!!, policy.origins(context), policy.loopbackOrigin(context)) != null
 
     // Server and transport text can carry the endpoint or ids: only the class name is ever logged.
     private fun logFailure(e: Throwable) = Log.w(TAG, "Push step failed: ${e.javaClass.name}")

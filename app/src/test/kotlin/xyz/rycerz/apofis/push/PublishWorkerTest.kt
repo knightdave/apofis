@@ -169,7 +169,12 @@ class PublishWorkerTest {
         now += VERIFY_EVERY_MS
         assertEquals(ListenableWorker.Result.success(), run(local = false)) // waiting for an endpoint is not a retry
         assertTrue("nothing stamped for a row known to be missing", !prefs.contains(Keys.VERIFIED_AT))
-        assertTrue(r.ui.value.state != PushState.On(NTFY_PACKAGE))
+        // (a) A record known unusable is a server error, also after the local job and in a new process.
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        run(local = true)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), registrar().ui.value.state)
+        ctx.registrar = r
         // Inside the hour, the same URL arrives for the new token.
         val token = registrationOf(prefs)?.token
         assertTrue(prefs.edit().putString(Keys.ENDPOINT_NEW, VALID).putString(Keys.ENDPOINT_NEW_TOKEN, token).commit())
@@ -219,5 +224,112 @@ class PublishWorkerTest {
         assertEquals(ListenableWorker.Result.success(), run(local = false))
         assertEquals(1, port.calls.count { it.startsWith("register") })
         assertEquals(PushState.On(NTFY_PACKAGE), cold.ui.value.state)
+    }
+
+    // Merge review fixes, round 3.
+
+    @Test
+    fun aFailedRecreateStaysAServerError() = runTest { // (b)
+        val r = registrar()
+        r.on()
+        server.rows.clear() // the row is gone
+        now += VERIFY_EVERY_MS
+        api.sendFails = true // the reservation succeeds, the recreate does not
+        assertEquals(ListenableWorker.Result.retry(), run(local = false))
+        assertTrue(prefs.contains(Keys.PENDING_ID))
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        run(local = true)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), registrar().ui.value.state)
+        ctx.registrar = r
+        api.sendFails = false
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+    }
+
+    @Test
+    fun anUnreachableReadWithADisplacedTokenChangesNothing() = runTest { // (c)
+        val r = registrar()
+        r.on()
+        port.lostRegistration = true
+        now += VERIFY_EVERY_MS
+        r.verify(force = true) // re-registers: the new token's endpoint has not arrived yet
+        val before = r.ui.value.state
+        val stored = prefs.all.toMap()
+        api.failWith = xyz.rycerz.apofis.api.ApiError.Network(java.io.IOException("down"))
+        r.verify(force = true)
+        assertEquals("the state does not change", before, r.ui.value.state)
+        assertEquals(PushState.Registering, r.ui.value.state)
+        assertEquals(stored - Keys.FLUSH, prefs.all.toMap() - Keys.FLUSH)
+    }
+
+    @Test
+    fun aFailedHideFromTheUserCheckIsScheduledAndRepaired() = runTest { // (d)
+        var scheduled = 0
+        var hideFails = false
+        current = object : RecordApi by api {
+            override suspend fun hide(id: String) = if (hideFails) throw xyz.rycerz.apofis.api.ApiError.Network(java.io.IOException("down")) else api.hide(id)
+        }
+        val r = PushRegistrar(ctx, prefs, { current }, { 0L }, { now }, backgroundScope, TestPolicy(), flaky) { scheduled++ }.also { ctx.registrar = it }
+        r.on()
+        server.rows.values.single().hidden = false
+        hideFails = true
+        scheduled = 0
+        r.verify(force = true)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        assertTrue("work is scheduled", scheduled > 0)
+        // Without an API the worker does not report success.
+        val withServer = current
+        current = null
+        assertEquals(ListenableWorker.Result.retry(), run(local = false))
+        current = withServer
+        hideFails = false
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
+        assertTrue(server.rows.values.single().hidden)
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+    }
+
+    @Test
+    fun anUnrenewableRecordIsAServerError() = runTest { // (e)
+        val r = registrar()
+        r.on()
+        prefs.edit().putInt(Keys.SEQ, MAX_SEQ).commit()
+        now += ROTATE_AFTER_MS
+        assertEquals(ListenableWorker.Result.retry(), run(local = false))
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        run(local = true)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), registrar().ui.value.state)
+    }
+
+    @Test
+    fun aStoredEndpointThePolicyRefusesIsAServerError() = runTest { // (f)
+        val loopback = "http://127.0.0.1:41234"
+        val endpoint = "$loopback/upWIRECHECK012?up=1"
+        val r = PushRegistrar(ctx, prefs, { current }, { 0L }, { now }, backgroundScope, TestPolicy(loopback = loopback), flaky).also { ctx.registrar = it }
+        r.enableNow()
+        assertTrue(prefs.edit().putString(Keys.ENDPOINT_NEW, endpoint).putString(Keys.ENDPOINT_NEW_TOKEN, registrationOf(prefs)?.token).commit())
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        // The running policy no longer accepts that origin; the token and the URL are unchanged.
+        val strict = PushRegistrar(ctx, prefs, { current }, { 0L }, { now }, backgroundScope, TestPolicy(), flaky).also { ctx.registrar = it }
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), strict.ui.value.state)
+        assertEquals(ListenableWorker.Result.retry(), run(local = false))
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), strict.ui.value.state)
+    }
+
+    @Test
+    fun aFirstPublicationThatCannotReachTheServerIsAServerError() = runTest { // (g)
+        val r = registrar()
+        r.enableNow()
+        assertTrue(prefs.edit().putString(Keys.ENDPOINT_NEW, VALID).putString(Keys.ENDPOINT_NEW_TOKEN, registrationOf(prefs)?.token).commit())
+        api.sendFails = true
+        assertEquals(ListenableWorker.Result.retry(), run(local = false))
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), registrar().ui.value.state)
+        ctx.registrar = r
+        api.sendFails = false
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
     }
 }

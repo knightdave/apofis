@@ -928,4 +928,17 @@ class PushRegistrarTest {
             assertTrue(!prefs.contains(Keys.VERIFIED_AT) && !prefs.contains(Keys.RECORD))
         }
     }
+
+    @Test
+    fun offAndASwitchRemoveTheFlagWithTheRecord() = runTest { // (h)
+        for (off in listOf(true, false)) {
+            with(World()) {
+                val r = registrar()
+                turnedOn(r)
+                assertTrue(prefs.edit().putBoolean(Keys.SERVER_UNDONE, true).commit())
+                if (off) r.disable() else { connection++; r.prepareSwitch() }
+                assertTrue(!prefs.contains(Keys.SERVER_UNDONE) && !prefs.contains(Keys.RECORD))
+            }
+        }
+    }
 }

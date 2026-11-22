@@ -17,7 +17,8 @@ internal object Keys {
     const val RECORD_TITLE = "record_title"
     const val ENDPOINT = "endpoint" // the record's endpoint
     const val PUBLISHED_AT = "published_at"
-    const val VERIFIED_AT = "verified_at"
+    const val VERIFIED_AT = "verified_at" // the server's last answer about the current record was good
+    const val SERVER_UNDONE = "server_undone" // the last server-facing operation left something undone
     const val PENDING_ID = "pending_id"
     const val PENDING_ENDPOINT = "pending_endpoint"
     const val PENDING_TITLE = "pending_title"
@@ -63,7 +64,10 @@ internal fun confirmedEndpoint(prefs: SharedPreferences, allowed: Set<String>, e
 internal fun needsWork(prefs: SharedPreferences, allowed: Set<String>, epoch: Long): Boolean {
     if (prefs.contains(Keys.REVOKE) || prefs.contains(Keys.UNREGISTERED_INSTANCE) || prefs.contains(Keys.PENDING_ID)) return true
     if (!prefs.getBoolean(Keys.ENABLED, false)) return false
+    if (prefs.contains(Keys.SERVER_UNDONE)) return true
     val confirmed = confirmedEndpoint(prefs, allowed, epoch)
+    // A record without proof is a repair to do once its endpoint is confirmed.
+    if (confirmed != null && prefs.contains(Keys.RECORD) && !prefs.contains(Keys.VERIFIED_AT)) return true
     return confirmed == null || confirmed != prefs.getString(Keys.ENDPOINT, null)
 }
 
