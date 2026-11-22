@@ -170,6 +170,7 @@
     <string name="chat_show_full">Show full message</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
     <string name="drawer_open">Open chat list</string>
+    <string name="drawer_close">Close the chat list</string>
     <string name="drawer_new_chat">New chat</string>
     <string name="drawer_search_hint">Search chats</string>
     <string name="drawer_no_match">No chats match</string>

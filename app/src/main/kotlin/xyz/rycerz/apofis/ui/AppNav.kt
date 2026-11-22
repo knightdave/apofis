@@ -8,22 +8,17 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.rememberDrawerState
-import androidx.compose.runtime.snapshotFlow
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.lifecycle.ViewModelStoreOwner
 import xyz.rycerz.apofis.ui.drawer.ArchivedScreen
 import xyz.rycerz.apofis.ui.drawer.DrawerActions
 import xyz.rycerz.apofis.ui.drawer.DrawerContent
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
 import xyz.rycerz.apofis.ui.drawer.PromptHost
+import xyz.rycerz.apofis.ui.drawer.PushDrawer
+import xyz.rycerz.apofis.ui.drawer.rememberPushDrawerState
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -165,7 +160,6 @@ fun AppNav(container: AppContainer) {
  * The chat with the drawer. [owner] lives as long as the connection and holds the drawer, which owns the open chat. Only the chat on screen has a view model: switching chats clears the old one.
  * Choosing never leaves a blank screen: while loading, or after a failure (with Retry), the chat screen itself shows.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner, taps: Int, onSettings: () -> Unit, onConnection: () -> Unit) {
     val prefs = container.preferences
@@ -178,21 +172,9 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     val refreshFailed by drawer.refreshFailed.collectAsState()
     val prompt by drawer.prompt.collectAsState()
     var showArchived by rememberSaveable { mutableStateOf(false) }
-    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val drawerState = rememberPushDrawerState()
     val scope = rememberCoroutineScope()
-    val keyboard = LocalSoftwareKeyboardController.current
-    val focus = LocalFocusManager.current
-
-    LaunchedEffect(drawerState) {
-        snapshotFlow { drawerState.targetValue }.collect {
-            if (it == DrawerValue.Open) {
-                keyboard?.hide()
-                focus.clearFocus()
-                drawer.onOpen()
-            }
-        }
-    }
-    BackHandler(drawerState.isOpen) { scope.launch { drawerState.close() } }
+    val drawerButtonFocus = remember { FocusRequester() }
     LaunchedEffect(showArchived, archived.isEmpty()) { if (showArchived && archived.isEmpty()) showArchived = false }
     LaunchedEffect(taps) {
         if (taps == 0) return@LaunchedEffect
@@ -209,10 +191,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         }
     }
     val drawerButton: @Composable () -> Unit = {
-        DrawerButton {
-            keyboard?.hide()
-            scope.launch { drawerState.open() }
-        }
+        DrawerButton(Modifier.focusRequester(drawerButtonFocus)) { scope.launch { drawerState.open() } }
     }
     val newChatButton: @Composable RowScope.() -> Unit = {
         ApofisIconButton(onClick = drawer::newChat, contentDescription = stringResource(R.string.drawer_new_chat)) {
@@ -223,27 +202,27 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         BackHandler { showArchived = false }
         ArchivedScreen(archived, open, onBack = { showArchived = false })
     } else {
-        ModalNavigationDrawer(
+        PushDrawer(
+            drawerState,
             drawerContent = {
-                ModalDrawerSheet(Modifier.fillMaxWidth(0.75f), drawerContainerColor = MaterialTheme.colorScheme.surface) {
-                    DrawerContent(
-                        rows,
-                        query,
-                        refreshFailed,
-                        hasArchived = archived.isNotEmpty(),
-                        actions = open,
-                        onQuery = drawer::onQuery,
-                        onNewChat = {
-                            drawer.newChat()
-                            scope.launch { drawerState.close() }
-                        },
-                        onArchived = { showArchived = true },
-                        onSettings = onSettings,
-                    )
-                }
+                DrawerContent(
+                    rows,
+                    query,
+                    refreshFailed,
+                    hasArchived = archived.isNotEmpty(),
+                    actions = open,
+                    onQuery = drawer::onQuery,
+                    onNewChat = {
+                        drawer.newChat()
+                        scope.launch { drawerState.close() }
+                    },
+                    onArchived = { showArchived = true },
+                    onSettings = onSettings,
+                )
             },
-            drawerState = drawerState,
-        ) {
+            onOpening = drawer::onOpen,
+            restoreFocus = drawerButtonFocus,
+        ) { dragArea ->
             val sessionKey = selected
             if (sessionKey == null) {
                 ChatScreen(
@@ -253,6 +232,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                     onRetryLoad = drawer::retryLoad,
                     navigationIcon = drawerButton,
                     appBarActions = newChatButton,
+                    dragArea = dragArea,
                 )
             } else {
                 key(sessionKey) {
@@ -270,7 +250,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                         container.chatShown(conn.generation, sessionKey, true)
                         onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
                     }
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value })
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, dragArea = dragArea)
                 }
             }
         }
@@ -280,8 +260,8 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
 
 /** The chat bar's drawer button: a 20 dp glyph in a 40 dp box, 48 dp target. */
 @Composable
-internal fun DrawerButton(onClick: () -> Unit) {
-    ApofisIconButton(onClick, contentDescription = stringResource(R.string.drawer_open), visualSize = 40.dp) {
+internal fun DrawerButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
+    ApofisIconButton(onClick, contentDescription = stringResource(R.string.drawer_open), modifier, visualSize = 40.dp) {
         Icon(painterResource(R.drawable.lucide_menu), contentDescription = null, Modifier.size(20.dp))
     }
 }

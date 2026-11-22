@@ -16,6 +16,11 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.click
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.test.swipeDown
 import java.time.ZoneOffset
 import kotlinx.coroutines.runBlocking
@@ -62,6 +67,7 @@ class ChromeInputsTest {
         override fun openUri(uri: String) = Unit
     })
     private var currentState by mutableStateOf<(() -> ChatUiState)?>(null)
+    private var dragArea by mutableStateOf<Modifier>(Modifier)
 
     private class FakeClipboard : Clipboard {
         val writes = ArrayList<String?>()
@@ -78,7 +84,7 @@ class ChromeInputsTest {
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                 CompositionLocalProvider(LocalBlur provides blur, LocalUriHandler provides uri, LocalClipboard provides clipboard) {
-                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState)
+                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState, dragArea = dragArea)
                 }
             }
         }
@@ -186,5 +192,26 @@ class ChromeInputsTest {
         rule.onNodeWithContentDescription("Copy").performClick()
         rule.waitForIdle()
         assertEquals("Copy did not read the replacement reader", listOf<String?>("Hello"), clipboard.writes)
+    }
+
+    /** The push drawer's drag area is an input too: the top bar and the transcript carry the replacement, the composer neither. */
+    @Test
+    fun replacedDragAreaReceivesTheDrags() {
+        val hits = IntArray(2)
+        fun counting(i: Int) = Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent(); hits[i]++ } } }
+        dragArea = counting(0)
+        show()
+        dragArea = counting(1)
+        rule.waitForIdle()
+        val before = hits[0]
+        rule.onNodeWithTag("chat.topbar").performTouchInput { click(Offset(width / 2f, height / 2f)) }
+        val onBar = hits[1]
+        assertTrue("the top bar does not carry the new drag area", onBar > 0)
+        rule.onNode(hasScrollToIndexAction()).performTouchInput { click(center) }
+        assertTrue("the transcript does not carry the new drag area", hits[1] > onBar)
+        val onList = hits[1]
+        rule.onNodeWithTag("composer.field").performTouchInput { click(center) }
+        assertEquals("the composer carries the drag area", onList, hits[1])
+        assertEquals("the old drag area is still used", before, hits[0])
     }
 }

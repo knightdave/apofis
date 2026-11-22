@@ -26,6 +26,17 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.graphicsLayer
+import xyz.rycerz.apofis.ui.theme.EaseOutCubic
+import xyz.rycerz.apofis.ui.theme.Motion
+import xyz.rycerz.apofis.ui.theme.transparent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
@@ -82,6 +93,7 @@ fun DrawerContent(
     modifier: Modifier = Modifier,
 ) {
     val empty = rows.isEmpty() && query.isEmpty() && !hasArchived
+    val seenHeaders = remember { HashSet<GroupLabel>() } // headers already shown in this drawer's lifetime appear without motion
     // The drawer moves focus into its sheet when it opens, which would focus the search field and raise the keyboard.
     // That programmatic entry is refused; moving focus in with a keyboard (Tab, arrows) still works.
     Column(
@@ -114,7 +126,7 @@ fun DrawerContent(
             }
             items(labelled, key = { (row, _) -> if (row is DrawerRow.Chat) row.key else (row as DrawerRow.Header).label.toString() }) { (row, isPinned) ->
                 when (row) {
-                    is DrawerRow.Header -> GroupHeader(row.label)
+                    is DrawerRow.Header -> GroupHeader(row.label, seenHeaders)
                     is DrawerRow.Chat -> ChatRow(
                         row,
                         onClick = { actions.onSelect(row.key) },
@@ -144,7 +156,15 @@ fun DrawerContent(
                 }
             }
         }
-        Box(Modifier.padding(start = 16.dp, top = 10.dp, end = 16.dp, bottom = 12.dp)) {
+        val surface = MaterialTheme.colorScheme.surface
+        Box(
+            Modifier
+                .drawBehind { // the list fades out under the footer over 20 dp
+                    val fade = 20.dp.toPx()
+                    drawRect(Brush.verticalGradient(listOf(surface.transparent(), surface), startY = -fade, endY = 0f), Offset(0f, -fade), Size(size.width, fade))
+                }
+                .padding(start = 16.dp, top = 10.dp, end = 16.dp, bottom = 12.dp),
+        ) {
             IconRow(R.drawable.lucide_settings, stringResource(R.string.settings_title), onSettings)
         }
     }
@@ -183,7 +203,11 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
 }
 
 @Composable
-private fun GroupHeader(label: GroupLabel) {
+private fun GroupHeader(label: GroupLabel, seen: MutableSet<GroupLabel>) {
+    val first = remember(label) { seen.add(label) }
+    val reduceMotion = ApofisTheme.reduceMotion
+    val shown = remember(label) { Animatable(if (first && !reduceMotion) 0f else 1f) }
+    LaunchedEffect(shown) { shown.animateTo(1f, tween(Motion.GROUP_HEADER, easing = EaseOutCubic)) }
     val text = when (label) {
         GroupLabel.Pinned -> stringResource(R.string.drawer_pinned)
         GroupLabel.Today -> stringResource(R.string.chat_today)
@@ -195,7 +219,13 @@ private fun GroupHeader(label: GroupLabel) {
     }
     Text(
         text,
-        Modifier.padding(start = 14.dp, top = 6.dp, bottom = 6.dp).semantics { heading() },
+        Modifier
+            .graphicsLayer {
+                alpha = shown.value
+                translationY = (1f - shown.value) * 4.dp.toPx() // fades in and slides up 4 dp
+            }
+            .padding(start = 14.dp, top = 6.dp, bottom = 6.dp)
+            .semantics { heading() },
         style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
         color = MaterialTheme.colorScheme.primary,
     )

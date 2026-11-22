@@ -114,6 +114,7 @@ fun ChatScreen(
     today: LocalDate = LocalDate.now(zone),
     listState: LazyListState = rememberLazyListState(),
     currentState: (() -> ChatUiState)? = null, // the owner's state now, for Copy and Select at action time
+    dragArea: Modifier = Modifier, // where a horizontal drag may start (the push drawer): the top bar and the transcript, never the composer
 ) {
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
@@ -146,12 +147,13 @@ fun ChatScreen(
     val objects = rememberUpdatedState(Objects(listState, follow, backdrop, uriHandler))
     // Read by the transcript slot only: the app passes a new lambda with every state, which must not reach the composer.
     val current = rememberUpdatedState(currentState)
+    val drag = rememberUpdatedState(dragArea)
 
     val barSlot = remember {
         @Composable {
             SideEffect { ChromeProbe.barCompositions++ }
             val c = barCallbacks.value
-            ChatTopBar(barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions, Modifier.blockTouchesBelow().coverForAccessibility(order = -1f))
+            ChatTopBar(barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions, drag.value.blockTouchesBelow().coverForAccessibility(order = -1f))
         }
     }
     val bottomSlot = remember {
@@ -204,13 +206,15 @@ fun ChatScreen(
                 val listState = o.list
                 val follow = o.follow
                 val backdrop = o.backdrop
+                val dragArea = drag.value
                 SideEffect {
+                    ChromeProbe.bodyCompositions++
                     ChromeProbe.bodyBackdropId = System.identityHashCode(backdrop)
                     ChromeProbe.bodyBackdropHasLayer = backdrop.layer != null
                 }
                 val surface = MaterialTheme.colorScheme.surface
                 if (state.status == StatusLine.LOAD_FAILED) {
-                    Uncovered(barHeight, bottomArea, fullScreen = false) {
+                    Uncovered(barHeight, bottomArea, fullScreen = false, dragArea) {
                         BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             // Too little room (landscape with the keyboard): the title's own retry stays; a second Retry
                             // in a viewport too small to reach would only promise a control that cannot be tapped.
@@ -234,7 +238,7 @@ fun ChatScreen(
                             bottom = bottomArea.toDp() + 8.dp,
                         )
                     }
-                    Uncovered(barHeight, bottomArea, fullScreen = true) {
+                    Uncovered(barHeight, bottomArea, fullScreen = true, dragArea) {
                         MessageList(
                             state.items,
                             state.live,
@@ -453,8 +457,8 @@ private fun WashTextButton(label: Int, onClick: () -> Unit) {
  * parent; touches are stopped by the bars themselves); otherwise the content is laid out inside it.
  */
 @Composable
-private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, content: @Composable () -> Unit) {
-    Layout(content) { measurables, constraints ->
+private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, modifier: Modifier, content: @Composable () -> Unit) {
+    Layout(content, modifier) { measurables, constraints ->
         val height = (constraints.maxHeight - top - bottom).coerceAtLeast(0)
         val full = Constraints.fixed(constraints.maxWidth, constraints.maxHeight)
         val placeable = measurables.single().measure(if (fullScreen) full else Constraints.fixed(constraints.maxWidth, height))
@@ -507,6 +511,7 @@ internal object ChromeProbe {
     var barCompositions = 0
     var bottomCompositions = 0
     var rootMeasures = 0
+    var bodyCompositions = 0
     var pins = 0 // requests the follow rules made to move the list to the bottom
     // Which backdrop the transcript was last composed with, as scalars: no reference keeps it alive after the screen.
     var bodyBackdropId = 0
