@@ -939,4 +939,51 @@ class ChromeLayoutTest {
         repeat(60) { rule.mainClock.advanceTimeByFrame() }
         assertEquals("a fresh tap scrolls to the bottom", 0, list.firstVisibleItemIndex)
     }
+
+    /** I4: Expand without room for its target is removed: a focused Expand takes no key; it returns unfocused with room. */
+    @Test
+    @Config(qualifiers = "w360dp-h320dp-xhdpi")
+    fun anExpandWithoutRoomTakesNoKeys() {
+        show(withDraft(chat(failed), 6))
+        insets(top = 48) // 296 dp of safe band: room for Expand
+        val expand = hasContentDescription("Expand the editor")
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) }
+        rule.onNode(expand).performSemanticsAction(SemanticsActions.RequestFocus)
+        rule.waitForIdle()
+        assertTrue(rule.onNode(expand).fetchSemanticsNode().config[SemanticsProperties.Focused])
+        insets(top = 48, ime = 192) // 200 dp of safe band: the row gets 80 dp, one target
+        assertEquals("Expand is still composed", 0, rule.onAllNodes(expand, useUnmergedTree = true).fetchSemanticsNodes().size)
+        rule.runOnUiThread {
+            val compose = (rule.activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as ViewGroup).getChildAt(0)
+            compose.dispatchKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_ENTER))
+            compose.dispatchKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_ENTER))
+        }
+        rule.waitForIdle()
+        insets(top = 48)
+        assertEquals("an invisible Expand expanded the editor", 0, rule.onAllNodes(hasContentDescription("Collapse the editor"), useUnmergedTree = true).fetchSemanticsNodes().size)
+        assertFalse("the returning Expand took focus", rule.onNode(expand).fetchSemanticsNode().config.getOrNull(SemanticsProperties.Focused) == true)
+        screen().performTouchInput { click(visible(expand).center) }
+        rule.waitForIdle()
+        rule.onNode(hasContentDescription("Collapse the editor")).assertExists()
+    }
+
+    /** I4: tapping Expand never makes the field shorter, not even by a pixel, where the line height is not a whole pixel. */
+    private fun expandNeverShortensTheField(status: Int, lines: Int) {
+        show(withDraft(chat(failed), lines))
+        insets(top = status)
+        val before = rule.onNode(hasTestTag("composer.field"), useUnmergedTree = true).fetchSemanticsNode().size.height
+        rule.onNode(hasContentDescription("Expand the editor")).performClick()
+        rule.waitForIdle()
+        rule.onNode(hasContentDescription("Collapse the editor")).assertExists()
+        val after = rule.onNode(hasTestTag("composer.field"), useUnmergedTree = true).fetchSemanticsNode().size.height
+        assertTrue("the field went from $before px to $after px", after >= before)
+    }
+
+    @Test
+    @Config(qualifiers = "w360dp-h254dp-mdpi")
+    fun expandAt230dpMdpiKeepsEveryPixel() = expandNeverShortensTheField(status = 24, lines = 4) // 19.5 px lines
+
+    @Test
+    @Config(qualifiers = "w360dp-h254dp-hdpi")
+    fun expandAt230dpHdpiKeepsEveryPixel() = expandNeverShortensTheField(status = 36, lines = 4) // 29.25 px lines
 }

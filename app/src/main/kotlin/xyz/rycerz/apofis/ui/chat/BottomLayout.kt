@@ -20,8 +20,8 @@ internal data class BottomDims(
     val noticeRow: Int,
     val transcriptMin: Int,
 ) {
-    /** The field for [lines] lines, with its padding. */
-    fun field(lines: Int): Int = ceil(line * lines).toInt() + fieldPadding
+    /** The field for [lines] lines, with its padding; the text rounds each line's height up to a whole pixel. */
+    fun field(lines: Int): Int = ceil(line).toInt() * lines + fieldPadding
 
     /** The bare row: Send or Stop at 48 dp beside a one-line field, no card margins or padding. */
     val row1: Int get() = maxOf(target, field(1))

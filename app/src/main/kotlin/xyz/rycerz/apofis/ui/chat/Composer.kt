@@ -31,6 +31,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -41,14 +42,11 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.Layout
@@ -123,7 +121,14 @@ internal class ComposerLook(
     val progress: Animatable<Float, *>,
     val lines: () -> Int,
     val expandedHeight: Dp,
+    val room: ExpandRoom,
 )
+
+/** Whether the allocation leaves Expand its second 48 dp target: [now] for keys in this frame, [state] for composing it. */
+internal class ExpandRoom {
+    var now = true
+    val state = mutableStateOf(true)
+}
 
 /**
  * The composer's parts, in this order: the card's glass, the field, the expand button (an empty box when not shown)
@@ -151,6 +156,7 @@ internal fun ComposerParts(
     backdrop: BackdropState? = null,
     subject: Any? = null,
     transcript: Boolean = true,
+    clock: () -> Long = System::nanoTime,
 ): ComposerLook {
     if (BuildConfig.DEBUG) SideEffect { ChromeProbe.composerBackdropId = System.identityHashCode(backdrop) }
     val shape = RoundedCornerShape(20.dp)
@@ -200,9 +206,13 @@ internal fun ComposerParts(
         },
     )
     val wantsExpand = expanded || manyLines
+    val room = remember { ExpandRoom() }
     Box {
-        if (wantsExpand) {
+        // Composed only while the allocation has room for it: without room it is removed, so a focused Expand gives up
+        // focus; until that recomposition, its key filter lets no key through.
+        if (wantsExpand && room.state.value) {
             ApofisIconButton(
+                modifier = Modifier.onPreviewKeyEvent { !room.now },
                 onClick = { onExpandedChange(!expanded) },
                 contentDescription = stringResource(if (expanded) R.string.composer_collapse else R.string.composer_expand),
                 visualSize = 24.dp,
@@ -213,9 +223,9 @@ internal fun ComposerParts(
     }
     Row {
         if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
-        PrimaryButton(mode, busy, subject, submit, onStop)
+        PrimaryButton(mode, busy, subject, submit, onStop, clock)
     }
-    return ComposerLook(dims, expanded, wantsExpand, progress, { lines }, expandedHeight)
+    return ComposerLook(dims, expanded, wantsExpand, progress, { lines }, expandedHeight, room)
 }
 
 /** The composer's four measurables (see [ComposerParts]), measured with [shares] and placed from [y]. */
@@ -257,7 +267,10 @@ internal fun MeasureScope.measureComposer(
     }
     val f = field ?: parts[1].measure(Constraints.fixed(fieldWidth, s.field))
     val glass = parts[0].measure(Constraints.fixed((width - 2 * marginX).coerceAtLeast(0), s.card))
-    val expand = expandBox.takeIf { s.actions >= 2 * d.target && it.height > 0 } // dropped before Send when both do not fit
+    val fits = s.actions >= 2 * d.target
+    look.room.now = fits
+    if (look.room.state.value != fits) look.room.state.value = fits
+    val expand = expandBox.takeIf { fits && it.height > 0 } // dropped before Send when both do not fit
     return s to ComposerPlacement(glass, f, expand, buttons, s, side, marginX)
 }
 
@@ -282,10 +295,11 @@ internal fun Composer(
     expandedHeight: Dp = Dp.Unspecified,
     backdrop: BackdropState? = null,
     subject: Any? = null,
+    clock: () -> Long = System::nanoTime,
 ) {
     var look: ComposerLook? = null
     Layout(
-        content = { look = ComposerParts(draft, mode, onDraftChange, onSend, onStop, busy, enterToSend, expanded, onExpandedChange, expandedHeight, backdrop, subject, transcript = false) },
+        content = { look = ComposerParts(draft, mode, onDraftChange, onSend, onStop, busy, enterToSend, expanded, onExpandedChange, expandedHeight, backdrop, subject, transcript = false, clock = clock) },
         modifier = modifier.fillMaxWidth().semantics { isTraversalGroup = true },
     ) { measurables, constraints ->
         val available = if (constraints.hasBoundedHeight) constraints.maxHeight else 1_000_000
@@ -298,17 +312,18 @@ private val MARGIN_X = 12.dp
 
 /**
  * The primary button: Send, Steer or Stop, one stable control (one focus target, one labelled node) whatever the mode.
- * Each shown action and its [subject] (the run for Stop and Steer, the chat for Send) is a new generation. A physical
- * activation (a pointer, an activation key, an indirect pointer) counts only when its press began in the generation
- * still shown; an accessibility click, which has no press, runs the action shown when it arrives.
+ * Two times on [clock]: `changedAt`, when the shown action or its [subject] changed (the run for Stop and Steer, the
+ * chat for Send), and `downAt`, the latest press-down on the button (a pointer, an indirect pointer, the first key-down
+ * of an activation key). A click from a pointer or a key counts only when its press came after the change; an
+ * accessibility click, which has no press, runs the action shown when it arrives. No press is tracked beyond that, so
+ * a lost release or a cancelled pointer can never block a later press.
  */
 @Composable
-private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, submit: () -> Unit, onStop: () -> Unit) {
+private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, submit: () -> Unit, onStop: () -> Unit, clock: () -> Long) {
     val action = if (mode == ComposerMode.SEND_DISABLED) ComposerMode.SEND else mode
-    val counter = remember { intArrayOf(0) }
-    val generation = remember(action, subject) { ++counter[0] }
-    val shown = rememberUpdatedState(generation)
-    val press = remember { ActionPress() }
+    val changedAt = remember(action, subject) { clock() }
+    val downAt = remember { longArrayOf(Long.MIN_VALUE) }
+    val now = rememberUpdatedState(clock)
     val stop = mode == ComposerMode.STOP
     val enabled = primaryEnabled(mode, busy)
     val run = if (stop) onStop else submit
@@ -318,141 +333,49 @@ private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, subm
         else -> R.string.chat_send
     }
     val label = stringResource(labelId)
+    val pressed = { downAt[0] = now.value() }
     RoundButton(
         if (stop) R.drawable.lucide_square else R.drawable.lucide_arrow_up,
         labelId,
         enabled = enabled,
         tag = if (stop) STOP_TAG else SEND_TAG,
         modifier = Modifier
-            .pressStart(press) { shown.value }
-            .then(IndirectPressElement(press) { shown.value })
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        if (event.changes.any { it.changedToDownIgnoreConsumed() }) pressed()
+                    }
+                }
+            }
+            .then(IndirectPressElement(pressed))
+            .onPreviewKeyEvent {
+                if (it.key in activationKeys && it.type == KeyEventType.KeyDown && it.nativeKeyEvent.repeatCount == 0) pressed()
+                false
+            }
             // The accessibility click: no press of its own, so it runs what is shown now.
             .then(if (enabled) Modifier.semantics { onClick(label) { run(); true } } else Modifier),
-        onClick = { if (press.accepts(generation)) run() }, // every physical activation
+        onClick = { if (downAt[0] > changedAt) run() }, // every physical activation
     )
-}
-
-/** The primary button's presses: the generation shown when each began (pointer, activation key, indirect pointer). */
-private class ActionPress {
-    var pointer: Int? = null
-    var pointerReleasing = false // the release of that gesture is being dispatched
-    val keys = HashMap<Key, Int>()
-    var keyReleased: Int? = null // the generation recorded for the key whose release is being dispatched
-    var keyReleasing = false
-    var indirect: Int? = null
-    var indirectReleasing = false
-    var overlapped = false // a press began while another was down: neither counts
-
-    private val down get() = pointer != null || keys.isNotEmpty() || indirect != null
-
-    /** A press begins in generation [generation]; one that overlaps another makes both invalid until all are released. */
-    fun begin(generation: Int, record: () -> Unit) {
-        if (down) overlapped = true
-        record()
-    }
-
-    /** Called when a press ended; once none is down, the next press is judged on its own again. */
-    fun ended() {
-        if (!down) overlapped = false
-    }
-
-    /** Called by the physical click with the generation it would act in: consumes the press it came from. */
-    fun accepts(now: Int): Boolean {
-        val begun = when {
-            pointerReleasing -> pointer.also { pointer = null; pointerReleasing = false }
-            keyReleasing -> keyReleased.also { keyReleased = null; keyReleasing = false }
-            indirectReleasing -> indirect.also { indirect = null; indirectReleasing = false }
-            else -> null // a physical click without an observed press: never counted
-        }
-        val ok = !overlapped && begun == now
-        ended()
-        return ok
-    }
 }
 
 private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
 
-/** Records the shown generation at each pointer and activation-key press, before the click handling sees it. */
-private fun Modifier.pressStart(press: ActionPress, shown: () -> Int): Modifier = this
-    .pointerInput(press) {
-        awaitEachGesture {
-            try {
-                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                val generation = shown()
-                press.begin(generation) { press.pointer = generation }
-                do {
-                    val event = awaitPointerEvent(PointerEventPass.Initial)
-                } while (event.changes.any { it.pressed })
-                press.pointerReleasing = true // the click, if any, comes from this release (Main pass)
-                awaitPointerEvent(PointerEventPass.Final) // the same release, after the click
-            } finally {
-                press.pointer = null
-                press.pointerReleasing = false
-                press.ended()
-            }
-        }
-    }
-    .onFocusChanged {
-        if (!it.hasFocus) {
-            press.keys.clear()
-            press.ended()
-        }
-    }
-    .onPreviewKeyEvent {
-        if (it.key in activationKeys) {
-            if (it.type == KeyEventType.KeyDown && it.nativeKeyEvent.repeatCount == 0) {
-                // A second keyboard's down of the same key must not overwrite the first press: both become invalid.
-                val generation = shown()
-                press.begin(generation) { press.keys[it.key] = generation }
-            } else if (it.type == KeyEventType.KeyUp) {
-                press.keyReleased = press.keys.remove(it.key)
-                press.keyReleasing = true
-            }
-        }
-        false
-    }
-    .onKeyEvent {
-        // Reached only when the button did not take the release as a click: drop what that release recorded.
-        if (it.type == KeyEventType.KeyUp) {
-            press.keyReleased = null
-            press.keyReleasing = false
-            press.ended()
-        }
-        false
-    }
-
-/** Records indirect pointer presses (touch navigation devices), which the clickable turns into clicks without pointerInput. */
-private data class IndirectPressElement(val press: ActionPress, val shown: () -> Int) : ModifierNodeElement<IndirectPressNode>() {
-    override fun create() = IndirectPressNode(press, shown)
+/** Notes indirect pointer presses (touch navigation devices), which the clickable turns into clicks without pointerInput. */
+private data class IndirectPressElement(val pressed: () -> Unit) : ModifierNodeElement<IndirectPressNode>() {
+    override fun create() = IndirectPressNode(pressed)
 
     override fun update(node: IndirectPressNode) {
-        node.press = press
-        node.shown = shown
+        node.pressed = pressed
     }
-
-    override fun equals(other: Any?) = other is IndirectPressElement && other.press === press
-
-    override fun hashCode() = System.identityHashCode(press)
 }
 
-private class IndirectPressNode(var press: ActionPress, var shown: () -> Int) : Modifier.Node(), IndirectPointerInputModifierNode {
+private class IndirectPressNode(var pressed: () -> Unit) : Modifier.Node(), IndirectPointerInputModifierNode {
     override fun onIndirectPointerEvent(event: IndirectPointerEvent, pass: PointerEventPass) {
-        when {
-            pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Press -> shown().let { g -> press.begin(g) { press.indirect = g } }
-            pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Release -> press.indirectReleasing = true
-            pass == PointerEventPass.Final && event.type == IndirectPointerEventType.Release -> {
-                press.indirect = null
-                press.indirectReleasing = false
-                press.ended()
-            }
-        }
+        if (pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Press) pressed()
     }
 
-    override fun onCancelIndirectPointerInput() {
-        press.indirect = null
-        press.indirectReleasing = false
-        press.ended()
-    }
+    override fun onCancelIndirectPointerInput() = Unit
 }
 
 /** A 32 dp circle with an 18 dp glyph inside a 48 dp touch target; the glyph swaps with a scale and fade. */

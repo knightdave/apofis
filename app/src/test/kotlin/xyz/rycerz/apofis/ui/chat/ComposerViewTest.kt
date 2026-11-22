@@ -148,6 +148,7 @@ class ComposerViewTest {
     private var accept = true // what the test's holder answers
     private var sends = 0 // send attempts
     private var stops = 0
+    private var now = 0L
     private var stopsHook: () -> Unit = {}
     private val sentTexts = ArrayList<String>()
     private val edits = ArrayList<String>()
@@ -182,6 +183,7 @@ class ComposerViewTest {
                                 onSend = { onSendHook() },
                                 onStop = { stops++; stopsHook() },
                                 busy = busy, enterToSend = enter, expanded = expanded, onExpandedChange = { expanded = it }, expandedHeight = expandedHeight, subject = subject,
+                                clock = { ++now }, // a manual clock: every reading is one tick later
                             )
                         }
                     }
@@ -375,33 +377,56 @@ class ComposerViewTest {
         assertEquals("an indirect press held across a change", 1, sends)
     }
 
-    /** I9: Enter down on keyboard A (Stop for run A), the run is replaced, Enter down on keyboard B, release A then B: nothing fires. */
+    /** A lost key-up (Enter down, no release ever arrives) blocks nothing: a fresh Space press fires once. */
     @Test
-    fun overlappingPressesFromTwoKeyboardsFireNothing() {
-        mode = ComposerMode.STOP
-        draft = ""
-        subject = "run-A"
-        val stopped = ArrayList<Any?>()
+    fun aLostReleaseBlocksNoLaterPress() {
+        mode = ComposerMode.SEND
+        draft = "typed"
+        subject = "chat-1"
         show()
-        stopsHook = { stopped += subject }
         val node = primaryNode()
         rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) }
         rule.onNode(androidx.compose.ui.test.SemanticsMatcher("primary") { it.id == node.id }, useUnmergedTree = true).performSemanticsAction(SemanticsActions.RequestFocus)
         rule.waitForIdle()
-        fun on(device: Int, action: Int) = NativeKeyEvent(0L, 0L, action, NativeKeyEvent.KEYCODE_ENTER, 0, 0, device, 0)
-        dispatch(on(1, NativeKeyEvent.ACTION_DOWN))
-        subject = "run-B"
+        dispatch(key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_ENTER)) // its release is lost
         rule.waitForIdle()
-        dispatch(on(2, NativeKeyEvent.ACTION_DOWN))
+        dispatch(key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_SPACE), key(NativeKeyEvent.ACTION_UP, NativeKeyEvent.KEYCODE_SPACE))
         rule.waitForIdle()
-        dispatch(on(1, NativeKeyEvent.ACTION_UP))
+        assertEquals(1, sends)
+    }
+
+    /** Two fingers down and up with no change of action: the holder takes the draft once; Stop goes to the shown run only. */
+    @Test
+    fun twoFingersWithoutAChange() {
+        val scope = CoroutineScope(Job() + Dispatchers.Unconfined)
+        val holder = DraftHolder(scope)
+        holder.edit("k", "hello", holder.current("k").revision)
+        var stores = 0
+        onSendHook = { holder.send("k") { stores++; awaitCancellation() } != null }
+        draft = "hello"
+        subject = "chat-1"
+        show()
+        fun twoFingers() {
+            val c = primaryNode().boundsInRoot.center
+            rule.onRoot().performTouchInput {
+                down(0, c)
+                down(1, c + androidx.compose.ui.geometry.Offset(4f, 4f))
+                up(0)
+                up(1)
+            }
+            rule.waitForIdle()
+        }
+        twoFingers()
+        assertEquals("the send went out once", 1, stores)
+        mode = ComposerMode.STOP
+        draft = ""
+        subject = "run-A"
+        val stopped = ArrayList<Any?>()
+        stopsHook = { stopped += subject }
         rule.waitForIdle()
-        dispatch(on(2, NativeKeyEvent.ACTION_UP))
-        rule.waitForIdle()
-        assertEquals("an overlapped press fired", emptyList<Any?>(), stopped)
-        dispatch(on(2, NativeKeyEvent.ACTION_DOWN), on(2, NativeKeyEvent.ACTION_UP)) // a fresh single press
-        rule.waitForIdle()
-        assertEquals(listOf<Any?>("run-B"), stopped)
+        twoFingers()
+        assertTrue("Stop requested for run A only: $stopped", stopped.isNotEmpty() && stopped.all { it == "run-A" })
+        scope.cancel()
     }
 
     /** Each activation key: a fresh press fires once; held across a change of generation it fires nothing. */
