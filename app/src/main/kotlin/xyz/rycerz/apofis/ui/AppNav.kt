@@ -147,7 +147,7 @@ fun AppNav(container: AppContainer) {
                 dynamicColor = prefs.dynamicColor.collectAsState().value,
                 pureBlack = prefs.pureBlack.collectAsState().value,
                 versionName = version,
-                notifications = { NotificationsSetting({ container.push }, { container.testPush }, container.notifyPrefs, container.scope, conn?.generation ?: 0) },
+                notifications = { NotificationsSetting({ container.push }, { container.testPush }, container.notifyPrefs, container.pushCommands, conn?.generation ?: 0) },
                 onConnection = { chosen = Screen.RECONNECT },
                 onThemeMode = { scope.launch { prefs.setThemeMode(it) } },
                 onDynamicColor = { scope.launch { prefs.setDynamicColor(it) } },

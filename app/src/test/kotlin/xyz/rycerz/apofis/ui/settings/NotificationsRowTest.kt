@@ -21,6 +21,12 @@ import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.room.Room
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
+import androidx.lifecycle.viewmodel.compose.rememberViewModelStoreOwner
 import androidx.work.WorkManager
 import androidx.work.testing.WorkManagerTestInitHelper
 import java.util.Collections
@@ -192,6 +198,10 @@ class NotificationsRowTest {
     private val held = LinkedBlockingQueue<Runnable>()
     private val heldScope = CoroutineScope(commands + Executor { held.put(it) }.asCoroutineDispatcher())
 
+    // The container's one command holder, over each scope.
+    private val uiCommands by lazy { PushCommands(uiScope) }
+    private val heldCommands by lazy { PushCommands(heldScope) }
+
     /** Runs the held dispatches on this (the main) thread until [done]; fails instead of hanging when none comes. */
     private fun runHeld(done: () -> Boolean) {
         while (!done()) (held.poll(WATCHDOG_MS, TimeUnit.MILLISECONDS) ?: throw AssertionError("no dispatch came")).run()
@@ -243,8 +253,8 @@ class NotificationsRowTest {
     }
 
     /** The setting, once it has resolved the registrar and read the access off the main thread. */
-    private fun setting(scope: CoroutineScope = uiScope, push: () -> PushRegistrar = { registrar }, prefs: SharedPreferences = notifyPrefs) {
-        themed { NotificationsSetting(push, { testPush }, prefs, scope) }
+    private fun setting(commands: PushCommands = uiCommands, push: () -> PushRegistrar = { registrar }, prefs: SharedPreferences = notifyPrefs) {
+        themed { NotificationsSetting(push, { testPush }, prefs, commands) }
         waitReady()
     }
 
@@ -558,7 +568,7 @@ class NotificationsRowTest {
     @Test
     fun beforeTheFirstReadTheRowIsNeutral() {
         val resolving = CompletableDeferred<Unit>()
-        themed { NotificationsSetting({ await(resolving); registrar }, { testPush }, notifyPrefs, uiScope) }
+        themed { NotificationsSetting({ await(resolving); registrar }, { testPush }, notifyPrefs, uiCommands) }
         rule.waitForIdle()
         rule.onNodeWithText(text(R.string.settings_notifications)).assertIsDisplayed().assert(SemanticsMatcher.keyNotDefined(SemanticsActions.OnClick))
         assertTrue("no Off placeholder", rule.onAllNodes(hasText(text(R.string.settings_notif_off), substring = true)).fetchSemanticsNodes().isEmpty())
@@ -623,7 +633,7 @@ class NotificationsRowTest {
     private fun droppedOffThenRetry(blocked: Boolean) {
         turnedOn()
         if (blocked) denied()
-        setting(scope = heldScope)
+        setting(commands = heldCommands)
         rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
         runBlocking { withTimeout(WATCHDOG_MS) { registrar.prepareSwitch() } } // the switch starts first
         turnOffViaDialog() // confirmed: the command waits for its dispatch
@@ -669,7 +679,7 @@ class NotificationsRowTest {
                 .putString(Keys.REGISTRATION, Registration("g1", NTFY_PACKAGE, "tok-g1", connectionEpoch(app)).encode()).commit())
             fakePort.connectorTokens["g1"] = "tok-g1"
             fakePort.subscribed += "tok-g1"
-            setting(scope = heldScope, push = { container.push })
+            setting(commands = heldCommands, push = { container.push })
             rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
             turnOffViaDialog() // confirmed before the switch; its dispatch comes late, as on Dispatchers.Default
 
@@ -840,7 +850,7 @@ class NotificationsRowTest {
         val restoration = StateRestorationTester(rule)
         restoration.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
-                CompositionLocalProvider(LocalHaptics provides counting) { NotificationsSetting({ registrar }, { testPush }, notifyPrefs, heldScope) }
+                CompositionLocalProvider(LocalHaptics provides counting) { NotificationsSetting({ registrar }, { testPush }, notifyPrefs, heldCommands) }
             }
         }
         waitReady()
@@ -883,7 +893,7 @@ class NotificationsRowTest {
     @Test
     fun aTestTapForAReplacedRegistrationSendsNothing() {
         turnedOn()
-        setting(scope = heldScope)
+        setting(commands = heldCommands)
         rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
         rule.onNodeWithText(text(R.string.settings_notif_test)).performClick() // tapped while the sheet shows A
         val a = registrar.ui.value.testOwner!!
@@ -960,7 +970,7 @@ class NotificationsRowTest {
     fun aDroppedOffOfOneConnectionIsNotShownOnTheNext() {
         turnedOn()
         var conn by mutableStateOf(0L)
-        themed { key(conn) { NotificationsSetting({ registrar }, { testPush }, notifyPrefs, heldScope, conn) } }
+        themed { key(conn) { NotificationsSetting({ registrar }, { testPush }, notifyPrefs, heldCommands, conn) } }
         waitReady()
         rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
         runBlocking { withTimeout(WATCHDOG_MS) { registrar.prepareSwitch() } }
@@ -972,7 +982,9 @@ class NotificationsRowTest {
         conn = 1 // Settings entered on the next connection while A's Off is held
         waitReady()
         rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
-        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).assertIsEnabled() // A's busy is not B's
+        // A push command runs: B offers no push action either, so nothing can be confirmed and silently dropped.
+        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).assertIsNotEnabled().performClick()
+        assertTrue("no confirmation on B", rule.onAllNodes(hasText(text(R.string.settings_notif_turn_off_text))).fetchSemanticsNodes().isEmpty())
         connection++
         epoch++
         inside.open.complete(Unit)
@@ -981,6 +993,7 @@ class NotificationsRowTest {
         runBlocking { withTimeout(WATCHDOG_MS) { registrar.reconcileLocal() } }
         rule.waitForIdle()
         assertTrue("A's failure line is not B's", rule.onAllNodes(hasText(text(R.string.settings_notif_turn_off_failed))).fetchSemanticsNodes().isEmpty())
+        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).assertIsEnabled() // A's job ended
 
         turnOffViaDialog() // B's own command runs
         runHeld(::commandsDone)
@@ -991,7 +1004,7 @@ class NotificationsRowTest {
     @Test
     fun aCommandCancelledBeforeItsFirstDispatchFreesTheGuard() {
         turnedOn()
-        setting(scope = heldScope)
+        setting(commands = heldCommands)
         rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
         rule.onNodeWithText(text(R.string.settings_notif_test)).performClick()
         commands.children.single().cancel() // before its first dispatch: its body never runs
@@ -1044,6 +1057,52 @@ class NotificationsRowTest {
         assertNull("g2 is journaled under the old epoch: not the owner of a target", registrar.testEndpoint("1:g2"))
         assertNull(registrar.testEndpoint("0:g2"))
         assertTrue(sent.isEmpty())
+    }
+
+    // ---- Fix round 4 ----
+
+    @Test
+    fun twoScreensOverOneContainerAdmitOneCommand() {
+        themed {
+            Column {
+                // Two screens, each with its own view model store (two activities in one process), one container.
+                for (tag in listOf("first", "second")) {
+                    CompositionLocalProvider(LocalViewModelStoreOwner provides rememberViewModelStoreOwner()) {
+                        Box(Modifier.testTag(tag)) { NotificationsSetting({ registrar }, { testPush }, notifyPrefs, uiCommands) }
+                    }
+                }
+            }
+        }
+        rule.waitUntil(WATCHDOG_MS) { rule.onAllNodes(hasText(text(R.string.settings_notif_off), substring = true)).fetchSemanticsNodes().size == 2 }
+        val registering = Gate().also { registerGate = it }
+        rule.onNode(hasText(text(R.string.settings_notifications)) and hasClickAction() and hasAnyAncestor(hasTestTag("first"))).performClick()
+        await(registering.entered) // the first screen's enable is outstanding
+        rule.waitForIdle()
+        rule.onNode(hasText(text(R.string.settings_notifications)) and hasClickAction() and hasAnyAncestor(hasTestTag("second")))
+            .assertIsNotEnabled().performClick() // the other screen offers no enable meanwhile
+        registering.open.complete(Unit)
+        joinCommands()
+        waitFor(text(R.string.settings_notif_registering))
+        assertEquals("one admission", 1, fakePort.calls.count { it.startsWith("register") })
+    }
+
+    @Test
+    fun theHolderSendsTheTestForTheOwnerTheSheetDrew() {
+        turnedOn()
+        val drawn = registrar.ui.value.testOwner!! // the sheet drew A
+        switchToB()
+        endpointArrives(VALID2)
+        runBlocking { withTimeout(WATCHDOG_MS) { registrar.publishPending() } }
+        val b = registrar.ui.value.testOwner!!
+        runBlocking { withTimeout(WATCHDOG_MS) { testPush.send(VALID2, b) } } // B's own test window is open
+        elapsed += 10_000 // past the throttle: a stale tap could start a new send
+
+        sendTest(uiCommands, registrar, testPush, drawn) // the holder's real callback, with the owner the sheet drew
+        joinCommands()
+        assertEquals("no POST for A's tap", listOf(VALID2), sent)
+        assertEquals("B's window and result untouched", TestOutcome(b, TestPushResult.SENT), testPush.lastResult.value)
+        testPush.onWake(b)
+        assertEquals(TestOutcome(b, TestPushResult.WAKE_ARRIVED), testPush.lastResult.value)
     }
 
     @Test

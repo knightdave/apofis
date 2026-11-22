@@ -36,9 +36,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.LifecycleResumeEffect
-import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -111,26 +109,29 @@ private fun lines(value: String, summary: String?) = listOfNotNull(value, summar
 internal fun ticks(open: Boolean, last: TestOutcome?) = open && last?.result == TestPushResult.SENT
 
 /**
- * Settings' push commands at the lifetime of the command, not of the screen: one admitted at a time, and its busy state
- * and a message not shown yet survive rotation and leaving Settings (the activity's view model store holds this).
- * Admission runs on the main thread; the command runs in a scope that outlives the screen.
+ * The process's push commands, owned by the container for the lifetime of the running job: one admitted at a time, and
+ * [busy] is what every Settings screen shows, whatever connection it was entered on. Only [message] belongs to one
+ * connection's screen. Admission runs on the main thread; the command runs in [scope], which outlives every screen.
  */
-internal class PushCommands : ViewModel() {
-    /** The connection of the screen that admitted the running command; null when none runs. */
-    var running by mutableStateOf<Long?>(null)
+class PushCommands(private val scope: CoroutineScope) {
+    var busy by mutableStateOf(false)
         private set
 
-    /** A message for the screen of one connection: (connection, string). */
+    /** A message for the screen of one connection: (connection generation, string). */
     var message by mutableStateOf<Pair<Long, Int>?>(null)
 
-    /** One command at a time, whichever screen admitted it; released when its job completes in any way. */
-    fun run(scope: CoroutineScope, connection: Long, block: suspend () -> Unit) {
-        if (running != null) return
-        running = connection
+    fun run(block: suspend () -> Unit) {
+        if (busy) return
+        busy = true
         message = null
         val job = scope.launch { block() }
-        job.invokeOnCompletion { running = null } // also when cancelled before its first dispatch
+        job.invokeOnCompletion { busy = false } // also when cancelled before its first dispatch
     }
+}
+
+/** The holder's test-push action: for the owner the sheet drew, sent only to the target that registration owns. */
+internal fun sendTest(commands: PushCommands, push: PushRegistrar, test: TestPush, shown: String?) {
+    if (shown != null) commands.run { push.testEndpoint(shown)?.let { test.send(it, shown) } }
 }
 
 /** The bell only for push On with every part of access allowed. */
@@ -138,10 +139,10 @@ internal fun iconOf(ui: NotificationsUi): Int = if (ui.state is PushState.On && 
 
 /** The Settings row: the state, and under it the fallback line while push is off; one selection feedback per tap. */
 @Composable
-fun NotificationsRow(ui: NotificationsUi, onClick: () -> Unit) {
+fun NotificationsRow(ui: NotificationsUi, enabled: Boolean = true, onClick: () -> Unit) {
     val haptics = ApofisTheme.haptics
     val value = lines(stringResource(valueOf(ui)), summaryOf(ui)?.let { stringResource(it) })
-    RowLayout(Modifier.clickable(role = Role.Button) { haptics.selection(); onClick() }, iconOf(ui), stringResource(R.string.settings_notifications), value) {
+    RowLayout(Modifier.clickable(enabled = enabled, role = Role.Button) { haptics.selection(); onClick() }, iconOf(ui), stringResource(R.string.settings_notifications), value) {
         Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
@@ -246,11 +247,11 @@ private fun DialogButton(onClick: () -> Unit, enabled: Boolean = true, content: 
 /**
  * The Notifications row and its sheet, wired to the registrar and the test push. The lazily built [push] and [testPush]
  * are resolved and the access is read off the main thread; on every resume the access is read again and the registrar
- * recomputes its state in turn with its operations. One command at a time runs in [scope], which outlives this screen;
+ * recomputes its state in turn with its operations. One command at a time runs through the container's [commands];
  * its outcome shows in the sheet.
  */
 @Composable
-fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, notifyPrefs: SharedPreferences, scope: CoroutineScope, connection: Long = 0) {
+fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, notifyPrefs: SharedPreferences, commands: PushCommands, connection: Long = 0) {
     val context = LocalContext.current
     val local = rememberCoroutineScope()
     var parts by remember { mutableStateOf<Pair<PushRegistrar, TestPush>?>(null) }
@@ -272,7 +273,6 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
     }
     // The dialog's answer and the stored mark are read back at once, so the next tap acts on them.
     val ask = rememberAskNotificationsOnce(notifyPrefs, onSettled = { local.launch { readAccess() } })
-    val commands = viewModel { PushCommands() }
     val (p, t) = parts ?: return PendingRow()
     val a = access ?: return PendingRow()
 
@@ -281,10 +281,10 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
     // A result counts only for the registration it was sent for, which the registrar reports with its state.
     val ui = NotificationsUi(a, pushUi, last?.takeIf { it.owner == pushUi.testOwner }?.result)
     var open by rememberSaveable { mutableStateOf(false) }
-    // Busy and messages belong to the connection whose screen admitted them: a screen entered on another never shows them.
-    val busy = commands.running == connection
+    // Busy is the process's: no screen offers a push action while one runs. A message belongs to its connection's screen.
+    val busy = commands.busy
     val message = commands.message?.takeIf { it.first == connection }?.second
-    fun command(block: suspend () -> Unit) = commands.run(scope, connection, block)
+    fun command(block: suspend () -> Unit) = commands.run(block)
     fun say(text: Int?) {
         commands.message = text?.let { connection to it }
     }
@@ -299,7 +299,7 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
             context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
         }
     }
-    NotificationsRow(ui) {
+    NotificationsRow(ui, enabled = !(busy && tapOf(ui) == RowTap.ENABLE)) {
         if (!busy) say(null)
         when (tapOf(ui)) {
             RowTap.ASK -> ask()
@@ -325,10 +325,7 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
     if (open) {
         NotificationsSheet(
             ui,
-            onTest = { shown ->
-                // Its endpoint in one read with the owner: a tap for a registration that is no longer current sends nothing.
-                if (shown != null) command { p.testEndpoint(shown)?.let { t.send(it, shown) } }
-            },
+            onTest = { shown -> sendTest(commands, p, t, shown) },
             onRetry = { command { p.verify(force = true) } },
             // The outcome is disable()'s own; a cancellation or an exception reports nothing.
             onTurnOff = { command { if (!p.disable()) say(R.string.settings_notif_turn_off_failed) } },
