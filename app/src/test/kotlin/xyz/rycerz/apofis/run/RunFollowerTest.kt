@@ -19,6 +19,7 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -856,14 +857,14 @@ class RunFollowerTest {
     fun finishTailSurvivesCancellation() = runTest {
         val done = CompletableDeferred<Unit>()
         // Leaving the foreground while onRunFinished runs cancels the follower job; the handoff must still complete.
-        val f = follower(done) {
+        val f = follower(done, beforeFinished = {
             pauseAll()
             yield()
-        }
+        })
         messages()
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
         started(f)
-        done.await()
+        withContext(Dispatchers.Default) { withTimeout(10_000) { done.await() } } // real time: a lost hand-off names this line
 
         assertEquals(listOf(KEY), finished)
         assertNull(f.live(KEY).value)
