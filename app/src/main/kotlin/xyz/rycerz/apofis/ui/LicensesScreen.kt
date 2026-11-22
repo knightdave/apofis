@@ -32,12 +32,14 @@ import xyz.rycerz.apofis.R
 const val LUCIDE_LICENSE_ASSET = "LUCIDE-LICENSE"
 const val COMMONMARK_LICENSE_ASSET = "COMMONMARK-LICENSE"
 const val COMMONMARK_NOTICE_ASSET = "COMMONMARK-NOTICE"
+const val UNIFIEDPUSH_LICENSE_ASSET = "UNIFIEDPUSH-CONNECTOR-LICENSE"
 
 /** Every shipped license: its heading and its asset. */
 private val LICENSES = listOf(
     R.string.licenses_lucide to listOf(LUCIDE_LICENSE_ASSET),
     // The repository's license at the pinned tag, then the notice the four jars carry (another copyright line).
     R.string.licenses_commonmark to listOf(COMMONMARK_LICENSE_ASSET, COMMONMARK_NOTICE_ASSET),
+    R.string.licenses_unifiedpush to listOf(UNIFIEDPUSH_LICENSE_ASSET),
 )
 
 /** The third-party license texts shipped in the app, verbatim. */

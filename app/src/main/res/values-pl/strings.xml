@@ -153,6 +153,7 @@
     <string name="settings_licenses">Licencje open source</string>
     <string name="licenses_lucide">Ikony Lucide</string>
     <string name="licenses_commonmark">commonmark-java (licencja BSD 2-Clause)</string>
+    <string name="licenses_unifiedpush">UnifiedPush Android connector (licencja Apache 2.0)</string>
     <string name="md_image">Obraz</string>
     <string name="md_table">Tabela</string>
     <string name="md_table_copy">Kopiuj tabelę</string>
