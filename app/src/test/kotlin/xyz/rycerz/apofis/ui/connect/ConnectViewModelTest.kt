@@ -9,6 +9,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -66,12 +67,16 @@ class ConnectViewModelTest {
 
     @Test
     fun privateAddressAsksFirstAndTriesEvenWhenRefused() {
-        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false })
+        val vm = ConnectViewModel(
+            null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false },
+            check = { awaitCancellation() }, // cancelled where it runs: no probe still unwinds on another thread
+        )
         vm.submit("http://10.0.2.2:18642", "k")
         assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
-        vm.onLocalNetworkResult() // refused: a VPN route may still work, so the check starts anyway
+        val job = vm.onLocalNetworkResult() // refused: a VPN route may still work, so the check starts anyway
         assertEquals(ConnectState.Testing, vm.state) // not waited for, it would go to the network
         vm.cancel()
+        assertTrue(job!!.isCompleted) // nothing still runs on another thread when the test resets Main
         assertTrue(saved.isEmpty())
     }
 
@@ -100,12 +105,16 @@ class ConnectViewModelTest {
 
     @Test
     fun grantedLocalNetworkIsNotAskedAgain() {
-        val vm = ConnectViewModel(null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { true })
+        val vm = ConnectViewModel(
+            null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { true },
+            check = { awaitCancellation() }, // cancelled where it runs: no probe still unwinds on another thread
+        )
         vm.onUrlChange("http://192.168.1.5:8642")
         vm.onKeyChange("k")
-        vm.connect()
+        val job = vm.connect()
         assertEquals(ConnectState.Testing, vm.state)
         vm.cancel()
+        assertTrue(job!!.isCompleted) // nothing still runs on another thread when the test resets Main
     }
 
     @Test

@@ -544,6 +544,7 @@ class ChatViewModelTest {
 
         awaitTrue { runBlocking { db.pendingSendDao().rows(KEY).isNotEmpty() } }
         assertEquals(listOf("Remember the milk"), db.pendingSendDao().rows(KEY).map { it.text })
+        awaitTrue { connected.composer.current(KEY).draft.isEmpty() } // the field empties just after the row commits
         assertEquals("", connected.composer.current(KEY).draft)
     }
 
