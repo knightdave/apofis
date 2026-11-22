@@ -63,6 +63,7 @@ fun SettingsScreen(
     dynamicColor: Boolean,
     pureBlack: Boolean,
     versionName: String,
+    notifications: @Composable () -> Unit,
     onConnection: () -> Unit,
     onThemeMode: (ThemeMode) -> Unit,
     onDynamicColor: (Boolean) -> Unit,
@@ -113,6 +114,7 @@ fun SettingsScreen(
                 SwitchRow(R.drawable.lucide_palette, R.string.settings_dynamic_color, R.string.settings_dynamic_color_summary, dynamicColor, onDynamicColor)
                 SwitchRow(R.drawable.lucide_contrast, R.string.settings_pure_black, R.string.settings_pure_black_summary, pureBlack, onPureBlack)
             }
+            Section(R.string.settings_notifications) { notifications() }
             Section(R.string.settings_about) {
                 InfoRow(R.drawable.lucide_info, stringResource(R.string.settings_version), versionName)
                 InfoRow(R.drawable.lucide_scale, stringResource(R.string.settings_license), stringResource(R.string.settings_license_value))
@@ -177,7 +179,7 @@ private fun SwitchRow(icon: Int, title: Int, summary: Int, checked: Boolean, onC
 
 /** 15 sp row, 20 dp icon in a 36 dp slot, 12 by 11 dp padding, at least 48 dp tall; [trailing] sits at the end. */
 @Composable
-private fun RowLayout(modifier: Modifier, icon: Int, title: String, value: String? = null, trailing: @Composable () -> Unit) {
+internal fun RowLayout(modifier: Modifier, icon: Int, title: String, value: String? = null, trailing: @Composable () -> Unit) {
     Row(
         modifier
             .fillMaxWidth()

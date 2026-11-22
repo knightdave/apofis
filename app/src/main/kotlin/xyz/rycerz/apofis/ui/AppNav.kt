@@ -62,6 +62,7 @@ import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_MIN_SDK
 import xyz.rycerz.apofis.ui.connect.LOCAL_NETWORK_PERMISSION
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
+import xyz.rycerz.apofis.ui.settings.NotificationsSetting
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.compose.runtime.mutableIntStateOf
 import xyz.rycerz.apofis.notify.rememberAskNotificationsOnce
@@ -146,6 +147,7 @@ fun AppNav(container: AppContainer) {
                 dynamicColor = prefs.dynamicColor.collectAsState().value,
                 pureBlack = prefs.pureBlack.collectAsState().value,
                 versionName = version,
+                notifications = { NotificationsSetting(container.push, container.testPush, container.notifyPrefs, container.scope) },
                 onConnection = { chosen = Screen.RECONNECT },
                 onThemeMode = { scope.launch { prefs.setThemeMode(it) } },
                 onDynamicColor = { scope.launch { prefs.setDynamicColor(it) } },
