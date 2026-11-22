@@ -37,6 +37,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.LocalDate
@@ -976,21 +977,19 @@ internal fun MessageList(
     } else {
         null
     }
-    // Growth at the bottom for the follow rules, per run: the live tail as shown (text, steps, a pending request) or,
-    // while polling (an empty tail), the stored transcript (items, and the newest reply's text and steps).
+    // Growth at the bottom for the follow rules, per run and per part, so one part shrinking never hides another growing:
+    // a stored item added (polling shows the stored transcript), the newest stored reply's text or steps, the live text
+    // as revealed, its steps, a new pending request. A new run's first values are a baseline, not growth.
     @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
-    val size = when {
-        live == null -> -1L
-        live.connection == Connection.POLLING -> (stored.lastOrNull { it is AssistantReply } as AssistantReply?)
-            .let { stored.size.toLong() + (it?.text?.length ?: 0) + (it?.steps?.size ?: 0) }
-        else -> (liveText?.length ?: 0).toLong() + (liveItem?.steps?.size ?: 0) + (if (live.pending != null) 1 else 0)
+    val newest = stored.lastOrNull { it is AssistantReply } as AssistantReply?
+    val bottom = live?.let {
+        Bottom(it.runId, stored.size, newest?.key, newest?.text?.length ?: 0, newest?.steps?.size ?: 0, liveText?.length ?: 0, liveItem?.steps?.size ?: 0, it.pending != null)
     }
-    val grown = remember { arrayOf<Any?>(null, -1L) } // the run and its size at the last applied composition
+    val before = remember { arrayOfNulls<Bottom>(1) } // at the last applied composition
     val grewNow by rememberUpdatedState(onRevealGrew)
     SideEffect {
-        if (live != null && grown[0] == live.runId && size > grown[1] as Long) grewNow()
-        grown[0] = live?.runId
-        grown[1] = size
+        if (bottom != null && before[0]?.let { bottom.grewFrom(it) } == true) grewNow()
+        before[0] = bottom
     }
     val rows = builder.rows(items, liveText).let { if (gone) Joined(it, listOf(GoneRow)) else it }
     // Copy and Select check the transcript as it is at action time: the owner's current state when given.
@@ -1036,8 +1035,25 @@ internal fun MessageList(
                 }
             }
         }
-        RunEndAnnouncer(live?.runId)
+        RunEndAnnouncer(live?.runId, contentPadding.calculateTopPadding())
     }
+}
+
+/** What a run shows at the bottom, part by part (see [MessageList]'s growth signal). */
+private data class Bottom(
+    val run: String,
+    val items: Int,
+    val reply: String?,
+    val replyText: Int,
+    val replySteps: Int,
+    val shown: Int,
+    val steps: Int,
+    val pending: Boolean,
+) {
+    fun grewFrom(b: Bottom) = run == b.run && (
+        items > b.items || (reply == b.reply && (replyText > b.replyText || replySteps > b.replySteps)) ||
+            shown > b.shown || steps > b.steps || (pending && !b.pending)
+        )
 }
 
 /** Whether lazy item key [key] is a row of reply [reply]: its steps, a text row or its footer. */
@@ -1047,37 +1063,40 @@ private fun isRowOf(key: Any, reply: String): Boolean =
 /** Run statuses after which nothing more streams (the follower's terminal set). */
 private val TERMINAL_STATUSES = setOf("completed", "failed", "cancelled", "interrupted")
 
-/** How long "Reply finished" stays on the announcer: past Compose's 100 ms accessibility batching and TalkBack's read. */
+/** How long "Reply ended" stays on the announcer: past Compose's 100 ms accessibility batching and TalkBack's read. */
 internal const val ANNOUNCE_MS = 1000L
 
 /**
- * One persistent, invisible 1 dp node in the middle of the list (clear of the bars that hide what is under them), a
- * polite live region whose state description is empty, and "Reply finished" for [ANNOUNCE_MS] after a run ended. Ended
+ * One persistent, invisible 1 dp node just below the list's top content padding (the top bar's measured height plus
+ * its gap), so it lies in the uncovered transcript, not under the bar or the composer and keyboard, which hide from
+ * accessibility what is under them. A polite live region the whole time; its state description exists only while it
+ * says "Reply ended" (one neutral line for finished, stopped and failed), for [ANNOUNCE_MS] after a run ended: idle,
+ * an empty description would still make it a screen-reader focus stop. Ended
  * means the live run id was set and is now another one or none, so run A followed directly by run B still announces A.
  * The previous id is remembered, never saved: a first composition (opening, rotation, process recreation) announces
  * nothing. Streamed text is not a live region, so TalkBack hears one line per run, not every token. The node exists the
  * whole time and only its state description changes, so Compose sends the change from this node itself.
  */
 @Composable
-private fun BoxScope.RunEndAnnouncer(runId: String?) {
-    val finished = stringResource(R.string.chat_reply_finished)
+private fun BoxScope.RunEndAnnouncer(runId: String?, top: Dp) {
+    val ended = stringResource(R.string.chat_reply_ended)
     val previous = remember { arrayOf(runId) }
     var ends by remember { mutableIntStateOf(0) }
-    var said by remember { mutableStateOf("") }
+    var said by remember { mutableStateOf<String?>(null) }
     SideEffect {
         if (previous[0] != null && previous[0] != runId) ends++
         previous[0] = runId
     }
     LaunchedEffect(ends) { // a new run starting does not cut the hold short; another end restarts it
         if (ends == 0) return@LaunchedEffect
-        said = finished
+        said = ended
         delay(ANNOUNCE_MS)
-        said = ""
+        said = null
     }
     Box(
-        Modifier.align(Alignment.Center).size(1.dp).semantics {
+        Modifier.align(Alignment.TopCenter).padding(top = top).size(1.dp).semantics {
             liveRegion = LiveRegionMode.Polite
-            stateDescription = said
+            said?.let { stateDescription = it }
         },
     )
 }

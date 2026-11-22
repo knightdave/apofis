@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.captureToImage
@@ -39,6 +40,7 @@ import java.time.ZoneOffset
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -71,7 +73,7 @@ class StreamingUiTest {
     val rule = createComposeRule()
 
     private val letters = "abcdefghij"
-    private val finished = "Reply finished"
+    private val finished = "Reply ended"
 
     @Before
     fun manualClock() {
@@ -299,13 +301,12 @@ class StreamingUiTest {
 
     // ---- the run-end announcement ----
 
-    /** The one persistent announcer: a polite live region with a state description, outside every row. */
-    private fun announcer(): SemanticsNode = rule.onAllNodes(
-        SemanticsMatcher.keyIsDefined(SemanticsProperties.LiveRegion) and SemanticsMatcher.keyIsDefined(SemanticsProperties.StateDescription),
-        useUnmergedTree = true,
-    ).fetchSemanticsNodes().single()
+    /** The one persistent announcer: a polite live region outside every row (no notices in these lists). */
+    private fun announcer(): SemanticsNode =
+        rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.LiveRegion), useUnmergedTree = true).fetchSemanticsNodes().single()
 
-    private fun said() = announcer().config[SemanticsProperties.StateDescription]
+    /** Its state description; idle it has none at all (an empty one would make it a screen-reader focus stop). */
+    private fun said() = announcer().config.getOrNull(SemanticsProperties.StateDescription) ?: ""
 
     @Test
     fun announcesOnceWhenARunEnds() {
@@ -317,7 +318,7 @@ class StreamingUiTest {
         val node = announcer()
         assertTrue("present and visible", node.size.width > 0 && node.size.height > 0)
         assertEquals(LiveRegionMode.Polite, node.config[SemanticsProperties.LiveRegion])
-        assertEquals("", said())
+        assertFalse("idle: no state description at all", node.config.contains(SemanticsProperties.StateDescription))
         var text = ""
         repeat(30) {
             text += letters
@@ -332,19 +333,21 @@ class StreamingUiTest {
         frame(3)
         assertEquals(finished, said())
         assertEquals("the same node, which existed all along", node.id, announcer().id)
+        assertEquals(LiveRegionMode.Polite, announcer().config[SemanticsProperties.LiveRegion])
         rule.mainClock.advanceTimeBy(ANNOUNCE_MS - 5 * 16, ignoreFrameDuration = true)
         frame()
         assertEquals("held for ANNOUNCE_MS", finished, said())
         rule.mainClock.advanceTimeBy(6 * 16, ignoreFrameDuration = true)
         frame()
-        assertEquals("", said())
+        assertFalse(announcer().config.contains(SemanticsProperties.StateDescription))
+        assertEquals(node.id, announcer().id)
         // Later updates of the same chat (a refresh, an edit) never repeat it.
         items = listOf(user, AssistantReply("r1", emptyList(), text + " edited", FIXED_NOW))
         frame(3)
         assertEquals("", said())
     }
 
-    /** Counts the frames in which the announcer turned to "Reply finished", over [frames] frames. */
+    /** Counts the frames in which the announcer turned to "Reply ended", over [frames] frames. */
     private fun announcementsOver(frames: Int): Int {
         var count = 0
         var before = said()

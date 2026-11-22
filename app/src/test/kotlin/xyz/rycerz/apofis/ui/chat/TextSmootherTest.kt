@@ -186,4 +186,29 @@ class TextSmootherTest {
             length += 7
         }
     }
+
+    private fun boundaryOf(text: String, at: Int) = BreakIterator.getCharacterInstance().apply { setText(text) }.isBoundary(at)
+
+    @Test
+    fun aClampOntoItsAnchorStillChecksTheNextTarget() {
+        // Re-review I2 (a): the clamp retreats onto its anchor, then another target arrives before any tick.
+        val s = TextSmoother("a")
+        assertEquals("ab", s.step("ab"))
+        s.accept("ab\u0301", snap = false) // the b takes a mark: back to "a"
+        assertEquals("a", s.visible)
+        val next = "a\u0301z" // now the a takes a mark: 1 is no boundary any more
+        s.accept(next, snap = false)
+        assertTrue("shown ${s.shown} of '$next'", boundaryOf(next, s.shown))
+    }
+
+    @Test
+    fun aTickNeverCutsALongCluster() {
+        // Re-review I2 (b): a slice of 4 after a slice of 3, into "b" plus 1099 combining marks (backlog 1100, under the
+        // budget, longer than the cut's lookahead).
+        val s = TextSmoother("")
+        assertEquals(3, s.step("a".repeat(12)).length)
+        val next = "aaa" + "b" + "\u0301".repeat(1099)
+        s.step(next)
+        assertTrue("shown ${s.shown} of ${next.length}", boundaryOf(next, s.shown))
+    }
 }

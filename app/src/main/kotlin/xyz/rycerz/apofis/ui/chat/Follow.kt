@@ -50,7 +50,7 @@ internal fun shouldPin(state: FollowState, contentGrew: Boolean, atBottom: Boole
  * ([Follower.onGrew]), and scrolling costs a few O(1) reads of the list state.
  */
 @Stable
-internal class Follower(private val list: LazyListState, internal var wasLive: Boolean) {
+internal class Follower(private val list: LazyListState, internal var lastRun: String?) {
     // Read by effects only, so changes recompose nothing. Not following until the first measured layout says the list
     // is at the bottom: a position restored many screens up (recreation) is a reader.
     internal var state = FollowState(following = false, holdUntilMs = 0)
@@ -99,7 +99,7 @@ internal class Follower(private val list: LazyListState, internal var wasLive: B
 @Composable
 internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
     val live = ui.live
-    val follower = remember(list) { Follower(list, live != null) }
+    val follower = remember(list) { Follower(list, live?.runId) }
     val threshold = with(LocalDensity.current) { 56.dp.toPx() }
     LaunchedEffect(list, follower, threshold) {
         // The first layout that shows data: an empty first layout (the transcript still loading) decides nothing, and a
@@ -131,9 +131,10 @@ internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
             follower.recentlyScrolled = false
         }
     }
-    LaunchedEffect(live != null) {
-        val ended = follower.wasLive && live == null
-        follower.wasLive = live != null
+    // A run ended: its id was set and is now none or another run's (A replaced directly by B holds like A ending).
+    LaunchedEffect(live?.runId) {
+        val ended = follower.lastRun != null && follower.lastRun != live?.runId
+        follower.lastRun = live?.runId
         if (!ended) return@LaunchedEffect
         var now = withFrameMillis { it }
         follower.state = onRunEnded(follower.state, now)

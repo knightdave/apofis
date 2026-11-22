@@ -436,4 +436,61 @@ class FollowTest {
         assertEquals("composer recomposed by ticks", bottom, ChromeProbe.bottomCompositions)
         assertEquals("root measured by ticks", root, ChromeProbe.rootMeasures)
     }
+
+    // ---- fix round 2: growth per component, and a direct run replacement holds like a run end ----
+
+    private fun polling() = LiveReply("run_1", "running", "", emptyList(), null, Connection.POLLING)
+
+    @Test
+    fun aNewStoredReplyWhilePollingPinsAFollower() {
+        val set = show(state(polling()))
+        assertTrue(atBottom())
+        nudge(60f) // a follower 30 dp up
+        // A short new reply for the run arrives by polling, after a much longer older reply: an item was added.
+        set(state(polling(), history + AssistantReply("r99", emptyList(), "Done", FIXED_NOW)))
+        frames(3)
+        assertTrue("${distanceFromBottom()}", atBottom())
+    }
+
+    @Test
+    fun aNewStoredReplyWhilePollingLeavesAReader() {
+        val set = show(state(polling()))
+        drag(600f)
+        val before = anchor()
+        set(state(polling(), history + AssistantReply("r99", emptyList(), "Done", FIXED_NOW)))
+        frames(3)
+        assertEquals(before, anchor())
+    }
+
+    private val next = UserMessage("u14", "And more", steered = false, timestamp = FIXED_NOW, runId = "run_2")
+
+    /** Run A's reply is stored and run B starts in the same update: no frame without a run. */
+    private fun replaced() = ChatUiState(
+        "apofis-1", "Follow", StatusLine.WORKING,
+        withLive(history + AssistantReply("r99", emptyList(), text(1600), FIXED_NOW) + next, LiveReply("run_2", "running", "", emptyList(), null, Connection.LIVE)) { FIXED_NOW },
+        ComposerMode.STOP, "", "hermes.example", LiveReply("run_2", "running", "", emptyList(), null, Connection.LIVE),
+    )
+
+    @Test
+    fun aDirectReplacementHoldsAFollowerLikeARunEnd() {
+        val set = show(state(live(text(1200))))
+        assertTrue(atBottom())
+        set(replaced())
+        frames()
+        nudge(60f) // the stored rows settle during the hold
+        frames(Motion.FOLLOW_HOLD / 16)
+        assertTrue("${list.firstVisibleItemIndex}/${list.firstVisibleItemScrollOffset}", atBottom())
+    }
+
+    @Test
+    fun aDirectReplacementLeavesAReader() {
+        val set = show(state(live(text(1200))))
+        drag(600f) // released
+        nudge(3000f) // further up, into the history, so the anchored row outlives the swap of the reply's rows
+        settle()
+        val before = anchor()
+        set(replaced())
+        frames(Motion.FOLLOW_HOLD / 16 + 4)
+        assertEquals(before, anchor())
+    }
 }

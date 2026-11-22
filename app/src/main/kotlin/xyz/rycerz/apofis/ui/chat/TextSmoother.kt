@@ -52,7 +52,8 @@ class TextSmoother(initial: String) {
         if (snap || shown > SMOOTH_MAX_SHOWN) return null
         if (next === target) return shown
         if (shown > next.length || !next.regionMatches(0, target, 0, shown)) return null
-        return cutAt(next, anchor, shown, orFrom = true)
+        // A cut that retreated onto its anchor is no known boundary of [next]: read from 0 then (at most the shown text).
+        return cutAt(next, if (anchor < shown) anchor else 0, shown, orFrom = true)
     }
 
     /** What [accept] would show for [next], without changing anything (read in composition). */
@@ -84,6 +85,8 @@ class TextSmoother(initial: String) {
         if (previous > 2) slice = minOf(slice, (previous * 1.5).toInt())
         slice = slice.coerceIn(minOf(2, backlog), minOf(MAX_SLICE, backlog))
         previous = slice
+        // pieceEnd is exact only when its lookahead reaches the end of the text; past that it may cut a long cluster.
+        if (backlog > slice + GRAPHEME_SLACK) return showAll(target)
         val end = pieceEnd(target, shown, slice)
         if (end > SMOOTH_MAX_SHOWN && end < target.length) return showAll(target)
         anchor = shown
