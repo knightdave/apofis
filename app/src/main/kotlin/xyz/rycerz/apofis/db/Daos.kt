@@ -238,3 +238,41 @@ interface ReplyOutcomeDao {
     @Upsert
     suspend fun upsert(o: ReplyOutcomeEntity)
 }
+
+@Dao
+interface NoticeOutboxDao {
+    @Query("SELECT * FROM NoticeOutboxEntity WHERE generation = :generation ORDER BY runStartedAt, runId")
+    suspend fun all(generation: Long): List<NoticeOutboxEntity>
+
+    @Query("SELECT * FROM NoticeOutboxEntity WHERE generation = :generation AND eventId = :eventId")
+    suspend fun get(generation: Long, eventId: String): NoticeOutboxEntity?
+
+    @Upsert
+    suspend fun upsert(row: NoticeOutboxEntity)
+
+    @Query("DELETE FROM NoticeOutboxEntity WHERE generation = :generation AND eventId = :eventId")
+    suspend fun delete(generation: Long, eventId: String)
+
+    /** Strictly older only: a reader that is behind never removes a newer connection's row. */
+    @Query("DELETE FROM NoticeOutboxEntity WHERE generation < :generation")
+    suspend fun deleteOlder(generation: Long)
+
+    @Query("DELETE FROM NoticeOutboxEntity")
+    suspend fun clear()
+}
+
+@Dao
+interface NoticeStateDao {
+    @Query("SELECT * FROM NoticeStateEntity WHERE sessionKey = :sessionKey")
+    suspend fun get(sessionKey: String): NoticeStateEntity?
+
+    @Upsert
+    suspend fun upsert(row: NoticeStateEntity)
+
+    /** State of another connection, or of a chat no longer on this phone. */
+    @Query("DELETE FROM NoticeStateEntity WHERE generation != :generation OR sessionKey NOT IN (SELECT `key` FROM SessionEntity)")
+    suspend fun deleteStale(generation: Long)
+
+    @Query("DELETE FROM NoticeStateEntity")
+    suspend fun clear()
+}

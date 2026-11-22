@@ -28,6 +28,19 @@ uses-permission: name='xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSIO
 expect 0 local-network "package: xyz.rycerz.apofis
 uses-permission: name='android.permission.INTERNET'
 uses-permission: name='android.permission.ACCESS_LOCAL_NETWORK'"
+# Android 13+ needs POST_NOTIFICATIONS to show the reply notifications.
+expect 0 notifications "package: xyz.rycerz.apofis
+uses-permission: name='android.permission.INTERNET'
+uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
+uses-permission: name='android.permission.WAKE_LOCK'
+uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'
+uses-permission: name='android.permission.ACCESS_LOCAL_NETWORK'
+uses-permission: name='android.permission.POST_NOTIFICATIONS'
+uses-permission: name='xyz.rycerz.apofis.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'"
+expect 1 notifications-no-internet "uses-permission: name='android.permission.POST_NOTIFICATIONS'"
+expect 1 vibrate "uses-permission: name='android.permission.INTERNET'
+uses-permission: name='android.permission.POST_NOTIFICATIONS'
+uses-permission: name='android.permission.VIBRATE'"
 expect 1 nearby-wifi "uses-permission: name='android.permission.INTERNET'
 uses-permission: name='android.permission.NEARBY_WIFI_DEVICES'"
 expect 1 foreground-service "uses-permission: name='android.permission.INTERNET'

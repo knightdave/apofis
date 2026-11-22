@@ -193,4 +193,10 @@
     <string name="drawer_error_closed">Połączenie zostało zamknięte</string>
     <string name="archived_title">Zarchiwizowane czaty</string>
     <string name="drawer_more_actions">Więcej opcji</string>
+    <string name="notif_channel_replies">Odpowiedzi</string>
+    <string name="notif_channel_answers">Czeka na Twoją odpowiedź</string>
+    <string name="notif_reply_finished">Odpowiedź gotowa</string>
+    <string name="notif_reply_failed">Odpowiedź nie została dokończona</string>
+    <string name="notif_needs_answer">Hermes czeka na Twoją odpowiedź</string>
+    <string name="notif_public">Nowa aktywność w czacie</string>
 </resources>

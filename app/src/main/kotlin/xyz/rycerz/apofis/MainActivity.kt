@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis
 
+import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -27,6 +28,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val container = (application as ApofisApp).container
+        if (savedInstanceState == null) openChat(intent) // a recreated activity must not reopen a tapped chat
         // The activity's own lifecycle: Apofis has one activity, and no foreground service keeps streams alive.
         lifecycle.addObserver(
             LifecycleEventObserver { _, event ->
@@ -68,5 +70,16 @@ class MainActivity : ComponentActivity() {
                 Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        openChat(intent)
+    }
+
+    /** A notification tap; the container ignores anything but a chat of the current connection. */
+    private fun openChat(intent: Intent) {
+        val container = (application as ApofisApp).container
+        lifecycleScope.launch { container.openChat(intent) }
     }
 }
