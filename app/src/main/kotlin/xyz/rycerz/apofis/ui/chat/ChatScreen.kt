@@ -38,7 +38,14 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.activity.compose.BackHandler
-import androidx.compose.ui.layout.Placeable
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.runtime.snapshotFlow
 import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.draw.drawWithContent
@@ -158,25 +165,38 @@ fun ChatScreen(
     // Read by the transcript slot only: the app passes a new lambda with every state, which must not reach the composer.
     val current = rememberUpdatedState(currentState)
 
+    val barHidden = remember { BarHidden() }
     val barSlot = remember {
         @Composable {
             SideEffect { ChromeProbe.barCompositions++ }
             val c = barCallbacks.value
-            ChatTopBar(barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions, Modifier.blockTouchesBelow().coverForAccessibility(order = -1f))
+            ChatTopBar(
+                barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions,
+                Modifier
+                    .blockTouchesBelow()
+                    .coverForAccessibility(order = -1f)
+                    .onFocusChanged { barHidden.focused = it.hasFocus }
+                    .onPreviewKeyEvent { barHidden.now }, // hidden: no key reaches a control that kept focus
+            )
         }
     }
+    // A hidden bar keeps no focus: released as soon as it hides (never the editor's, and nothing is focused when it returns).
+    val focusManager = LocalFocusManager.current
+    LaunchedEffect(barHidden) { snapshotFlow { barHidden.state.value }.collect { if (it && barHidden.focused) focusManager.clearFocus(force = true) } }
+    val statusInsets = rememberUpdatedState(WindowInsets.statusBars)
+    val bottomInsets = rememberUpdatedState(WindowInsets.ime.union(WindowInsets.navigationBars)) // max of the two, as the bottom area pads
+    val bodyStyle = rememberUpdatedState(MaterialTheme.typography.bodyLarge)
     // The run-end announcer, in its own slot: it reads only the live run id, so a token recomposes nothing here.
     val runId = rememberUpdatedState(state.live?.runId)
     val announcerSlot = remember { @Composable { RunEndAnnouncer(runId.value) } }
     // The bottom area for a bar height (its share of the height depends on it): the same lambda while it holds.
     val bottoms = remember { BodyCache() }
-    val bottomFor = { barHeight: Int ->
-        bottoms.get(barHeight, 0) {
+    val bottomFor = { barHeight: Int, statusTop: Int ->
+        bottoms.get(barHeight, statusTop) {
         @Composable {
             SideEffect { ChromeProbe.bottomCompositions++ }
             val input = bottomInput.value
             val actions = callbacks.value.actions
-            val style = MaterialTheme.typography.bodyLarge
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -188,16 +208,19 @@ fun ChatScreen(
                     .imePadding() // max(keyboard, navigation bar), applied once
                     .onSizeChanged { bottomContent = it.height },
             ) {
-                // One height budget for the bar, the notes, the composer and the transcript (bottomShares); each part is
-                // measured with its share and the area reports what it occupies.
+                // One allocation (bottomShares) for the bar, the notes, the composer's parts and the transcript, in the safe
+                // band between the status inset and the keyboard or navigation inset; each part is measured and placed with
+                // exactly its share, and the area reports what it occupies.
+                var look: ComposerLook? = null
                 Layout({
-                    // Notes keep a backing of their own over scrolled text, and scroll inside their share when taller.
-                    Column(Modifier.background(MaterialTheme.colorScheme.surface).verticalScroll(rememberScrollState())) {
+                    // Notes keep a backing of their own over scrolled text, and scroll inside their share when taller. The
+                    // unsent entry comes first, so its row is the one the guaranteed share shows.
+                    Column(Modifier.semantics { traversalIndex = -2f }.background(MaterialTheme.colorScheme.surface).verticalScroll(rememberScrollState())) {
+                        input.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                         input.note?.let { ComposerNoteLine(it) }
                         if (input.linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
-                        input.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                     }
-                    Composer(
+                    look = ComposerParts(
                         input.draft,
                         input.mode,
                         { actions.onDraftChange(it, input.draftRevision) },
@@ -218,18 +241,18 @@ fun ChatScreen(
                         expanded = input.expanded,
                         onExpandedChange = { expandedIn.value = if (it) input.sessionKey else null },
                         backdrop = objects.value.backdrop,
+                        subject = if (input.mode == ComposerMode.STOP || input.mode == ComposerMode.STEER) input.runId else input.sessionKey,
                     )
                 }) { measurables, constraints ->
                     val width = constraints.maxWidth
-                    var composer: Placeable? = null
-                    val shares = bottomShares(
-                        available = constraints.maxHeight, bar = barHeight, notes = measurables[0].maxIntrinsicHeight(width),
-                        unsent = input.unsent != null, wantsExpand = input.expanded, d = bottomDims(style),
-                    ) { room -> measurables[1].measure(Constraints(width, width, 0, room)).also { composer = it }.height }
+                    val (shares, composer) = measureComposer(
+                        measurables.subList(1, 5), look!!, width, available = constraints.maxHeight - statusTop, bar = barHeight,
+                        notes = measurables[0].maxIntrinsicHeight(width), unsent = input.unsent != null,
+                    )
                     val notes = measurables[0].measure(Constraints.fixed(width, shares.notes))
                     layout(width, shares.notes + shares.composer) {
                         notes.place(0, 0)
-                        composer!!.place(0, shares.notes)
+                        with(composer) { place(width, shares.notes) }
                     }
                 }
             }
@@ -239,7 +262,7 @@ fun ChatScreen(
     // The body for a pair of bar heights: the same lambda while they hold, so a token recomposes the body only through
     // the state it reads; new heights compose it at once with the new padding (same pass, no stale frame).
     val bodies = remember { BodyCache() }
-    val bodyFor = { barHeight: Int, bottomArea: Int ->
+    val bodyFor = { barHeight: Int, bottomArea: Int, barShown: Boolean ->
         bodies.get(barHeight, bottomArea) {
             @Composable {
                 val state = latest.value
@@ -257,13 +280,16 @@ fun ChatScreen(
                 if (state.status == StatusLine.LOAD_FAILED) {
                     Uncovered(barHeight, bottomArea, fullScreen = false) {
                         BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            // Too little room (landscape with the keyboard): the title's own retry stays; a second Retry
-                            // in a viewport too small to reach would only promise a control that cannot be tapped.
+                            // With room, the text and Retry. With less, the title's own retry stays while the bar is shown;
+                            // with the bar hidden, a compact Retry alone wherever its 48 dp target fits. Below that nothing:
+                            // a control in a viewport too small to reach would only promise a tap that cannot happen.
                             if (maxHeight >= 96.dp) {
                                 Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                                     Text(stringResource(R.string.chat_load_failed_text), color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                                     WashTextButton(R.string.chat_load_retry, c.onRetryLoad)
                                 }
+                            } else if (!barShown && maxHeight >= 48.dp) {
+                                WashTextButton(R.string.chat_load_retry, c.onRetryLoad)
                             }
                         }
                     }
@@ -335,21 +361,27 @@ fun ChatScreen(
         val measure: SubcomposeMeasureScope.(Constraints) -> MeasureResult = { constraints ->
             ChromeProbe.rootMeasures++
             val loose = constraints.copy(minWidth = 0, minHeight = 0)
-            val bar = subcompose(ChromeSlot.BAR, barSlot).single().measure(loose)
-            val bottom = subcompose(ChromeSlot.BOTTOM, bottomFor(bar.height)).single().measure(loose)
-            // The bottom area shares the height with the bar (bottomShares): it leaves the bar its height exactly when the
-            // bar fits beside the smallest composer, and takes it otherwise; then the bar is not placed at all (not drawn,
-            // not hit-tested, not in the accessibility tree) until it fits again.
-            val barShown = bar.height + bottom.height <= constraints.maxHeight
-            val top = if (barShown) bar.height else 0
-            val body = subcompose(ChromeSlot.BODY, bodyFor(top, bottom.height)).map { it.measure(loose) }
+            // The status inset is the system's: reserved at the top whether the bar is shown or not.
+            val status = statusInsets.value.getTop(this)
+            val measuredBar = subcompose(ChromeSlot.BAR, barSlot).single().measure(loose)
+            val bottom = subcompose(ChromeSlot.BOTTOM, bottomFor((measuredBar.height - status).coerceAtLeast(0), status)).single().measure(loose)
+            // The allocation (bottomShares) decides: the bar is shown only when it fits beside the bare composer row.
+            // Hidden, it is not placed (not drawn, not hit-tested, not in the accessibility tree), takes no keys and
+            // gives up focus; it returns, unfocused, when it fits.
+            val barShown = barFits(constraints.maxHeight - status - bottomInsets.value.getBottom(this), measuredBar.height - status, bodyStyle.value.let { bottomDims(it) })
+            barHidden.now = !barShown
+            if (barHidden.state.value == barShown) barHidden.state.value = !barShown
+            val bar = measuredBar.takeIf { barShown }
+            val top = bar?.height ?: status
+            val body = subcompose(ChromeSlot.BODY, bodyFor(top, bottom.height, barShown)).map { it.measure(loose) }
             val announcer = subcompose(ChromeSlot.ANNOUNCER, announcerSlot).single().measure(loose)
             layout(constraints.maxWidth, constraints.maxHeight) {
                 body.first().place(0, top) // the uncovered region
-                // The scroll button, at the end edge (mirrored in right-to-left layouts).
-                body.getOrNull(1)?.let { it.placeRelative(constraints.maxWidth - it.width, constraints.maxHeight - bottom.height - it.height) }
+                // The scroll button, at the end edge (mirrored in right-to-left layouts), only when its target fits in the
+                // uncovered transcript band.
+                body.getOrNull(1)?.let { if (constraints.maxHeight - top - bottom.height >= it.height) it.placeRelative(constraints.maxWidth - it.width, constraints.maxHeight - bottom.height - it.height) }
                 bottom.place(0, constraints.maxHeight - bottom.height, zIndex = 1f)
-                if (barShown) bar.place(0, 0, zIndex = 1f)
+                bar?.place(0, 0, zIndex = 1f)
                 // Just below the bar, above everything, so neither the bar nor the composer ever covers it.
                 announcer.place((constraints.maxWidth - announcer.width) / 2, top, zIndex = 2f)
             }
@@ -516,6 +548,13 @@ private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, content: @Comp
 }
 
 private enum class ChromeSlot { BOTTOM, BAR, BODY, ANNOUNCER }
+
+/** Whether the bar is hidden: [now] for key events in this very frame, [state] for releasing focus; [focused]: it holds focus. */
+private class BarHidden {
+    var now = false
+    val state = mutableStateOf(false)
+    var focused = false
+}
 
 /** What the composer slot shows: equal values notify nothing, so tokens do not recompose it. */
 private data class BottomInput(

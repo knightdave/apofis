@@ -144,9 +144,11 @@ class ComposerViewTest {
     private var busy by mutableStateOf(false)
     private var enter by mutableStateOf(false)
     private var expanded by mutableStateOf(false)
+    private var subject by mutableStateOf<Any?>("run-A") // what the primary acts on: the run, or the chat for Send
     private var accept = true // what the test's holder answers
     private var sends = 0 // send attempts
     private var stops = 0
+    private var stopsHook: () -> Unit = {}
     private val sentTexts = ArrayList<String>()
     private val edits = ArrayList<String>()
     private lateinit var inputMode: androidx.compose.ui.input.InputModeManager
@@ -178,8 +180,8 @@ class ComposerViewTest {
                                     if (writeBack) draft = it
                                 },
                                 onSend = { onSendHook() },
-                                onStop = { stops++ },
-                                busy = busy, enterToSend = enter, expanded = expanded, onExpandedChange = { expanded = it }, expandedHeight = expandedHeight,
+                                onStop = { stops++; stopsHook() },
+                                busy = busy, enterToSend = enter, expanded = expanded, onExpandedChange = { expanded = it }, expandedHeight = expandedHeight, subject = subject,
                             )
                         }
                     }
@@ -299,9 +301,107 @@ class ComposerViewTest {
         hold(ComposerMode.STOP, "", ComposerMode.STEER, "dictated")
         hold(ComposerMode.STEER, "dictated", ComposerMode.SEND, "dictated")
         hold(ComposerMode.SEND, "typed", ComposerMode.STOP, "")
-        rule.onNodeWithTag(STOP_TAG).performClick() // the accessibility action, with no press of its own
+        rule.onNodeWithTag(STOP_TAG).performSemanticsAction(SemanticsActions.OnClick) // the accessibility click: no press of its own
         rule.waitForIdle()
-        assertEquals(2, stops)
+        assertEquals("a direct accessibility activation", 2, stops)
+    }
+
+    /** Held through Stop, Steer and back to Stop: the shown action is Stop again, but a new generation; nothing fires. */
+    @Test
+    fun aPressHeldThroughStopSteerStopFiresNothing() {
+        mode = ComposerMode.STOP
+        draft = ""
+        show()
+        val at = primaryNode().boundsInRoot.center
+        rule.onRoot().performTouchInput { down(at) }
+        mode = ComposerMode.STEER
+        draft = "dictated"
+        rule.waitForIdle()
+        mode = ComposerMode.STOP
+        draft = ""
+        rule.waitForIdle()
+        rule.onRoot().performTouchInput { up() }
+        rule.waitForIdle()
+        assertEquals("a press begun on an earlier Stop stopped", 0, stops)
+        rule.onRoot().performTouchInput { click(at) }
+        rule.waitForIdle()
+        assertEquals("a fresh tap stops once", 1, stops)
+    }
+
+    /** Run A ends and run B starts while the press is held: the release does not stop B. */
+    @Test
+    fun aPressHeldAcrossARunReplacementDoesNotStopTheNewRun() {
+        mode = ComposerMode.STOP
+        draft = ""
+        subject = "run-A"
+        val stopped = ArrayList<Any?>()
+        show()
+        stopsHook = { stopped += subject }
+        val at = primaryNode().boundsInRoot.center
+        rule.onRoot().performTouchInput { down(at) }
+        subject = "run-B" // still Stop, another run
+        rule.waitForIdle()
+        rule.onRoot().performTouchInput { up() }
+        rule.waitForIdle()
+        assertEquals("run B was stopped by a press begun on run A", emptyList<Any?>(), stopped)
+        rule.onNodeWithTag(STOP_TAG).performSemanticsAction(SemanticsActions.OnClick)
+        rule.waitForIdle()
+        assertEquals(listOf<Any?>("run-B"), stopped)
+    }
+
+    /** An indirect pointer (a touch navigation device) on the focused button: a fresh press fires once, a held one across a change nothing. */
+    @Test
+    fun anIndirectPressIsGuardedToo() {
+        mode = ComposerMode.SEND
+        draft = "typed"
+        subject = "chat-1"
+        show()
+        val node = primaryNode()
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) }
+        rule.onNode(androidx.compose.ui.test.SemanticsMatcher("primary") { it.id == node.id }, useUnmergedTree = true).performSemanticsAction(SemanticsActions.RequestFocus)
+        rule.waitForIdle()
+        fun indirect(action: Int) = android.view.MotionEvent.obtain(0L, 0L, action, 10f, 10f, 0).apply { source = android.view.InputDevice.SOURCE_TOUCH_NAVIGATION }
+        rule.runOnUiThread {
+            composeView().dispatchGenericMotionEvent(indirect(android.view.MotionEvent.ACTION_DOWN))
+            composeView().dispatchGenericMotionEvent(indirect(android.view.MotionEvent.ACTION_UP))
+        }
+        rule.waitForIdle()
+        assertEquals("a fresh indirect press", 1, sends)
+        rule.runOnUiThread { composeView().dispatchGenericMotionEvent(indirect(android.view.MotionEvent.ACTION_DOWN)) }
+        subject = "chat-2"
+        rule.waitForIdle()
+        rule.runOnUiThread { composeView().dispatchGenericMotionEvent(indirect(android.view.MotionEvent.ACTION_UP)) }
+        rule.waitForIdle()
+        assertEquals("an indirect press held across a change", 1, sends)
+    }
+
+    /** Each activation key: a fresh press fires once; held across a change of generation it fires nothing. */
+    @Test
+    fun everyActivationKeyIsGuarded() {
+        mode = ComposerMode.SEND
+        draft = "typed"
+        subject = "chat-1"
+        show()
+        val node = primaryNode()
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) }
+        rule.onNode(androidx.compose.ui.test.SemanticsMatcher("primary") { it.id == node.id }, useUnmergedTree = true).performSemanticsAction(SemanticsActions.RequestFocus)
+        rule.waitForIdle()
+        var expected = 0
+        for (code in listOf(NativeKeyEvent.KEYCODE_SPACE, NativeKeyEvent.KEYCODE_NUMPAD_ENTER, NativeKeyEvent.KEYCODE_DPAD_CENTER, NativeKeyEvent.KEYCODE_ENTER)) {
+            // Fresh, with a held repeat in between: once.
+            dispatch(key(NativeKeyEvent.ACTION_DOWN, code), key(NativeKeyEvent.ACTION_DOWN, code, repeat = 1), key(NativeKeyEvent.ACTION_UP, code))
+            rule.waitForIdle()
+            expected++
+            assertEquals("key $code: a fresh press", expected, sends)
+            // Held while the chat changes: nothing.
+            dispatch(key(NativeKeyEvent.ACTION_DOWN, code))
+            subject = "chat-$code"
+            rule.waitForIdle()
+            dispatch(key(NativeKeyEvent.ACTION_UP, code))
+            rule.waitForIdle()
+            assertEquals("key $code: held across a change", expected, sends)
+        }
+        assertEquals(node.id, primaryNode().id)
     }
 
     /**
@@ -554,7 +654,7 @@ class ComposerViewTest {
     @Test
     fun expandIsDroppedBeforeSend() {
         draft = (1..4).joinToString("\n") { "line $it" }
-        show(height = 120.dp) // the card's row gets 88 dp: one target
+        show(height = 90.dp) // the bare row gets all 90 dp before decoration: less than two 48 dp targets
         val placedExpand = rule.onAllNodes(hasContentDescription("Expand the editor"), useUnmergedTree = true).fetchSemanticsNodes().filter { it.layoutInfo.isPlaced }
         assertEquals("Expand shown without room for two targets", 0, placedExpand.size)
         val send = bounds(SEND_TAG)

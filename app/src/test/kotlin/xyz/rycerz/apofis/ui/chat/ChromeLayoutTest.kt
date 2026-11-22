@@ -36,6 +36,7 @@ import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.performScrollTo
@@ -46,6 +47,8 @@ import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.sp
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -91,11 +94,11 @@ class ChromeLayoutTest {
     fun edgeToEdge() = rule.runOnUiThread { WindowCompat.setDecorFitsSystemWindows(rule.activity.window, false) }
 
     /** Window insets in px, as the system would dispatch them. */
-    private fun insets(ime: Int = 0, left: Int = 0, right: Int = 0, top: Int = 0) {
+    private fun insets(ime: Int = 0, left: Int = 0, right: Int = 0, top: Int = 0, bottom: Int = 0) {
         rule.runOnUiThread {
             val i = WindowInsetsCompat.Builder()
                 .setInsets(WindowInsetsCompat.Type.ime(), Insets.of(0, 0, 0, ime)).setVisible(WindowInsetsCompat.Type.ime(), ime > 0)
-                .setInsets(WindowInsetsCompat.Type.navigationBars(), Insets.of(left, 0, 0, 0))
+                .setInsets(WindowInsetsCompat.Type.navigationBars(), Insets.of(left, 0, 0, bottom))
                 .setInsets(WindowInsetsCompat.Type.displayCutout(), Insets.of(0, 0, right, 0))
                 .setInsets(WindowInsetsCompat.Type.statusBars(), Insets.of(0, top, 0, 0))
                 .build()
@@ -111,6 +114,8 @@ class ChromeLayoutTest {
     private val cancelled = ArrayList<String>()
     private var drawerTaps = 0
     private var discardAsked = 0
+    private lateinit var inputMode: androidx.compose.ui.input.InputModeManager
+    private val stopped = ArrayList<String>()
     private var newChatTaps = 0
     private var shown by androidx.compose.runtime.mutableStateOf<ChatUiState?>(null) // the state on screen; set again to change it
 
@@ -139,6 +144,10 @@ class ChromeLayoutTest {
             override fun onDiscardUnsent() {
                 discardAsked++
             }
+
+            override fun onStopClick(runId: String) {
+                stopped += runId
+            }
         }
         val newChat: @Composable RowScope.() -> Unit = {
             ApofisIconButton(onClick = { newChatTaps++ }, contentDescription = "New chat") { Icon(painterResource(R.drawable.lucide_square_pen), null) }
@@ -150,6 +159,7 @@ class ChromeLayoutTest {
                 LocalLayoutDirection provides if (rtl) LayoutDirection.Rtl else LayoutDirection.Ltr,
             ) {
                 ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                    inputMode = androidx.compose.ui.platform.LocalInputModeManager.current
                     androidx.compose.foundation.layout.Box(Modifier.semantics { testTagsAsResourceId = true }) {
                         list = rememberLazyListState(initialIndex, initialOffset)
                         ChatScreen(
@@ -404,7 +414,7 @@ class ChromeLayoutTest {
         val area = bounds(hasTestTag("chat.bottom"))
         for (m in listOf(hasTestTag("composer.field"), hasTestTag("composer.send"))) {
             val r = rule.onNode(m, useUnmergedTree = true).fetchSemanticsNode().unclipped()
-            assertTrue("$case: $m at $r inside the bottom area $area, above the keyboard", r.top >= area.top - 0.5f && r.bottom <= height - ime + 0.5f)
+            assertTrue("$case: $m at $r inside the bottom area $area, above the keyboard (height $height)", r.top >= area.top - 0.5f && r.bottom <= height - ime + 0.5f)
         }
         val send = visible(hasTestTag("composer.send"))
         assertTrue("$case: Send is a whole 48 dp target: $send", send.height >= px(48f) - 0.5f && send.width >= px(48f) - 0.5f)
@@ -437,13 +447,19 @@ class ChromeLayoutTest {
     @Config(qualifiers = "w760dp-h360dp-land-xhdpi")
     fun landscapeWithTheKeyboardHidesTheBarWhenItDoesNotFit() {
         show(withDraft(chat(failed), 1), fontScale = 2f)
-        insets(top = 48, ime = 400)
+        insets(top = 48, ime = 480) // 96 dp of safe band: the bare row (48 dp) and the 66 dp bar do not fit together
         assertFalse("the bar is in the accessibility tree", barInAccessibility())
+        val announcer = announcerInfo()?.second ?: error("no announcer exported with the bar hidden")
+        val at = android.graphics.Rect().also { announcer.getBoundsInScreen(it) }
+        assertEquals("the announcer sits at the status inset, in its own slot", 48, at.top)
+        for (m in listOf(hasTestTag("composer.field"), hasTestTag("composer.send"))) {
+            assertTrue("$m below the status inset", visible(m).top >= 48f)
+        }
         assertTrue("the bar is placed", rule.onAllNodes(hasTestTag("chat.topbar"), useUnmergedTree = true).fetchSemanticsNodes().none { it.layoutInfo.isPlaced })
         screen().performTouchInput { click(androidx.compose.ui.geometry.Offset(px(40f), px(40f))) } // where the drawer button was
         rule.waitForIdle()
         assertEquals(0, drawerTaps)
-        assertComposerInsideTheBottomArea(400, "scale 2.0")
+        assertComposerInsideTheBottomArea(480, "scale 2.0")
         screen().performTouchInput { click(visible(hasTestTag("composer.send")).center) }
         screen().performTouchInput { click(visible(hasTestTag("composer.field")).center) }
         rule.waitForIdle()
@@ -489,7 +505,7 @@ class ChromeLayoutTest {
     @Config(qualifiers = "w360dp-h240dp-xhdpi")
     fun shortWindowReachesTheLastRowsCancel() {
         val queued = UserMessage("uq", "The last message, queued", false, FIXED_NOW, SendState.QUEUED, "kq")
-        show(withDraft(chat(failed.take(6) + queued), 1))
+        show(withDraft(chat(failed.take(6) + queued), 6)) // six lines: only the 64 dp share keeps the transcript
         insets(top = 48)
         rule.runOnUiThread { kotlinx.coroutines.runBlocking { list.scrollToItem(0) } }
         rule.waitForIdle()
@@ -559,17 +575,37 @@ class ChromeLayoutTest {
 
     // ---- I7: the load failure lies in the uncovered area and its Retry can be tapped ----
 
-    /** I7: with no room left for it (landscape, status bar, keyboard), no second, unreachable Retry is shown; the title's is. */
+    /** Retry nodes that are placed (the bar's copy for measuring is never placed and has no semantics). */
+    private fun placedRetries() = rule.onAllNodes(SemanticsMatcher("retry") { it.config.getOrNull(SemanticsActions.OnClick)?.label == "Try again" || it.config.getOrNull(SemanticsProperties.Text)?.any { t -> t.text == "Try again" } == true })
+        .fetchSemanticsNodes().filter { it.layoutInfo.isPlaced && it.config.contains(SemanticsActions.OnClick) }
+
+    /**
+     * I7 and I11: after a failed load with the keyboard open in landscape, the bar (and its title's retry) is hidden; the
+     * body offers a compact Retry wherever its 48 dp target fits: placed, exported by the accessibility provider and
+     * tappable. With a taller keyboard no 48 dp target fits and none is offered (none can be tapped); with the keyboard
+     * closed the bar returns with its own retry.
+     */
     @Test
     @Config(qualifiers = "w760dp-h360dp-land-xhdpi")
-    fun loadFailureWithoutRoomOffersOnlyTheTitleRetry() {
+    fun loadFailureKeepsAReachableRetry() {
         insets(top = 48, ime = 480)
         show(ChatUiState("", "", StatusLine.LOAD_FAILED, emptyList(), ComposerMode.SEND_DISABLED, ""))
-        insets(top = 48, ime = 480) // 24 dp status bar, 240 dp keyboard in a 360 dp window
-        assertEquals(0, rule.onAllNodes(hasText("Try again") and androidx.compose.ui.test.hasClickAction()).fetchSemanticsNodes().size)
-        val titleRetry = rule.onAllNodes(SemanticsMatcher("retry from the title") { it.config.getOrNull(SemanticsActions.OnClick)?.label == "Try again" })
-            .fetchSemanticsNodes()
-        assertEquals(1, titleRetry.size)
+        insets(top = 48, ime = 480) // 24 dp status, 240 dp keyboard: 96 dp of safe band, the bar hidden, 48 dp of body
+        assertFalse("the bar is shown", barInAccessibility())
+        val retry = placedRetries().single()
+        assertTrue("the compact Retry is exported to accessibility", "Try again" in accessibilityTexts())
+        assertTrue("its target ${retry.boundsInRoot} is whole and below the status inset", retry.boundsInRoot.height >= px(40f) - 0.5f && retry.boundsInRoot.top >= 48f)
+        screen().performTouchInput { click(retry.boundsInRoot.center) }
+        rule.waitForIdle()
+        assertEquals(1, retryLoads)
+        insets(top = 48, ime = 560) // 280 dp keyboard: 56 dp of safe band, the bare row takes 48; no 48 dp target fits
+        assertEquals("a Retry where no 48 dp target fits", 0, placedRetries().size)
+        insets(top = 48, ime = 0)
+        assertTrue("the bar returns", barInAccessibility())
+        val title = placedRetries().first { it.boundsInRoot.top < barBottom() }
+        screen().performTouchInput { click(title.boundsInRoot.center) }
+        rule.waitForIdle()
+        assertEquals(2, retryLoads)
     }
 
     @Test
@@ -653,5 +689,166 @@ class ChromeLayoutTest {
         val (_, hold) = announcerInfo() ?: error("no announcer exported with the editor expanded")
         assertTrue("visible with the editor expanded", hold.isVisibleToUser)
         assertEquals("Reply ended", hold.stateDescription?.toString())
+        val r = android.graphics.Rect().also { hold.getBoundsInScreen(it) }
+        assertEquals("in its root slot at the bar's bottom edge, not in the list below it", barBottom(), r.top.toFloat(), 1f)
+    }
+
+    // ---- Fix round 3: boundary cases on the real safe bounds ----
+
+    /** The bottom area's placed geometry equals the allocation computed from the measured inputs. */
+    private fun assertPlacedAsAllocated(status: Int, bottomInset: Int, notes: Int, unsent: Boolean, lines: Int) {
+        val height = screen().fetchSemanticsNode().size.height
+        val d = rule.density.bottomDims(androidx.compose.ui.text.TextStyle(fontSize = 15.sp, lineHeight = 1.3.em))
+        val barOwn = bounds(hasTestTag("chat.topbar.row")).height.toInt()
+        val s = bottomShares(height - status - bottomInset, barOwn, notes, unsent, lines >= 3, null, d) { room -> minOf(room, d.field(minOf(lines, 5))) }
+        val area = bounds(hasTestTag("chat.bottom"))
+        assertEquals("the bottom area holds the notes and the composer", (height - bottomInset - s.notes - s.composer).toFloat(), area.top, 1f)
+        val field = rule.onNode(hasTestTag("composer.field"), useUnmergedTree = true).fetchSemanticsNode().unclipped()
+        val composerTop = area.top + s.notes
+        assertEquals("the field ends at the row's bottom", composerTop + s.marginTop + s.paddingTop + s.row, field.bottom, 1f)
+        assertEquals("the field's share", s.field.toFloat(), field.height, 1f)
+        assertEquals("the transcript's share", s.transcript.toFloat(), area.top - barBottom(), 1f)
+    }
+
+    /** 200 dp, a 24 dp status inset and an 80 dp bar: the transcript has its 64 dp and the last row's Cancel is tapped. */
+    @Test
+    @Config(qualifiers = "w360dp-h200dp-xhdpi")
+    fun at200dpTheTranscriptKeepsItsShare() {
+        val queued = UserMessage("uq", "The last message, queued", false, FIXED_NOW, SendState.QUEUED, "kq")
+        show(withDraft(chat(failed.take(6) + queued), 1))
+        insets(top = 48)
+        assertTrue(barInAccessibility())
+        assertEquals("64 dp of transcript", px(64), bottomAreaTop() - barBottom(), 1f)
+        assertPlacedAsAllocated(status = 48, bottomInset = 0, notes = 0, unsent = false, lines = 1)
+        rule.runOnUiThread { kotlinx.coroutines.runBlocking { list.scrollToItem(0) } }
+        rule.waitForIdle()
+        val cancel = visible(hasContentDescription("Cancel sending"))
+        assertTrue("cancel $cancel whole between the bar ${barBottom()} and the composer ${bottomAreaTop()}", cancel.top >= barBottom() - 0.5f && cancel.bottom <= bottomAreaTop() + 0.5f && cancel.height >= px(48) - 0.5f)
+        screen().performTouchInput { click(cancel.center) }
+        rule.waitForIdle()
+        assertEquals(listOf("kq"), cancelled)
+    }
+
+    /** Put back and Discard of the visible notice row, by accessibility action (as TalkBack activates them). */
+    private fun activate(text: String) = rule.onNode(hasText(text) and androidx.compose.ui.test.hasClickAction()).performSemanticsAction(SemanticsActions.OnClick)
+
+    /** 220 dp with a 24 dp status inset, 24 dp navigation and a failed send: the whole 54 dp row; Discard by accessibility, Put back by touch. */
+    @Test
+    @Config(qualifiers = "w360dp-h220dp-xhdpi")
+    fun at220dpWithNavigationTheWholeNoticeRowShows() {
+        show(chat(failed).copy(unsent = unsent))
+        insets(top = 48, bottom = 48)
+        assertTrue(barInAccessibility())
+        val notesHeight = bottomAreaTop().let { top -> visible(hasTestTag("composer.field")).top - top }
+        assertTrue("the notice row has its 54 dp: $notesHeight", notesHeight >= px(54) - 1f)
+        val put = button("Put back")
+        val discard = button("Discard")
+        assertTrue("both exported", accessibilityTexts().containsAll(listOf("Put back", "Discard")))
+        assertTrue(put.top >= barBottom() && discard.top >= barBottom())
+        activate("Discard")
+        rule.waitForIdle()
+        assertEquals(1, discardAsked)
+        screen().performTouchInput { click(put.center) }
+        rule.waitForIdle()
+        assertEquals(unsent.text, rule.onNode(hasTestTag("composer.field")).fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+    }
+
+    /** The same, Put back by accessibility and Discard by touch. */
+    @Test
+    @Config(qualifiers = "w360dp-h220dp-xhdpi")
+    fun at220dpWithNavigationPutBackByAccessibility() {
+        show(chat(failed).copy(unsent = unsent))
+        insets(top = 48, bottom = 48)
+        screen().performTouchInput { click(button("Discard").center) }
+        rule.waitForIdle()
+        assertEquals(1, discardAsked)
+        activate("Put back")
+        rule.waitForIdle()
+        assertEquals(unsent.text, rule.onNode(hasTestTag("composer.field")).fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+    }
+
+    /** An unsent notice and a second note: the guaranteed row is the unsent one; the note follows when there is room. */
+    @Test
+    @Config(qualifiers = "w360dp-h220dp-xhdpi")
+    fun anUnsentNoticeWithASecondNoteKeepsItsRow() {
+        show(chat(failed).copy(unsent = unsent, composerNote = ComposerNote.CANCEL_TOO_LATE))
+        insets(top = 48, bottom = 48)
+        val put = button("Put back")
+        assertTrue("Put back $put whole in the guaranteed row", put.top >= bottomAreaTop() - 0.5f)
+        screen().performTouchInput { click(put.center) }
+        rule.waitForIdle()
+        assertEquals(unsent.text, rule.onNode(hasTestTag("composer.field")).fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+    }
+
+    /** The editor expanded with a note: the note keeps its natural height above the card. */
+    @Test
+    fun theExpandedEditorKeepsTheNotes() {
+        show(withDraft(chat(failed), 3).copy(composerNote = ComposerNote.REMOVED_MAY_HAVE_SENT))
+        rule.onNode(hasContentDescription("Expand the editor")).performClick()
+        rule.waitForIdle()
+        rule.onNode(hasContentDescription("Collapse the editor")).assertExists()
+        val note = visible(hasText("Removed from this phone", substring = true))
+        assertTrue("the note is shown whole: $note", note.height >= px(16) && note.bottom <= visible(hasTestTag("composer.field")).top)
+        assertTrue("and exported", accessibilityTexts().any { it.startsWith("Removed from this phone") })
+    }
+
+    /** A running reply, the bar hidden (landscape, keyboard): Stop is below the status inset and takes a real tap. */
+    @Test
+    @Config(qualifiers = "w760dp-h360dp-land-xhdpi")
+    fun stopWorksWithTheBarHidden() {
+        val user = UserMessage("u1", "Hello", false, FIXED_NOW, runId = "A")
+        val live = LiveReply("A", "running", "Working on it", emptyList(), null, Connection.LIVE)
+        show(chat(listOf(user), StatusLine.WORKING, live))
+        insets(top = 48, ime = 480)
+        assertFalse(barInAccessibility())
+        val stop = visible(hasTestTag("composer.stop"))
+        assertTrue("Stop $stop whole below the status inset and above the keyboard", stop.top >= 48f && stop.height >= px(48) - 0.5f && stop.bottom <= screen().fetchSemanticsNode().size.height - 480 + 0.5f)
+        screen().performTouchInput { click(stop.center) }
+        rule.waitForIdle()
+        assertEquals(listOf("A"), stopped)
+    }
+
+    /** I10: New chat focused by keyboard, then the bar hides: Enter creates no chat; the restored bar works and took no focus. */
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test
+    @Config(qualifiers = "w760dp-h360dp-land-xhdpi")
+    fun aHiddenBarTakesNoKeys() {
+        show(withDraft(chat(failed), 1))
+        insets(top = 48)
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) } // a hardware keyboard
+        rule.onNode(hasContentDescription("New chat")).performSemanticsAction(SemanticsActions.RequestFocus)
+        rule.waitForIdle()
+        assertTrue("New chat has keyboard focus", rule.onNode(hasContentDescription("New chat")).fetchSemanticsNode().config[SemanticsProperties.Focused])
+        insets(top = 48, ime = 480) // the bar hides
+        assertFalse(barInAccessibility())
+        rule.runOnUiThread {
+            val compose = (rule.activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as ViewGroup).getChildAt(0)
+            compose.dispatchKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_ENTER))
+            compose.dispatchKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_ENTER))
+        }
+        rule.waitForIdle()
+        assertEquals("a hidden New chat took Enter", 0, newChatTaps)
+        insets(top = 48)
+        assertTrue(barInAccessibility())
+        assertFalse("the returning bar took focus", rule.onNode(hasContentDescription("New chat")).fetchSemanticsNode().config.getOrNull(SemanticsProperties.Focused) == true)
+        screen().performTouchInput { click(visible(hasContentDescription("New chat")).center) }
+        rule.waitForIdle()
+        assertEquals(1, newChatTaps)
+    }
+
+    /** The scroll-to-bottom button is placed only where its 48 dp target fits in the uncovered transcript band. */
+    @Test
+    @Config(qualifiers = "w760dp-h360dp-land-xhdpi")
+    fun theScrollButtonNeedsRoomForItsTarget() {
+        show(withDraft(chat(failed), 1))
+        insets(top = 48)
+        rule.mainClock.autoAdvance = false // the button hides 2 s after scrolling: look while it is shown
+        rule.onNode(androidx.compose.ui.test.hasScrollToIndexAction()).performTouchInput { swipeDown(startY = top + height / 4, endY = bottom - height / 4) }
+        repeat(10) { rule.mainClock.advanceTimeByFrame() }
+        fun placedButtons() = rule.onAllNodes(hasContentDescription("Scroll to the latest message"), useUnmergedTree = true).fetchSemanticsNodes().filter { it.layoutInfo.isPlaced }
+        assertEquals("shown with room", 1, placedButtons().size)
+        insets(top = 48, ime = 560) // 56 dp of safe band: the bare row leaves the transcript 8 dp
+        repeat(2) { rule.mainClock.advanceTimeByFrame() }
+        assertEquals("placed without room for its target", 0, placedButtons().size)
     }
 }

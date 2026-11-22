@@ -52,6 +52,14 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.Measurable
+import androidx.compose.ui.layout.MeasureScope
+import androidx.compose.ui.layout.Placeable
+import androidx.compose.ui.node.ModifierNodeElement
+import androidx.compose.ui.input.indirect.IndirectPointerEvent
+import androidx.compose.ui.input.indirect.IndirectPointerEventType
+import androidx.compose.ui.input.indirect.IndirectPointerInputModifierNode
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -107,19 +115,157 @@ internal fun enterKey(enterToSend: Boolean, enter: Boolean, down: Boolean, repea
     else -> EnterKey.CONSUME
 }
 
+/** What the composer's layout needs from its composition (read during measure). */
+internal class ComposerLook(
+    val dims: BottomDims,
+    val expanded: Boolean,
+    val wantsExpand: Boolean, // Expand is composed (three lines, or expanded)
+    val progress: Animatable<Float, *>,
+    val lines: () -> Int,
+    val expandedHeight: Dp,
+)
+
 /**
- * A frosted card in one row: the text, then a button column with the expand button at the top (once the text is three
- * lines tall, and only when the column has room for two 48 dp targets) and the send button (with Stop before it while
- * steering) at the bottom.
- *
- * The composer takes at most its constraints' height (its room) and reports the height it occupies: collapsed, 1 to 5
- * lines (the text scrolls inside the field), expanded the whole room (or [expandedHeight] for the field), growing over
- * [Motion.COMPOSER_EXPAND] ms; collapsing snaps. In a short room the card's margins and padding shrink first, so Send
- * keeps its 48 dp; see [BottomDims].
+ * The composer's parts, in this order: the card's glass, the field, the expand button (an empty box when not shown)
+ * and the action row (Stop before Steer while steering, then the primary button). They are laid out by [placeComposer]
+ * with the numbers of [bottomShares]: by [Composer] on its own, or by the chat screen's bottom area together with the
+ * notes, so one allocation decides every height.
  *
  * The text is the holder's [draft]; only user edits call [onDraftChange]. [onSend] asks the holder and returns whether
  * it took the draft; only then the composer collapses. The button, the IME action (only with [enterToSend]) and
  * hardware Enter (see [enterKey]) all go through it. [busy]: see [primaryEnabled]; the field also takes no edits then.
+ * [subject]: what the primary action acts on (the run for Stop and Steer, the chat for Send); see [PrimaryButton].
+ */
+@Composable
+internal fun ComposerParts(
+    draft: String,
+    mode: ComposerMode,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Boolean,
+    onStop: () -> Unit,
+    busy: Boolean = false,
+    enterToSend: Boolean = false,
+    expanded: Boolean = false,
+    onExpandedChange: (Boolean) -> Unit = {},
+    expandedHeight: Dp = Dp.Unspecified,
+    backdrop: BackdropState? = null,
+    subject: Any? = null,
+    transcript: Boolean = true,
+): ComposerLook {
+    if (BuildConfig.DEBUG) SideEffect { ChromeProbe.composerBackdropId = System.identityHashCode(backdrop) }
+    val shape = RoundedCornerShape(20.dp)
+    val scheme = MaterialTheme.colorScheme
+    val colors = ApofisTheme.colors
+    val style = MaterialTheme.typography.bodyLarge.copy(color = scheme.onSurface)
+    val density = LocalDensity.current
+    val dims = remember(density, style, transcript) { density.bottomDims(style, transcript) }
+    val progress = remember { Animatable(if (expanded) 1f else 0f) } // 0 collapsed, 1 expanded
+    LaunchedEffect(expanded) { if (expanded) progress.animateTo(1f, tween(Motion.COMPOSER_EXPAND, easing = EaseOutCubic)) else progress.snapTo(0f) }
+    val submit = { if (onSend()) onExpandedChange(false) }
+    var lines by remember { mutableIntStateOf(1) }
+    val manyLines by remember { derivedStateOf { showsExpand(lines, expanded = false) } }
+    val pad = with(density) { (dims.fieldPadding / 2f).toDp() }
+
+    val fillOnly = backdrop?.layer == null || !ApofisTheme.blur
+    // Without blur the glass shows the content under it: a page backplate keeps text and icons at their contrast.
+    val backplate = if (fillOnly) Modifier.background(scheme.surface, shape) else Modifier
+    Box(Modifier.then(backplate).frostedGlass(backdrop, shape, colors.glassFill, colors.glassBorder)) // the card
+    BasicTextField(
+        draft,
+        onDraftChange,
+        Modifier
+            .fillMaxWidth()
+            .semantics { traversalIndex = -1f } // read before the buttons
+            .testTag(FIELD_TAG)
+            .onPreviewKeyEvent { e ->
+                val enter = e.key == Key.Enter || e.key == Key.NumPadEnter
+                when (enterKey(enterToSend, enter, e.type == KeyEventType.KeyDown, e.nativeKeyEvent.repeatCount, e.isShiftPressed)) {
+                    EnterKey.FIELD -> false
+                    EnterKey.SEND -> true.also { submit() }
+                    EnterKey.CONSUME -> true
+                }
+            },
+        readOnly = busy, // it shows the text being stored, which no keystroke may change
+        textStyle = style,
+        keyboardOptions = KeyboardOptions(imeAction = if (enterToSend) ImeAction.Send else ImeAction.Default),
+        keyboardActions = KeyboardActions(onSend = { if (enterToSend) submit() }),
+        maxLines = if (expanded) Int.MAX_VALUE else 5,
+        onTextLayout = { lines = it.lineCount },
+        cursorBrush = SolidColor(scheme.primary),
+        decorationBox = { inner ->
+            Box(Modifier.padding(start = 4.dp, top = pad, bottom = pad)) {
+                if (draft.isEmpty()) Text(stringResource(R.string.chat_message_hint), style = MaterialTheme.typography.bodyLarge, color = colors.muted)
+                inner()
+            }
+        },
+    )
+    val wantsExpand = expanded || manyLines
+    Box {
+        if (wantsExpand) {
+            ApofisIconButton(
+                onClick = { onExpandedChange(!expanded) },
+                contentDescription = stringResource(if (expanded) R.string.composer_collapse else R.string.composer_expand),
+                visualSize = 24.dp,
+            ) {
+                Icon(painterResource(if (expanded) R.drawable.lucide_minimize_2 else R.drawable.lucide_maximize_2), null, Modifier.size(16.dp), tint = colors.expandIcon)
+            }
+        }
+    }
+    Row {
+        if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
+        PrimaryButton(mode, busy, subject, submit, onStop)
+    }
+    return ComposerLook(dims, expanded, wantsExpand, progress, { lines }, expandedHeight)
+}
+
+/** The composer's four measurables (see [ComposerParts]), measured with [shares] and placed from [y]. */
+internal class ComposerPlacement(private val glass: Placeable, private val field: Placeable, private val expand: Placeable?, private val buttons: Placeable, private val s: BottomShares, private val side: Int, private val marginX: Int) {
+    fun Placeable.PlacementScope.place(width: Int, y: Int) {
+        glass.placeRelative(marginX, y + s.marginTop)
+        val top = y + s.marginTop + s.paddingTop
+        field.placeRelative(side, top + s.row - field.height)
+        expand?.placeRelative(width - side - expand.width, top)
+        buttons.placeRelative(width - side - buttons.width, top + s.row - buttons.height)
+    }
+}
+
+/**
+ * Lays out the composer's parts in one [bottomShares] allocation: the bar, notes and transcript inputs come from the
+ * caller ([bar] own height, [notes] natural height, [unsent]); [available] is the safe band. Returns the shares and the
+ * placement; every part is measured with exactly its share (the field once, through the allocation).
+ */
+internal fun MeasureScope.measureComposer(
+    parts: List<Measurable>,
+    look: ComposerLook,
+    width: Int,
+    available: Int,
+    bar: Int = 0,
+    notes: Int = 0,
+    unsent: Boolean = false,
+): Pair<BottomShares, ComposerPlacement> {
+    val d = look.dims
+    val marginX = MARGIN_X.roundToPx()
+    val side = marginX + CARD_PADDING.roundToPx()
+    val inner = (width - 2 * side).coerceAtLeast(0)
+    val buttons = parts[3].measure(Constraints(0, inner, 0, d.target))
+    val expandBox = parts[2].measure(Constraints(0, inner, 0, d.target))
+    val fieldWidth = (inner - maxOf(expandBox.width, buttons.width)).coerceAtLeast(0)
+    var field: Placeable? = null
+    val expansion = if (look.expanded) Expansion(look.progress.value, look.lines(), if (look.expandedHeight.isSpecified) look.expandedHeight.roundToPx() else Int.MAX_VALUE) else null
+    val s = bottomShares(available, bar, notes, unsent, look.wantsExpand, expansion, d) { room ->
+        parts[1].measure(Constraints(fieldWidth, fieldWidth, 0, room)).also { field = it }.height // 1 to 5 lines (maxLines), scrolling inside
+    }
+    val f = field ?: parts[1].measure(Constraints.fixed(fieldWidth, s.field))
+    val glass = parts[0].measure(Constraints.fixed((width - 2 * marginX).coerceAtLeast(0), s.card))
+    val expand = expandBox.takeIf { s.actions >= 2 * d.target && it.height > 0 } // dropped before Send when both do not fit
+    return s to ComposerPlacement(glass, f, expand, buttons, s, side, marginX)
+}
+
+/**
+ * The composer on its own (previews, goldens, component tests): the parts of [ComposerParts] in one [bottomShares]
+ * allocation with no bar, notes or transcript; it takes at most its constraints' height and reports what it occupies.
+ * Collapsed, the text shows 1 to 5 lines (it scrolls inside the field); expanded, the field takes the room (or
+ * [expandedHeight]), growing over [Motion.COMPOSER_EXPAND] ms; collapsing snaps.
  */
 @Composable
 internal fun Composer(
@@ -135,107 +281,16 @@ internal fun Composer(
     onExpandedChange: (Boolean) -> Unit = {},
     expandedHeight: Dp = Dp.Unspecified,
     backdrop: BackdropState? = null,
+    subject: Any? = null,
 ) {
-    if (BuildConfig.DEBUG) SideEffect { ChromeProbe.composerBackdropId = System.identityHashCode(backdrop) }
-    val shape = RoundedCornerShape(20.dp)
-    val scheme = MaterialTheme.colorScheme
-    val colors = ApofisTheme.colors
-    val style = MaterialTheme.typography.bodyLarge.copy(color = scheme.onSurface)
-    val density = LocalDensity.current
-    val dims = remember(density, style) { density.bottomDims(style) }
-    val progress = remember { Animatable(if (expanded) 1f else 0f) } // 0 collapsed, 1 expanded
-    LaunchedEffect(expanded) { if (expanded) progress.animateTo(1f, tween(Motion.COMPOSER_EXPAND, easing = EaseOutCubic)) else progress.snapTo(0f) }
-    val submit = { if (onSend()) onExpandedChange(false) }
-    var lines by remember { mutableIntStateOf(1) }
-    val manyLines by remember { derivedStateOf { showsExpand(lines, expanded = false) } }
-    val pad = with(density) { (dims.fieldPadding / 2f).toDp() }
-
-    val fillOnly = backdrop?.layer == null || !ApofisTheme.blur
-    // Without blur the glass shows the content under it: a page backplate keeps text and icons at their contrast.
-    val backplate = if (fillOnly) Modifier.background(scheme.surface, shape) else Modifier
+    var look: ComposerLook? = null
     Layout(
-        content = {
-            Box(Modifier.then(backplate).frostedGlass(backdrop, shape, colors.glassFill, colors.glassBorder)) // the card
-            BasicTextField(
-                draft,
-                onDraftChange,
-                Modifier
-                    .fillMaxWidth()
-                    .semantics { traversalIndex = -1f } // read before the buttons
-                    .testTag(FIELD_TAG)
-                    .onPreviewKeyEvent { e ->
-                        val enter = e.key == Key.Enter || e.key == Key.NumPadEnter
-                        when (enterKey(enterToSend, enter, e.type == KeyEventType.KeyDown, e.nativeKeyEvent.repeatCount, e.isShiftPressed)) {
-                            EnterKey.FIELD -> false
-                            EnterKey.SEND -> true.also { submit() }
-                            EnterKey.CONSUME -> true
-                        }
-                    },
-                readOnly = busy, // it shows the text being stored, which no keystroke may change
-                textStyle = style,
-                keyboardOptions = KeyboardOptions(imeAction = if (enterToSend) ImeAction.Send else ImeAction.Default),
-                keyboardActions = KeyboardActions(onSend = { if (enterToSend) submit() }),
-                maxLines = if (expanded) Int.MAX_VALUE else 5,
-                onTextLayout = { lines = it.lineCount },
-                cursorBrush = SolidColor(scheme.primary),
-                decorationBox = { inner ->
-                    Box(Modifier.padding(start = 4.dp, top = pad, bottom = pad)) {
-                        if (draft.isEmpty()) Text(stringResource(R.string.chat_message_hint), style = MaterialTheme.typography.bodyLarge, color = colors.muted)
-                        inner()
-                    }
-                },
-            )
-            Box {
-                if (expanded || manyLines) {
-                    ApofisIconButton(
-                        onClick = { onExpandedChange(!expanded) },
-                        contentDescription = stringResource(if (expanded) R.string.composer_collapse else R.string.composer_expand),
-                        visualSize = 24.dp,
-                    ) {
-                        Icon(painterResource(if (expanded) R.drawable.lucide_minimize_2 else R.drawable.lucide_maximize_2), null, Modifier.size(16.dp), tint = colors.expandIcon)
-                    }
-                }
-            }
-            Row {
-                if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
-                PrimaryButton(mode, busy, submit, onStop)
-            }
-        },
+        content = { look = ComposerParts(draft, mode, onDraftChange, onSend, onStop, busy, enterToSend, expanded, onExpandedChange, expandedHeight, backdrop, subject, transcript = false) },
         modifier = modifier.fillMaxWidth().semantics { isTraversalGroup = true },
     ) { measurables, constraints ->
-        val width = constraints.maxWidth
-        val room = if (constraints.hasBoundedHeight) constraints.maxHeight else Int.MAX_VALUE / 2
-        // Vertical margins and padding for this room: they shrink first (padding last), so the row keeps its height.
-        val insets = if (room >= dims.row(1) + dims.cardInsets) dims.cardInsets else (room - dims.row(1)).coerceAtLeast(0)
-        val padding = minOf(insets / 2, CARD_PADDING.roundToPx())
-        val margin = insets / 2 - padding
-        val rowRoom = (room - 2 * (margin + padding)).coerceAtLeast(0)
-        val side = MARGIN_X.roundToPx() + CARD_PADDING.roundToPx()
-        val inner = (width - 2 * side).coerceAtLeast(0)
-        val loose = Constraints(0, inner, 0, rowRoom)
-        val buttons = measurables[3].measure(loose)
-        val expand = measurables[2].measure(loose)
-        val withExpand = expand.height > 0 && dims.actions(rowRoom, wantsExpand = true) >= buttons.height + expand.height
-        val fieldWidth = (inner - maxOf(expand.width, buttons.width)).coerceAtLeast(0)
-        val field = if (!expanded) {
-            measurables[1].measure(Constraints(fieldWidth, fieldWidth, 0, rowRoom)) // 1 to 5 lines (maxLines), scrolling inside
-        } else {
-            val full = if (expandedHeight.isSpecified) minOf(expandedHeight.roundToPx(), rowRoom) else rowRoom
-            val from = minOf(dims.field(lines.coerceIn(1, 5)), full) // the collapsed field for the current text
-            val h = lerp(from, full, progress.value)
-            measurables[1].measure(Constraints.fixed(fieldWidth, h))
-        }
-        val row = minOf(rowRoom, maxOf(field.height, buttons.height + if (withExpand) expand.height else 0))
-        val card = row + 2 * padding
-        val height = card + 2 * margin
-        val glass = measurables[0].measure(Constraints.fixed((width - 2 * MARGIN_X.roundToPx()).coerceAtLeast(0), card))
-        layout(width, height) {
-            glass.placeRelative(MARGIN_X.roundToPx(), margin)
-            val top = margin + padding
-            field.placeRelative(side, top + row - field.height)
-            if (withExpand) expand.placeRelative(width - side - expand.width, top)
-            buttons.placeRelative(width - side - buttons.width, top + row - buttons.height)
-        }
+        val available = if (constraints.hasBoundedHeight) constraints.maxHeight else 1_000_000
+        val (s, placement) = measureComposer(measurables, look!!, constraints.maxWidth, available)
+        layout(constraints.maxWidth, s.composer) { with(placement) { place(constraints.maxWidth, 0) } }
     }
 }
 
@@ -243,44 +298,57 @@ private val MARGIN_X = 12.dp
 
 /**
  * The primary button: Send, Steer or Stop, one stable control (one focus target, one labelled node) whatever the mode.
- * A click counts only if its press began while the same action was shown: the action is recorded when the pointer goes
- * down or an activation key is pressed, and compared at the click (an accessibility action, with no press of its own,
- * is judged when it arrives). A press held while the action changes fires nothing.
+ * Each shown action and its [subject] (the run for Stop and Steer, the chat for Send) is a new generation. A physical
+ * activation (a pointer, an activation key, an indirect pointer) counts only when its press began in the generation
+ * still shown; an accessibility click, which has no press, runs the action shown when it arrives.
  */
 @Composable
-private fun PrimaryButton(mode: ComposerMode, busy: Boolean, submit: () -> Unit, onStop: () -> Unit) {
+private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, submit: () -> Unit, onStop: () -> Unit) {
     val action = if (mode == ComposerMode.SEND_DISABLED) ComposerMode.SEND else mode
-    val shown = rememberUpdatedState(action)
+    val counter = remember { intArrayOf(0) }
+    val generation = remember(action, subject) { ++counter[0] }
+    val shown = rememberUpdatedState(generation)
     val press = remember { ActionPress() }
     val stop = mode == ComposerMode.STOP
+    val enabled = primaryEnabled(mode, busy)
+    val run = if (stop) onStop else submit
+    val labelId = when (mode) {
+        ComposerMode.STEER -> R.string.chat_steer
+        ComposerMode.STOP -> R.string.chat_stop
+        else -> R.string.chat_send
+    }
+    val label = stringResource(labelId)
     RoundButton(
         if (stop) R.drawable.lucide_square else R.drawable.lucide_arrow_up,
-        when (mode) {
-            ComposerMode.STEER -> R.string.chat_steer
-            ComposerMode.STOP -> R.string.chat_stop
-            else -> R.string.chat_send
-        },
-        enabled = primaryEnabled(mode, busy),
+        labelId,
+        enabled = enabled,
         tag = if (stop) STOP_TAG else SEND_TAG,
-        modifier = Modifier.pressStart(press) { shown.value },
-        onClick = { if (press.accepts(action)) (if (action == ComposerMode.STOP) onStop else submit)() },
+        modifier = Modifier
+            .pressStart(press) { shown.value }
+            .then(IndirectPressElement(press) { shown.value })
+            // The accessibility click: no press of its own, so it runs what is shown now.
+            .then(if (enabled) Modifier.semantics { onClick(label) { run(); true } } else Modifier),
+        onClick = { if (press.accepts(generation)) run() }, // every physical activation
     )
 }
 
-/** The primary button's presses: the action shown when the pointer went down and when each activation key went down. */
+/** The primary button's presses: the generation shown when each began (pointer, activation key, indirect pointer). */
 private class ActionPress {
-    var pointer: ComposerMode? = null
+    var pointer: Int? = null
     var pointerReleasing = false // the release of that gesture is being dispatched
-    val keys = HashMap<Key, ComposerMode>()
-    var keyReleased: ComposerMode? = null // the action recorded for the key whose release is being dispatched
+    val keys = HashMap<Key, Int>()
+    var keyReleased: Int? = null // the generation recorded for the key whose release is being dispatched
     var keyReleasing = false
+    var indirect: Int? = null
+    var indirectReleasing = false
 
-    /** Called by the click with the action it would run: consumes the press it came from. */
-    fun accepts(now: ComposerMode): Boolean {
+    /** Called by the physical click with the generation it would act in: consumes the press it came from. */
+    fun accepts(now: Int): Boolean {
         val begun = when {
-            pointerReleasing -> pointer.also { pointer = null; pointerReleasing = false } ?: return false
-            keyReleasing -> keyReleased.also { keyReleased = null; keyReleasing = false } ?: return false
-            else -> now // no press of its own (an accessibility action)
+            pointerReleasing -> pointer.also { pointer = null; pointerReleasing = false }
+            keyReleasing -> keyReleased.also { keyReleased = null; keyReleasing = false }
+            indirectReleasing -> indirect.also { indirect = null; indirectReleasing = false }
+            else -> null // a physical click without an observed press: never counted
         }
         return begun == now
     }
@@ -288,8 +356,8 @@ private class ActionPress {
 
 private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
 
-/** Records the shown action at each press, before the click handling sees the press. */
-private fun Modifier.pressStart(press: ActionPress, shown: () -> ComposerMode): Modifier = this
+/** Records the shown generation at each pointer and activation-key press, before the click handling sees it. */
+private fun Modifier.pressStart(press: ActionPress, shown: () -> Int): Modifier = this
     .pointerInput(press) {
         awaitEachGesture {
             try {
@@ -326,6 +394,38 @@ private fun Modifier.pressStart(press: ActionPress, shown: () -> ComposerMode): 
         }
         false
     }
+
+/** Records indirect pointer presses (touch navigation devices), which the clickable turns into clicks without pointerInput. */
+private data class IndirectPressElement(val press: ActionPress, val shown: () -> Int) : ModifierNodeElement<IndirectPressNode>() {
+    override fun create() = IndirectPressNode(press, shown)
+
+    override fun update(node: IndirectPressNode) {
+        node.press = press
+        node.shown = shown
+    }
+
+    override fun equals(other: Any?) = other is IndirectPressElement && other.press === press
+
+    override fun hashCode() = System.identityHashCode(press)
+}
+
+private class IndirectPressNode(var press: ActionPress, var shown: () -> Int) : Modifier.Node(), IndirectPointerInputModifierNode {
+    override fun onIndirectPointerEvent(event: IndirectPointerEvent, pass: PointerEventPass) {
+        when {
+            pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Press -> press.indirect = shown()
+            pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Release -> press.indirectReleasing = true
+            pass == PointerEventPass.Final && event.type == IndirectPointerEventType.Release -> {
+                press.indirect = null
+                press.indirectReleasing = false
+            }
+        }
+    }
+
+    override fun onCancelIndirectPointerInput() {
+        press.indirect = null
+        press.indirectReleasing = false
+    }
+}
 
 /** A 32 dp circle with an 18 dp glyph inside a 48 dp touch target; the glyph swaps with a scale and fade. */
 @Composable
