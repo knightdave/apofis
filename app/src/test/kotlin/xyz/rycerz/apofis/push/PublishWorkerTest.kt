@@ -332,4 +332,51 @@ class PublishWorkerTest {
         assertEquals(ListenableWorker.Result.success(), run(local = false))
         assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
     }
+
+    // Final check fixes.
+
+    @Test
+    fun aRevocationDuringRefreshDoesNotCrash() = runTest {
+        var armed = false
+        // The refresh reads the record's endpoint; right after that read, a revocation removes it (and the record).
+        val racing = object : android.content.SharedPreferences by prefs {
+            override fun getString(key: String, defValue: String?): String? {
+                val value = prefs.getString(key, defValue)
+                if (armed && key == Keys.ENDPOINT) {
+                    armed = false
+                    assertTrue(prefs.edit().remove(Keys.ENDPOINT).remove(Keys.RECORD).commit())
+                }
+                return value
+            }
+        }
+        val r = PushRegistrar(ctx, racing, { current }, { 0L }, { now }, backgroundScope, TestPolicy(), flaky).also { ctx.registrar = it }
+        r.enableNow()
+        assertTrue(prefs.edit().putString(Keys.ENDPOINT_NEW, VALID).putString(Keys.ENDPOINT_NEW_TOKEN, registrationOf(prefs)?.token).commit())
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        armed = true
+        r.refresh() // on the receiver's thread, without the registrar mutex: no exception
+        assertTrue(r.ui.value.state in setOf(PushState.On(NTFY_PACKAGE), PushState.ServerError(NTFY_PACKAGE), PushState.Registering))
+    }
+
+    @Test
+    fun aConnectionThatCannotBeBuiltIsARetry() = runTest {
+        val r = registrar()
+        r.on()
+        val broken = PushRegistrar(ctx, prefs, { throw IllegalStateException("closed") }, { 0L }, { now }, backgroundScope, TestPolicy(), flaky)
+            .also { ctx.registrar = it }
+        assertEquals(ListenableWorker.Result.retry(), run(local = true))
+        assertEquals(ListenableWorker.Result.retry(), run(local = false))
+        assertTrue(broken.ui.value.state is PushState)
+    }
+
+    @Test
+    fun aLeftoverFlagAfterOffIsNoWork() = runTest {
+        val r = registrar()
+        r.on()
+        r.disable()
+        assertTrue(prefs.edit().putBoolean(Keys.SERVER_UNDONE, true).commit()) // left over
+        current = null
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
+    }
 }

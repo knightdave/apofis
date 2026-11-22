@@ -271,9 +271,10 @@ class PushRegistrar(
                 live = { connectionGeneration() == start && epoch() == startEpoch }
                 var error: Exception? = null
                 var stale = false
-                val a = api()?.let { a -> Guarded(a, live) }
+                var a: RecordApi? = null
                 try {
                     flushOrThrow()
+                    a = api()?.let { api -> Guarded(api, live) } // building the connection may throw: then a failure, not a crash
                     block(a)
                 } catch (_: Stale) {
                     stale = true
@@ -324,8 +325,8 @@ class PushRegistrar(
 
     private fun confirmed() = confirmedEndpoint(prefs, policy.distributors(context), epoch())
 
-    private fun needsServer() = prefs.contains(Keys.PENDING_ID) || prefs.contains(Keys.SERVER_UNDONE) ||
-        (enabled() && confirmed().let { it != null && (it != prefs.getString(Keys.ENDPOINT, null) || unproven()) })
+    private fun needsServer() = prefs.contains(Keys.PENDING_ID) || (enabled() && (prefs.contains(Keys.SERVER_UNDONE) ||
+        confirmed().let { it != null && (it != prefs.getString(Keys.ENDPOINT, null) || unproven()) }))
 
     /** A record without the server's proof. */
     private fun unproven() = prefs.contains(Keys.RECORD) && !prefs.contains(Keys.VERIFIED_AT)
@@ -501,6 +502,10 @@ class PushRegistrar(
     private fun compute(): PushUi {
         val distributor = registrationOf(prefs)?.distributor?.takeIf { it in policy.distributors(context) }
             ?: allowed().firstOrNull() ?: NTFY_PACKAGE
+        // Read once: compute also runs on the receiver's thread, where a revocation may remove it meanwhile.
+        val endpoint = prefs.getString(Keys.ENDPOINT, null)
+        val matching = endpoint != null && prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && confirmed() == endpoint
+        val accepted = endpoint != null && validateEndpoint(endpoint, policy.origins(context), policy.loopbackOrigin(context)) != null
         val s = when {
             PushStore.isDirty(prefs) || prefs.contains(Keys.REVOKE) -> PushState.Registering // not on disk, or not yet handed to the distributor
             !enabled() -> if (allowed().isEmpty()) PushState.NoDistributor else PushState.Off
@@ -509,17 +514,13 @@ class PushRegistrar(
             unproven() -> PushState.ServerError(distributor) // the server last said this record is not usable
             // The record holds the endpoint the distributor confirmed for the current token, the server proved it, and the
             // running policy accepts it. A transport failure does not change a proven On.
-            matchingRecord() && accepted() -> PushState.On(distributor)
-            matchingRecord() -> PushState.ServerError(distributor) // the running policy refuses the stored endpoint
+            matching && accepted -> PushState.On(distributor)
+            matching -> PushState.ServerError(distributor) // the running policy refuses the stored endpoint
             else -> PushState.Registering
         }
         return PushUi(s)
     }
 
-    private fun matchingRecord() = prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) &&
-        confirmed().let { it != null && it == prefs.getString(Keys.ENDPOINT, null) }
-
-    private fun accepted() = validateEndpoint(prefs.getString(Keys.ENDPOINT, null)!!, policy.origins(context), policy.loopbackOrigin(context)) != null
 
     // Server and transport text can carry the endpoint or ids: only the class name is ever logged.
     private fun logFailure(e: Throwable) = Log.w(TAG, "Push step failed: ${e.javaClass.name}")
