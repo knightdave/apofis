@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.ui.drawer
 
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.theme.PulsingDot
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -274,12 +275,9 @@ internal fun ChatRow(row: DrawerRow.Chat, onClick: () -> Unit, onLongPress: () -
                     .semantics { contentDescription = label },
             )
         } else if (row.running) {
-            Icon(
-                painterResource(R.drawable.lucide_loader_circle),
-                stringResource(R.string.drawer_working),
-                Modifier.padding(start = 8.dp).size(16.dp),
-                tint = scheme.primary,
-            )
+            val label = stringResource(R.string.drawer_working)
+            // The panel stays composed while closed: the dot runs only while the drawer shows it.
+            PulsingDot(scheme.primary, Modifier.padding(start = 8.dp, end = 4.dp).semantics { contentDescription = label }, active = LocalDrawerExposed.current)
         }
     }
 }

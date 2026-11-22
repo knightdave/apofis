@@ -80,6 +80,7 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.Haptics
 import xyz.rycerz.apofis.ui.theme.LocalHaptics
+import xyz.rycerz.apofis.ui.theme.PulseProbe
 
 /**
  * The push drawer driven by touch, keys, Back and accessibility on the virtual clock (input moves it in 16 ms events).
@@ -124,7 +125,7 @@ class DrawerUiTest {
     private val rows = listOf(
         DrawerRow.Header(GroupLabel.Today),
         DrawerRow.Chat("apofis-1", "Largest files", selected = true, running = false, needsInput = false),
-        DrawerRow.Chat("apofis-2", "Garden beds", selected = false, running = true, needsInput = false),
+        DrawerRow.Chat("apofis-2", "Garden beds", selected = false, running = false, needsInput = false),
     )
 
     private fun drawerOf(rows: List<DrawerRow>, actions: DrawerActions = object : DrawerActions {}): @Composable () -> Unit = {
@@ -550,5 +551,20 @@ class DrawerUiTest {
         rule.waitForIdle()
         assertOpen() // restored where it rested, never part way
         assertEquals(0, rule.onAllNodes(hasTestTag("chat.title")).fetchSemanticsNodes().size)
+    }
+
+    /** The running chat's pulsing dot schedules no frame while the panel is closed and moves once it is shown. */
+    @Test
+    fun runningDotRunsOnlyWhileShown() {
+        rule.mainClock.autoAdvance = false
+        show(drawer = drawerOf(listOf(DrawerRow.Chat("apofis-2", "Garden beds", selected = false, running = true, needsInput = false))))
+        repeat(5) { rule.mainClock.advanceTimeByFrame() }
+        val closed = PulseProbe.frames
+        repeat(30) { rule.mainClock.advanceTimeByFrame() }
+        assertEquals("the closed panel's dot scheduled frames", closed, PulseProbe.frames)
+        rule.runOnIdle { scope.launch { state.open() } }
+        repeat(30) { rule.mainClock.advanceTimeByFrame() }
+        assertTrue("the shown dot does not move", PulseProbe.frames - closed >= 20)
+        rule.onNodeWithContentDescription("working").assertExists()
     }
 }

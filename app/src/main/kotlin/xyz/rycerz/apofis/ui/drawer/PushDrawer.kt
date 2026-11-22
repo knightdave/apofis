@@ -27,6 +27,8 @@ import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
@@ -70,6 +72,9 @@ import xyz.rycerz.apofis.ui.theme.LocalReduceMotion
 import xyz.rycerz.apofis.ui.theme.Motion
 
 enum class PushDrawerValue { Closed, Open }
+
+/** Whether the drawer panel is on screen (any part of it); the panel content stays composed while it is not. */
+val LocalDrawerExposed = compositionLocalOf { true }
 
 /** The panel's share of the screen width. */
 private const val DRAWER_WIDTH = 0.75f
@@ -271,6 +276,6 @@ fun PushDrawer(
                 .focusRequester(panelFocus)
                 .focusProperties { canFocus = !panelHidden }
                 .focusable(),
-        ) { drawerContent() }
+        ) { CompositionLocalProvider(LocalDrawerExposed provides !panelHidden, content = drawerContent) }
     }
 }
