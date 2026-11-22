@@ -327,6 +327,7 @@ class PushRegistrarTest {
         with(World()) {
             val r = registrar()
             turnedOn(r)
+            now += VERIFY_EVERY_MS // the publication itself proved the record
             r.verify()
             val afterFirst = apiA.calls.size
             assertTrue(afterFirst > 2)
@@ -693,7 +694,7 @@ class PushRegistrarTest {
             turnedOn(r)
             apiA.failWith = ApiError.Network(java.io.IOException("down"))
             r.verify(force = true)
-            assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+            assertEquals("unreachable proves nothing: the last proof stands", PushState.On(NTFY_PACKAGE), r.ui.value.state)
             apiA.failWith = null
             r.verify(force = true)
             assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
@@ -905,6 +906,26 @@ class PushRegistrarTest {
             assertEquals(b.created.single().first, prefs.getString(Keys.RECORD, null))
             assertTrue(bToken in port.subscribed)
             assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        }
+    }
+
+    // Merge review fixes, round 2.
+
+    @Test
+    fun offAndASwitchRemoveTheProofWithTheRecord() = runTest {
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            assertTrue(prefs.contains(Keys.VERIFIED_AT))
+            r.disable()
+            assertTrue(!prefs.contains(Keys.VERIFIED_AT) && !prefs.contains(Keys.RECORD))
+        }
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            connection++
+            r.prepareSwitch()
+            assertTrue(!prefs.contains(Keys.VERIFIED_AT) && !prefs.contains(Keys.RECORD))
         }
     }
 }

@@ -223,8 +223,6 @@ class PushRegistrar(
                 }
             }
         }
-        // Stamped only after a completed check against the server.
-        if (!failed && a != null) commitLive { putLong(Keys.VERIFIED_AT, clock()) }
         !failed
     } ?: false
 
@@ -371,7 +369,7 @@ class PushRegistrar(
         putString(Keys.REVOKE, (revocationsOf(prefs) + revoke).joinToString("\n") { it.encode() })
         putLong(Keys.GENERATION, generation() + 1)
         if (off || prefs.getString(Keys.UNREGISTERED_INSTANCE, null) == currentInstance()) putBoolean(Keys.ENABLED, false)
-        for (k in listOf(Keys.REGISTRATION, Keys.RECORD, Keys.RECORD_TITLE, Keys.ENDPOINT, Keys.PUBLISHED_AT, Keys.PENDING_ID,
+        for (k in listOf(Keys.VERIFIED_AT, Keys.REGISTRATION, Keys.RECORD, Keys.RECORD_TITLE, Keys.ENDPOINT, Keys.PUBLISHED_AT, Keys.PENDING_ID,
             Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE, Keys.ENDPOINT_NEW, Keys.ENDPOINT_NEW_TOKEN, Keys.UNREGISTERED_INSTANCE)) remove(k)
     }
 
@@ -395,10 +393,18 @@ class PushRegistrar(
 
     private suspend fun check(a: RecordApi) {
         val record = prefs.getString(Keys.RECORD, null) ?: return
-        val row = a.read(record)
-        // Gone, retitled, or a turn ran in it: left alone, a new record replaces it.
-        if (row == null || !pristine(row, prefs.getString(Keys.RECORD_TITLE, null))) return publish(a, force = true)
-        if (!row.hidden || row.pinned) a.hide(record)
+        val row = a.read(record) // a read that throws proves nothing: the last proof stands
+        val ours = row != null && pristine(row, prefs.getString(Keys.RECORD_TITLE, null))
+        if (ours && row!!.hidden && !row.pinned) {
+            commitLive { putLong(Keys.VERIFIED_AT, clock()) } // the server's answer about the current record is good
+        } else {
+            // Unusable as it is: the proof goes before any repair, so a failed repair can never show as On.
+            commitLive { remove(Keys.VERIFIED_AT) }
+            // Gone, retitled, or a turn ran in it: left alone, a new record replaces it. Ours but visible: hidden again.
+            if (!ours) return publish(a, force = true)
+            a.hide(record)
+            commitLive { putLong(Keys.VERIFIED_AT, clock()) }
+        }
         if (!fresh()) publish(a, force = true)
     }
 
@@ -450,7 +456,7 @@ class PushRegistrar(
         a.hide(id)
         commitLive {
             putString(Keys.RECORD, id).putString(Keys.RECORD_TITLE, title).putString(Keys.ENDPOINT, endpoint)
-            putLong(Keys.PUBLISHED_AT, clock())
+            putLong(Keys.PUBLISHED_AT, clock()).putLong(Keys.VERIFIED_AT, clock()) // created and hidden: proven
             removePending()
         }
     }
@@ -468,14 +474,18 @@ class PushRegistrar(
         val s = when {
             PushStore.isDirty(prefs) || prefs.contains(Keys.REVOKE) -> PushState.Registering // not on disk, or not yet handed to the distributor
             !enabled() -> if (allowed().isEmpty()) PushState.NoDistributor else PushState.Off
+            // From stored values only: the record holds the endpoint the distributor confirmed for the current token, and
+            // the server's last answer about that record was good. A transport failure does not change a proven On.
+            matchingRecord() && prefs.contains(Keys.VERIFIED_AT) -> PushState.On(distributor)
+            matchingRecord() -> PushState.ServerError(distributor) // the server last said this record is not usable
             failed -> PushState.ServerError(distributor)
-            // The record holds the endpoint the distributor confirmed for the current registration's token.
-            prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && confirmed().let { it != null && it == prefs.getString(Keys.ENDPOINT, null) } ->
-                PushState.On(distributor)
             else -> PushState.Registering
         }
         return PushUi(s)
     }
+
+    private fun matchingRecord() = prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) &&
+        confirmed().let { it != null && it == prefs.getString(Keys.ENDPOINT, null) }
 
     // Server and transport text can carry the endpoint or ids: only the class name is ever logged.
     private fun logFailure(e: Throwable) = Log.w(TAG, "Push step failed: ${e.javaClass.name}")

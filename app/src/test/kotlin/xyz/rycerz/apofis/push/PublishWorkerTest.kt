@@ -144,14 +144,53 @@ class PublishWorkerTest {
         r.on()
         server.rows.values.single().hidden = false // the record became visible on the server
         now += VERIFY_EVERY_MS // a verification is due
-        val stamp = prefs.getLong(Keys.VERIFIED_AT, -1)
         hideFails = true
         assertEquals(ListenableWorker.Result.retry(), run(local = false))
         assertEquals("no false On", PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
-        assertEquals("not stamped", stamp, prefs.getLong(Keys.VERIFIED_AT, -1))
+        assertTrue("the proof went before the repair", !prefs.contains(Keys.VERIFIED_AT))
+        // The local job, queued beside it, succeeds without the server: it proves nothing about the record.
+        run(local = true)
+        assertEquals("still a server error after local work", PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        // A new process over the same prefs knows it too.
+        assertEquals(PushState.ServerError(NTFY_PACKAGE), registrar().ui.value.state)
+        ctx.registrar = r
         hideFails = false
         assertEquals(ListenableWorker.Result.success(), run(local = false))
         assertTrue(server.rows.values.single().hidden)
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+    }
+
+    @Test
+    fun aMissingRowIsRepairedBeforeOnEvenWhenItsEndpointComesLate() = runTest {
+        val r = registrar()
+        r.on()
+        server.rows.clear() // the row is gone on the server
+        port.lostRegistration = true // and the next REGISTER gets a new token, whose endpoint has not arrived yet
+        now += VERIFY_EVERY_MS
+        assertEquals(ListenableWorker.Result.success(), run(local = false)) // waiting for an endpoint is not a retry
+        assertTrue("nothing stamped for a row known to be missing", !prefs.contains(Keys.VERIFIED_AT))
+        assertTrue(r.ui.value.state != PushState.On(NTFY_PACKAGE))
+        // Inside the hour, the same URL arrives for the new token.
+        val token = registrationOf(prefs)?.token
+        assertTrue(prefs.edit().putString(Keys.ENDPOINT_NEW, VALID).putString(Keys.ENDPOINT_NEW_TOKEN, token).commit())
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
+        assertEquals("recreated", 1, server.rows.size)
+        assertTrue("and hidden", server.rows.values.single().hidden)
+        assertEquals(server.rows.keys.single(), prefs.getString(Keys.RECORD, null))
+        assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
+    }
+
+    @Test
+    fun aReadThatCannotReachTheServerKeepsAProvenOn() = runTest {
+        val r = registrar()
+        r.on()
+        now += VERIFY_EVERY_MS
+        api.failWith = xyz.rycerz.apofis.api.ApiError.Network(java.io.IOException("down"))
+        assertEquals(ListenableWorker.Result.retry(), run(local = false))
+        assertEquals("the last proof stands", PushState.On(NTFY_PACKAGE), r.ui.value.state)
+        assertTrue(prefs.contains(Keys.VERIFIED_AT))
+        api.failWith = null
+        assertEquals(ListenableWorker.Result.success(), run(local = false))
         assertEquals(PushState.On(NTFY_PACKAGE), r.ui.value.state)
     }
 
@@ -164,8 +203,7 @@ class PublishWorkerTest {
         val stamp = prefs.getLong(Keys.VERIFIED_AT, -1)
         api.failWith = xyz.rycerz.apofis.api.ApiError.Network(java.io.IOException("down"))
         assertEquals(ListenableWorker.Result.retry(), run(local = false))
-        assertTrue("no false On", r.ui.value.state != PushState.On(NTFY_PACKAGE))
-        assertEquals("not stamped", stamp, prefs.getLong(Keys.VERIFIED_AT, -1))
+        assertEquals("a read that fails proves nothing: unchanged", stamp, prefs.getLong(Keys.VERIFIED_AT, -1))
         api.failWith = null
         assertEquals(ListenableWorker.Result.success(), run(local = false))
         assertEquals(1, server.rows.size)
