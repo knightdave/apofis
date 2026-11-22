@@ -299,6 +299,7 @@ fun ChatScreen(
                             onLink = { url -> linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure },
                             onSelect = { selectKey = it },
                             current = current.value?.let { now -> { now().items } },
+                            onRevealGrew = follow::onGrew, // the follower read through the objects holder above
                         )
                     }
                     ScrollToBottomButton(

@@ -522,4 +522,51 @@ class ChromeLayoutTest {
         rule.waitForIdle()
         assertEquals(1, retryLoads)
     }
+
+    // ---- Task 6: the run-end announcer sits in the uncovered transcript and is no focus stop while idle ----
+
+    /** The announcer as the accessibility provider exports it: the 1 dp polite live region. Null if not exported. */
+    private fun announcerInfo(): Pair<Int, AccessibilityNodeInfo>? {
+        val manager = rule.activity.getSystemService(AccessibilityManager::class.java)
+        shadowOf(manager).setEnabled(true)
+        shadowOf(manager).setTouchExplorationEnabled(true)
+        val content = rule.activity.findViewById<ViewGroup>(android.R.id.content)
+        val compose = (content.getChildAt(0) as ViewGroup).getChildAt(0)
+        val provider = compose.accessibilityNodeProvider
+        val childId = AccessibilityNodeInfo::class.java.getDeclaredMethod("getChildId", Int::class.java).apply { isAccessible = true }
+        var found: Pair<Int, AccessibilityNodeInfo>? = null
+        fun walk(id: Int) {
+            val n = provider.createAccessibilityNodeInfo(id) ?: return
+            val r = android.graphics.Rect().also { n.getBoundsInScreen(it) }
+            if (n.liveRegion == View.ACCESSIBILITY_LIVE_REGION_POLITE && r.height() <= px(2)) found = id to n
+            for (i in 0 until n.childCount) walk(((childId.invoke(n, i) as Long) shr 32).toInt())
+        }
+        walk(View.NO_ID)
+        return found
+    }
+
+    @Test
+    @Config(qualifiers = "w360dp-h400dp-xhdpi")
+    fun theAnnouncerIsVisibleAboveTheKeyboardAndNoIdleFocusStop() {
+        val user = UserMessage("u1", "Hello", false, FIXED_NOW, runId = "A")
+        show(chat(listOf(user), StatusLine.WORKING, LiveReply("A", "running", "Working on it", emptyList(), null, Connection.LIVE)))
+        insets(ime = 320) // 160 dp keyboard in a 400 dp window: the window centre is under the composer, the top is not
+        rule.mainClock.autoAdvance = false
+        repeat(3) { rule.mainClock.advanceTimeByFrame() }
+        val (idleId, idle) = announcerInfo() ?: error("no announcer exported")
+        assertTrue("visible before the run ends", idle.isVisibleToUser)
+        assertFalse("no focus stop while idle", idle.isScreenReaderFocusable)
+        assertEquals(null, idle.stateDescription)
+        val r = android.graphics.Rect().also { idle.getBoundsInScreen(it) }
+        assertTrue("below the bar ${barBottom()}, above the composer ${bottomAreaTop()}: $r", r.top >= barBottom() && r.bottom <= bottomAreaTop())
+        shown = chat(listOf(user.copy(runId = null), AssistantReply("r1", emptyList(), "Done", FIXED_NOW)))
+        repeat(4) {
+            androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
+            rule.mainClock.advanceTimeByFrame()
+        }
+        val (holdId, hold) = announcerInfo() ?: error("no announcer exported during the hold")
+        assertEquals("the same node", idleId, holdId)
+        assertTrue("visible during the hold", hold.isVisibleToUser)
+        assertEquals("Reply ended", hold.stateDescription?.toString())
+    }
 }

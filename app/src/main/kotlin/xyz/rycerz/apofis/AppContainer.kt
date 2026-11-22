@@ -5,10 +5,12 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.os.SystemClock
 import android.util.Log
 import androidx.work.WorkManager
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -28,6 +30,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
@@ -35,6 +38,16 @@ import xyz.rycerz.apofis.db.openAppDatabase
 import xyz.rycerz.apofis.notify.NOTIFY_PREFS
 import xyz.rycerz.apofis.notify.Notifier
 import xyz.rycerz.apofis.notify.chatUri
+import xyz.rycerz.apofis.push.HermesRecordApi
+import xyz.rycerz.apofis.push.PublishWorker
+import xyz.rycerz.apofis.push.PushStore
+import xyz.rycerz.apofis.push.PushRegistrar
+import xyz.rycerz.apofis.push.RealUnifiedPush
+import xyz.rycerz.apofis.push.UnifiedPushPort
+import xyz.rycerz.apofis.push.TestPush
+import xyz.rycerz.apofis.push.pushPolicy
+import xyz.rycerz.apofis.push.pushPrefs
+import xyz.rycerz.apofis.push.validateEndpoint
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
@@ -101,7 +114,12 @@ private const val TAG = "Apofis"
 internal const val CACHE_PREFS = "cache"
 private const val CACHE_URL = "cache_base_url" // the server the cached rows came from
 internal const val SWITCH_MARKER = "switch_in_progress" // present from the first write of a switch until its last
-private const val CONNECTION_EPOCH = "connection_epoch" // +1 with every switch's marker; notices and taps carry it
+// +1 in the one commit that writes SWITCH_MARKER (in AppContainer.connect, inside the notifier's lane and the push lock):
+// every connection gets a new epoch. Notices, taps, push registrations and wakes carry it.
+internal const val CONNECTION_EPOCH = "connection_epoch"
+
+/** The one reader of the persisted connection epoch. */
+internal fun connectionEpoch(c: Context) = c.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).getLong(CONNECTION_EPOCH, 0)
 
 private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity")
 private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
@@ -126,6 +144,8 @@ private val logOnly = CoroutineExceptionHandler { _, e -> logFailure(e) }
 class AppContainer(
     private val app: Application,
     val credentials: CredentialStore = CredentialStore(app),
+    pushPort: UnifiedPushPort = RealUnifiedPush,
+    private val pushStore: SharedPreferences = pushPrefs(app),
     openDatabase: () -> AppDatabase = { openAppDatabase(app) },
 ) {
     val preferences = Preferences(app)
@@ -149,8 +169,19 @@ class AppContainer(
     private val published = MutableStateFlow<Connected?>(null)
     private val switchLock = Mutex()
 
+    // Incremented when a switch starts: push work begun on the old connection stops at its next step.
+    private val connectionGeneration = AtomicLong()
+
+    /** Push registration on the current server; its records live there, revocation debt per server. */
+    val push by lazy {
+        PushRegistrar(app, pushStore, api = { connected()?.let { HermesRecordApi(it.credentials.baseUrl, it.api) } },
+            connectionGeneration = connectionGeneration::get, clock = System::currentTimeMillis, scope = scope, port = pushPort,
+            scheduleWork = { PublishWorker.recover(app, pushStore) }, epoch = { connectionEpoch(app) })
+    }
+    val testPush by lazy { TestPush(SystemClock::elapsedRealtime, OkHttpClient()) { validateEndpoint(it, pushPolicy.origins(app), pushPolicy.loopbackOrigin(app)) } }
+
     /** The current connection's generation: persisted, so a restart keeps it; every switch moves it on. */
-    fun epoch(): Long = cachePrefs.getLong(CONNECTION_EPOCH, 0)
+    fun epoch(): Long = connectionEpoch(app)
 
     val notifyPrefs: SharedPreferences = app.getSharedPreferences(NOTIFY_PREFS, Context.MODE_PRIVATE)
     private val visibleChat = MutableStateFlow<Pair<Long, String>?>(null) // (epoch of its graph, key)
@@ -221,11 +252,12 @@ class AppContainer(
 
     /**
      * Test hooks: [beforeResume] runs on the lifecycle path after the started check, before the follower opens its gate;
-     * [afterResume] once it has opened it; [beforeSwitch] at the start of a switch.
+     * [afterResume] once it has opened it; [beforeSwitch] at the start of a switch; [afterSwitchMarker] right after its marker.
      */
     internal var beforeResume: suspend () -> Unit = {}
     internal var afterResume: suspend () -> Unit = {}
     internal var beforeSwitch: () -> Unit = {}
+    internal var afterSwitchMarker: () -> Unit = {}
 
     private val foreground = Foreground(scope, resume = { stillStarted ->
         val c = connected()
@@ -278,6 +310,9 @@ class AppContainer(
      */
     suspend fun connect(c: Credentials): Unit = withContext(NonCancellable + Dispatchers.IO) {
         switchLock.withLock {
+            // The old registration's revocation is committed first. If that fails, nothing else has changed: the old
+            // connection stays as it was.
+            push.prepareSwitch()
             var old: Connected? = null
             var next: Connected? = null
             var done = false
@@ -287,15 +322,23 @@ class AppContainer(
                     switching = true
                     current
                 }
+                PushStore.locked { connectionGeneration.incrementAndGet() } // ordered with the receiver's wake hand-off
                 beforeSwitch()
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
-                // The generation moves with the marker: from here on no notice, clear or tap of the old one is accepted.
-                // The epoch moves with the marker, inside the notifier's lane: no notice, clear or tap of the old one
-                // is accepted afterwards, and its notifications and rows go. A death here is finished by the start sweep.
-                notifier.switchEpoch { commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true).putLong(CONNECTION_EPOCH, epoch() + 1)) }
+                // The one place the epoch advances: with the marker, in one commit, inside the notifier's lane (so no
+                // notice, clear or tap of the old one is accepted afterwards, and its notifications and rows go) and
+                // under the push lock (so no wake or registration check falls between). A death here is finished by
+                // the start sweep and by push recovery.
+                notifier.switchEpoch {
+                    PushStore.locked { commitOrThrow(cachePrefs.edit().putBoolean(SWITCH_MARKER, true).putLong(CONNECTION_EPOCH, epoch() + 1)) }
+                }
                 chatRequest.value = null
+                afterSwitchMarker()
+                // Only now, under the new epoch, push work: the local job unregisters the old registration (never this
+                // switch itself) and registers anew; the switch does not claim a revocation it has not done.
+                runCatching { PublishWorker.recover(app, pushStore) }.onFailure(::logFailure)
                 if (cachePrefs.getString(CACHE_URL, null) != c.baseUrl) {
                     commitOrThrow(cachePrefs.edit().remove(CACHE_URL))
                     withRepositoryLock {
@@ -378,6 +421,7 @@ class AppContainer(
 
     /** Durable send work was cancelled for the switch: schedule it again for what is still queued, then resume. */
     private suspend fun afterSwitch() {
+        runCatching { PublishWorker.recover(app) }.onFailure(::logFailure) // push work skipped while the switch ran
         if (current != null) scheduleQueuedSends()
         foreground.refresh()
     }

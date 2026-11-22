@@ -51,6 +51,7 @@
     <string name="chat_today">Today</string>
     <string name="chat_yesterday">Yesterday</string>
     <string name="chat_replying">Hermes is replying</string>
+    <string name="chat_reply_ended">Reply ended</string>
     <string name="chat_catching_up">Catching up</string>
     <string name="chat_reconnecting">Reconnecting</string>
     <string name="chat_queued">Waiting to send</string>
@@ -157,6 +158,7 @@
     <string name="settings_licenses">Open-source licenses</string>
     <string name="licenses_lucide">Lucide icons</string>
     <string name="licenses_commonmark">commonmark-java (BSD 2-Clause)</string>
+    <string name="licenses_unifiedpush">UnifiedPush Android connector (Apache License 2.0)</string>
     <string name="md_image">Image</string>
     <string name="md_table">Table</string>
     <string name="md_table_copy">Copy table</string>
