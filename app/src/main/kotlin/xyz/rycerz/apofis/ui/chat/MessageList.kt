@@ -12,6 +12,19 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.stateDescription
+import kotlinx.coroutines.delay
+import xyz.rycerz.apofis.run.Connection
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -24,6 +37,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.LocalDate
@@ -460,6 +474,7 @@ internal object Work {
     var highlightFailures = 0L // blocks shown plain because highlighting failed: a bug, never expected
     var timelineRows = 0L // timeline step rows composed
     var pageEnds = 0L // text pages measured
+    var smoothFrames = 0L // frames the text smoother's loop woke for
 }
 
 /**
@@ -846,7 +861,8 @@ internal class ChatRows(private val zone: ZoneId) {
     var mapped = 0
         private set
 
-    fun rows(items: List<ChatItem>): List<Row> {
+    /** [liveText]: the live reply's text as shown (see [rememberSmoothedText]), a prefix of its text; null: all of it. */
+    fun rows(items: List<ChatItem>, liveText: String? = null): List<Row> {
         val joined = items as? Joined<*>
         @Suppress("UNCHECKED_CAST")
         val stored = joined?.head as List<ChatItem>? ?: items
@@ -877,7 +893,7 @@ internal class ChatRows(private val zone: ZoneId) {
             if (item is AssistantReply && item.live) {
                 if (item.steps.isNotEmpty()) out += StepsRow(item)
                 parts += out
-                parts += live.update(item.key, item.text)
+                parts += live.update(item.key, liveText ?: item.text)
                 out = arrayListOf<Row>(FooterRow(item))
             } else {
                 val rows = tailCache[item] ?: cache[item] ?: rowsOf(item)
@@ -933,6 +949,7 @@ internal fun MessageList(
     onLink: (String) -> Unit = {},
     onSelect: (String) -> Unit = {},
     current: (() -> List<ChatItem>)? = null,
+    onRevealGrew: () -> Unit = {}, // what the run shows at the bottom grew (see below); called after the change is applied
 ) {
     val builder = remember(zone) { ChatRows(zone) }
     // Copy reads the reply as it is when tapped. Referential: comparing the items would compare a live reply's steps.
@@ -944,49 +961,164 @@ internal fun MessageList(
     val pendingId = live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     // An answer that came too late shows under the reply, live or stored, unless that request is somehow drawn again.
     val gone = notes.any { (ref, note) -> note.result == AnswerResult.GONE && ref != pendingId }
-    val rows = builder.rows(items).let { if (gone) Joined(it, listOf(GoneRow)) else it }
+    // Only the live tail is smoothed: the stored head goes through unchanged and by identity, controls read the canonical reply.
+    @Suppress("UNCHECKED_CAST")
+    val liveItem = if (live == null) null else (items as? Joined<ChatItem>)?.tail?.firstOrNull { it is AssistantReply && it.live } as AssistantReply?
+    // The reveal runs only while a row of the live reply is on screen: off screen, or once the run is known to be over,
+    // the whole text shows at once (no replay when the reader scrolls back). Read through derivedStateOf: a scroll
+    // recomposes nothing unless that changes.
+    val liveKey = liveItem?.key
+    val liveOnScreen by remember(listState, liveKey) {
+        derivedStateOf { liveKey != null && listState.layoutInfo.visibleItemsInfo.any { isRowOf(it.key, liveKey) } }
+    }
+    val liveText = if (live != null && liveItem != null) {
+        val snap = ApofisTheme.reduceMotion || live.connection == Connection.POLLING || live.status in TERMINAL_STATUSES || !liveOnScreen
+        rememberSmoothedText(live.runId, liveItem.text, snap)
+    } else {
+        null
+    }
+    // Growth at the bottom for the follow rules, per run and per part, so one part shrinking never hides another growing:
+    // a stored item added (polling shows the stored transcript), the newest stored reply's text or steps, the live text
+    // as revealed, its steps, a new pending request. A new run's first values are a baseline, not growth.
+    @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
+    // Once per stored list instance (by reference: an equal but distinct list is a new instance), never per token or tick.
+    val head = remember { HeadFacts() }.of(stored)
+    val newest = head.newest
+    val bottom = live?.let {
+        Bottom(it.runId, stored.size, newest?.key, newest?.text?.length ?: 0, newest?.steps?.size ?: 0, liveText?.length ?: 0, liveItem?.steps?.size ?: 0, it.pending != null)
+    }
+    val before = remember { arrayOfNulls<Bottom>(1) } // at the last applied composition
+    val grewNow by rememberUpdatedState(onRevealGrew)
+    SideEffect {
+        if (bottom != null && before[0]?.let { bottom.grewFrom(it) } == true) grewNow()
+        before[0] = bottom
+    }
+    val rows = builder.rows(items, liveText).let { if (gone) Joined(it, listOf(GoneRow)) else it }
     // Copy and Select check the transcript as it is at action time: the owner's current state when given.
     val onSelectNow by rememberUpdatedState(onSelect)
     val currentNow by rememberUpdatedState(current)
     val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
     // No reply has actions while a run is live or unsettled: once per transcript, not per token.
-    @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
-    val active = live != null || remember(stored) { unsettled(stored) }
-    LazyColumn(modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
-        items(
-            count = rows.size,
-            key = { rows[rows.size - 1 - it].key },
-            contentType = { rows[rows.size - 1 - it]::class },
-        ) { index ->
-            val row = rows[rows.size - 1 - index]
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
-                Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
-                    when (row) {
-                        is DateRow -> DateSeparator(row.day, today)
-                        is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, actions = rowActions)
-                        is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
-                            // Read at tap time: a step that has since changed kind or gone opens nothing.
-                            (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
-                        })
-                        is TextRow -> {
-                            val source = { copySource(latest, row.key) }
-                            if (row.kind == BlockKind.TABLE) {
-                                TextBlock(row, onLink, tableScrolls.getOrPut(row.key.substringBeforeLast("/c")) { ScrollState(0) }, source)
-                            } else {
-                                TextBlock(row, onLink, source = source)
+    val active = live != null || head.anyUnsettled
+    Box(modifier.fillMaxSize()) {
+        LazyColumn(Modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
+            items(
+                count = rows.size,
+                key = { rows[rows.size - 1 - it].key },
+                contentType = { rows[rows.size - 1 - it]::class },
+            ) { index ->
+                val row = rows[rows.size - 1 - index]
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                    Box(Modifier.widthIn(max = 860.dp).fillMaxWidth().then(rowTag(row))) {
+                        when (row) {
+                            is DateRow -> DateSeparator(row.day, today)
+                            is UserRow -> UserBubble(row.message, onRetry = actions::onRetry, onCancel = onCancel, actions = rowActions)
+                            is StepsRow -> TimelineCard(row.reply, tag = "step:${row.reply.key}", onStep = { i ->
+                                // Read at tap time: a step that has since changed kind or gone opens nothing.
+                                (row.reply.steps.getOrNull(i) as? ToolStep)?.let { onStep(StepSubject(row.reply.key, i, it.callId.ifEmpty { null }, it.name)) }
+                            })
+                            is TextRow -> {
+                                val source = { copySource(latest, row.key) }
+                                if (row.kind == BlockKind.TABLE) {
+                                    TextBlock(row, onLink, tableScrolls.getOrPut(row.key.substringBeforeLast("/c")) { ScrollState(0) }, source)
+                                } else {
+                                    TextBlock(row, onLink, source = source)
+                                }
                             }
+                            is FooterRow -> ReplyFooter(
+                                row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
+                                rowActions, active = active,
+                                shownText = if (row.reply.live && liveText != null) liveText else row.reply.text,
+                            )
+                            is NoticeRow -> NoticeLine(row.notice.text)
+                            GoneRow -> Notice(R.string.chat_answer_gone)
                         }
-                        is FooterRow -> ReplyFooter(
-                            row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
-                            rowActions, active = active,
-                        )
-                        is NoticeRow -> NoticeLine(row.notice.text)
-                        GoneRow -> Notice(R.string.chat_answer_gone)
                     }
                 }
             }
         }
+        RunEndAnnouncer(live?.runId, contentPadding.calculateTopPadding())
     }
+}
+
+/** Facts about the stored head, found once per list instance: compared by reference, the new instance is kept. */
+private class HeadFacts {
+    private var list: List<ChatItem>? = null
+    var newest: AssistantReply? = null
+        private set
+    var anyUnsettled = false // see [unsettled]
+        private set
+
+    fun of(stored: List<ChatItem>): HeadFacts {
+        if (stored !== list) {
+            list = stored
+            newest = stored.lastOrNull { it is AssistantReply } as AssistantReply?
+            anyUnsettled = unsettled(stored)
+        }
+        return this
+    }
+}
+
+/** What a run shows at the bottom, part by part (see [MessageList]'s growth signal). */
+private data class Bottom(
+    val run: String,
+    val items: Int,
+    val reply: String?,
+    val replyText: Int,
+    val replySteps: Int,
+    val shown: Int,
+    val steps: Int,
+    val pending: Boolean,
+) {
+    fun grewFrom(b: Bottom) = run == b.run && (
+        items > b.items || (reply == b.reply && (replyText > b.replyText || replySteps > b.replySteps)) ||
+            shown > b.shown || steps > b.steps || (pending && !b.pending)
+        )
+}
+
+/** Whether lazy item key [key] is a row of reply [reply]: its steps, a text row or its footer. */
+private fun isRowOf(key: Any, reply: String): Boolean =
+    key is String && (key == reply || key == "$reply/end" || key.startsWith("$reply/b"))
+
+/** Run statuses after which nothing more streams (the follower's terminal set). */
+private val TERMINAL_STATUSES = setOf("completed", "failed", "cancelled", "interrupted")
+
+/** How long "Reply ended" stays on the announcer: past Compose's 100 ms accessibility batching and TalkBack's read. */
+internal const val ANNOUNCE_MS = 1000L
+
+/**
+ * One persistent, invisible 1 dp node just below the list's top content padding (the top bar's measured height plus
+ * its gap), so it lies in the uncovered transcript, not under the bar or the composer and keyboard, which hide from
+ * accessibility what is under them. A polite live region the whole time; its state description exists only while it
+ * says "Reply ended" (one neutral line for finished, stopped and failed), for [ANNOUNCE_MS] after a run ended: idle,
+ * an empty description would still make it a screen-reader focus stop. Ended
+ * means the live run id was set and is now another one or none, so run A followed directly by run B still announces A.
+ * The previous id is remembered, never saved: a first composition (opening, rotation, process recreation) announces
+ * nothing. Streamed text is not a live region, so TalkBack hears one line per run, not every token. The node exists the
+ * whole time and only its state description changes, so Compose sends the change from this node itself.
+ */
+@Composable
+private fun BoxScope.RunEndAnnouncer(runId: String?, top: Dp) {
+    val ended = stringResource(R.string.chat_reply_ended)
+    val previous = remember { arrayOf(runId) }
+    var ends by remember { mutableIntStateOf(0) }
+    var said by remember { mutableStateOf<String?>(null) }
+    SideEffect {
+        if (previous[0] != null && previous[0] != runId) ends++
+        previous[0] = runId
+    }
+    LaunchedEffect(ends) { // a new run starting does not cut the hold short; another end restarts it
+        if (ends == 0) return@LaunchedEffect
+        said = ended
+        delay(ANNOUNCE_MS)
+        said = null
+    }
+    Box(
+        Modifier.align(Alignment.TopCenter).padding(top = top).size(1.dp).semantics {
+            liveRegion = LiveRegionMode.Polite
+            said?.let { stateDescription = it }
+        },
+    )
 }
 
 /** The end-to-end tests' id of a row: the item kind and its opaque key (steps are tagged inside [TimelineCard]). */
