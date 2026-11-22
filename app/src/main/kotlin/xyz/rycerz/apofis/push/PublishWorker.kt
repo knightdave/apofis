@@ -23,8 +23,8 @@ class PublishWorker(context: Context, params: WorkerParameters) : CoroutineWorke
         val done = if (inputData.getBoolean(LOCAL, false)) {
             registrar.reconcileLocal()
         } else {
-            registrar.verifyNow(force = false)
-            registrar.publishPending()
+            // A failed verification keeps its error (no false On) and retries; it is not covered by a local fast path.
+            registrar.verifyNow(force = false) && registrar.publishPending()
         }
         return if (done) Result.success() else Result.retry()
     }

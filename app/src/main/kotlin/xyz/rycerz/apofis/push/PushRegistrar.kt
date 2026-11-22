@@ -203,26 +203,30 @@ class PushRegistrar(
         afterUserOp()
     }
 
-    /** [verify] without scheduling work: the network job runs it itself. */
-    internal suspend fun verifyNow(force: Boolean) {
-        op { a ->
-            val last = prefs.getLong(Keys.VERIFIED_AT, 0)
-            if (!force && prefs.contains(Keys.VERIFIED_AT) && clock() - last in 0 until VERIFY_EVERY_MS) return@op
-            reconcile(a)
-            if (enabled()) {
-                if (allowed().isEmpty()) {
-                    rotate(off = true) // the distributor was uninstalled
-                } else {
-                    register() // idempotent: also notices a subscription the distributor lost
-                    if (a != null) {
-                        publish(a, force = false)
-                        check(a)
-                    }
+    /**
+     * [verify] without scheduling work: the network job runs it itself. True when the verification succeeded or was not
+     * due; false when a required server read or repair failed (then it is not stamped, and the job retries).
+     */
+    internal suspend fun verifyNow(force: Boolean): Boolean = op { a ->
+        val last = prefs.getLong(Keys.VERIFIED_AT, 0)
+        if (!force && prefs.contains(Keys.VERIFIED_AT) && clock() - last in 0 until VERIFY_EVERY_MS) return@op true
+        val registered = reconcile(a)
+        if (enabled()) {
+            if (allowed().isEmpty()) {
+                rotate(off = true) // the distributor was uninstalled
+            } else {
+                // Idempotent, and at most once per verification: also notices a subscription the distributor lost.
+                if (!registered) register()
+                if (a != null) {
+                    publish(a, force = false)
+                    check(a)
                 }
             }
-            commitLive { putLong(Keys.VERIFIED_AT, clock()) }
         }
-    }
+        // Stamped only after a completed check against the server.
+        if (!failed && a != null) commitLive { putLong(Keys.VERIFIED_AT, clock()) }
+        !failed
+    } ?: false
 
     /**
      * First half of a server switch, called by AppContainer.connect before its switch marker: commits the revocation of
@@ -311,23 +315,29 @@ class PushRegistrar(
         if (!ok) throw IOException("push prefs not written")
     }
 
-    /** Walks every persisted intent: revocations, the receiver's events, push on without a usable registration. */
-    private suspend fun reconcile(a: RecordApi?) {
+    /**
+     * Walks every persisted intent: revocations, the receiver's events, push on without a usable registration. True when
+     * it sent a REGISTER.
+     */
+    private suspend fun reconcile(a: RecordApi?): Boolean {
         finishRevocations()
         if (prefs.contains(Keys.UNREGISTERED_INSTANCE)) {
             if (prefs.getString(Keys.UNREGISTERED_INSTANCE, null) == currentInstance() && enabled()) rotate(off = true)
             else commitLive { remove(Keys.UNREGISTERED_INSTANCE) }
         }
-        if (!enabled()) return
+        if (!enabled()) return false
         val r = registrationOf(prefs)
         if (r?.instance == currentInstance() && (r.distributor !in policy.distributors(context) || r.epoch != epoch())) {
             // Journaled by a build with another policy, or under another connection epoch (its topic may be known to that
             // epoch's server): revoke it and register a new instance, with a new token and topic.
             rotate(off = false)
+            return true
         } else if (!registeredThisProcess || confirmed() == null) {
             // Once per process, and until the distributor confirms: an endpoint update lost to a failed commit is resent.
             register()
+            return true
         }
+        return false
     }
 
     private fun register() {

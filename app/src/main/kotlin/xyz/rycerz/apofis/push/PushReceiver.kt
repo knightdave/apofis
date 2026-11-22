@@ -193,6 +193,13 @@ class PushReceiver : MessagingReceiver() {
         val prefs = pushPrefs(context)
         PushStore.locked {
             if (!trusted(context) || instance != instanceOf(prefs)) return@locked
+            // The endpoint already on disk for this token (a reply to an idempotent REGISTER): nothing to do, and no
+            // recovery that would replace the running verification that asked for it.
+            if (!PushStore.isDirty(prefs) && prefs.getString(Keys.ENDPOINT_NEW, null) == endpoint.url &&
+                prefs.getString(Keys.ENDPOINT_NEW_TOKEN, null) == token
+            ) {
+                return@locked
+            }
             // A failed commit throws: the connector then sends no ACK, and the registration is not confirmed.
             durably(prefs) { putString(Keys.ENDPOINT_NEW, endpoint.url).putString(Keys.ENDPOINT_NEW_TOKEN, token) }
             changed = true
