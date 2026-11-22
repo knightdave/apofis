@@ -54,7 +54,22 @@ class BottomSharesTest {
                     val more = minOf(n - noticeRow, left) // 5. the rest of the notes, at their natural height
                     left -= more
                     assertEquals("$case: 3 and 5. the notes", noticeRow + more, s.notes)
-                    if (!expanded) {
+                    if (expanded) {
+                        // Expanded = the collapsed layout with the transcript's surplus over 64 dp in the field.
+                        val c = bottomShares(available, bar, n, unsent, wantsExpand, null, d) { room -> minOf(room, natural) }
+                        for ((name, e, col) in listOf(
+                            Triple("bar", s.bar, c.bar), Triple("notes", s.notes, c.notes), Triple("row", s.row, c.row), Triple("field", s.field, c.field),
+                            Triple("actions", s.actions, c.actions), Triple("decoration", deco, c.marginTop + c.paddingTop + c.paddingBottom + c.marginBottom),
+                        )) assertTrue("$case: expanding shrank the $name ($col to $e)", e >= col)
+                        assertEquals("$case: the bar stays", c.barShown, s.barShown)
+                        assertTrue("$case: the transcript keeps its 64 dp", s.transcript >= minOf(c.transcript, d.transcriptMin))
+                        if (c.actions == 2 * d.target) {
+                            assertEquals("$case: Collapse shown while expanded", 2 * d.target, s.actions)
+                            assertEquals("$case: the surplus goes to the field", minOf(c.transcript, d.transcriptMin), s.transcript)
+                        } else {
+                            assertEquals("$case: no room for Collapse: shown collapsed", c, s)
+                        }
+                    } else {
                         // 6. further lines and Expand's room, then 7. decoration.
                         val wanted = maxOf(natural, if (wantsExpand) 2 * d.target else d.target)
                         val grow = (minOf(wanted, row1 + left) - row1).coerceAtLeast(0)
@@ -63,10 +78,6 @@ class BottomSharesTest {
                         val decoration = minOf(d.cardInsets, left)
                         assertEquals("$case: 7. decoration only from what is left", decoration, deco)
                         assertEquals(case, reserve + left - decoration, s.transcript)
-                    } else {
-                        // 7. decoration, then 8. the expanded field takes the rest; the transcript keeps its 64 dp.
-                        assertEquals("$case: 7. decoration", minOf(d.cardInsets, left), deco)
-                        assertEquals("$case: 8. the rest", reserve, s.transcript)
                     }
                     // Decoration gets nothing while a ruled share is short.
                     val short = reserve < d.transcriptMin || noticeRow < (if (unsent) minOf(n, d.noticeRow) else 0) || more < n - noticeRow
@@ -104,6 +115,19 @@ class BottomSharesTest {
         assertEquals(d.field(2), s.row)
         assertEquals(d.cardInsets, s.marginTop + s.paddingTop + s.paddingBottom + s.marginBottom)
         // The expanded editor never takes the notes' height.
+        // 216 dp of safe band, six lines: collapsed, a 96 dp row with both targets and no decoration; expanding keeps them.
+        val six = d.field(5)
+        val collapsed = bottomShares(432, 112, 0, false, true, null, d) { minOf(it, six) }
+        assertEquals(192, collapsed.row)
+        assertEquals(192, collapsed.actions)
+        assertEquals(128, collapsed.transcript)
+        val expanded = bottomShares(432, 112, 0, false, true, Expansion(1f, 6), d) { error("expanded measures after") }
+        assertEquals("nothing to grow into: the same layout", collapsed.copy(field = 192), expanded.copy(field = 192))
+        assertEquals("Collapse stays", 192, expanded.actions)
+        // 247 dp: collapsed shows five lines with 3 px of padding; expanded keeps them (no surplus over the 64 dp).
+        val roomy = bottomShares(494, 112, 0, false, true, Expansion(1f, 6), d) { error("expanded measures after") }
+        assertEquals(128, roomy.transcript)
+        assertTrue(roomy.field > collapsed.row)
         s = bottomShares(1520, 112, 60, false, true, Expansion(1f, 3), d) { error("expanded measures after") }
         assertEquals(60, s.notes)
         assertEquals(128, s.transcript)

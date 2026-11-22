@@ -215,7 +215,7 @@ fun ChatScreen(
                 Layout({
                     // Notes keep a backing of their own over scrolled text, and scroll inside their share when taller. The
                     // unsent entry comes first, so its row is the one the guaranteed share shows.
-                    Column(Modifier.semantics { traversalIndex = -2f }.background(MaterialTheme.colorScheme.surface).verticalScroll(rememberScrollState())) {
+                    Column(Modifier.semantics { traversalIndex = -2f }.testTag("chat.notes").background(MaterialTheme.colorScheme.surface).verticalScroll(rememberScrollState())) {
                         input.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
                         input.note?.let { ComposerNoteLine(it) }
                         if (input.linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
@@ -262,8 +262,8 @@ fun ChatScreen(
     // The body for a pair of bar heights: the same lambda while they hold, so a token recomposes the body only through
     // the state it reads; new heights compose it at once with the new padding (same pass, no stale frame).
     val bodies = remember { BodyCache() }
-    val bodyFor = { barHeight: Int, bottomArea: Int, barShown: Boolean ->
-        bodies.get(barHeight, bottomArea) {
+    val bodyFor = { barHeight: Int, bottomArea: Int, barShown: Boolean, buttonFits: Boolean ->
+        bodies.get(barHeight, bottomArea, buttonFits) {
             @Composable {
                 val state = latest.value
                 val c = callbacks.value
@@ -339,7 +339,9 @@ fun ChatScreen(
                             onRevealGrew = follow::onGrew, // the follower read through the objects holder above
                         )
                     }
-                    ScrollToBottomButton(
+                    // Only where its 48 dp target fits in the uncovered band: otherwise not composed at all, so a button
+                    // that kept keyboard focus gives it up and no key reaches it; it returns unfocused.
+                    if (buttonFits) ScrollToBottomButton(
                         visible = follow.buttonVisible,
                         backdrop = backdrop,
                         onClick = {
@@ -373,13 +375,15 @@ fun ChatScreen(
             if (barHidden.state.value == barShown) barHidden.state.value = !barShown
             val bar = measuredBar.takeIf { barShown }
             val top = bar?.height ?: status
-            val body = subcompose(ChromeSlot.BODY, bodyFor(top, bottom.height, barShown)).map { it.measure(loose) }
+            val buttonFits = constraints.maxHeight - top - bottom.height >= 48.dp.roundToPx()
+            val body = subcompose(ChromeSlot.BODY, bodyFor(top, bottom.height, barShown, buttonFits)).map { it.measure(loose) }
             val announcer = subcompose(ChromeSlot.ANNOUNCER, announcerSlot).single().measure(loose)
             layout(constraints.maxWidth, constraints.maxHeight) {
                 body.first().place(0, top) // the uncovered region
                 // The scroll button, at the end edge (mirrored in right-to-left layouts), only when its target fits in the
                 // uncovered transcript band.
-                body.getOrNull(1)?.let { if (constraints.maxHeight - top - bottom.height >= it.height) it.placeRelative(constraints.maxWidth - it.width, constraints.maxHeight - bottom.height - it.height) }
+                // The 2 dp gap under the target shrinks first when the band is just 48 dp.
+                body.getOrNull(1)?.let { it.placeRelative(constraints.maxWidth - it.width, maxOf(top, constraints.maxHeight - bottom.height - it.height)) }
                 bottom.place(0, constraints.maxHeight - bottom.height, zIndex = 1f)
                 bar?.place(0, 0, zIndex = 1f)
                 // Just below the bar, above everything, so neither the bar nor the composer ever covers it.
@@ -589,11 +593,11 @@ private data class Callbacks(val actions: ChatActions, val onRetryLoad: () -> Un
 
 /** The body lambda for the last pair of bar heights. */
 private class BodyCache {
-    private var key = -1L
+    private var key: Triple<Int, Int, Boolean>? = null
     private var body: (@Composable () -> Unit)? = null
 
-    fun get(top: Int, bottom: Int, make: () -> @Composable () -> Unit): @Composable () -> Unit {
-        val k = top.toLong() shl 32 or (bottom.toLong() and 0xffffffffL)
+    fun get(top: Int, bottom: Int, flag: Boolean = false, make: () -> @Composable () -> Unit): @Composable () -> Unit {
+        val k = Triple(top, bottom, flag)
         if (k != key || body == null) {
             key = k
             body = make()

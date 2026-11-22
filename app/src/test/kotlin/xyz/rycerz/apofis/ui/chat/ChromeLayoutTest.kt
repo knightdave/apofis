@@ -696,18 +696,46 @@ class ChromeLayoutTest {
     // ---- Fix round 3: boundary cases on the real safe bounds ----
 
     /** The bottom area's placed geometry equals the allocation computed from the measured inputs. */
-    private fun assertPlacedAsAllocated(status: Int, bottomInset: Int, notes: Int, unsent: Boolean, lines: Int) {
+    /**
+     * The bottom area's placed geometry equals the allocation computed from the measured inputs (the bar's own row, the
+     * notes' natural height), to the pixel: the area, the notes viewport, the card's row, the field, Send, Expand and the
+     * transcript.
+     */
+    private fun assertPlacedAsAllocated(status: Int, bottomInset: Int, unsent: Boolean, lines: Int): BottomShares {
         val height = screen().fetchSemanticsNode().size.height
         val d = rule.density.bottomDims(androidx.compose.ui.text.TextStyle(fontSize = 15.sp, lineHeight = 1.3.em))
         val barOwn = bounds(hasTestTag("chat.topbar.row")).height.toInt()
+        val notesNode = rule.onAllNodes(hasTestTag("chat.notes"), useUnmergedTree = true).fetchSemanticsNodes().single()
+        val notes = notesNode.size.height + (notesNode.config.getOrNull(SemanticsProperties.VerticalScrollAxisRange)?.maxValue?.invoke()?.toInt() ?: 0)
         val s = bottomShares(height - status - bottomInset, barOwn, notes, unsent, lines >= 3, null, d) { room -> minOf(room, d.field(minOf(lines, 5))) }
         val area = bounds(hasTestTag("chat.bottom"))
-        assertEquals("the bottom area holds the notes and the composer", (height - bottomInset - s.notes - s.composer).toFloat(), area.top, 1f)
+        fun eq(what: String, expected: Int, actual: Float) = assertEquals("$what: $s", expected.toFloat(), actual, 0.5f)
+        eq("the bottom area holds the notes and the composer", height - bottomInset - s.notes - s.composer, area.top)
+        eq("the notes viewport", s.notes, notesNode.size.height.toFloat())
+        val rowTop = area.top.toInt() + s.notes + s.marginTop + s.paddingTop
         val field = rule.onNode(hasTestTag("composer.field"), useUnmergedTree = true).fetchSemanticsNode().unclipped()
-        val composerTop = area.top + s.notes
-        assertEquals("the field ends at the row's bottom", composerTop + s.marginTop + s.paddingTop + s.row, field.bottom, 1f)
-        assertEquals("the field's share", s.field.toFloat(), field.height, 1f)
-        assertEquals("the transcript's share", s.transcript.toFloat(), area.top - barBottom(), 1f)
+        eq("the field ends at the row's bottom", rowTop + s.row, field.bottom)
+        eq("the field's share", s.field, field.height)
+        val send = rule.onNode(hasTestTag("composer.send"), useUnmergedTree = true).fetchSemanticsNode().unclipped()
+        eq("Send ends at the row's bottom", rowTop + s.row, send.bottom)
+        eq("Send's target", d.target, send.height)
+        val expand = rule.onAllNodes(hasContentDescription("Expand the editor") or hasContentDescription("Collapse the editor"), useUnmergedTree = true).fetchSemanticsNodes().filter { it.layoutInfo.isPlaced }
+        assertEquals("Expand placed exactly when the allocation has two targets: $s", s.actions == 2 * d.target, expand.isNotEmpty())
+        expand.firstOrNull()?.let { eq("Expand at the row's top", rowTop, it.unclipped().top) }
+        eq("the transcript's share", s.transcript, area.top - barBottom())
+        return s
+    }
+
+    /** An odd number of spare pixels: 353 px of safe band leaves 17 px of decoration, 8 above the row and 9 below. */
+    @Test
+    @Config(qualifiers = "w360dp-h224dp-xhdpi")
+    fun oddSparePixelsArePlacedAsAllocated() {
+        show(withDraft(chat(failed), 1))
+        insets(top = 48, bottom = 47) // 448 - 48 - 47 = 353 px
+        val s = assertPlacedAsAllocated(status = 48, bottomInset = 47, unsent = false, lines = 1)
+        assertEquals(17, s.marginTop + s.paddingTop + s.paddingBottom + s.marginBottom)
+        assertEquals(8, s.paddingTop)
+        assertEquals(9, s.paddingBottom)
     }
 
     /** 200 dp, a 24 dp status inset and an 80 dp bar: the transcript has its 64 dp and the last row's Cancel is tapped. */
@@ -719,7 +747,7 @@ class ChromeLayoutTest {
         insets(top = 48)
         assertTrue(barInAccessibility())
         assertEquals("64 dp of transcript", px(64), bottomAreaTop() - barBottom(), 1f)
-        assertPlacedAsAllocated(status = 48, bottomInset = 0, notes = 0, unsent = false, lines = 1)
+        assertPlacedAsAllocated(status = 48, bottomInset = 0, unsent = false, lines = 1)
         rule.runOnUiThread { kotlinx.coroutines.runBlocking { list.scrollToItem(0) } }
         rule.waitForIdle()
         val cancel = visible(hasContentDescription("Cancel sending"))
@@ -739,6 +767,7 @@ class ChromeLayoutTest {
         show(chat(failed).copy(unsent = unsent))
         insets(top = 48, bottom = 48)
         assertTrue(barInAccessibility())
+        assertPlacedAsAllocated(status = 48, bottomInset = 48, unsent = true, lines = 1) // the compact case
         val notesHeight = bottomAreaTop().let { top -> visible(hasTestTag("composer.field")).top - top }
         assertTrue("the notice row has its 54 dp: $notesHeight", notesHeight >= px(54) - 1f)
         val put = button("Put back")
@@ -850,5 +879,64 @@ class ChromeLayoutTest {
         insets(top = 48, ime = 560) // 56 dp of safe band: the bare row leaves the transcript 8 dp
         repeat(2) { rule.mainClock.advanceTimeByFrame() }
         assertEquals("placed without room for its target", 0, placedButtons().size)
+    }
+
+    /** Expanding with a six-line draft at 216 and 247 dp of safe height: the field does not shrink and Collapse is there and works. */
+    private fun expandKeepsTheField() {
+        show(withDraft(chat(failed), 6))
+        insets(top = 48)
+        val before = rule.onNode(hasTestTag("composer.field"), useUnmergedTree = true).fetchSemanticsNode().unclipped()
+        rule.onNode(hasContentDescription("Expand the editor")).performClick()
+        rule.waitForIdle()
+        val after = rule.onNode(hasTestTag("composer.field"), useUnmergedTree = true).fetchSemanticsNode().unclipped()
+        assertTrue("the field shrank from $before to $after", after.height >= before.height - 0.5f && after.top <= before.top + 0.5f)
+        val collapse = rule.onAllNodes(hasContentDescription("Collapse the editor"), useUnmergedTree = true).fetchSemanticsNodes().single { it.layoutInfo.isPlaced }
+        assertTrue("Collapse ${collapse.boundsInRoot} on screen, a whole target", collapse.boundsInRoot.height >= px(48) - 0.5f && collapse.boundsInRoot.top >= barBottom())
+        screen().performTouchInput { click(collapse.boundsInRoot.center) }
+        rule.waitForIdle()
+        rule.onNode(hasContentDescription("Expand the editor")).assertExists()
+    }
+
+    @Test
+    @Config(qualifiers = "w360dp-h240dp-xhdpi")
+    fun expandingAt216dpKeepsTheField() = expandKeepsTheField()
+
+    @Test
+    @Config(qualifiers = "w360dp-h271dp-xhdpi")
+    fun expandingAt247dpKeepsTheField() = expandKeepsTheField()
+
+    /** I12: a focused scroll button whose target no longer fits is removed: Enter does nothing; back with room, it works and is not focused. */
+    @Test
+    @Config(qualifiers = "w760dp-h360dp-land-xhdpi")
+    fun aScrollButtonWithoutRoomTakesNoKeys() {
+        show(withDraft(chat(failed), 1))
+        insets(top = 48)
+        rule.mainClock.autoAdvance = false // the button hides 2 s after scrolling: act while it is shown
+        rule.onNode(androidx.compose.ui.test.hasScrollToIndexAction()).performTouchInput { swipeDown(startY = top + height / 4, endY = bottom - height / 4) }
+        repeat(10) { rule.mainClock.advanceTimeByFrame() }
+        val button = hasContentDescription("Scroll to the latest message")
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) }
+        rule.onNode(button).performSemanticsAction(SemanticsActions.RequestFocus)
+        repeat(2) { rule.mainClock.advanceTimeByFrame() }
+        assertTrue(rule.onNode(button).fetchSemanticsNode().config[SemanticsProperties.Focused])
+        insets(top = 48, ime = 560) // 56 dp of safe band: the bare row leaves the transcript 8 dp
+        repeat(2) { rule.mainClock.advanceTimeByFrame() }
+        val index = list.firstVisibleItemIndex
+        assertTrue("scrolled away", index > 0)
+        assertEquals("the button is still composed", 0, rule.onAllNodes(button, useUnmergedTree = true).fetchSemanticsNodes().size)
+        rule.runOnUiThread {
+            val compose = (rule.activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as ViewGroup).getChildAt(0)
+            compose.dispatchKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_ENTER))
+            compose.dispatchKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_ENTER))
+        }
+        repeat(30) { rule.mainClock.advanceTimeByFrame() }
+        assertTrue("a removed button took the reader to the bottom (${list.firstVisibleItemIndex}, was $index)", list.firstVisibleItemIndex > 0)
+        insets(top = 48)
+        rule.onNode(androidx.compose.ui.test.hasScrollToIndexAction()).performTouchInput { swipeDown(startY = top + height / 4, endY = bottom - height / 4) }
+        repeat(10) { rule.mainClock.advanceTimeByFrame() }
+        assertFalse("the returning button took focus", rule.onNode(button).fetchSemanticsNode().config.getOrNull(SemanticsProperties.Focused) == true)
+        screen().performTouchInput { click(visible(button).center) }
+        repeat(60) { rule.mainClock.advanceTimeByFrame() }
+        assertEquals("a fresh tap scrolls to the bottom", 0, list.firstVisibleItemIndex)
     }
 }

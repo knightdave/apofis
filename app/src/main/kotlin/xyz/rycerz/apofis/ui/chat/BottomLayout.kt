@@ -65,18 +65,20 @@ internal data class BottomShares(
 
 /**
  * Shares the [available] height of the safe band among the top [bar] (its own row, without the status inset), the notes
- * (natural height [notes]; [unsent] when an unsent entry is among them), the composer and the transcript. Bare content
- * comes before decoration; first to last:
+ * (natural height [notes]; [unsent] when an unsent entry is among them), the composer and the transcript. Collapsed, bare
+ * content comes before decoration; first to last:
  *  1. the bare row: Send or Stop at 48 dp with a one-line field (all the band when even that does not fit);
  *  2. the top bar, shown only when it fits beside the bare row;
  *  3. one notice row when an unsent entry exists;
  *  4. the transcript's 64 dp;
  *  5. the rest of the notes, at their natural height (they scroll inside their share when capped);
- *  6. further field lines up to five ([field] gives the field's natural height for a room; collapsed) and the room for
- *     Expand above Send when [wantsExpand] (both 48 dp targets);
- *  7. the card's padding, then its margins (up to 32 dp together; odd pixels go to the bottom);
- *  8. expanded ([expansion]): the field takes the rest, growing with its progress.
- * The transcript gets what is left. Nothing is negative; the shares sum to the band.
+ *  6. further field lines up to five ([field] gives the field's natural height for a room) and the room for Expand above
+ *     Send when [wantsExpand] (both 48 dp targets);
+ *  7. the card's padding, then its margins (up to 32 dp together; odd pixels go to the bottom).
+ * The transcript gets what is left. Expanded ([expansion]), the layout is the collapsed one with the transcript's surplus
+ * over its 64 dp moved into the field (growing with the expansion's progress, at most its cap), so expanding never makes
+ * anything smaller and Collapse stands where Expand stood; where the collapsed layout has no room for Expand, an
+ * expanded editor is shown collapsed. Nothing is negative; the shares sum to the band.
  */
 internal fun bottomShares(
     available: Int,
@@ -88,6 +90,16 @@ internal fun bottomShares(
     d: BottomDims,
     field: (room: Int) -> Int,
 ): BottomShares {
+    // Expanded, the collapsed field is the text's 1 to 5 lines (the field itself is measured once, at the result).
+    val collapsedField: (Int) -> Int = if (expansion == null) field else { room -> minOf(room, d.field(expansion.lines.coerceIn(1, 5))) }
+    val c = collapsedShares(available, bar, notes, unsent, wantsExpand, d, collapsedField)
+    if (expansion == null || c.actions < 2 * d.target) return c
+    val surplus = minOf((c.transcript - d.transcriptMin).coerceAtLeast(0), (expansion.cap - c.row).coerceAtLeast(0))
+    val grow = (surplus * expansion.progress.coerceIn(0f, 1f)).toInt()
+    return c.copy(row = c.row + grow, field = c.row + grow, transcript = c.transcript - grow)
+}
+
+private fun collapsedShares(available: Int, bar: Int, notes: Int, unsent: Boolean, wantsExpand: Boolean, d: BottomDims, field: (room: Int) -> Int): BottomShares {
     val total = available.coerceAtLeast(0)
     var row = minOf(total, d.row1)
     var left = total - row
@@ -99,28 +111,15 @@ internal fun bottomShares(
     left -= reserve
     val moreNotes = minOf(notes - noticeRow, left).coerceAtLeast(0)
     left -= moreNotes
-    var fieldHeight: Int
-    if (expansion == null) {
-        fieldHeight = field(row + left).coerceIn(0, row + left) // 1 to 5 lines, measured once
-        val wanted = maxOf(fieldHeight, if (wantsExpand) 2 * d.target else d.target)
-        val grow = (minOf(wanted, row + left) - row).coerceAtLeast(0)
-        row += grow
-        left -= grow
-    } else {
-        fieldHeight = row
-    }
+    val fieldHeight = field(row + left).coerceIn(0, row + left) // 1 to 5 lines, measured once
+    val wanted = maxOf(fieldHeight, if (wantsExpand) 2 * d.target else d.target)
+    val grow = (minOf(wanted, row + left) - row).coerceAtLeast(0)
+    row += grow
+    left -= grow
     val padding = minOf(d.cardPadding, left)
     left -= padding
     val margin = minOf(d.cardInsets - d.cardPadding, left)
     left -= margin
-    if (expansion != null) {
-        val full = minOf(row + left, expansion.cap.coerceAtLeast(row))
-        val from = minOf(d.field(expansion.lines.coerceIn(1, 5)).coerceAtLeast(row), full)
-        val grown = (from + (full - from) * expansion.progress.coerceIn(0f, 1f)).toInt().coerceIn(row, full)
-        left -= grown - row
-        row = grown
-        fieldHeight = grown
-    }
     val actions = if (wantsExpand && row >= 2 * d.target) 2 * d.target else minOf(row, d.target)
     return BottomShares(
         barShown, if (barShown) bar else 0, noticeRow + moreNotes,

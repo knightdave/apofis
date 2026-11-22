@@ -375,6 +375,35 @@ class ComposerViewTest {
         assertEquals("an indirect press held across a change", 1, sends)
     }
 
+    /** I9: Enter down on keyboard A (Stop for run A), the run is replaced, Enter down on keyboard B, release A then B: nothing fires. */
+    @Test
+    fun overlappingPressesFromTwoKeyboardsFireNothing() {
+        mode = ComposerMode.STOP
+        draft = ""
+        subject = "run-A"
+        val stopped = ArrayList<Any?>()
+        show()
+        stopsHook = { stopped += subject }
+        val node = primaryNode()
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) }
+        rule.onNode(androidx.compose.ui.test.SemanticsMatcher("primary") { it.id == node.id }, useUnmergedTree = true).performSemanticsAction(SemanticsActions.RequestFocus)
+        rule.waitForIdle()
+        fun on(device: Int, action: Int) = NativeKeyEvent(0L, 0L, action, NativeKeyEvent.KEYCODE_ENTER, 0, 0, device, 0)
+        dispatch(on(1, NativeKeyEvent.ACTION_DOWN))
+        subject = "run-B"
+        rule.waitForIdle()
+        dispatch(on(2, NativeKeyEvent.ACTION_DOWN))
+        rule.waitForIdle()
+        dispatch(on(1, NativeKeyEvent.ACTION_UP))
+        rule.waitForIdle()
+        dispatch(on(2, NativeKeyEvent.ACTION_UP))
+        rule.waitForIdle()
+        assertEquals("an overlapped press fired", emptyList<Any?>(), stopped)
+        dispatch(on(2, NativeKeyEvent.ACTION_DOWN), on(2, NativeKeyEvent.ACTION_UP)) // a fresh single press
+        rule.waitForIdle()
+        assertEquals(listOf<Any?>("run-B"), stopped)
+    }
+
     /** Each activation key: a fresh press fires once; held across a change of generation it fires nothing. */
     @Test
     fun everyActivationKeyIsGuarded() {

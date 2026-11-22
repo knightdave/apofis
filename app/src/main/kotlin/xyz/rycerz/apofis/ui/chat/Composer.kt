@@ -341,6 +341,20 @@ private class ActionPress {
     var keyReleasing = false
     var indirect: Int? = null
     var indirectReleasing = false
+    var overlapped = false // a press began while another was down: neither counts
+
+    private val down get() = pointer != null || keys.isNotEmpty() || indirect != null
+
+    /** A press begins in generation [generation]; one that overlaps another makes both invalid until all are released. */
+    fun begin(generation: Int, record: () -> Unit) {
+        if (down) overlapped = true
+        record()
+    }
+
+    /** Called when a press ended; once none is down, the next press is judged on its own again. */
+    fun ended() {
+        if (!down) overlapped = false
+    }
 
     /** Called by the physical click with the generation it would act in: consumes the press it came from. */
     fun accepts(now: Int): Boolean {
@@ -350,7 +364,9 @@ private class ActionPress {
             indirectReleasing -> indirect.also { indirect = null; indirectReleasing = false }
             else -> null // a physical click without an observed press: never counted
         }
-        return begun == now
+        val ok = !overlapped && begun == now
+        ended()
+        return ok
     }
 }
 
@@ -362,7 +378,8 @@ private fun Modifier.pressStart(press: ActionPress, shown: () -> Int): Modifier 
         awaitEachGesture {
             try {
                 awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                press.pointer = shown()
+                val generation = shown()
+                press.begin(generation) { press.pointer = generation }
                 do {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
                 } while (event.changes.any { it.pressed })
@@ -371,14 +388,22 @@ private fun Modifier.pressStart(press: ActionPress, shown: () -> Int): Modifier 
             } finally {
                 press.pointer = null
                 press.pointerReleasing = false
+                press.ended()
             }
         }
     }
-    .onFocusChanged { if (!it.hasFocus) press.keys.clear() }
+    .onFocusChanged {
+        if (!it.hasFocus) {
+            press.keys.clear()
+            press.ended()
+        }
+    }
     .onPreviewKeyEvent {
         if (it.key in activationKeys) {
             if (it.type == KeyEventType.KeyDown && it.nativeKeyEvent.repeatCount == 0) {
-                press.keys[it.key] = shown()
+                // A second keyboard's down of the same key must not overwrite the first press: both become invalid.
+                val generation = shown()
+                press.begin(generation) { press.keys[it.key] = generation }
             } else if (it.type == KeyEventType.KeyUp) {
                 press.keyReleased = press.keys.remove(it.key)
                 press.keyReleasing = true
@@ -391,6 +416,7 @@ private fun Modifier.pressStart(press: ActionPress, shown: () -> Int): Modifier 
         if (it.type == KeyEventType.KeyUp) {
             press.keyReleased = null
             press.keyReleasing = false
+            press.ended()
         }
         false
     }
@@ -412,11 +438,12 @@ private data class IndirectPressElement(val press: ActionPress, val shown: () ->
 private class IndirectPressNode(var press: ActionPress, var shown: () -> Int) : Modifier.Node(), IndirectPointerInputModifierNode {
     override fun onIndirectPointerEvent(event: IndirectPointerEvent, pass: PointerEventPass) {
         when {
-            pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Press -> press.indirect = shown()
+            pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Press -> shown().let { g -> press.begin(g) { press.indirect = g } }
             pass == PointerEventPass.Initial && event.type == IndirectPointerEventType.Release -> press.indirectReleasing = true
             pass == PointerEventPass.Final && event.type == IndirectPointerEventType.Release -> {
                 press.indirect = null
                 press.indirectReleasing = false
+                press.ended()
             }
         }
     }
@@ -424,6 +451,7 @@ private class IndirectPressNode(var press: ActionPress, var shown: () -> Int) : 
     override fun onCancelIndirectPointerInput() {
         press.indirect = null
         press.indirectReleasing = false
+        press.ended()
     }
 }
 
