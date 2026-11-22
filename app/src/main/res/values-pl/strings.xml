@@ -48,6 +48,7 @@
     <string name="chat_today">Dzisiaj</string>
     <string name="chat_yesterday">Wczoraj</string>
     <string name="chat_replying">Hermes odpowiada</string>
+    <string name="chat_reply_ended">Odpowiedź zakończona</string>
     <string name="chat_catching_up">Wczytywanie odpowiedzi</string>
     <string name="chat_reconnecting">Ponowne łączenie</string>
     <string name="chat_queued">Czeka na wysłanie</string>
