@@ -237,4 +237,27 @@ class ChromeInputsTest {
         rule.waitForIdle()
         assertEquals(listOf("k1"), got)
     }
+
+    /** A link tapped while covered opens nothing; uncovered it opens. */
+    @Test
+    fun aCoveredLinkOpensNothing() {
+        ui = chat(listOf(AssistantReply("r1", emptyList(), "[docs](https://example.com/docs)", FIXED_NOW)))
+        val opened = ArrayList<String>()
+        uri = object : UriHandler {
+            override fun openUri(uri: String) {
+                opened += uri
+            }
+        }
+        covered = true
+        show()
+        val link = rule.onNode(androidx.compose.ui.test.hasClickAction() and androidx.compose.ui.test.hasAnyAncestor(androidx.compose.ui.test.hasTestTag("reply:r1/b0/c0")), useUnmergedTree = true)
+        link.performClick()
+        rule.waitForIdle()
+        assertEquals(emptyList<String>(), opened)
+        covered = false
+        rule.waitForIdle()
+        link.performClick()
+        rule.waitForIdle()
+        assertEquals(listOf("https://example.com/docs"), opened)
+    }
 }

@@ -248,9 +248,9 @@ class AnswerGuardTest {
         }
         tick(1_000)
         rule.runOnIdle { scope.launch { drawer.open() } }
-        tick(400)
+        tick(48) // reduced motion: open in a frame
         rule.runOnIdle { scope.launch { drawer.close() } }
-        tick(400)
+        tick(48) // closed; well inside the 300 ms answer interval, which counts from when the request showed, not from the close
         rule.onNodeWithText("Allow once").performClick() // at once
         assertEquals(1, approvals.size)
     }

@@ -1,6 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
-import xyz.rycerz.apofis.ui.theme.keepSidewaysDrags
+import xyz.rycerz.apofis.ui.theme.claimSideways
 import xyz.rycerz.apofis.ui.theme.sidewaysScroll
 import androidx.annotation.StringRes
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -131,7 +131,7 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
             OutlinedTextField(
                 answer,
                 { answer = it },
-                Modifier.weight(1f).keepSidewaysDrags(),
+                Modifier.weight(1f).claimSideways(),
                 placeholder = { Text(stringResource(R.string.chat_clarify_hint)) },
                 maxLines = 5,
                 enabled = !answering,

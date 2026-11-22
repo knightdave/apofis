@@ -46,6 +46,7 @@ import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.getBoundsInRoot
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasScrollToIndexAction
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -81,6 +82,7 @@ import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -97,6 +99,7 @@ import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.DrawerButton
+import xyz.rycerz.apofis.ui.NewChatButton
 import xyz.rycerz.apofis.ui.FIXED_NOW
 import xyz.rycerz.apofis.ui.FIXED_TODAY
 import xyz.rycerz.apofis.ui.closingOnSelect
@@ -176,6 +179,7 @@ class DrawerUiTest {
         }
     }
     private var shownChat by mutableStateOf(chat)
+    private var newChats = 0
 
     private val rows = listOf(
         DrawerRow.Header(GroupLabel.Today),
@@ -192,12 +196,14 @@ class DrawerUiTest {
         ChatScreen(
             shownChat, recording, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, dragArea = drag,
             covered = state.covered,
+            coveredNow = { state.covered },
             navigationIcon = {
                 Row {
                     ApofisIconButton({}, contentDescription = "Before") {} // first in focus order: automatic focus lands here, not on the button
                     DrawerButton(Modifier.focusRequester(button)) { scope.launch { state.open() } }
                 }
             },
+            appBarActions = { NewChatButton { newChats++ } },
         )
     }
 
@@ -471,6 +477,91 @@ class DrawerUiTest {
         assertEquals("", search.fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
     }
 
+    private val longLine = "val answer = listOf(" + (1..40).joinToString { "\"item$it\"" } + ")"
+    private val wideTable = "| Name of the column | Second column here | Third column of it | Fourth column wide |\n|---|---|---|---|\n" +
+        "| a fairly long cell | another long cell | yet another cell | the last long cell |"
+
+    private fun replyWith(text: String) = chat.copy(items = items.take(2) + AssistantReply("md", emptyList(), text, FIXED_NOW))
+
+    /** A swipe 35 degrees off horizontal, 10 moves held, starting at [from] on [node]; asserts the drawer per frame. */
+    private fun diagonal(node: SemanticsNodeInteraction, toward: Float = 1f, stays: Boolean) {
+        node.performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(toward * 17f, 11.9f)) }
+        }
+        repeat(3) {
+            frames()
+            if (stays) assertEquals("the drawer moved", if (state.isOpen) 1f else 0f, state.fraction)
+        }
+        if (!stays) assertTrue("the drawer did not move", state.fraction > 0f)
+        up()
+        settled()
+    }
+
+    /** Ownership is decided at the down: a 35 degree swipe on a scrolling code block, a scrolling table or either field never moves the drawer. */
+    @Test
+    fun diagonalSwipesOnSidewaysOwnersLeaveTheDrawer() {
+        shownChat = replyWith("Code:\n\n```\n$longLine\n```\n\n$wideTable")
+        show()
+        diagonal(rule.onNodeWithText(longLine, substring = true), stays = true)
+        diagonal(rule.onNodeWithText("a fairly long cell"), stays = true)
+        assertClosed()
+        shownChat = withPending(clarify)
+        frames(3)
+        diagonal(rule.onNode(hasSetTextAction() and !hasTestTag("composer.field")), stays = true)
+        runCode { state.open() }
+        settled()
+        diagonal(rule.onNodeWithContentDescription("Search chats"), toward = -1f, stays = true)
+        assertOpen()
+    }
+
+    /** The same diagonal swipe on plain transcript text moves the drawer. */
+    @Test
+    fun diagonalSwipeOnPlainTextMovesTheDrawer() {
+        show()
+        diagonal(rule.onNodeWithText("Answer 29, long enough to wrap onto a second line of the chat screen."), stays = false)
+    }
+
+    /**
+     * A table that fits (two short columns, at 2.625x where each cell and the divider round on their own) is no
+     * sideways scroller: a swipe that starts on it moves the drawer.
+     */
+    @Test
+    @Config(qualifiers = "w411dp-h860dp-420dpi")
+    fun fittedTableLetsTheDrawerMove() {
+        shownChat = replyWith("| abcde | fghij |\n|---|---|\n| klmno | pqrst |")
+        show()
+        drag(0.6f * state.width, 40, rule.onNodeWithText("klmno"), release = false)
+        frames()
+        assertTrue("the fitted table kept the swipe", state.fraction > 0.2f)
+        up()
+        settled()
+        assertOpen()
+    }
+
+    /** The element under the finger goes away mid-drag (a row re-keyed): the drawer neither picks the gesture up nor jumps. */
+    @Test
+    fun ownerRemovedMidDragNoJump() {
+        val code = ScrollState(0)
+        var shown by mutableStateOf(true)
+        show(drawer = drawerOf(emptyList())) { drag ->
+            Box(Modifier.fillMaxSize().then(drag)) {
+                if (shown) Row(Modifier.align(Alignment.Center).fillMaxWidth().sidewaysScroll(code).testTag("code")) { Box(Modifier.width(900.dp).height(100.dp)) }
+            }
+        }
+        runCode { code.scrollTo(code.maxValue) }
+        frames(2)
+        drag(-300f, 20, rule.onNodeWithTag("code"), release = false) // scrolls the row back, held
+        frames()
+        shown = false
+        frames(2)
+        rule.onRoot().performTouchInput { repeat(10) { moveBy(Offset(20f, 0f)) } }
+        shutFor(5)
+        up()
+        shutFor(30)
+        assertClosed()
+    }
+
     @Test
     fun verticalScrollIsNotStolen() {
         show()
@@ -524,8 +615,7 @@ class DrawerUiTest {
         settled()
         assertClosed()
         assertFalse("Back is still taken", backEnabled())
-        tester.emulateSavedInstanceStateRestore()
-        frames(2)
+        restore(tester)
         assertClosed() // the saver stored Closed
         rule.onNodeWithContentDescription("Open chat list").performClick()
         settled()
@@ -557,7 +647,7 @@ class DrawerUiTest {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = false, blur = false) {
                 state = rememberPushDrawerState()
                 scope = rememberCoroutineScope()
-                if (drawerShown) PushDrawer(state, drawerOf(rows), content = chatContent)
+                if (drawerShown) PushDrawer(state, drawerOf(rows), onOpening = { openings++ }, content = chatContent)
             }
         }
         frames(2)
@@ -570,8 +660,115 @@ class DrawerUiTest {
         assertTrue("the settle was not interrupted", stopped > 0f && stopped < 1f)
         drawerShown = true
         settled()
-        assertTrue("left at ${state.fraction} (target ${state.target}, fingers ${state.fingers}, settling ${state.settling})", state.fraction == 0f || state.fraction == 1f)
+        assertTrue("left at ${state.fraction} (target ${state.target}, owner ${state.owner}, settling ${state.settling})", state.fraction == 0f || state.fraction == 1f)
         assertEquals(state.isOpen, state.fraction == 1f)
+    }
+
+    /**
+     * A drag held exactly at the open end (target still Closed) whose drawer leaves the screen before the finger lifts:
+     * on return the idle rule settles the endpoint too, with its target and the opening refresh.
+     */
+    @Test
+    fun aLostDragAtTheOpenEndIsSettledOnReturn() {
+        var drawerShown by mutableStateOf(true)
+        rule.mainClock.autoAdvance = false
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = false, blur = false) {
+                state = rememberPushDrawerState()
+                scope = rememberCoroutineScope()
+                if (drawerShown) PushDrawer(state, drawerOf(rows), onOpening = { openings++ }, content = chatContent)
+            }
+        }
+        frames(2)
+        drag(1.1f * panel, 40, release = false)
+        frames()
+        assertEquals(1f, state.fraction)
+        assertFalse(state.isOpen)
+        drawerShown = false
+        frames(3)
+        up()
+        drawerShown = true
+        settled()
+        assertOpen()
+        assertEquals(1, openings)
+    }
+
+    /** The drag's own node goes away while another finger stays down: the drag ends at once, not when that finger lifts. */
+    @Test
+    fun aDragWhoseNodeGoesAwayEndsWithAnotherFingerDown() {
+        var shown by mutableStateOf(true)
+        show(drawer = drawerOf(emptyList())) { drag ->
+            androidx.compose.foundation.layout.Column(Modifier.fillMaxSize()) {
+                Box(Modifier.fillMaxWidth().height(500.dp).testTag("area").then(if (shown) drag else Modifier))
+                Box(Modifier.fillMaxWidth().height(100.dp).testTag("plain"))
+            }
+        }
+        rule.onNodeWithTag("area").performTouchInput {
+            down(0, center)
+            repeat(20) { moveBy(0, Offset(0.3f * panel / 20, 0f)) }
+        }
+        frames()
+        assertTrue(state.fraction > 0.2f)
+        rule.onRoot().performTouchInput { down(1, Offset(100f, 1100f)) } // on the plain box, held
+        shown = false
+        settled()
+        assertClosed() // both fingers still down
+        rule.onRoot().performTouchInput {
+            up(0)
+            up(1)
+        }
+        settled()
+        assertClosed()
+    }
+
+    /** The drag's handler is reset mid-drag (the layout direction flips): the drag ends at once, by position. */
+    @Test
+    fun aDragWhoseHandlerIsResetStillSettles() {
+        var direction by mutableStateOf(LayoutDirection.Ltr)
+        rule.mainClock.autoAdvance = false
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = false, blur = false) {
+                CompositionLocalProvider(LocalLayoutDirection provides direction) {
+                    state = rememberPushDrawerState()
+                    scope = rememberCoroutineScope()
+                    PushDrawer(state, drawerOf(emptyList())) { drag -> Box(Modifier.fillMaxSize().then(drag)) }
+                }
+            }
+        }
+        frames(2)
+        drag(0.3f * panel, 20, release = false)
+        frames()
+        assertTrue(state.fraction > 0.2f)
+        direction = LayoutDirection.Rtl
+        settled()
+        assertClosed() // the finger is still down
+        up()
+        settled()
+        assertClosed()
+    }
+
+    /**
+     * A second scrim drag begun while the first one's release is settling owns the scrim: held at the closed end through
+     * frames it keeps its finger, and moving back out moves the drawer.
+     */
+    @Test
+    fun aScrimDragDuringASettleKeepsItsFinger() {
+        show(PushDrawerValue.Open)
+        drag(-0.3f * panel, 20, rule.onNodeWithTag("drawer.scrim"), from = code()) // released: settles back open
+        frames(3)
+        assertTrue("not settling", state.fraction > 0.5f && state.fraction < 1f)
+        drag(-1.2f * panel, 30, rule.onNodeWithTag("drawer.scrim"), from = code(), release = false)
+        frames(3)
+        assertEquals(0f, state.fraction)
+        rule.onRoot().performTouchInput { repeat(10) { moveBy(Offset(0.03f * panel, 0f)) } } // back out, same finger
+        frames()
+        assertTrue("the held scrim drag lost its finger at the closed end", state.fraction > 0.2f)
+        rule.onRoot().performTouchInput { repeat(10) { moveBy(Offset(-0.03f * panel, 0f)) } }
+        frames()
+        up()
+        settled()
+        assertClosed()
+        assertFalse(backEnabled())
     }
 
     // ---- Ruling C: a covered chat does not act ----
@@ -621,6 +818,59 @@ class DrawerUiTest {
         rule.onNodeWithTag("composer.send").performClick()
         frames()
         assertEquals(1, sends)
+    }
+
+    /**
+     * The approval is released in the same input batch in which the other finger moved the drawer off zero, before any
+     * composition: the gate asks the drawer then, so the answer is dropped.
+     */
+    @Test
+    fun anApprovalReleasedBeforeTheNextCompositionIsDropped() {
+        shownChat = withPending(approval)
+        show()
+        frames(40)
+        val allow = rule.onNodeWithText("Allow once").getBoundsInRoot()
+        val bar = rule.onNodeWithTag("chat.topbar").getBoundsInRoot()
+        val density = rule.density.density
+        rule.onRoot().performTouchInput {
+            down(0, Offset((allow.left + allow.right).value / 2 * density, (allow.top + allow.bottom).value / 2 * density))
+            down(1, Offset(width / 2f, (bar.top + bar.bottom).value / 2 * density))
+            repeat(8) { moveBy(1, Offset(6f, 0f)) }
+            up(0)
+        }
+        assertTrue(state.fraction > 0f)
+        frames()
+        assertEquals("an answer fired while covered", emptyList<ApprovalChoice>(), approvals)
+        rule.onRoot().performTouchInput { up(1) }
+        settled()
+        assertClosed()
+        frames(40)
+        rule.onNodeWithText("Allow once").performClick()
+        frames()
+        assertEquals(listOf(ApprovalChoice.ONCE), approvals)
+    }
+
+    /** The bar's real New chat button, held while another finger drags the transcript out, does nothing on release. */
+    @Test
+    fun aHeldNewChatDoesNothingUnderTheDrawer() {
+        show()
+        val newChat = rule.onNodeWithContentDescription("New chat")
+        newChat.performTouchInput { down(0, center) }
+        rule.onNodeWithText("Answer 29, long enough to wrap onto a second line of the chat screen.").performTouchInput {
+            down(1, center)
+            repeat(8) { moveBy(1, Offset(6f, 0f)) }
+        }
+        frames()
+        assertTrue(state.fraction > 0f)
+        rule.onRoot().performTouchInput { up(0) }
+        frames()
+        assertEquals(0, newChats)
+        rule.onRoot().performTouchInput { up(1) }
+        settled()
+        assertClosed()
+        rule.onNodeWithContentDescription("New chat").performClick()
+        frames()
+        assertEquals(1, newChats)
     }
 
     /** A one-finger drag that starts on a button moves the drawer and presses nothing. */
@@ -977,6 +1227,16 @@ class DrawerUiTest {
         assertClosed()
     }
 
+    /** Recreates the drawer from its saved state; recreating needs frames, so the clock runs for it. */
+    private fun restore(tester: StateRestorationTester) {
+        val old = state
+        rule.mainClock.autoAdvance = true
+        tester.emulateSavedInstanceStateRestore()
+        rule.mainClock.autoAdvance = false
+        frames(2)
+        assertNotSame("the drawer was not recreated", old, state)
+    }
+
     @Test
     fun restoredAtItsRestingValue() {
         val tester = StateRestorationTester(rule)
@@ -985,17 +1245,17 @@ class DrawerUiTest {
         frames(2)
         drag(0.6f * panel, 30)
         settled()
-        tester.emulateSavedInstanceStateRestore()
-        frames(2)
+        restore(tester)
         assertOpen()
         drag(-0.3f * panel, 20, rule.onNodeWithTag("drawer.panel"), release = false) // part way back, finger down
-        tester.emulateSavedInstanceStateRestore()
-        frames(2)
-        assertTrue(state.isOpen) // restored at the value it rested at, not the part-way position
-        up() // the finger still down drags the restored drawer; its release settles as any drag
+        frames()
+        assertTrue(state.fraction < 1f)
+        restore(tester)
+        assertOpen() // restored where it rested, never part way
+        assertEquals(0, rule.onAllNodes(hasTestTag("chat.title")).fetchSemanticsNodes().size)
+        up()
         settled()
         assertOpen()
-        assertEquals(0, rule.onAllNodes(hasTestTag("chat.title")).fetchSemanticsNodes().size)
     }
 
     /** The running chat's pulsing dot schedules no frame while the panel is closed and moves once it is shown. */
@@ -1048,7 +1308,7 @@ class DrawerUiTest {
         assertTrue(rule.onNodeWithText("New chat").getBoundsInRoot().right <= 360.dp - 25.dp)
     }
 
-    /** With the keyboard up and large text the fixed header and footer leave no row: the panel scrolls as one list. */
+    /** With the keyboard up and large text the fixed header and footer leave no row: the panel scrolls as one, by touch and by accessibility. */
     @Test
     fun shortWindowKeepsResultsAndSettingsReachable() {
         val selected = ArrayList<String>()
@@ -1069,19 +1329,43 @@ class DrawerUiTest {
             ),
         )
         insets(ime = 1220) // 610 dp of the 760 dp window: 150 dp left, less than the large header and footer need
+        frames(3)
+        val search = rule.onNodeWithContentDescription("Search chats")
+        val top = search.fetchSemanticsNode().positionInRoot.y // unclipped: the header scrolls out above the panel
         assertTrue("the keyboard inset did not reach the panel", rule.onNodeWithText("New chat").getBoundsInRoot().top < 150.dp)
-        rule.mainClock.autoAdvance = true // the scroll-to actions need frames to lay the lists out; nothing here runs forever
-        val results = rule.onNode(hasScrollToIndexAction() and hasAnyAncestor(hasTestTag("drawer.panel")))
-        val listHeight = results.fetchSemanticsNode().size.height // laid out, not clipped by the panel's scroll
-        assertTrue("the result list has no room for a row: $listHeight px", listHeight >= 192) // one row at font scale 2
-        results.performScrollToNode(hasText("Chat number 9")) // within the result list
-        results.performScrollTo() // and the list within the panel
-        frames(2)
+        // Touch: a swipe up that starts on a visible result moves the header with it.
+        rule.onNodeWithText("Chat number 1").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(0f, -12f)) }
+            up()
+        }
+        frames(5)
+        val lazyLists = rule.onAllNodes(hasScrollToIndexAction() and hasAnyAncestor(hasTestTag("drawer.panel"))).fetchSemanticsNodes().size
+        val moved = top - search.fetchSemanticsNode().positionInRoot.y
+        assertTrue("the header did not move with the rows: $moved px, lazy lists $lazyLists", moved > 80f)
+        // Accessibility: the panel has one vertical scroll, and scrolling it reaches a later result and Settings.
+        val vertical = androidx.compose.ui.test.SemanticsMatcher.keyIsDefined(SemanticsProperties.VerticalScrollAxisRange)
+        assertEquals("not one vertical scroll owner", 1, rule.onAllNodes(vertical and hasAnyAncestor(hasTestTag("drawer.panel"))).fetchSemanticsNodes().size)
+        val scroller = rule.onNode(hasScrollAction() and vertical and hasAnyAncestor(hasTestTag("drawer.panel")))
+        repeat(20) {
+            if (!isShown("Chat number 9")) {
+                scroller.performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, 100f) }
+                frames(30) // an accessibility scroll animates
+            }
+        }
         rule.onNodeWithText("Chat number 9").assertIsDisplayed().performClick()
         frames(2)
         assertEquals(listOf("apofis-9"), selected)
-        rule.onNodeWithText("Settings").performScrollTo().assertIsDisplayed().performClick()
+        repeat(30) {
+            if (!isShown("Settings")) {
+                scroller.performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, 100f) }
+                frames(30) // an accessibility scroll animates
+            }
+        }
+        rule.onNodeWithText("Settings").assertIsDisplayed().performClick()
         frames(2)
         assertEquals(1, settings)
     }
+
+    private fun isShown(text: String): Boolean = runCatching { rule.onNodeWithText(text).assertIsDisplayed() }.isSuccess
 }

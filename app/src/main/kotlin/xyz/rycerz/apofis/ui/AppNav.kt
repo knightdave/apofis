@@ -44,6 +44,7 @@ import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.chat.ChatScreen
+import xyz.rycerz.apofis.ui.chat.LocalChatGate
 import xyz.rycerz.apofis.ui.chat.ChatViewModel
 import xyz.rycerz.apofis.ui.chat.ChatActions
 import xyz.rycerz.apofis.ui.chat.ChatUiState
@@ -189,11 +190,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     val drawerButton: @Composable () -> Unit = {
         DrawerButton(Modifier.focusRequester(drawerButtonFocus)) { scope.launch { drawerState.open() } }
     }
-    val newChatButton: @Composable RowScope.() -> Unit = {
-        ApofisIconButton(onClick = drawer::newChat, contentDescription = stringResource(R.string.drawer_new_chat)) {
-            Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = null, Modifier.size(20.dp))
-        }
-    }
+    val newChatButton: @Composable RowScope.() -> Unit = { NewChatButton(drawer::newChat) }
     if (showArchived) {
         BackHandler { showArchived = false }
         ArchivedScreen(archived, open, onBack = { showArchived = false })
@@ -230,6 +227,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                     appBarActions = newChatButton,
                     dragArea = dragArea,
                     covered = drawerState.covered,
+                    coveredNow = { drawerState.covered },
                 )
             } else {
                 key(sessionKey) {
@@ -247,7 +245,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                         container.chatShown(conn.generation, sessionKey, true)
                         onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
                     }
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, dragArea = dragArea, covered = drawerState.covered)
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, dragArea = dragArea, covered = drawerState.covered, coveredNow = { drawerState.covered })
                 }
             }
         }
@@ -258,8 +256,18 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
 /** The chat bar's drawer button: a 20 dp glyph in a 40 dp box, 48 dp target. */
 @Composable
 internal fun DrawerButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
-    ApofisIconButton(onClick, contentDescription = stringResource(R.string.drawer_open), modifier, visualSize = 40.dp) {
+    val gate = LocalChatGate.current // a press held while the drawer came out does nothing
+    ApofisIconButton({ gate(onClick) }, contentDescription = stringResource(R.string.drawer_open), modifier, visualSize = 40.dp) {
         Icon(painterResource(R.drawable.lucide_menu), contentDescription = null, Modifier.size(20.dp))
+    }
+}
+
+/** The chat bar's New chat button, through the chat's action gate. */
+@Composable
+internal fun NewChatButton(onNewChat: () -> Unit) {
+    val gate = LocalChatGate.current
+    ApofisIconButton(onClick = { gate(onNewChat) }, contentDescription = stringResource(R.string.drawer_new_chat)) {
+        Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = null, Modifier.size(20.dp))
     }
 }
 

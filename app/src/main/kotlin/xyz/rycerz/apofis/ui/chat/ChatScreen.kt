@@ -28,6 +28,8 @@ import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.layout.SubcomposeMeasureScope
 import androidx.compose.ui.layout.MeasureResult
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.foundation.layout.asPaddingValues
@@ -116,7 +118,8 @@ fun ChatScreen(
     listState: LazyListState = rememberLazyListState(),
     currentState: (() -> ChatUiState)? = null, // the owner's state now, for Copy and Select at action time
     dragArea: Modifier = Modifier, // where a horizontal drag may start (the push drawer): the top bar and the transcript, never the composer
-    covered: Boolean = false, // the drawer covers the chat: every action of the chat is dropped
+    covered: Boolean = false, // the drawer covers the chat, for what composition needs
+    coveredNow: () -> Boolean = { covered }, // the same, read live when an action fires: every action is dropped while true
 ) {
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
@@ -144,9 +147,10 @@ fun ChatScreen(
     )
     // One gate for everything the chat can do: while the drawer covers it, a press that was already down (another
     // finger dragged the drawer) or any late activation does nothing. Read at call time, so it recomposes nothing.
-    val coveredNow = rememberUpdatedState(covered)
+    val coveredRead = rememberUpdatedState(coveredNow)
     val actionsNow = rememberUpdatedState(actions)
-    val gate = remember { Gate { coveredNow.value } }
+    val gate = remember { Gate { coveredRead.value() } }
+    val passGate: (() -> Unit) -> Unit = remember { gate::pass } // one instance: a new one would recompose the bar
     val gated = remember { CoveredActions({ actionsNow.value }, gate) }
     val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
     val openConnection = remember { { gate.pass { barCallbacks.value.onOpenConnection() } } }
@@ -163,7 +167,12 @@ fun ChatScreen(
         @Composable {
             SideEffect { ChromeProbe.barCompositions++ }
             val c = barCallbacks.value
-            ChatTopBar(barInput.value, openConnection, retryLoad, c.navigationIcon, c.appBarActions, drag.value.blockTouchesBelow().coverForAccessibility(order = -1f))
+            val input = barInput.value // read here, so this slot (and its probe) recomposes when the bar's inputs change
+            val modifier = drag.value.blockTouchesBelow().coverForAccessibility(order = -1f)
+            // The slots' own buttons (the drawer button, New chat) go through the same gate (LocalChatGate).
+            CompositionLocalProvider(LocalChatGate provides passGate) {
+                ChatTopBar(input, openConnection, retryLoad, c.navigationIcon, c.appBarActions, modifier)
+            }
         }
     }
     val bottomSlot = remember {
@@ -192,7 +201,7 @@ fun ChatScreen(
                     input.mode,
                     { actions.onDraftChange(it, input.draftRevision) },
                     onSend = send@{
-                        if (coveredNow.value) return@send
+                        if (coveredRead.value()) return@send
                         val o = objects.value // the current list and follower, at tap time
                         linkFailed = false
                         actions.onSendClick()
@@ -257,7 +266,7 @@ fun ChatScreen(
                             state.answering,
                             c.actions,
                             onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
-                            onStep = { detail = it },
+                            onStep = { step -> gate.pass { detail = step } },
                             listState = listState,
                             contentPadding = padding,
                             zone = c.zone,
@@ -279,7 +288,7 @@ fun ChatScreen(
                                     drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
                                 },
                             onLink = { url -> gate.pass { linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure } },
-                            onSelect = { selectKey = it },
+                            onSelect = { key -> gate.pass { selectKey = key } },
                             current = current.value?.let { now -> { now().items } },
                             onRevealGrew = follow::onGrew, // the follower read through the objects holder above
                         )
@@ -288,8 +297,10 @@ fun ChatScreen(
                         visible = follow.buttonVisible,
                         backdrop = backdrop,
                         onClick = {
-                            follow.onButton()
-                            scope.launch { listState.animateScrollToItem(0) }
+                            gate.pass {
+                                follow.onButton()
+                                scope.launch { listState.animateScrollToItem(0) }
+                            }
                         },
                         // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
                         Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)).padding(end = 2.dp, bottom = 2.dp),
@@ -503,16 +514,23 @@ private data class Objects(val list: LazyListState, val follow: Follower, val ba
 
 private data class Callbacks(val actions: ChatActions, val onRetryLoad: () -> Unit, val zone: ZoneId, val today: LocalDate)
 
-/** Runs an action only while the chat is not covered by the drawer. */
-private class Gate(private val covered: () -> Boolean) {
+/**
+ * The chat's one action gate for controls a caller puts in [ChatScreen]'s top bar slots: `LocalChatGate.current { action() }`
+ * runs the action only while the drawer does not cover the chat.
+ */
+val LocalChatGate = staticCompositionLocalOf<(() -> Unit) -> Unit> { { it() } }
+
+/** Runs an action only while the chat is not covered by the drawer, asking [covered] at that moment. */
+internal class Gate(private val covered: () -> Boolean) {
     fun pass(action: () -> Unit) {
         if (!covered()) action()
     }
 }
 
 /** [actions] through [gate]; typing ([onDraftChange]) is not an action and always reaches the draft. */
-private class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
+internal class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
     override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
+    // shortcut: returns Unit here; at the Task 8 merge (onSendClick(): Boolean) return false while covered and the delegate's result otherwise.
     override fun onSendClick() = gate.pass { actions().onSendClick() }
     override fun onStopClick(runId: String) = gate.pass { actions().onStopClick(runId) }
     override fun onRetry(idempotencyKey: String) = gate.pass { actions().onRetry(idempotencyKey) }

@@ -4,13 +4,22 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.MutatePriority
+import androidx.compose.foundation.MutatorMutex
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.horizontalDrag
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.pointer.util.addPointerInputChange
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
+import xyz.rycerz.apofis.ui.theme.SidewaysClaims
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.gestures.DraggableState
-import androidx.compose.foundation.gestures.Orientation
-import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
@@ -49,7 +58,6 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
@@ -89,10 +97,13 @@ private const val DRAWER_WIDTH = 0.75f
 /** A release faster than this (dp/s) settles by its direction; slower ones by the halfway point. */
 private const val FLING_DP_PER_SECOND = 365f
 
+/** One finger's drag of the drawer. [fromScrim]: the scrim (its own hit target) stays until this drag has settled. */
+internal class DragOwner(val fromScrim: Boolean)
+
 /**
  * Where the push drawer is: [fraction] 0 closed to 1 open. Only a direct drag (on the chat's drag area, the panel or the
  * scrim) and code ([open], [close]) move it. [isOpen] is the value it rests at or settles to; a drag does not change it,
- * its end does. Whenever no finger is down and nothing animates, [fraction] is 0 or 1 and equals [isOpen].
+ * its end does. Whenever no drag owns it and nothing animates, [fraction] is 0 or 1 and equals [isOpen].
  */
 @Stable
 class PushDrawerState internal constructor(initial: PushDrawerValue) {
@@ -102,48 +113,68 @@ class PushDrawerState internal constructor(initial: PushDrawerValue) {
     var fraction by mutableFloatStateOf(if (initial == PushDrawerValue.Open) 1f else 0f)
         private set
 
-    /** The chat is covered: the drawer is not fully closed. Changes only at the ends, not per frame. */
+    /** The chat is covered: the drawer is not fully closed. Live when read outside composition too. */
     val covered: Boolean by derivedStateOf { fraction > 0f || target == PushDrawerValue.Open }
 
     internal var width = 0f // the panel width in px, from layout; not state, read only when a drag delta arrives
     internal var reduceMotion = false
     internal var onOpening: () -> Unit = {}
-    internal var dragging by mutableStateOf(false) // a finger drag owns the drawer, until its end has settled
+    internal var scope: CoroutineScope? = null // the drawer's own: a drag's settle outlives the node the drag began on
+    internal var owner by mutableStateOf<DragOwner?>(null) // the finger drag that owns the drawer, until its end has settled
     internal var settling by mutableStateOf(false) // a settle animation runs
-    internal var fingers by mutableStateOf(false) // a pointer is down anywhere on the drawer's screen
+    private val motion = MutatorMutex() // settles at Default, code at PreventUserInput
+    private var codeMoves = 0
+    private var settleJob: Job? = null
 
-    internal val drag = DraggableState { delta ->
-        if (width > 0f) fraction = (fraction + delta / width).coerceIn(0f, 1f)
-    }
+    /** Opens over [Motion.DRAWER] ms. Wins over a finger on the drawer: that finger's further moves and release do nothing. */
+    suspend fun open() = byCode(PushDrawerValue.Open)
 
-    /**
-     * Opens over [Motion.DRAWER] ms. Wins over a finger on the drawer: the drag recognizer drops a gesture whose drag
-     * was cancelled, so that finger's further moves and its release do nothing.
-     */
-    suspend fun open() = drag.drag(MutatePriority.PreventUserInput) { settle(PushDrawerValue.Open) }
+    suspend fun close() = byCode(PushDrawerValue.Closed)
 
-    suspend fun close() = drag.drag(MutatePriority.PreventUserInput) { settle(PushDrawerValue.Closed) }
-
-    internal fun dragStarted() {
-        dragging = true
-    }
-
-    /** The one settle rule at a drag's end (also when it ends exactly at an end): by position and velocity. */
-    internal suspend fun dragStopped(velocityDpPerSecond: Float) {
+    private suspend fun byCode(value: PushDrawerValue) {
+        owner = null
+        codeMoves++
         try {
-            drag.drag { settle(settleTo(fraction, velocityDpPerSecond)) }
+            motion.mutate(MutatePriority.PreventUserInput) { settle(value) }
         } finally {
-            dragging = false
+            codeMoves--
         }
     }
 
-    /** Nothing holds the drawer: no finger, no animation. Any gesture whose end was lost (its node gone) ends here. */
-    internal suspend fun idle() {
-        dragging = false
-        if (fraction != if (isOpen) 1f else 0f) drag.drag { settle(settleTo(fraction, 0f)) }
+    /** A finger crossed the slop: it owns the drawer (stopping a release settle), unless code is moving it. */
+    internal fun startDrag(owner: DragOwner): Boolean {
+        if (codeMoves > 0) return false
+        settleJob?.cancel()
+        this.owner = owner
+        return true
     }
 
-    /** Call while holding [drag]'s mutex. Ends exactly at 0 or 1 unless cancelled; a cancelled settle is redone by [idle]. */
+    internal fun dragBy(owner: DragOwner, px: Float) {
+        if (this.owner === owner && width > 0f) fraction = (fraction + px / width).coerceIn(0f, 1f)
+    }
+
+    /**
+     * The one settle rule at a drag's end, also exactly at an end: by position and velocity. Only the owner ends itself,
+     * so a settle it outlived never clears a newer drag. A [lost] drag (its node gone) lets go at once.
+     */
+    internal fun endDrag(owner: DragOwner, velocityDpPerSecond: Float, lost: Boolean) {
+        if (this.owner !== owner) return
+        if (lost || scope?.isActive != true) this.owner = null // nothing to keep, or nothing can settle now: the idle rule will
+        settleJob = scope?.launch {
+            try {
+                motion.mutate { settle(settleTo(fraction, velocityDpPerSecond)) }
+            } finally {
+                if (this@PushDrawerState.owner === owner) this@PushDrawerState.owner = null
+            }
+        }
+    }
+
+    /** Nothing owns the drawer and nothing animates: a cancelled settle (the drawer left the screen) is finished here. */
+    internal fun idle() {
+        if (fraction != if (isOpen) 1f else 0f) settleJob = scope?.launch { motion.mutate { settle(settleTo(fraction, 0f)) } }
+    }
+
+    /** Call while holding [motion]. Ends exactly at 0 or 1 unless cancelled; a cancelled settle is redone by [idle]. */
     internal suspend fun settle(value: PushDrawerValue) {
         if (target == PushDrawerValue.Closed && value == PushDrawerValue.Open) onOpening()
         target = value
@@ -162,6 +193,42 @@ class PushDrawerState internal constructor(initial: PushDrawerValue) {
 
     companion object {
         internal val Saver = Saver<PushDrawerState, PushDrawerValue>(save = { it.target }, restore = { PushDrawerState(it) })
+    }
+}
+
+/**
+ * The drawer's drag recognizer: horizontal touch slop, then the finger moves the drawer until it lifts. Whether a
+ * gesture may move the drawer is decided at its down: one that began on an element owning sideways drags
+ * ([SidewaysClaims]) never does. It takes part in no nested scrolling and never picks up a gesture an inner element
+ * consumed: that gesture is over for the drawer until every finger is up.
+ */
+private fun Modifier.drawerDrag(state: PushDrawerState, rtl: Boolean, fromScrim: Boolean): Modifier = pointerInput(state, rtl, fromScrim) {
+    val sign = if (rtl) -1f else 1f
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        if (SidewaysClaims.isClaimed(down.id)) return@awaitEachGesture
+        val owner = DragOwner(fromScrim)
+        val velocity = VelocityTracker().apply { addPointerInputChange(down) }
+        var started = false
+        var ended = false
+        try {
+            val slop = awaitHorizontalTouchSlopOrCancellation(down.id) { change, over ->
+                started = state.startDrag(owner)
+                change.consume()
+                if (started) state.dragBy(owner, sign * over)
+            }
+            if (slop == null || !started) return@awaitEachGesture
+            velocity.addPointerInputChange(slop)
+            val lifted = horizontalDrag(slop.id) { change ->
+                velocity.addPointerInputChange(change)
+                state.dragBy(owner, sign * change.positionChange().x)
+                change.consume()
+            }
+            ended = true
+            state.endDrag(owner, if (lifted) sign * velocity.calculateVelocity().x / density else 0f, lost = false)
+        } finally {
+            if (started && !ended) state.endDrag(owner, 0f, lost = true)
+        }
     }
 }
 
@@ -198,7 +265,6 @@ fun PushDrawer(
     content: @Composable (dragArea: Modifier) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    val density = LocalDensity.current.density
     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     val sign = if (rtl) -1f else 1f
     val reduceMotion = LocalReduceMotion.current
@@ -206,17 +272,11 @@ fun PushDrawer(
     SideEffect {
         state.reduceMotion = reduceMotion
         state.onOpening = { latestOpening() }
+        state.scope = scope
     }
     // A horizontal drag latches only after horizontal touch slop, so vertical scrolls and taps stay with the content.
-    val dragArea = remember(state, rtl, density) {
-        Modifier.draggable(
-            state.drag,
-            Orientation.Horizontal,
-            reverseDirection = rtl,
-            onDragStarted = { state.dragStarted() },
-            onDragStopped = { velocity -> state.dragStopped(velocity / density) },
-        )
-    }
+    val dragArea = remember(state, rtl) { Modifier.drawerDrag(state, rtl, fromScrim = false) }
+    val scrimDrag = remember(state, rtl) { Modifier.drawerDrag(state, rtl, fromScrim = true) }
     val contentHidden by remember(state) { derivedStateOf { state.fraction > 0f } }
     val panelHidden by remember(state) { derivedStateOf { state.fraction == 0f } }
     val close: () -> Unit = { scope.launch { state.close() } }
@@ -245,14 +305,13 @@ fun PushDrawer(
             previous = current
         }
     }
-    // The one settle rule: once no finger is down and nothing animates (a frame later, so a release's own settle
-    // starts first), the drawer is brought to the end its position says, with the matching target.
+    // The one settle rule, for what no drag end covers (a settle cancelled because the drawer left the screen): once no
+    // drag owns the drawer and nothing animates, a frame later, it goes to the end its position says, with that target.
     LaunchedEffect(state) {
-        snapshotFlow { state.fingers || state.settling }.collect { busy ->
+        snapshotFlow { state.owner != null || state.settling }.collect { busy ->
             if (busy) return@collect
             withFrameNanos { }
-            // Not collectLatest: the settle started here flips `settling` and must not cancel itself.
-            if (!state.fingers && !state.settling) runCatching { state.idle() }
+            if (state.owner == null && !state.settling) state.idle()
         }
     }
 
@@ -261,15 +320,7 @@ fun PushDrawer(
     val paneLabel = stringResource(R.string.drawer_title)
     val panelSource = remember { MutableInteractionSource() }
     val keyboardMode = LocalInputModeManager.current.inputMode == InputMode.Keyboard // touch opens focus the panel too, without a ring
-    Box(
-        modifier
-            .fillMaxSize()
-            .pointerInput(state) {
-                awaitPointerEventScope {
-                    while (true) state.fingers = awaitPointerEvent(PointerEventPass.Initial).changes.any { it.pressed }
-                }
-            },
-    ) {
+    Box(modifier.fillMaxSize()) {
         Box(
             Modifier
                 .fillMaxSize()
@@ -282,15 +333,15 @@ fun PushDrawer(
                     .focusProperties { onEnter = { if (state.fraction > 0f) cancelFocusChange() } }
                     .focusGroup(),
             ) { content(dragArea) }
-            // Kept while its own drag runs, so a drag that reaches the closed end is still settled by its release.
-            if (contentHidden || state.dragging) {
+            // Kept while its own drag owns the drawer, so a drag that reaches the closed end keeps its finger until it lifts.
+            if (contentHidden || state.owner?.fromScrim == true) {
                 Box(
                     Modifier
                         .fillMaxSize()
                         .testTag("drawer.scrim")
                         .graphicsLayer { alpha = state.fraction }
                         .background(scrim)
-                        .then(dragArea)
+                        .then(scrimDrag)
                         .semantics {
                             contentDescription = closeLabel
                             traversalIndex = 1f
