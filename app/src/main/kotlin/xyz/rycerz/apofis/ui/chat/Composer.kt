@@ -30,8 +30,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
-import androidx.compose.runtime.movableContentOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -43,25 +41,29 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.Layout
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.traversalIndex
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Constraints
-import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.isSpecified
 import androidx.compose.ui.util.lerp
-import kotlin.math.ceil
 import xyz.rycerz.apofis.BuildConfig
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
@@ -80,7 +82,6 @@ internal const val FIELD_TAG = "composer.field"
 /** The card's outer margin above and below; the chat's bottom fade ends at the card's bottom edge (ChatScreen). */
 internal val COMPOSER_MARGIN = 8.dp
 private val CARD_PADDING = 8.dp
-private val TARGET = 48.dp
 
 /** Whether the main button works: a send in flight ([busy]) blocks another send or steer, never Stop. Drawing only. */
 internal fun primaryEnabled(mode: ComposerMode, busy: Boolean) = when (mode) {
@@ -106,27 +107,15 @@ internal fun enterKey(enterToSend: Boolean, enter: Boolean, down: Boolean, repea
     else -> EnterKey.CONSUME
 }
 
-private fun Density.lineHeight(style: TextStyle): Float =
-    if (style.lineHeight.isEm) style.lineHeight.value * style.fontSize.toPx() else style.lineHeight.toPx()
-
-/** Above and below the text: one line is as tall as the 48 dp send target (14 dp at font scale 1), at least 4 dp. */
-private fun Density.fieldPadding(style: TextStyle): Dp = ((TARGET.toPx() - lineHeight(style)) / 2).toDp().coerceIn(4.dp, 14.dp)
-
-/** The field's height for [lines] lines of [style], with its padding, px. */
-private fun Density.fieldHeight(style: TextStyle, lines: Int): Int = ceil(lineHeight(style) * lines).toInt() + (fieldPadding(style) * 2).roundToPx()
-
-/** The smallest card, px: margins, padding and one row as tall as one line of [style] or a 48 dp target, whichever is taller. */
-internal fun Density.composerMinHeight(style: TextStyle): Int =
-    ((COMPOSER_MARGIN + CARD_PADDING) * 2).roundToPx() + maxOf(TARGET.roundToPx(), fieldHeight(style, 1))
-
 /**
  * A frosted card in one row: the text, then a button column with the expand button at the top (once the text is three
  * lines tall, and only when the column has room for two 48 dp targets) and the send button (with Stop before it while
  * steering) at the bottom.
  *
- * The card takes at most its constraints' height, never less than [composerMinHeight] (then its top is cut off and Send
- * stays on screen). Collapsed, the text shows 1 to 5 lines within that height and scrolls inside the field. [expanded]
- * grows the field over [Motion.COMPOSER_EXPAND] ms to the whole height (or [expandedHeight]); collapsing snaps.
+ * The composer takes at most its constraints' height (its room) and reports the height it occupies: collapsed, 1 to 5
+ * lines (the text scrolls inside the field), expanded the whole room (or [expandedHeight] for the field), growing over
+ * [Motion.COMPOSER_EXPAND] ms; collapsing snaps. In a short room the card's margins and padding shrink first, so Send
+ * keeps its 48 dp; see [BottomDims].
  *
  * The text is the holder's [draft]; only user edits call [onDraftChange]. [onSend] asks the holder and returns whether
  * it took the draft; only then the composer collapses. The button, the IME action (only with [enterToSend]) and
@@ -152,18 +141,21 @@ internal fun Composer(
     val scheme = MaterialTheme.colorScheme
     val colors = ApofisTheme.colors
     val style = MaterialTheme.typography.bodyLarge.copy(color = scheme.onSurface)
+    val density = LocalDensity.current
+    val dims = remember(density, style) { density.bottomDims(style) }
     val progress = remember { Animatable(if (expanded) 1f else 0f) } // 0 collapsed, 1 expanded
     LaunchedEffect(expanded) { if (expanded) progress.animateTo(1f, tween(Motion.COMPOSER_EXPAND, easing = EaseOutCubic)) else progress.snapTo(0f) }
     val submit = { if (onSend()) onExpandedChange(false) }
     var lines by remember { mutableIntStateOf(1) }
     val manyLines by remember { derivedStateOf { showsExpand(lines, expanded = false) } }
-    val pad = with(androidx.compose.ui.platform.LocalDensity.current) { fieldPadding(style) }
+    val pad = with(density) { (dims.fieldPadding / 2f).toDp() }
 
     val fillOnly = backdrop?.layer == null || !ApofisTheme.blur
     // Without blur the glass shows the content under it: a page backplate keeps text and icons at their contrast.
     val backplate = if (fillOnly) Modifier.background(scheme.surface, shape) else Modifier
     Layout(
         content = {
+            Box(Modifier.then(backplate).frostedGlass(backdrop, shape, colors.glassFill, colors.glassBorder)) // the card
             BasicTextField(
                 draft,
                 onDraftChange,
@@ -177,18 +169,6 @@ internal fun Composer(
                             EnterKey.FIELD -> false
                             EnterKey.SEND -> true.also { submit() }
                             EnterKey.CONSUME -> true
-                        }
-                    }
-                    .layout { measurable, constraints ->
-                        if (!expanded || !constraints.hasBoundedHeight) {
-                            val p = measurable.measure(constraints) // 1 to 5 lines (maxLines), at most the room given
-                            layout(p.width, p.height) { p.place(0, 0) }
-                        } else {
-                            val room = if (expandedHeight.isSpecified) minOf(expandedHeight.roundToPx(), constraints.maxHeight) else constraints.maxHeight
-                            val collapsed = fieldHeight(style, lines.coerceIn(1, 5)).coerceAtMost(room)
-                            val h = lerp(collapsed, room, progress.value)
-                            val p = measurable.measure(constraints.copy(minHeight = h, maxHeight = h))
-                            layout(p.width, h) { p.place(0, 0) }
                         }
                     },
                 readOnly = busy, // it shows the text being stored, which no keystroke may change
@@ -217,62 +197,139 @@ internal fun Composer(
                 }
             }
             Row {
-                if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, action = mode, onClick = onStop)
-                val stop = mode == ComposerMode.STOP
-                RoundButton(
-                    if (stop) R.drawable.lucide_square else R.drawable.lucide_arrow_up,
-                    when (mode) {
-                        ComposerMode.STEER -> R.string.chat_steer
-                        ComposerMode.STOP -> R.string.chat_stop
-                        else -> R.string.chat_send
-                    },
-                    enabled = primaryEnabled(mode, busy),
-                    tag = if (stop) STOP_TAG else SEND_TAG,
-                    action = if (mode == ComposerMode.SEND_DISABLED) ComposerMode.SEND else mode,
-                    onClick = if (stop) onStop else submit,
-                )
+                if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
+                PrimaryButton(mode, busy, submit, onStop)
             }
         },
-        modifier = modifier
-            .layout { measurable, constraints ->
-                // Never smaller than one row: in a window too short for it the top is cut off, Send stays.
-                if (!constraints.hasBoundedHeight) return@layout measurable.measure(constraints).let { p -> layout(p.width, p.height) { p.place(0, 0) } }
-                val floor = composerMinHeight(style)
-                val p = measurable.measure(constraints.copy(maxHeight = maxOf(constraints.maxHeight, floor)))
-                val h = minOf(p.height, constraints.maxHeight).coerceAtLeast(constraints.minHeight)
-                layout(p.width, h) { p.place(0, h - p.height) }
-            }
-            .padding(horizontal = 12.dp, vertical = COMPOSER_MARGIN)
-            .fillMaxWidth()
-            .then(backplate)
-            .frostedGlass(backdrop, shape, colors.glassFill, colors.glassBorder)
-            .semantics { isTraversalGroup = true }
-            .padding(CARD_PADDING),
+        modifier = modifier.fillMaxWidth().semantics { isTraversalGroup = true },
     ) { measurables, constraints ->
-        // The buttons keep their own column at the end: the expand target never overlaps the text, send or stop.
-        val loose = constraints.copy(minWidth = 0, minHeight = 0)
-        val buttons = measurables[2].measure(loose)
-        val expand = measurables[1].measure(loose)
-        // Expand is dropped before Send when the column cannot hold both 48 dp targets.
-        val withExpand = expand.height > 0 && buttons.height + expand.height <= constraints.maxHeight
         val width = constraints.maxWidth
-        val fieldWidth = (width - maxOf(expand.width, buttons.width)).coerceAtLeast(0)
-        val field = measurables[0].measure(Constraints(fieldWidth, fieldWidth, 0, constraints.maxHeight))
-        val height = maxOf(field.height, buttons.height + if (withExpand) expand.height else 0)
+        val room = if (constraints.hasBoundedHeight) constraints.maxHeight else Int.MAX_VALUE / 2
+        // Vertical margins and padding for this room: they shrink first (padding last), so the row keeps its height.
+        val insets = if (room >= dims.row(1) + dims.cardInsets) dims.cardInsets else (room - dims.row(1)).coerceAtLeast(0)
+        val padding = minOf(insets / 2, CARD_PADDING.roundToPx())
+        val margin = insets / 2 - padding
+        val rowRoom = (room - 2 * (margin + padding)).coerceAtLeast(0)
+        val side = MARGIN_X.roundToPx() + CARD_PADDING.roundToPx()
+        val inner = (width - 2 * side).coerceAtLeast(0)
+        val loose = Constraints(0, inner, 0, rowRoom)
+        val buttons = measurables[3].measure(loose)
+        val expand = measurables[2].measure(loose)
+        val withExpand = expand.height > 0 && dims.actions(rowRoom, wantsExpand = true) >= buttons.height + expand.height
+        val fieldWidth = (inner - maxOf(expand.width, buttons.width)).coerceAtLeast(0)
+        val field = if (!expanded) {
+            measurables[1].measure(Constraints(fieldWidth, fieldWidth, 0, rowRoom)) // 1 to 5 lines (maxLines), scrolling inside
+        } else {
+            val full = if (expandedHeight.isSpecified) minOf(expandedHeight.roundToPx(), rowRoom) else rowRoom
+            val from = minOf(dims.field(lines.coerceIn(1, 5)), full) // the collapsed field for the current text
+            val h = lerp(from, full, progress.value)
+            measurables[1].measure(Constraints.fixed(fieldWidth, h))
+        }
+        val row = minOf(rowRoom, maxOf(field.height, buttons.height + if (withExpand) expand.height else 0))
+        val card = row + 2 * padding
+        val height = card + 2 * margin
+        val glass = measurables[0].measure(Constraints.fixed((width - 2 * MARGIN_X.roundToPx()).coerceAtLeast(0), card))
         layout(width, height) {
-            field.placeRelative(0, height - field.height)
-            if (withExpand) expand.placeRelative(width - expand.width, 0)
-            buttons.placeRelative(width - buttons.width, height - buttons.height)
+            glass.placeRelative(MARGIN_X.roundToPx(), margin)
+            val top = margin + padding
+            field.placeRelative(side, top + row - field.height)
+            if (withExpand) expand.placeRelative(width - side - expand.width, top)
+            buttons.placeRelative(width - side - buttons.width, top + row - buttons.height)
         }
     }
 }
 
+private val MARGIN_X = 12.dp
+
 /**
- * A 32 dp circle with an 18 dp glyph inside a 48 dp touch target; the glyph swaps with a scale and fade. The clickable is
- * keyed by [action], so a press begun on one action is cancelled when the action changes; the glyph moves along.
+ * The primary button: Send, Steer or Stop, one stable control (one focus target, one labelled node) whatever the mode.
+ * A click counts only if its press began while the same action was shown: the action is recorded when the pointer goes
+ * down or an activation key is pressed, and compared at the click (an accessibility action, with no press of its own,
+ * is judged when it arrives). A press held while the action changes fires nothing.
  */
 @Composable
-private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, tag: String, action: ComposerMode, filled: Boolean = true, onClick: () -> Unit) {
+private fun PrimaryButton(mode: ComposerMode, busy: Boolean, submit: () -> Unit, onStop: () -> Unit) {
+    val action = if (mode == ComposerMode.SEND_DISABLED) ComposerMode.SEND else mode
+    val shown = rememberUpdatedState(action)
+    val press = remember { ActionPress() }
+    val stop = mode == ComposerMode.STOP
+    RoundButton(
+        if (stop) R.drawable.lucide_square else R.drawable.lucide_arrow_up,
+        when (mode) {
+            ComposerMode.STEER -> R.string.chat_steer
+            ComposerMode.STOP -> R.string.chat_stop
+            else -> R.string.chat_send
+        },
+        enabled = primaryEnabled(mode, busy),
+        tag = if (stop) STOP_TAG else SEND_TAG,
+        modifier = Modifier.pressStart(press) { shown.value },
+        onClick = { if (press.accepts(action)) (if (action == ComposerMode.STOP) onStop else submit)() },
+    )
+}
+
+/** The primary button's presses: the action shown when the pointer went down and when each activation key went down. */
+private class ActionPress {
+    var pointer: ComposerMode? = null
+    var pointerReleasing = false // the release of that gesture is being dispatched
+    val keys = HashMap<Key, ComposerMode>()
+    var keyReleased: ComposerMode? = null // the action recorded for the key whose release is being dispatched
+    var keyReleasing = false
+
+    /** Called by the click with the action it would run: consumes the press it came from. */
+    fun accepts(now: ComposerMode): Boolean {
+        val begun = when {
+            pointerReleasing -> pointer.also { pointer = null; pointerReleasing = false } ?: return false
+            keyReleasing -> keyReleased.also { keyReleased = null; keyReleasing = false } ?: return false
+            else -> now // no press of its own (an accessibility action)
+        }
+        return begun == now
+    }
+}
+
+private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key.DirectionCenter)
+
+/** Records the shown action at each press, before the click handling sees the press. */
+private fun Modifier.pressStart(press: ActionPress, shown: () -> ComposerMode): Modifier = this
+    .pointerInput(press) {
+        awaitEachGesture {
+            try {
+                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                press.pointer = shown()
+                do {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                } while (event.changes.any { it.pressed })
+                press.pointerReleasing = true // the click, if any, comes from this release (Main pass)
+                awaitPointerEvent(PointerEventPass.Final) // the same release, after the click
+            } finally {
+                press.pointer = null
+                press.pointerReleasing = false
+            }
+        }
+    }
+    .onFocusChanged { if (!it.hasFocus) press.keys.clear() }
+    .onPreviewKeyEvent {
+        if (it.key in activationKeys) {
+            if (it.type == KeyEventType.KeyDown && it.nativeKeyEvent.repeatCount == 0) {
+                press.keys[it.key] = shown()
+            } else if (it.type == KeyEventType.KeyUp) {
+                press.keyReleased = press.keys.remove(it.key)
+                press.keyReleasing = true
+            }
+        }
+        false
+    }
+    .onKeyEvent {
+        // Reached only when the button did not take the release as a click: drop what that release recorded.
+        if (it.type == KeyEventType.KeyUp) {
+            press.keyReleased = null
+            press.keyReleasing = false
+        }
+        false
+    }
+
+/** A 32 dp circle with an 18 dp glyph inside a 48 dp touch target; the glyph swaps with a scale and fade. */
+@Composable
+private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, tag: String, modifier: Modifier = Modifier, filled: Boolean = true, onClick: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     val fill = if (enabled && filled) scheme.primary else Color.Transparent
     // Disabled: the button fades the opaque glyph to 0.38, drawn over the 0.12 fill behind it (outside that fade).
@@ -281,26 +338,19 @@ private fun RoundButton(@DrawableRes icon: Int, label: Int, enabled: Boolean, ta
         filled -> scheme.onPrimary
         else -> scheme.primary
     }
-    val glyph = remember {
-        movableContentOf { i: Int, t: Color ->
-            val swap = tween<Float>(Motion.GLYPH_SWAP, easing = EaseOutCubic)
-            AnimatedContent(i, transitionSpec = { (scaleIn(swap, 0.6f) + fadeIn(swap)) togetherWith (scaleOut(swap, 0.6f) + fadeOut(swap)) }, label = "glyph") {
-                Icon(painterResource(it), contentDescription = null, Modifier.size(18.dp), tint = t)
-            }
-        }
-    }
     Box(contentAlignment = Alignment.Center) {
         if (!enabled) Box(Modifier.size(32.dp).background(scheme.disabledFill, CircleShape))
-        key(action) {
-            ApofisIconButton(onClick = onClick, contentDescription = stringResource(label), Modifier.testTag(tag), enabled = enabled, visualSize = 32.dp) {
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .background(fill, CircleShape)
-                        .then(if (filled) Modifier else Modifier.border(1.5.dp, scheme.primary, CircleShape)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    glyph(icon, tint)
+        ApofisIconButton(onClick = onClick, contentDescription = stringResource(label), modifier.testTag(tag), enabled = enabled, visualSize = 32.dp) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(fill, CircleShape)
+                    .then(if (filled) Modifier else Modifier.border(1.5.dp, scheme.primary, CircleShape)),
+                contentAlignment = Alignment.Center,
+            ) {
+                val swap = tween<Float>(Motion.GLYPH_SWAP, easing = EaseOutCubic)
+                AnimatedContent(icon, transitionSpec = { (scaleIn(swap, 0.6f) + fadeIn(swap)) togetherWith (scaleOut(swap, 0.6f) + fadeOut(swap)) }, label = "glyph") {
+                    Icon(painterResource(it), contentDescription = null, Modifier.size(18.dp), tint = tint)
                 }
             }
         }

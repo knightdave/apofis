@@ -19,6 +19,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.performTouchInput
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -145,6 +149,7 @@ class ComposerViewTest {
     private var stops = 0
     private val sentTexts = ArrayList<String>()
     private val edits = ArrayList<String>()
+    private lateinit var inputMode: androidx.compose.ui.input.InputModeManager
     private var ancestorEnters = 0 // Enter events that reached a handler above the composer
     private var onSendHook: () -> Boolean = {
         sends++
@@ -157,6 +162,7 @@ class ComposerViewTest {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale), LocalLayoutDirection provides if (rtl) LayoutDirection.Rtl else LayoutDirection.Ltr) {
                 ApofisTheme(theme, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                    inputMode = androidx.compose.ui.platform.LocalInputModeManager.current
                     Box(Modifier.fillMaxSize().testTag("root"), contentAlignment = Alignment.BottomCenter) {
                         Box(
                             (if (height != null) Modifier.fillMaxWidth().height(height) else Modifier.fillMaxWidth()).testTag("slot").onKeyEvent {
@@ -264,39 +270,84 @@ class ComposerViewTest {
         for (tag in listOf(SEND_TAG, STOP_TAG)) for (node in nodes(tag)) assertEquals("$tag mid swap", 1, node.descs().size)
     }
 
-    /** A press begun on one action never lands on another: changing the action cancels it. */
-    @Test
-    fun pressBegunOnOneActionIsCancelledWhenTheActionChanges() {
-        mode = ComposerMode.STOP
-        draft = ""
-        show()
-        val at = bounds(STOP_TAG).center
-        rule.onRoot().performTouchInput { down(at) }
-        draft = "dictated"
-        mode = ComposerMode.STEER // the filled button under the finger is now Steer
-        rule.waitForIdle()
-        rule.onRoot().performTouchInput { up() }
-        rule.waitForIdle()
-        assertEquals("a press begun on Stop sent", 0, sends)
-        assertEquals("and stopped nothing either", 0, stops)
-        rule.onNodeWithTag(STOP_TAG).performClick() // a fresh tap on each target works
-        rule.onNodeWithTag(SEND_TAG).performClick()
-        rule.waitForIdle()
-        assertEquals(1, stops)
-        assertEquals(1, sends)
 
-        val steer = bounds(SEND_TAG).center
-        rule.onRoot().performTouchInput { down(steer) }
-        draft = ""
-        mode = ComposerMode.STOP
-        rule.waitForIdle()
-        rule.onRoot().performTouchInput { up() }
-        rule.waitForIdle()
-        assertEquals("a press begun on Steer stopped the run", 1, stops)
-        assertEquals(1, sends)
-        rule.onNodeWithTag(STOP_TAG).performClick()
+    /** The filled button at the end: the primary control, whatever its action. */
+    private fun primaryNode() = rule.onAllNodes(hasTestTag(SEND_TAG) or hasTestTag(STOP_TAG), useUnmergedTree = true).fetchSemanticsNodes().maxBy { it.boundsInRoot.right }
+
+    /** A press held while the action changes fires nothing, for every change; a fresh press then works. */
+    @Test
+    fun aPressHeldAcrossAnActionChangeFiresNothing() {
+        fun hold(from: ComposerMode, fromDraft: String, to: ComposerMode, toDraft: String) {
+            mode = from
+            draft = fromDraft
+            rule.waitForIdle()
+            val at = primaryNode().boundsInRoot.center
+            val (s0, t0) = sends to stops
+            rule.onRoot().performTouchInput { down(at) }
+            mode = to
+            draft = toDraft
+            rule.waitForIdle()
+            rule.onRoot().performTouchInput { up() }
+            rule.waitForIdle()
+            assertEquals("$from to $to: sent", s0, sends)
+            assertEquals("$from to $to: stopped", t0, stops)
+            rule.onRoot().performTouchInput { click(primaryNode().boundsInRoot.center) } // a fresh press on the new action
+            rule.waitForIdle()
+            if (to == ComposerMode.STOP) assertEquals("$to: a fresh tap", t0 + 1, stops) else assertEquals("$to: a fresh tap", s0 + 1, sends)
+        }
+        show()
+        hold(ComposerMode.STOP, "", ComposerMode.STEER, "dictated")
+        hold(ComposerMode.STEER, "dictated", ComposerMode.SEND, "dictated")
+        hold(ComposerMode.SEND, "typed", ComposerMode.STOP, "")
+        rule.onNodeWithTag(STOP_TAG).performClick() // the accessibility action, with no press of its own
         rule.waitForIdle()
         assertEquals(2, stops)
+    }
+
+    /**
+     * One stable control: focused on Steer, the run finishing turns it into Send without losing keyboard focus or its
+     * accessibility node; one fresh keyboard activation sends once. A key press held across a change fires nothing.
+     */
+    @Test
+    fun thePrimaryKeepsFocusAndIdentityAcrossActions() {
+        mode = ComposerMode.STEER
+        draft = "dictated"
+        show()
+        val node = primaryNode()
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) } // as a Tab would
+        rule.waitForIdle()
+        rule.onNode(androidx.compose.ui.test.SemanticsMatcher("primary") { it.id == node.id }, useUnmergedTree = true).performSemanticsAction(SemanticsActions.RequestFocus)
+        rule.waitForIdle()
+        fun focusedPrimary() = primaryNode().also { assertTrue("the primary lost focus", it.config[SemanticsProperties.Focused]) }
+        assertTrue("the primary took focus on Steer", primaryNode().config[SemanticsProperties.Focused])
+        mode = ComposerMode.SEND // the run finished
+        rule.waitForIdle()
+        assertEquals("the same accessibility node", node.id, focusedPrimary().id)
+        assertEquals(listOf("Send"), primaryNode().descs())
+        dispatch(key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_SPACE), key(NativeKeyEvent.ACTION_UP, NativeKeyEvent.KEYCODE_SPACE))
+        rule.waitForIdle()
+        assertEquals("one fresh activation sends once", 1, sends)
+        // A key held across Send to Stop, then Stop to Steer: nothing fires.
+        dispatch(key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_ENTER))
+        mode = ComposerMode.STOP
+        draft = ""
+        rule.waitForIdle()
+        dispatch(key(NativeKeyEvent.ACTION_UP, NativeKeyEvent.KEYCODE_ENTER))
+        rule.waitForIdle()
+        assertEquals(1, sends)
+        assertEquals(0, stops)
+        assertEquals(node.id, focusedPrimary().id)
+        dispatch(key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_ENTER))
+        mode = ComposerMode.STEER
+        draft = "again"
+        rule.waitForIdle()
+        dispatch(key(NativeKeyEvent.ACTION_UP, NativeKeyEvent.KEYCODE_ENTER))
+        rule.waitForIdle()
+        assertEquals(1, sends)
+        assertEquals(0, stops)
+        dispatch(key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_ENTER), key(NativeKeyEvent.ACTION_UP, NativeKeyEvent.KEYCODE_ENTER))
+        rule.waitForIdle()
+        assertEquals("a fresh Enter on Steer", 2, sends)
     }
 
     /** The keyboard's Send action sends only with Enter to send on, whatever action the keyboard reports. */

@@ -232,7 +232,7 @@ class ChromeInputsTest {
             val bar = rule.onNodeWithTag("chat.topbar", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot.bottom
             return rule.onNodeWithTag(FIELD_TAG).fetchSemanticsNode().boundsInRoot.top - bar
         }
-        val card = with(rule.density) { 16.dp.toPx() } // the card's 8 dp margin and 8 dp padding
+        val card = with(rule.density) { (64 + 16).dp.toPx() } // the transcript's 64 dp, then the card's 8 dp margin and 8 dp padding
         assertEquals(card, gap(), 1.5f)
         fontScale = 2f
         rule.waitForIdle()
