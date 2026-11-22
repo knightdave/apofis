@@ -95,6 +95,20 @@ class ThemeTokensTest {
         assertEquals(emptyList<String>(), failures)
     }
 
+    /** The wave's brightest phase (reply dots on the page, mini dots on the timeline card) reaches 3:1; dimmer phases are decorative. */
+    @Test
+    fun theWavePeakReaches3to1() {
+        val peak = (0..1100).maxOf { dotWave(it.toLong(), 0).alpha }
+        val failures = mutableListOf<String>()
+        for ((name, scheme, c) in themes) {
+            for ((where, bg) in listOf("page" to scheme.surface, "timelineFill" to c.timelineFill)) {
+                val ratio = contrastRatio(scheme.primary.copy(alpha = peak).compositeOver(bg), bg)
+                if (ratio < 3.0) failures += "$name on $where: %.2f:1".format(ratio)
+            }
+        }
+        assertEquals(emptyList<String>(), failures)
+    }
+
     @Test
     fun noOpaqueBlackOrWhiteInScheme() {
         for ((name, scheme) in themes) {

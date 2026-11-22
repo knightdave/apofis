@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Debug only: the emulator end-to-end distributor (push/Policy.kt in src/debug). -->
+    <queries>
+        <package android:name="xyz.rycerz.apofis.e2e" />
+    </queries>
+</manifest>

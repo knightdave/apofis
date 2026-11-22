@@ -105,12 +105,12 @@ class FollowTest {
 
     private lateinit var list: LazyListState
 
-    private fun show(initial: ChatUiState, index: Int = 0, offset: Int = 0): (ChatUiState) -> Unit {
+    private fun show(initial: ChatUiState, index: Int = 0, offset: Int = 0, reduceMotion: Boolean = true): (ChatUiState) -> Unit {
         rule.mainClock.autoAdvance = false
         var ui by mutableStateOf(initial)
         val actions = object : ChatActions {} // stable, as the view model is in the app
         rule.setContent {
-            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = reduceMotion, blur = false) {
                 list = androidx.compose.foundation.lazy.rememberLazyListState(index, offset)
                 val now = ui
                 // As the app does: a new current-state reader with every state (it must not reach the composer or header).
@@ -372,5 +372,125 @@ class FollowTest {
         frames(2)
         assertTrue(ChromeProbe.barCompositions > bar)
         assertTrue(ChromeProbe.bottomCompositions > bottom)
+    }
+
+    // ---- reveal ticks (motion on): the follow rules see what is revealed, not what arrived ----
+
+    @Test
+    fun revealTicksKeepAFollowerPinned() {
+        val set = show(state(live(text(100))), reduceMotion = false)
+        set(state(live(text(1000)))) // one token of 900 characters, revealed over the next ticks with no new token
+        frames()
+        val pins = ChromeProbe.pins
+        for (f in 1..12) {
+            frames()
+            assertTrue("frame $f", atBottom())
+        }
+        nudge(60f) // a follower 30 dp up, inside the 56 dp zone
+        frames(12)
+        assertTrue("${distanceFromBottom()}", atBottom())
+        assertTrue("the ticks pinned", ChromeProbe.pins > pins)
+    }
+
+    @Test
+    fun revealTicksLeaveAReader() {
+        val set = show(state(live(text(400))), reduceMotion = false)
+        drag(600f)
+        val (key, offset) = anchor()
+        set(state(live(text(1300))))
+        for (f in 1..40) {
+            frames()
+            assertEquals("frame $f", key to offset, anchor())
+        }
+    }
+
+    @Test
+    fun revealTicksDoNotCancelASemanticsScroll() {
+        val set = show(state(live(text(400))), reduceMotion = false)
+        set(state(live(text(1300))))
+        frames()
+        // 150 dp up: outside the 56 dp zone, with the live reply still on screen, so its ticks keep coming.
+        rule.onNode(hasScrollToIndexAction()).performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, 300f) }
+        for (i in 1..60) { // more text keeps arriving and being revealed while and after the scroll runs
+            if (i % 6 == 0) set(state(live(text(1300 + i * 20))))
+            frames()
+        }
+        assertTrue("distance ${distanceFromBottom()}", distanceFromBottom() > 112)
+    }
+
+    /** Reveal ticks recompose the transcript only, like tokens. */
+    @Test
+    fun revealTicksLeaveTheChromeAlone() {
+        val set = show(state(live(text(100))), reduceMotion = false)
+        frames(5)
+        val bar = ChromeProbe.barCompositions
+        val bottom = ChromeProbe.bottomCompositions
+        val root = ChromeProbe.rootMeasures
+        set(state(live(text(1100))))
+        frames(40) // ticks with no new token
+        for (i in 1..50) {
+            set(state(live(text(1100 + i * 40))))
+            frames()
+        }
+        assertEquals("header recomposed by ticks", bar, ChromeProbe.barCompositions)
+        assertEquals("composer recomposed by ticks", bottom, ChromeProbe.bottomCompositions)
+        assertEquals("root measured by ticks", root, ChromeProbe.rootMeasures)
+    }
+
+    // ---- fix round 2: growth per component, and a direct run replacement holds like a run end ----
+
+    private fun polling() = LiveReply("run_1", "running", "", emptyList(), null, Connection.POLLING)
+
+    @Test
+    fun aNewStoredReplyWhilePollingPinsAFollower() {
+        val set = show(state(polling()))
+        assertTrue(atBottom())
+        nudge(60f) // a follower 30 dp up
+        // A short new reply for the run arrives by polling, after a much longer older reply: an item was added.
+        set(state(polling(), history + AssistantReply("r99", emptyList(), "Done", FIXED_NOW)))
+        frames(3)
+        assertTrue("${distanceFromBottom()}", atBottom())
+    }
+
+    @Test
+    fun aNewStoredReplyWhilePollingLeavesAReader() {
+        val set = show(state(polling()))
+        drag(600f)
+        val before = anchor()
+        set(state(polling(), history + AssistantReply("r99", emptyList(), "Done", FIXED_NOW)))
+        frames(3)
+        assertEquals(before, anchor())
+    }
+
+    private val next = UserMessage("u14", "And more", steered = false, timestamp = FIXED_NOW, runId = "run_2")
+
+    /** Run A's reply is stored and run B starts in the same update: no frame without a run. */
+    private fun replaced() = ChatUiState(
+        "apofis-1", "Follow", StatusLine.WORKING,
+        withLive(history + AssistantReply("r99", emptyList(), text(1600), FIXED_NOW) + next, LiveReply("run_2", "running", "", emptyList(), null, Connection.LIVE)) { FIXED_NOW },
+        ComposerMode.STOP, "", "hermes.example", LiveReply("run_2", "running", "", emptyList(), null, Connection.LIVE),
+    )
+
+    @Test
+    fun aDirectReplacementHoldsAFollowerLikeARunEnd() {
+        val set = show(state(live(text(1200))))
+        assertTrue(atBottom())
+        set(replaced())
+        frames()
+        nudge(60f) // the stored rows settle during the hold
+        frames(Motion.FOLLOW_HOLD / 16)
+        assertTrue("${list.firstVisibleItemIndex}/${list.firstVisibleItemScrollOffset}", atBottom())
+    }
+
+    @Test
+    fun aDirectReplacementLeavesAReader() {
+        val set = show(state(live(text(1200))))
+        drag(600f) // released
+        nudge(3000f) // further up, into the history, so the anchored row outlives the swap of the reply's rows
+        settle()
+        val before = anchor()
+        set(replaced())
+        frames(Motion.FOLLOW_HOLD / 16 + 4)
+        assertEquals(before, anchor())
     }
 }

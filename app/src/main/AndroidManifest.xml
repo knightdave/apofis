@@ -11,6 +11,11 @@
     <!-- No foreground service by design: the app must never call setForeground or use long-running workers. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" tools:node="remove" />
 
+    <!-- The only distributor the app uses (PushRegistrar picks it by package, no chooser). -->
+    <queries>
+        <package android:name="io.heckel.ntfy" />
+    </queries>
+
     <application
         android:name=".ApofisApp"
         android:allowBackup="false"
@@ -23,6 +28,29 @@
         <!-- WorkManager's foreground service, removed with the permission above. -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
+            tools:node="remove" />
+        <!-- UnifiedPush: our receiver replaces the library's. Its bind service (a priority boost only) and its distributor
+             chooser are not used. Exported: distributors deliver here; the connector drops any event without a known token. -->
+        <receiver
+            android:name=".push.PushReceiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.MESSAGE" />
+                <action android:name="org.unifiedpush.android.connector.UNREGISTERED" />
+                <action android:name="org.unifiedpush.android.connector.NEW_ENDPOINT" />
+                <action android:name="org.unifiedpush.android.connector.REGISTRATION_FAILED" />
+                <action android:name="org.unifiedpush.android.connector.TEMP_UNAVAILABLE" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name="org.unifiedpush.android.connector.internal.MessagingReceiverImpl"
+            tools:node="remove" />
+        <service
+            android:name="org.unifiedpush.android.connector.internal.RaiseToForegroundService"
+            tools:node="remove" />
+        <activity
+            android:name="org.unifiedpush.android.connector.internal.LinkActivity"
             tools:node="remove" />
         <!-- singleTask: a second instance would take over the app-wide Back target the Connect screen uses. -->
         <!-- adjustResize: the system does not pan the window for the keyboard; the chat applies the keyboard inset itself
