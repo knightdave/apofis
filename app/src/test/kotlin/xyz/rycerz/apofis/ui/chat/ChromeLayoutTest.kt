@@ -35,6 +35,9 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.performClick
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.click
@@ -103,12 +106,19 @@ class ChromeLayoutTest {
     private lateinit var list: LazyListState
     private val retried = ArrayList<String>()
     private var retryLoads = 0
+    private var sendClicks = 0
+    private var shown by androidx.compose.runtime.mutableStateOf<ChatUiState?>(null) // the state on screen; set again to change it
 
     @OptIn(ExperimentalComposeUiApi::class)
     private fun show(state: ChatUiState, fontScale: Float = 1f, rtl: Boolean = false, initialIndex: Int = 0, initialOffset: Int = 0) {
+        shown = state
         val actions = object : ChatActions {
             override fun onRetry(idempotencyKey: String) {
                 retried += idempotencyKey
+            }
+
+            override fun onSendClick() {
+                sendClicks++
             }
         }
         val newChat: @Composable RowScope.() -> Unit = {
@@ -124,7 +134,7 @@ class ChromeLayoutTest {
                     androidx.compose.foundation.layout.Box(Modifier.semantics { testTagsAsResourceId = true }) {
                         list = rememberLazyListState(initialIndex, initialOffset)
                         ChatScreen(
-                            state, actions, onOpenConnection = {}, onRetryLoad = { retryLoads++ },
+                            shown!!, actions, onOpenConnection = {}, onRetryLoad = { retryLoads++ },
                             navigationIcon = { DrawerButton {} }, appBarActions = newChat,
                             zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list,
                         )
@@ -291,6 +301,92 @@ class ChromeLayoutTest {
         rule.mainClock.advanceTimeBy(2000)
         val allow = bounds(hasText("Allow once"))
         assertTrue("contrast ${contrastIn(allow)}", contrastIn(allow) >= 4.5)
+    }
+
+    // ---- Task 8: at every composer height the last text and controls rest clear of the fade and the composer ----
+
+    private fun withDraft(state: ChatUiState, lines: Int) = state.copy(composer = ComposerMode.SEND, draft = (1..lines).joinToString("\n") { "Draft line $it" })
+
+    @Test
+    fun lastTextIsClearAtEveryComposerHeight() {
+        show(chat(listOf(question, answer)))
+        for (lines in listOf(1, 5, 12)) {
+            shown = withDraft(chat(listOf(question, answer)), lines)
+            rule.waitForIdle()
+            for (ime in listOf(0, 600)) {
+                insets(ime = ime)
+                val text = bounds(hasText("4 GB", substring = true))
+                assertTrue("$lines lines, keyboard $ime: text $text under the composer ${bottomAreaTop()}", text.bottom <= bottomAreaTop())
+                assertTrue("$lines lines, keyboard $ime: contrast ${lastTextContrast()}", lastTextContrast() >= 4.5)
+            }
+            insets(ime = 0)
+        }
+    }
+
+    @Test
+    fun approvalButtonsAreClearAtEveryComposerHeight() {
+        val live = LiveReply("run_1", "running", "", listOf(ToolStep("c1", "terminal", "ls", "ok", false, error = false, running = false)), PendingControl("approval", "ctl_1", 2, "rm -rf ~/old", null), Connection.LIVE)
+        show(chat(listOf(question.copy(runId = "run_1")), StatusLine.WORKING, live))
+        rule.mainClock.advanceTimeBy(2000)
+        for (lines in listOf(1, 5)) {
+            shown = withDraft(chat(listOf(question.copy(runId = "run_1")), StatusLine.WORKING, live), lines).copy(composer = ComposerMode.STEER)
+            rule.waitForIdle()
+            val allow = bounds(hasText("Allow once"))
+            assertTrue("$lines lines: $allow under the composer", allow.bottom <= bottomAreaTop())
+            assertTrue("$lines lines: contrast ${contrastIn(allow)}", contrastIn(allow) >= 4.5)
+        }
+    }
+
+    /** Expanded, the composer takes the free height: the last row still rests above it (reachable by scrolling), never under it. */
+    @Test
+    fun expandedComposerLeavesTheLastRowAboveIt() {
+        show(withDraft(chat(failed), 3))
+        rule.onNode(hasContentDescription("Expand the editor")).performClick()
+        rule.waitForIdle()
+        rule.onNode(hasContentDescription("Collapse the editor")).assertExists()
+        val field = bounds(hasTestTag("composer.field"))
+        assertTrue("expanded field $field starts below the bar ${barBottom()}", field.top >= barBottom())
+        assertTrue("expanded field fills the free height", field.height > px(400))
+        val lowest = rule.onAllNodes(tagged("user:") or tagged("reply:"), useUnmergedTree = true).fetchSemanticsNodes().maxOf { it.unclipped().bottom }
+        assertTrue("the last row $lowest rests above the composer ${bottomAreaTop()}", lowest <= bottomAreaTop())
+        // The keyboard shrinks the expanded editor; its controls stay on screen.
+        insets(ime = 600)
+        val height = rule.onRoot().fetchSemanticsNode().size.height
+        for (m in listOf(hasTestTag("composer.field"), hasTestTag("composer.send"), hasContentDescription("Collapse the editor"))) {
+            val r = bounds(m)
+            assertTrue("$r on screen above the keyboard", r.top >= barBottom() - 1 && r.bottom <= height - 600 + 1)
+        }
+    }
+
+    /** A 220 dp window (split screen), keyboard closed and open: the field, Send and Collapse are on screen and take taps. */
+    @Test
+    @Config(qualifiers = "w360dp-h220dp-xhdpi")
+    fun composerControlsReachableInAShortWindow() {
+        show(withDraft(chat(failed), 4))
+        rule.onNode(hasContentDescription("Expand the editor")).performClick()
+        rule.waitForIdle()
+        for (ime in listOf(0, 200)) {
+            insets(top = 48, ime = ime)
+            val height = rule.onRoot().fetchSemanticsNode().size.height
+            for (m in listOf(hasTestTag("composer.field"), hasTestTag("composer.send"), hasContentDescription("Collapse the editor"))) {
+                val r = bounds(m)
+                assertTrue("keyboard $ime: $r inside the window above the keyboard", r.top >= 0f && r.bottom <= height - ime + 1 && r.height > 0f)
+            }
+            val before = sendClicks
+            rule.onRoot().performTouchInput { click(bounds(hasTestTag("composer.send")).center) }
+            rule.waitForIdle()
+            assertEquals("keyboard $ime: a tap on Send reaches it", before + 1, sendClicks)
+            // The accepted send collapsed it (the fake actions keep the draft): expand again.
+            rule.onNode(hasContentDescription("Expand the editor")).performClick()
+            rule.waitForIdle()
+        }
+        insets(top = 48, ime = 200)
+        rule.onRoot().performTouchInput { click(bounds(hasContentDescription("Collapse the editor")).center) }
+        rule.waitForIdle()
+        rule.onNode(hasContentDescription("Expand the editor")).assertExists()
+        rule.onRoot().performTouchInput { click(bounds(hasTestTag("composer.field")).center) }
+        rule.waitForIdle()
+        assertTrue("a tap focuses the field", rule.onNode(hasTestTag("composer.field")).fetchSemanticsNode().config[SemanticsProperties.Focused])
     }
 
     // ---- I5: the header grows with large text ----

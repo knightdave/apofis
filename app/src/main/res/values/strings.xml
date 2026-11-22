@@ -45,6 +45,8 @@
     <string name="chat_send">Send</string>
     <string name="chat_steer">Send to the running reply</string>
     <string name="chat_stop">Stop</string>
+    <string name="composer_expand">Expand the editor</string>
+    <string name="composer_collapse">Collapse the editor</string>
     <string name="chat_scroll_to_bottom">Scroll to the latest message</string>
     <string name="chat_today">Today</string>
     <string name="chat_yesterday">Yesterday</string>

@@ -37,7 +37,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
-import androidx.compose.ui.zIndex
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
@@ -114,6 +114,7 @@ fun ChatScreen(
     today: LocalDate = LocalDate.now(zone),
     listState: LazyListState = rememberLazyListState(),
     currentState: (() -> ChatUiState)? = null, // the owner's state now, for Copy and Select at action time
+    enterToSend: Boolean = false, // Return sends (the setting); off, it starts a new line
 ) {
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
@@ -128,15 +129,18 @@ fun ChatScreen(
     val backdrop = rememberBackdropState()
     val density = LocalDensity.current
     var bottomContent by remember { mutableIntStateOf(0) } // the bottom area without the larger of keyboard and navigation bar, px
+    // The editor grown to the available height: kept across rotation and process recreation, reset in another chat.
+    var expanded by rememberSaveable(state.sessionKey) { mutableStateOf(false) }
+    BackHandler(enabled = expanded) { expanded = false } // collapses before Back leaves the chat
 
     // The slots read their inputs through these holders, so each recomposes only when its own inputs change: a streamed
     // token changes the transcript, never the header's or the composer's inputs (equal values notify nothing).
-    val latest = rememberUpdatedState(state)
+    val latest = rememberUpdatedState(state.forTranscript()) // typing changes nothing the transcript reads
     val barInput = rememberUpdatedState(ChatUiState("", state.title, state.status, emptyList(), ComposerMode.SEND_DISABLED, "", state.host))
     val bottomInput = rememberUpdatedState(
         BottomInput(
             state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
-            state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed,
+            state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed, enterToSend, expanded,
         ),
     )
     val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
@@ -154,11 +158,16 @@ fun ChatScreen(
             ChatTopBar(barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions, Modifier.blockTouchesBelow().coverForAccessibility(order = -1f))
         }
     }
-    val bottomSlot = remember {
+    // The bottom area for a bar height (what expanding leaves free above the composer): the same lambda while it holds.
+    val bottoms = remember { BodyCache() }
+    val bottomFor = { barHeight: Int ->
+        bottoms.get(barHeight, 0) {
         @Composable {
             SideEffect { ChromeProbe.bottomCompositions++ }
             val input = bottomInput.value
             val actions = callbacks.value.actions
+            val glass = objects.value.backdrop
+            SideEffect { ChromeProbe.composerBackdropId = System.identityHashCode(glass) }
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -188,8 +197,14 @@ fun ChatScreen(
                     },
                     onStop = { input.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
                     busy = input.sending,
+                    enterToSend = input.enterToSend,
+                    expanded = input.expanded,
+                    onExpandedChange = { expanded = it },
+                    backdrop = glass,
+                    reservePx = barHeight,
                 )
             }
+        }
         }
     }
     // The body for a pair of bar heights: the same lambda while they hold, so a token recomposes the body only through
@@ -205,6 +220,7 @@ fun ChatScreen(
                 val follow = o.follow
                 val backdrop = o.backdrop
                 SideEffect {
+                    ChromeProbe.bodyCompositions++
                     ChromeProbe.bodyBackdropId = System.identityHashCode(backdrop)
                     ChromeProbe.bodyBackdropHasLayer = backdrop.layer != null
                 }
@@ -253,11 +269,10 @@ fun ChatScreen(
                                     drawContent()
                                     // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
                                     // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom
-                                    // edge (above the insets and the card's 8 dp outer margin, Composer.kt) and below it: text
+                                    // edge (above the insets and the card's outer margin, Composer.kt) and below it: text
                                     // and controls at the bottom are never washed out, text passing behind the composer fades.
-                                    val gap = 8.dp.toPx()
-                                    val rest = size.height - bottomArea - gap
-                                    val edge = size.height - (bottomArea - bottomContent) - gap
+                                    val rest = size.height - bottomArea - 8.dp.toPx()
+                                    val edge = size.height - (bottomArea - bottomContent) - COMPOSER_MARGIN.toPx()
                                     if (edge > rest) {
                                         drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
                                     }
@@ -290,14 +305,15 @@ fun ChatScreen(
         val measure: SubcomposeMeasureScope.(Constraints) -> MeasureResult = { constraints ->
             ChromeProbe.rootMeasures++
             val loose = constraints.copy(minWidth = 0, minHeight = 0)
-            val bottom = subcompose(ChromeSlot.BOTTOM, bottomSlot).single().measure(loose)
             val bar = subcompose(ChromeSlot.BAR, barSlot).single().measure(loose)
+            val bottom = subcompose(ChromeSlot.BOTTOM, bottomFor(bar.height)).single().measure(loose)
             val body = subcompose(ChromeSlot.BODY, bodyFor(bar.height, bottom.height)).map { it.measure(loose) }
             layout(constraints.maxWidth, constraints.maxHeight) {
                 body.first().place(0, bar.height) // the uncovered region
                 // The scroll button, at the end edge (mirrored in right-to-left layouts).
                 body.getOrNull(1)?.let { it.placeRelative(constraints.maxWidth - it.width, constraints.maxHeight - bottom.height - it.height) }
-                bottom.place(0, constraints.maxHeight - bottom.height, zIndex = 1f)
+                // Over the bar: in a window too short for both, the field and its buttons stay reachable.
+                bottom.place(0, constraints.maxHeight - bottom.height, zIndex = 2f)
                 bar.place(0, 0, zIndex = 1f)
             }
         }
@@ -474,7 +490,13 @@ private data class BottomInput(
     val unsent: UnsentText?,
     val runId: String?,
     val linkFailed: Boolean,
+    val enterToSend: Boolean,
+    val expanded: Boolean,
 )
+
+/** What the transcript reads: without the composer's fields, so typing does not recompose it. */
+private fun ChatUiState.forTranscript() =
+    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0)
 
 private data class BarCallbacks(
     val onOpenConnection: () -> Unit,
@@ -511,6 +533,8 @@ internal object ChromeProbe {
     // Which backdrop the transcript was last composed with, as scalars: no reference keeps it alive after the screen.
     var bodyBackdropId = 0
     var bodyBackdropHasLayer = false
+    var composerBackdropId = 0 // the backdrop the composer's glass was last composed with
+    var bodyCompositions = 0
 }
 
 /**
