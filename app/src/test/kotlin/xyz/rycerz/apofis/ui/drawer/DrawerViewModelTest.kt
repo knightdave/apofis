@@ -434,6 +434,19 @@ class DrawerViewModelTest {
     }
 
     @Test
+    fun hiddenOpenChatIsReplacedWhileTheListStaysEmpty() = runTest {
+        // The open chat is archived, so the visible list is empty before and after it is hidden: an empty list equal to
+        // the drawer's starting value must still count as a change of the list.
+        addSession("apofis-a", "Archived and open")
+        db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(archived = true))
+        val vm = vm(lastChat = "apofis-a")
+        vm.selected.await { it == "apofis-a" }
+        db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(hidden = true))
+        val next = vm.selected.await { it != "apofis-a" }!!
+        assertFalse(db.sessionDao().get(next)!!.existsOnServer)
+    }
+
+    @Test
     fun notificationTapSelectsOnlyWhileItsGraphIsCurrent() = runTest {
         addSession("apofis-a", "Open one")
         addSession("apofis-b", "Tapped")
@@ -585,6 +598,7 @@ class DrawerViewModelTest {
         addSession("apofis-a", "Kept")
         val vm = vm()
         vm.rows.await { it.chats().size == 1 }
+        vm.selected.await { it == "apofis-a" } // else a start that still looks for a chat would make a local one
         vm.onLongPress("apofis-a")
         val prompt = vm.prompt.value!!
         db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(archived = true)) // archived elsewhere: still here
@@ -644,6 +658,7 @@ class DrawerViewModelTest {
         vm.onLongPress("apofis-a")
         vm.onOpen()
         vm.prompt.await { it == null }
+        refreshDone(vm) // the commit closes the sheet before the refresh ends; an open during it would be dropped
         // A newer prompt for a chat that is still there stays open through the next refresh.
         vm.onLongPress("apofis-b")
         val forB = vm.prompt.value!!

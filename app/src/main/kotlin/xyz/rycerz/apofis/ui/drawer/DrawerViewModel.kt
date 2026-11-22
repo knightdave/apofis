@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -132,8 +131,9 @@ class DrawerViewModel(
     init {
         load()
         viewModelScope.launch { selectedFlow.filterNotNull().collect { onSelected(it) } }
-        // A chat removed from this phone (a refresh, another screen) must not stay open.
-        viewModelScope.launch { sessions.drop(1).collect { reconcile() } }
+        // A chat removed from this phone (a refresh, another screen) must not stay open. Every list Room delivers counts:
+        // the sessions StateFlow swallows an empty list equal to its placeholder, which can be the removal itself.
+        viewModelScope.launch { repo.sessions().collect { reconcile() } }
         // Nor may a prompt for it, whoever refreshed: it watches its own chat's row (gone: missing or hidden; an
         // archived chat is still here). An idle prompt closes; a busy one, or one showing a failure, stays to show its
         // outcome but offers nothing more. Scoped by token, so a newer prompt is never closed for an older one's chat.
