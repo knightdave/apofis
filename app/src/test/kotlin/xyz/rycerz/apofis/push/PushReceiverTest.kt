@@ -410,6 +410,35 @@ class PushReceiverTest {
     }
 
     @Test
+    fun theHandOffEndsWhenTheSinkReturnsBeforeTheLossIsCounted() = runTest {
+        val (_, token) = enabled()
+        wake.onCommit = { log.step("wake commit ${it.sorted()}"); true }
+        lateinit var h: Handoff
+        val late = LogContext(app, log, prefs, PushSink { _, _ -> h.deadline(); false }) // the deadline passes inside the sink
+        h = Handoff { log.step("broadcast finished") }
+        log.events.clear()
+        PushReceiver().receive(object : ContextWrapperWithWake(late) {}, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, h::finishOnce, schedule, h)
+        assertEquals(listOf("broadcast finished", "wake commit [lost]"), log.events.filter { it.startsWith("broadcast finished") || it.startsWith("wake") })
+    }
+
+    @Test
+    fun aFailedDemandCommitIsCountedLostAndNeverRecovered() = runTest {
+        WorkManagerTestInitHelper.initializeTestWorkManager(app)
+        val (_, token) = enabled()
+        val real = object : ContextWrapperWithWake(LogContext(app, log, prefs, Wake)) {}
+        wake.onCommit = { WAKE_DEMAND !in it } // the demand commit fails; the loss count's own commit works
+        PushReceiver().receive(real, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule)
+        assertEquals(1L, wake.disk[WAKE_LOST])
+        assertNull("the loss count's commit did not persist the failed demand", wake.disk[WAKE_DEMAND])
+        assertTrue("nothing to recover", WorkManager.getInstance(app).getWorkInfosForUniqueWork(WAKE_WORK).get().isEmpty())
+        // The next push works: its demand is one, not two.
+        wake.onCommit = { true }
+        PushReceiver().receive(real, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule)
+        assertEquals(1L, wake.disk[WAKE_DEMAND])
+        assertEquals("its job is scheduled after the hand-off", 1, WorkManager.getInstance(app).getWorkInfosForUniqueWork(WAKE_WORK).get().size)
+    }
+
+    @Test
     fun wakeCheckAndCommitAreOneStep() = runTest {
         val (_, token) = enabled()
         val inSink = CountDownLatch(1)

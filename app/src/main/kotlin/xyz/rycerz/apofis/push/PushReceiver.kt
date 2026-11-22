@@ -34,8 +34,9 @@ private val REVOCATIONS = setOf("org.unifiedpush.android.connector.UNREGISTERED"
 /**
  * Takes a delivered push, which carries no body here. [onPush] runs under the push lock, after the receiver checked that
  * the registration belongs to [epoch], the persisted connection epoch (`connection_epoch`), which only changes under
- * that lock. It returns true only after a checked durable commit of the wake demand for that epoch. [recover] runs at
- * every process start and hands on demand of the current epoch that is not done yet.
+ * that lock. It returns true only after a checked durable commit of the wake demand for that epoch; a false return leaves
+ * nothing of it for a later commit to persist. [recover] runs at every process start, and after each handed-off push
+ * outside the lock, and hands on demand of the current epoch that is not done yet.
  */
 fun interface PushSink {
     fun onPush(context: Context, epoch: Long): Boolean
@@ -111,6 +112,7 @@ private class Abandoned : Exception()
 class PushReceiver : MessagingReceiver() {
     private var changed = false
     private var token: String? = null
+    private var woken: PushSink? = null // took a wake demand; schedules its job once the broadcast's work is done
 
     override fun getKeyManager(context: Context): KeyManager = PlainKeyManager
 
@@ -159,6 +161,7 @@ class PushReceiver : MessagingReceiver() {
             }
         } finally {
             if (changed) runCatching { schedule(context) } // not awaited: the commit is the hand-off, recovery re-schedules
+            woken?.let { runCatching { it.recover(context) } } // the wake job, after the hand-off and outside the push lock
             finish()
         }
     }
@@ -227,7 +230,8 @@ class PushReceiver : MessagingReceiver() {
                 } catch (e: Exception) {
                     false
                 }
-                if (!handedOff) {
+                handoff?.done() // the sink's attempt is the hand-off: the loss count below does not hold the broadcast
+                if (handedOff) woken = sink else {
                     lost("wake lost")
                     val wake = context.getSharedPreferences(WAKE_PREFS, Context.MODE_PRIVATE)
                     if (!wake.edit().putLong(WAKE_LOST, wake.getLong(WAKE_LOST, 0) + 1).commit()) lost("loss count not written")

@@ -24,7 +24,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -44,6 +46,7 @@ import xyz.rycerz.apofis.push.PushStore
 import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.RealUnifiedPush
 import xyz.rycerz.apofis.push.UnifiedPushPort
+import xyz.rycerz.apofis.push.Wake
 import xyz.rycerz.apofis.push.TestPush
 import xyz.rycerz.apofis.push.pushPolicy
 import xyz.rycerz.apofis.push.pushPrefs
@@ -160,6 +163,11 @@ class AppContainer(
     // One database for the app's lifetime; it outlives credential changes.
     private val db by lazy(openDatabase)
     private val cachePrefs = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
+
+    init {
+        // The fallback check runs while any run is stored, push on or off; the first emission reconciles at cold start.
+        scope.launch { db.activeRunDao().observeAll().map { it.isNotEmpty() }.distinctUntilChanged().collect { if (it) Wake.schedulePeriodic(app) else Wake.cancelPeriodic(app) } }
+    }
 
     // Guarded by this.
     @Volatile private var current: Connected? = null
@@ -327,6 +335,7 @@ class AppContainer(
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
+                Wake.cancelAll(app) // before the epoch moves on, so no job of the new connection can be cancelled
                 // The one place the epoch advances: with the marker, in one commit, inside the notifier's lane (so no
                 // notice, clear or tap of the old one is accepted afterwards, and its notifications and rows go) and
                 // under the push lock (so no wake or registration check falls between). A death here is finished by

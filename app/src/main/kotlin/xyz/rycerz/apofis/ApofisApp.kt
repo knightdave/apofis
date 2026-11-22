@@ -7,11 +7,14 @@ import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.PushSink
 import xyz.rycerz.apofis.push.PushSinkProvider
 import xyz.rycerz.apofis.push.TestPush
+import xyz.rycerz.apofis.push.Wake
+import xyz.rycerz.apofis.push.WakeProvider
+import xyz.rycerz.apofis.push.WakeTarget
 import xyz.rycerz.apofis.push.recoverPush
 import xyz.rycerz.apofis.sync.SendQueue
 import xyz.rycerz.apofis.sync.SendQueueProvider
 
-class ApofisApp : Application(), SendQueueProvider, PushSinkProvider {
+class ApofisApp : Application(), SendQueueProvider, PushSinkProvider, WakeProvider {
     val container by lazy { AppContainer(this) }
 
     override fun onCreate() {
@@ -23,7 +26,8 @@ class ApofisApp : Application(), SendQueueProvider, PushSinkProvider {
     }
 
     override val sendQueue: SendQueue? get() = container.connected()?.sendQueue
-    override val pushSink: PushSink? get() = null // Task 4: the wake
+    override val pushSink: PushSink get() = Wake
+    override val wakeTarget: WakeTarget? get() = container.connected()?.let { WakeTarget(it, it.generation, container.notifier, System::currentTimeMillis) }
     override val testPush: TestPush get() = container.testPush
     override val pushRegistrar: PushRegistrar get() = container.push
 }
