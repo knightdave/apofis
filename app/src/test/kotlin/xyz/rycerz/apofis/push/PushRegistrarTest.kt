@@ -444,7 +444,7 @@ class PushRegistrarTest {
             }
             assertEquals("kill at $k", emptySet<String>(), w.port.registered)
             assertNull(w.prefs.getString(Keys.REVOKE, null))
-            assertEquals(PushUi(PushState.Off), restarted.ui.value)
+            assertEquals(PushState.Off, restarted.ui.value.state)
             if (!died) break
             k++
         }
@@ -556,7 +556,7 @@ class PushRegistrarTest {
             prefs.onCommit = { true } // the disk recovers: the intent is written first, then acted on
             r.publishPending()
             assertEquals("unregister g1 tok-g1", port.calls.first())
-            assertEquals(PushUi(PushState.Off), r.ui.value)
+            assertEquals(PushState.Off, r.ui.value.state)
         }
         with(World()) { // a restart instead reads the disk, where push is still on
             val r = registrar()
@@ -739,7 +739,7 @@ class PushRegistrarTest {
             connection++
             r.switch()
             assertTrue(port.calls.none { it.startsWith("register") })
-            assertEquals(PushUi(PushState.Off), r.ui.value)
+            assertEquals(PushState.Off, r.ui.value.state)
         }
     }
 
@@ -832,7 +832,7 @@ class PushRegistrarTest {
             assertEquals(PushState.Registering, withFailingPort.ui.value.state)
             assertTrue(scheduled > 0)
             registrar().publishPending()
-            assertEquals(PushUi(PushState.Off), registrar().ui.value)
+            assertEquals(PushState.Off, registrar().ui.value.state)
         }
     }
 

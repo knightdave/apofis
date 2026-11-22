@@ -179,14 +179,22 @@ class PushRegistrar(
         afterUserOp()
     }
 
-    /** Off is committed (with the registration to revoke) before anything else happens. */
-    suspend fun disable() {
+    /**
+     * Off is committed (with the registration to revoke) before anything else happens. True when it was applied: Off is
+     * on disk (its unregistering may still fail and be retried); false when it was dropped because the connection it was
+     * admitted under is gone, or the commit failed.
+     */
+    suspend fun disable(): Boolean {
+        var applied = false
         withContext(NonCancellable) { // the user confirmed Off: a cancelled caller does not undo it
             op { _ ->
-                if (enabled()) rotate(off = true) else finishRevocations()
+                if (enabled()) commitLive { beginRevocation(off = true) }
+                applied = true
+                finishRevocations()
             }
         }
         afterUserOp()
+        return applied
     }
 
     /** Finishes persisted intents and publishes. True when nothing is left for this connection to retry. */
@@ -254,6 +262,9 @@ class PushRegistrar(
         reconcile(null)
         !prefs.contains(Keys.REVOKE)
     } ?: false
+
+    /** Recomputes the shown state in turn with the operations: under the registrar's lock, off the main thread, no network. */
+    suspend fun refreshNow() = withContext(Dispatchers.IO) { mutex.withLock { state.value = compute() } }
 
     /** Recomputes the shown state, e.g. after the receiver failed to store an endpoint. */
     fun refresh() {
@@ -518,7 +529,7 @@ class PushRegistrar(
             matching -> PushState.ServerError(distributor) // the running policy refuses the stored endpoint
             else -> PushState.Registering
         }
-        return PushUi(s)
+        return PushUi(s, testOwner(epoch(), currentInstance()))
     }
 
 

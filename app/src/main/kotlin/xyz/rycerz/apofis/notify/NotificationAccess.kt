@@ -10,7 +10,9 @@ import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
@@ -72,14 +74,16 @@ internal fun askAbandoned() = synchronized(askLock) { askInFlight = false }
 /**
  * For the first accepted send (and an explicit Settings tap): asks once ever, on API 33+, while never asked. The
  * decision and the mark run on IO; only the dialog launch runs here, through this composition's own launcher, and
- * the chance is used up only once that launch happened.
+ * the chance is used up only once that launch happened. [onSettled] runs on the main thread after the dialog's answer
+ * and after the decision and the mark are stored, so a caller can read the access again.
  */
 @SuppressLint("InlinedApi") // launched only after shouldAskNotifications, which is API 33+
 @Composable
-fun rememberAskNotificationsOnce(prefs: SharedPreferences): () -> Unit {
+fun rememberAskNotificationsOnce(prefs: SharedPreferences, onSettled: () -> Unit = {}): () -> Unit {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    val settled by rememberUpdatedState(onSettled)
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { settled() }
     return remember(launcher, prefs) {
         {
             scope.launch {
@@ -92,6 +96,7 @@ fun rememberAskNotificationsOnce(prefs: SharedPreferences): () -> Unit {
                     launched = true
                 } finally {
                     if (asking) withContext(NonCancellable + Dispatchers.IO) { if (launched) askLaunched(prefs) else askAbandoned() }
+                    settled()
                 }
             }
         }

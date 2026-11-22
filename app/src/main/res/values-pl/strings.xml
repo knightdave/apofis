@@ -170,6 +170,9 @@
     <string name="settings_notif_test_none">Nie dotarło żadne powiadomienie push</string>
     <string name="settings_notif_turn_off">Wyłącz push</string>
     <string name="settings_notif_turn_off_text">Odpowiedzi nadal będą sprawdzane mniej więcej co 15 minut, gdy któraś trwa.</string>
+    <string name="settings_notif_turn_off_title">Wyłączyć push?</string>
+    <string name="settings_notif_turn_off_failed">Nie udało się wyłączyć push. Spróbuj ponownie.</string>
+    <string name="settings_notif_system_unavailable">Nie udało się otworzyć ustawień systemu</string>
     <string name="licenses_lucide">Ikony Lucide</string>
     <string name="licenses_commonmark">commonmark-java (licencja BSD 2-Clause)</string>
     <string name="licenses_unifiedpush">UnifiedPush Android connector (licencja Apache 2.0)</string>

@@ -20,10 +20,17 @@ private val BODY = """{"kind":"test"}""".toByteArray()
 
 enum class TestPushResult { SENT, SEND_FAILED, WAKE_ARRIVED, NO_WAKE }
 
+/** A result and the registration it belongs to ([testOwner]). */
+data class TestOutcome(val owner: String, val result: TestPushResult)
+
+/** The non-secret identity of a registration: the connection epoch and the connector instance. */
+internal fun testOwner(epoch: Long, instance: String) = "$epoch:$instance"
+
 /**
  * The Settings test push, body-blind: the app POSTs `{"kind":"test"}` to its own endpoint, and a wake delivered within
  * [TEST_WINDOW_MS] after a 2xx answer counts as "a push arrived". Accepted limit: a wake delivered before that answer is
- * not counted (the user sends again). Nothing here reads a push or posts a notification. [elapsed] is a monotonic clock;
+ * not counted (the user sends again). A test belongs to the registration it was sent for: its window, its result and the
+ * wake that completes it count only for that owner. Nothing here reads a push or posts a notification. [elapsed] is a monotonic clock;
  * [validate] is the endpoint rule with the build's origins; [client] should be dedicated to this.
  */
 class TestPush(private val elapsed: () -> Long, client: OkHttpClient, private val validate: (String) -> String?) {
@@ -31,16 +38,17 @@ class TestPush(private val elapsed: () -> Long, client: OkHttpClient, private va
         .followRedirects(false).followSslRedirects(false).proxy(Proxy.NO_PROXY).cookieJar(CookieJar.NO_COOKIES)
         .callTimeout(10, TimeUnit.SECONDS)
         .build()
-    private val result = MutableStateFlow<TestPushResult?>(null)
-    val lastResult: StateFlow<TestPushResult?> = result.asStateFlow()
+    private val result = MutableStateFlow<TestOutcome?>(null)
+    val lastResult: StateFlow<TestOutcome?> = result.asStateFlow()
 
     // Guarded by this.
     private var sending = false
     private var sentAt: Long? = null
     private var windowFrom: Long? = null
+    private var windowOwner: String? = null
 
-    /** False without sending when a send is in flight or the last one started under 10 s ago. */
-    suspend fun send(endpoint: String): Boolean {
+    /** For [owner], taken when the user tapped. False without sending when a send is in flight or the last one started under 10 s ago. */
+    suspend fun send(endpoint: String, owner: String): Boolean {
         synchronized(this) {
             val now = elapsed()
             if (sending || sentAt?.let { now - it < SEND_EVERY_MS } == true) return false
@@ -59,8 +67,11 @@ class TestPush(private val elapsed: () -> Long, client: OkHttpClient, private va
                 false
             }
             synchronized(this) {
-                if (ok) windowFrom = elapsed()
-                result.value = if (ok) TestPushResult.SENT else TestPushResult.SEND_FAILED
+                if (ok) {
+                    windowFrom = elapsed()
+                    windowOwner = owner
+                }
+                result.value = TestOutcome(owner, if (ok) TestPushResult.SENT else TestPushResult.SEND_FAILED)
             }
         } finally {
             synchronized(this) { sending = false } // also when cancelled: the next send must work
@@ -68,12 +79,12 @@ class TestPush(private val elapsed: () -> Long, client: OkHttpClient, private va
         return ok
     }
 
-    /** Called by PushReceiver for every delivered message of the current registration. */
-    fun onWake() = synchronized(this) {
+    /** Called by PushReceiver for every delivered message of the current registration, [owner]; only its own test completes. */
+    fun onWake(owner: String) = synchronized(this) {
         tick()
-        if (windowFrom != null) {
+        if (windowFrom != null && windowOwner == owner) {
             windowFrom = null
-            result.value = TestPushResult.WAKE_ARRIVED
+            result.value = TestOutcome(owner, TestPushResult.WAKE_ARRIVED)
         }
     }
 
@@ -82,7 +93,7 @@ class TestPush(private val elapsed: () -> Long, client: OkHttpClient, private va
         val from = windowFrom ?: return@synchronized
         if (elapsed() - from >= TEST_WINDOW_MS) {
             windowFrom = null
-            result.value = TestPushResult.NO_WAKE
+            result.value = windowOwner?.let { TestOutcome(it, TestPushResult.NO_WAKE) }
         }
     }
 }

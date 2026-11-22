@@ -558,16 +558,16 @@ class PushReceiverTest {
 
     @Test
     fun aDeliveredWakeCompletesTheTestPush() = runTest {
-        val (_, token) = enabled()
+        val (r, token) = enabled()
         val answering = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
             okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("ok")
                 .body("".toResponseBody()).build()
         }.build()
         val test = TestPush({ 0L }, answering) { it }
-        assertTrue(test.send("https://ntfy.sh/upAbC123xyz_-9?up=1"))
+        assertTrue(test.send("https://ntfy.sh/upAbC123xyz_-9?up=1", r.ui.value.testOwner!!)) // the receiver names the same registration
         val withTest = object : ContextWrapperWithWake(LogContext(app, log, prefs, sink, test)) {}
         PushReceiver().receive(withTest, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule)
-        assertEquals(TestPushResult.WAKE_ARRIVED, test.lastResult.value)
+        assertEquals(TestOutcome(r.ui.value.testOwner!!, TestPushResult.WAKE_ARRIVED), test.lastResult.value)
     }
 }
 

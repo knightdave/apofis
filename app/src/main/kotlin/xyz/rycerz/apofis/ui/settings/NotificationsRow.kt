@@ -18,11 +18,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -30,14 +30,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.notify.NotificationAccess
 import xyz.rycerz.apofis.notify.Runtime
@@ -100,28 +104,51 @@ internal fun actionsOf(ui: NotificationsUi): List<SheetAction> = buildList {
 
 private fun lines(value: String, summary: String?) = listOfNotNull(value, summary).joinToString("\n")
 
+/** The bell only for push On with every part of access allowed. */
+internal fun iconOf(ui: NotificationsUi): Int = if (ui.state is PushState.On && ui.allowed) R.drawable.lucide_bell else R.drawable.lucide_bell_off
+
 /** The Settings row: the state, and under it the fallback line while push is off; one selection feedback per tap. */
 @Composable
 fun NotificationsRow(ui: NotificationsUi, onClick: () -> Unit) {
     val haptics = ApofisTheme.haptics
     val value = lines(stringResource(valueOf(ui)), summaryOf(ui)?.let { stringResource(it) })
-    val icon = if (ui.state is PushState.On && ui.allowed) R.drawable.lucide_bell else R.drawable.lucide_bell_off
-    RowLayout(Modifier.clickable { haptics.selection(); onClick() }, icon, stringResource(R.string.settings_notifications), value) {
+    RowLayout(Modifier.clickable(role = Role.Button) { haptics.selection(); onClick() }, iconOf(ui), stringResource(R.string.settings_notifications), value) {
         Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
+/** Before the registrar and the access have been read off the main thread: the title only, no state and no action. */
+@Composable
+private fun PendingRow() = RowLayout(Modifier, R.drawable.lucide_bell, stringResource(R.string.settings_notifications)) {}
+
+@Composable
+private fun ErrorLine(message: Int, modifier: Modifier) = Text(
+    stringResource(message),
+    modifier.semantics { liveRegion = LiveRegionMode.Polite },
+    style = MaterialTheme.typography.bodyMedium,
+    color = MaterialTheme.colorScheme.error,
+)
+
 /**
- * The state as the registrar reports it, the last test result while On, and the actions of [actionsOf]. "Turn off push"
- * asks first. The sheet stays open after a command: what it shows next is the registrar's answer, so an Off that was not
- * applied (it was queued under a connection that a switch replaced) shows the state that is real, with Turn off again.
+ * The state as the registrar reports it, the last test result while On, [message] (a command that was not applied, an
+ * activity that could not open) and the actions of [actionsOf], disabled while a command is [busy]. "Turn off push"
+ * asks first. The sheet stays open after a command, so its outcome shows here.
  */
 @Composable
-fun NotificationsSheet(ui: NotificationsUi, onTest: () -> Unit, onRetry: () -> Unit, onTurnOff: () -> Unit, onSystemSettings: () -> Unit, onDismiss: () -> Unit) {
+fun NotificationsSheet(
+    ui: NotificationsUi,
+    onTest: () -> Unit,
+    onRetry: () -> Unit,
+    onTurnOff: () -> Unit,
+    onSystemSettings: () -> Unit,
+    onDismiss: () -> Unit,
+    busy: Boolean = false,
+    message: Int? = null,
+) {
     var confirmOff by rememberSaveable { mutableStateOf(false) }
     ApofisSheet(onDismiss) {
         // Scrolls, so the last action stays reachable in a short window with a large font.
-        Column(Modifier.verticalScroll(rememberScrollState())) {
+        Column(Modifier.testTag(SHEET_TAG).verticalScroll(rememberScrollState())) {
             Text(stringResource(R.string.settings_notifications), Modifier.padding(start = 14.dp), style = MaterialTheme.typography.titleMedium)
             Text(
                 lines(stringResource(valueOf(ui)), summaryOf(ui)?.let { stringResource(it) }),
@@ -144,24 +171,27 @@ fun NotificationsSheet(ui: NotificationsUi, onTest: () -> Unit, onRetry: () -> U
                     style = MaterialTheme.typography.bodyMedium,
                 )
             }
+            if (message != null) ErrorLine(message, Modifier.padding(start = 14.dp, end = 14.dp, bottom = 8.dp))
+            val enabled = !busy
             for (action in actionsOf(ui)) {
                 when (action) {
-                    SheetAction.TEST -> SheetRow(R.drawable.lucide_bell, stringResource(R.string.settings_notif_test), onTest)
-                    SheetAction.RETRY -> SheetRow(R.drawable.lucide_server, stringResource(R.string.settings_notif_retry), onRetry)
-                    SheetAction.SYSTEM_SETTINGS -> SheetRow(R.drawable.lucide_settings, stringResource(R.string.settings_notif_system), onSystemSettings)
-                    SheetAction.TURN_OFF -> SheetRow(R.drawable.lucide_bell_off, stringResource(R.string.settings_notif_turn_off), { confirmOff = true })
+                    SheetAction.TEST -> SheetRow(R.drawable.lucide_bell, stringResource(R.string.settings_notif_test), onTest, enabled = enabled)
+                    SheetAction.RETRY -> SheetRow(R.drawable.lucide_server, stringResource(R.string.settings_notif_retry), onRetry, enabled = enabled)
+                    SheetAction.SYSTEM_SETTINGS -> SheetRow(R.drawable.lucide_settings, stringResource(R.string.settings_notif_system), onSystemSettings, enabled = enabled)
+                    SheetAction.TURN_OFF -> SheetRow(R.drawable.lucide_bell_off, stringResource(R.string.settings_notif_turn_off), { confirmOff = true }, enabled = enabled)
                 }
             }
         }
     }
     if (confirmOff) {
-        // shortcut: the drawer's AlertDialog with washed text buttons; Milestone 2 Task 10 replaces it with ApofisDialog.
+        // shortcut: Material's AlertDialog with washed text buttons, as the drawer uses; Milestone 2 Task 10 replaces it with ApofisDialog.
         AlertDialog(
             onDismissRequest = { confirmOff = false },
-            text = { Text(stringResource(R.string.settings_notif_turn_off_text)) },
+            title = { Text(stringResource(R.string.settings_notif_turn_off_title)) },
+            text = { Text(stringResource(R.string.settings_notif_turn_off_text), Modifier.verticalScroll(rememberScrollState())) },
             confirmButton = {
-                DialogButton({ confirmOff = false; onTurnOff() }) {
-                    Text(stringResource(R.string.settings_notif_turn_off), color = MaterialTheme.colorScheme.error)
+                DialogButton({ confirmOff = false; onTurnOff() }, enabled = !busy) {
+                    Text(stringResource(R.string.settings_notif_turn_off), color = MaterialTheme.colorScheme.error.copy(alpha = if (busy) 0.38f else 1f))
                 }
             },
             dismissButton = { DialogButton({ confirmOff = false }) { Text(stringResource(R.string.cancel)) } },
@@ -169,60 +199,116 @@ fun NotificationsSheet(ui: NotificationsUi, onTest: () -> Unit, onRetry: () -> U
     }
 }
 
+internal const val SHEET_TAG = "notifications.sheet"
+
 @Composable
-private fun DialogButton(onClick: () -> Unit, content: @Composable () -> Unit) {
+private fun DialogButton(onClick: () -> Unit, enabled: Boolean = true, content: @Composable () -> Unit) {
     val haptics = ApofisTheme.haptics
     val source = remember { MutableInteractionSource() }
-    TextButton({ haptics.selection(); onClick() }, Modifier.heightIn(min = 48.dp).wash(source, ButtonDefaults.textShape), interactionSource = source) { content() }
+    TextButton(
+        { haptics.selection(); onClick() },
+        Modifier.heightIn(min = 48.dp).wash(source, ButtonDefaults.textShape),
+        enabled = enabled,
+        interactionSource = source,
+    ) { content() }
 }
 
 /**
- * The Notifications row and its sheet, wired to the registrar and the test push. Access and the push state are read
- * again on every resume (system settings, an ntfy install). Commands run in [scope], which outlives this screen.
+ * The Notifications row and its sheet, wired to the registrar and the test push. The lazily built [push] and [testPush]
+ * are resolved and the access is read off the main thread; on every resume the access is read again and the registrar
+ * recomputes its state in turn with its operations. One command at a time runs in [scope], which outlives this screen;
+ * its outcome shows in the sheet.
  */
 @Composable
-fun NotificationsSetting(push: PushRegistrar, testPush: TestPush, notifyPrefs: SharedPreferences, scope: CoroutineScope) {
+fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, notifyPrefs: SharedPreferences, scope: CoroutineScope) {
     val context = LocalContext.current
-    var access by remember { mutableStateOf(notificationAccess(context, notifyPrefs)) }
-    LifecycleResumeEffect(push) {
-        access = notificationAccess(context, notifyPrefs)
-        push.refresh()
-        onPauseOrDispose {}
+    val local = rememberCoroutineScope()
+    var parts by remember { mutableStateOf<Pair<PushRegistrar, TestPush>?>(null) }
+    var access by remember { mutableStateOf<NotificationAccess?>(null) }
+    val readAccess: () -> Unit = { local.launch { access = withContext(Dispatchers.IO) { notificationAccess(context, notifyPrefs) } } }
+    LifecycleResumeEffect(Unit) {
+        val job = local.launch {
+            val (p, _) = parts ?: withContext(Dispatchers.IO) { push() to testPush() }.also { parts = it }
+            access = withContext(Dispatchers.IO) { notificationAccess(context, notifyPrefs) }
+            p.refreshNow()
+        }
+        onPauseOrDispose { job.cancel() }
     }
-    val pushUi by push.ui.collectAsState()
-    val test by testPush.lastResult.collectAsState()
-    val ui = NotificationsUi(access, pushUi, test)
+    // The dialog's answer and the stored mark are read back at once, so the next tap acts on them.
+    val ask = rememberAskNotificationsOnce(notifyPrefs, onSettled = readAccess)
+    val (p, t) = parts ?: return PendingRow()
+    val a = access ?: return PendingRow()
+
+    val pushUi by p.ui.collectAsState()
+    val last by t.lastResult.collectAsState()
+    // A result counts only for the registration it was sent for, which the registrar reports with its state.
+    val ui = NotificationsUi(a, pushUi, last?.takeIf { it.owner == pushUi.testOwner }?.result)
     var open by rememberSaveable { mutableStateOf(false) }
-    val ask = rememberAskNotificationsOnce(notifyPrefs)
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<Int?>(null) }
+    fun command(block: suspend () -> Unit) {
+        if (busy) return
+        busy = true
+        message = null
+        scope.launch {
+            try {
+                block()
+            } finally {
+                busy = false
+            }
+        }
+    }
+    fun start(failure: Int, activity: () -> Unit) {
+        message = null
+        if (runCatching(activity).isFailure) message = failure // no app for it: say so, stay here
+    }
     val uriHandler = LocalUriHandler.current
     val ntfyUrl = stringResource(R.string.settings_ntfy_url)
     val systemSettings = {
-        context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
+        start(R.string.settings_notif_system_unavailable) {
+            context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
+        }
     }
     NotificationsRow(ui) {
+        message = null
         when (tapOf(ui)) {
             RowTap.ASK -> ask()
             RowTap.SYSTEM_SETTINGS -> systemSettings()
             RowTap.SHEET -> open = true
-            RowTap.GET_NTFY -> runCatching { uriHandler.openUri(ntfyUrl) } // no browser or store: nothing to open
-            RowTap.ENABLE -> push.enable()
+            RowTap.GET_NTFY -> start(R.string.settings_link_no_app) { uriHandler.openUri(ntfyUrl) }
+            RowTap.ENABLE -> p.enable()
         }
     }
+    if (!open) message?.let { ErrorLine(it, Modifier.padding(start = 48.dp, end = 12.dp, bottom = 11.dp)) }
     if (open) {
-        LaunchedEffect(testPush) {
-            while (true) {
-                testPush.tick() // closes an expired test window as "No push arrived"
-                delay(1_000)
+        if (last?.result == TestPushResult.SENT) {
+            // Only while a window is open and the sheet is on screen; the first tick on every resume closes one that expired.
+            LifecycleResumeEffect(t) {
+                val ticker = local.launch {
+                    while (true) {
+                        t.tick()
+                        delay(1_000)
+                    }
+                }
+                onPauseOrDispose { ticker.cancel() }
             }
         }
         NotificationsSheet(
             ui,
-            // Without a record the empty endpoint fails validation: "Test not sent", and nothing leaves the phone.
-            onTest = { scope.launch { testPush.send(push.endpoint.orEmpty()) } },
-            onRetry = { scope.launch { push.verify(force = true) } },
-            onTurnOff = { scope.launch { push.disable() } },
+            onTest = {
+                val sentFor = pushUi.testOwner.orEmpty() // the registration tapped for, not the one current when the send runs
+                val endpoint = p.endpoint.orEmpty() // no record: fails validation, "Test not sent", nothing leaves the phone
+                command { t.send(endpoint, sentFor) }
+            },
+            onRetry = { command { p.verify(force = true) } },
+            onTurnOff = { command { if (!p.disable()) message = R.string.settings_notif_turn_off_failed } },
             onSystemSettings = systemSettings,
-            onDismiss = { open = false },
+            onDismiss = {
+                open = false
+                message = null
+            },
+            busy = busy,
+            message = message,
         )
     }
 }

@@ -172,6 +172,9 @@
     <string name="settings_notif_test_none">No push arrived</string>
     <string name="settings_notif_turn_off">Turn off push</string>
     <string name="settings_notif_turn_off_text">Replies will still be checked about every 15 minutes while one is running.</string>
+    <string name="settings_notif_turn_off_title">Turn off push?</string>
+    <string name="settings_notif_turn_off_failed">Could not turn off push. Try again.</string>
+    <string name="settings_notif_system_unavailable">System settings could not be opened</string>
     <string name="settings_ntfy_url" translatable="false">https://f-droid.org/packages/io.heckel.ntfy</string>
     <string name="licenses_lucide">Lucide icons</string>
     <string name="licenses_commonmark">commonmark-java (BSD 2-Clause)</string>
