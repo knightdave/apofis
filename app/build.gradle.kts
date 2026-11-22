@@ -67,7 +67,8 @@ android {
 
     testOptions {
         unitTests.isIncludeAndroidResources = true
-        unitTests.all { it.forkEvery = 1 }
+        // runTest's own limit (60 s by default) must fire after the tests' inner 60 s watchdogs, so a hang names its line.
+        unitTests.all { it.forkEvery = 1; it.systemProperty("kotlinx.coroutines.test.default_timeout", "180s") }
     }
 }
 
