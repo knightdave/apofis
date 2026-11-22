@@ -83,6 +83,10 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
 class ChromeLayoutTest {
+    private companion object {
+        const val SHORT_KEYBOARD = 80 // px: 40 dp, see shortWindowAtDoubleFontScaleStaysUsable
+    }
+
     @get:Rule
     val rule = createAndroidComposeRule<ComponentActivity>()
 
@@ -107,6 +111,9 @@ class ChromeLayoutTest {
     private val retried = ArrayList<String>()
     private var retryLoads = 0
     private var sendClicks = 0
+    private val cancelled = ArrayList<String>()
+    private var drawerTaps = 0
+    private var newChatTaps = 0
     private var shown by androidx.compose.runtime.mutableStateOf<ChatUiState?>(null) // the state on screen; set again to change it
 
     @OptIn(ExperimentalComposeUiApi::class)
@@ -117,12 +124,17 @@ class ChromeLayoutTest {
                 retried += idempotencyKey
             }
 
-            override fun onSendClick() {
+            override fun onSendClick(): Boolean {
                 sendClicks++
+                return true
+            }
+
+            override fun onCancel(idempotencyKey: String) {
+                cancelled += idempotencyKey
             }
         }
         val newChat: @Composable RowScope.() -> Unit = {
-            ApofisIconButton(onClick = {}, contentDescription = "New chat") { Icon(painterResource(R.drawable.lucide_square_pen), null) }
+            ApofisIconButton(onClick = { newChatTaps++ }, contentDescription = "New chat") { Icon(painterResource(R.drawable.lucide_square_pen), null) }
         }
         rule.setContent {
             val density = LocalDensity.current
@@ -135,7 +147,7 @@ class ChromeLayoutTest {
                         list = rememberLazyListState(initialIndex, initialOffset)
                         ChatScreen(
                             shown!!, actions, onOpenConnection = {}, onRetryLoad = { retryLoads++ },
-                            navigationIcon = { DrawerButton {} }, appBarActions = newChat,
+                            navigationIcon = { DrawerButton { drawerTaps++ } }, appBarActions = newChat,
                             zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list,
                         )
                     }
@@ -337,56 +349,91 @@ class ChromeLayoutTest {
         }
     }
 
-    /** Expanded, the composer takes the free height: the last row still rests above it (reachable by scrolling), never under it. */
+    private fun px(dp: Float) = with(rule.density) { dp.dp.toPx() }
+
+    /** The node's bounds clipped to the window and its parents, as the accessibility service and touch see them. */
+    private fun visible(m: SemanticsMatcher): Rect = rule.onNode(m, useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+
+    /** Expanded, the field takes the whole height between the bar and the keyboard; collapsed, the last row is fully visible. */
     @Test
-    fun expandedComposerLeavesTheLastRowAboveIt() {
+    fun expandedTakesTheBudgetAndCollapsedShowsTheLastRow() {
         show(withDraft(chat(failed), 3))
         rule.onNode(hasContentDescription("Expand the editor")).performClick()
         rule.waitForIdle()
-        rule.onNode(hasContentDescription("Collapse the editor")).assertExists()
-        val field = bounds(hasTestTag("composer.field"))
-        assertTrue("expanded field $field starts below the bar ${barBottom()}", field.top >= barBottom())
-        assertTrue("expanded field fills the free height", field.height > px(400))
-        val lowest = rule.onAllNodes(tagged("user:") or tagged("reply:"), useUnmergedTree = true).fetchSemanticsNodes().maxOf { it.unclipped().bottom }
-        assertTrue("the last row $lowest rests above the composer ${bottomAreaTop()}", lowest <= bottomAreaTop())
-        // The keyboard shrinks the expanded editor; its controls stay on screen.
-        insets(ime = 600)
-        val height = rule.onRoot().fetchSemanticsNode().size.height
-        for (m in listOf(hasTestTag("composer.field"), hasTestTag("composer.send"), hasContentDescription("Collapse the editor"))) {
-            val r = bounds(m)
-            assertTrue("$r on screen above the keyboard", r.top >= barBottom() - 1 && r.bottom <= height - 600 + 1)
+        val card = px(16f) // the card's margin and padding
+        for (ime in listOf(0, 600)) {
+            insets(ime = ime)
+            val height = rule.onRoot().fetchSemanticsNode().size.height
+            val field = visible(hasTestTag("composer.field"))
+            assertEquals("keyboard $ime: the field starts at the bar", barBottom() + card, field.top, 1.5f)
+            assertEquals("keyboard $ime: the field ends above the keyboard", height - ime - card, field.bottom, 1.5f)
         }
+        insets(ime = 0)
+        rule.onNode(hasContentDescription("Collapse the editor")).performClick()
+        rule.waitForIdle()
+        rule.runOnUiThread { kotlinx.coroutines.runBlocking { list.scrollToItem(0) } }
+        rule.waitForIdle()
+        val last = visible(tagged("reply:r30"))
+        assertTrue("the last row $last is fully between the bar ${barBottom()} and the composer ${bottomAreaTop()}", last.top >= barBottom() && last.bottom <= bottomAreaTop() && last.height > px(10f))
     }
 
-    /** A 220 dp window (split screen), keyboard closed and open: the field, Send and Collapse are on screen and take taps. */
+    /**
+     * A 220 dp window at font scale 2.0 with a six line Polish draft, keyboard closed and open, with and without an unsent
+     * notice: the bar's buttons take taps, Send (and Expand or Collapse when shown) is a full 48 dp target on screen, the
+     * field stays within the window above the keyboard; then, collapsed, the transcript's last row and its cancel action
+     * are reached and taken.
+     */
     @Test
-    @Config(qualifiers = "w360dp-h220dp-xhdpi")
-    fun composerControlsReachableInAShortWindow() {
-        show(withDraft(chat(failed), 4))
-        rule.onNode(hasContentDescription("Expand the editor")).performClick()
-        rule.waitForIdle()
-        for (ime in listOf(0, 200)) {
+    @Config(qualifiers = "pl-w360dp-h220dp-xhdpi")
+    fun shortWindowAtDoubleFontScaleStaysUsable() {
+        val queued = UserMessage("uq", "Ostatnia wiadomość w kolejce", false, FIXED_NOW, SendState.QUEUED, "kq")
+        val items = failed.take(6) + queued
+        val draft = (1..6).joinToString("\n") { "Wiersz $it szkicu" }
+        val base = chat(items).copy(composer = ComposerMode.SEND, draft = draft)
+        val unsent = xyz.rycerz.apofis.chat.UnsentText(1, "Nie zapisany tekst", xyz.rycerz.apofis.chat.ComposeError.NOT_STORED)
+        show(base, fontScale = 2f)
+        for (notice in listOf(null, unsent)) for (ime in listOf(0, SHORT_KEYBOARD)) {
+            shown = base.copy(unsent = notice)
             insets(top = 48, ime = ime)
+            val case = "notice ${notice != null}, keyboard $ime"
             val height = rule.onRoot().fetchSemanticsNode().size.height
-            for (m in listOf(hasTestTag("composer.field"), hasTestTag("composer.send"), hasContentDescription("Collapse the editor"))) {
-                val r = bounds(m)
-                assertTrue("keyboard $ime: $r inside the window above the keyboard", r.top >= 0f && r.bottom <= height - ime + 1 && r.height > 0f)
-            }
-            val before = sendClicks
-            rule.onRoot().performTouchInput { click(bounds(hasTestTag("composer.send")).center) }
+            val drawer = drawerTaps
+            val newChat = newChatTaps
+            rule.onRoot().performTouchInput { click(visible(hasContentDescription("Otwórz listę czatów")).center) }
+            rule.onRoot().performTouchInput { click(visible(hasContentDescription("New chat")).center) }
             rule.waitForIdle()
-            assertEquals("keyboard $ime: a tap on Send reaches it", before + 1, sendClicks)
-            // The accepted send collapsed it (the fake actions keep the draft): expand again.
-            rule.onNode(hasContentDescription("Expand the editor")).performClick()
+            assertEquals("$case: the drawer button took the tap", drawer + 1, drawerTaps)
+            assertEquals("$case: New chat took the tap", newChat + 1, newChatTaps)
+            val targets = listOf(hasTestTag("composer.send")) + listOf("Rozwiń edytor", "Zwiń edytor").map { hasContentDescription(it) }
+                .filter { m -> rule.onAllNodes(m, useUnmergedTree = true).fetchSemanticsNodes().any { it.layoutInfo.isPlaced } }
+            for (m in targets) {
+                val r = visible(m)
+                assertTrue("$case: $m at $r is a full target on screen", r.height >= px(48f) - 0.5f && r.top >= barBottom() - 0.5f && r.bottom <= height - ime + 0.5f)
+            }
+            val field = rule.onNode(hasTestTag("composer.field"), useUnmergedTree = true).fetchSemanticsNode().unclipped()
+            assertTrue("$case: field $field within the window above the keyboard, below the bar", field.top >= barBottom() - 0.5f && field.bottom <= height - ime + 0.5f)
+            val before = sendClicks
+            rule.onRoot().performTouchInput { click(visible(hasTestTag("composer.send")).center) }
+            rule.waitForIdle()
+            assertEquals("$case: a tap on Send reaches it", before + 1, sendClicks)
+        }
+        // Expand, collapse, then reach the last row and its cancel action with the keyboard closed, as the lower window
+        // of a split screen (no status bar; with one, about 42 dp of transcript remain: less than a whole 48 dp target).
+        shown = base
+        insets(top = 0, ime = 0)
+        if (rule.onAllNodes(hasContentDescription("Rozwiń edytor")).fetchSemanticsNodes().any { it.layoutInfo.isPlaced }) {
+            rule.onRoot().performTouchInput { click(visible(hasContentDescription("Rozwiń edytor")).center) }
+            rule.waitForIdle()
+            rule.onRoot().performTouchInput { click(visible(hasContentDescription("Zwiń edytor")).center) }
             rule.waitForIdle()
         }
-        insets(top = 48, ime = 200)
-        rule.onRoot().performTouchInput { click(bounds(hasContentDescription("Collapse the editor")).center) }
+        rule.runOnUiThread { kotlinx.coroutines.runBlocking { list.scrollToItem(0) } }
         rule.waitForIdle()
-        rule.onNode(hasContentDescription("Expand the editor")).assertExists()
-        rule.onRoot().performTouchInput { click(bounds(hasTestTag("composer.field")).center) }
+        val cancel = visible(hasContentDescription("Anuluj wysyłanie"))
+        assertTrue("the cancel action $cancel is visible between the bar ${barBottom()} and the composer ${bottomAreaTop()}", cancel.top >= barBottom() && cancel.bottom <= bottomAreaTop() && cancel.height >= px(48f) - 0.5f)
+        rule.onRoot().performTouchInput { click(cancel.center) }
         rule.waitForIdle()
-        assertTrue("a tap focuses the field", rule.onNode(hasTestTag("composer.field")).fetchSemanticsNode().config[SemanticsProperties.Focused])
+        assertEquals(listOf("kq"), cancelled)
     }
 
     // ---- I5: the header grows with large text ----

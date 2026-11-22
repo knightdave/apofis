@@ -4,6 +4,24 @@ import android.view.KeyEvent as NativeKeyEvent
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import androidx.activity.ComponentActivity
+import android.view.View
+import android.view.inputmethod.InputConnection
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.material3.DrawerState
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.performTouchInput
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,7 +40,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
@@ -43,7 +60,6 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performKeyInput
-import androidx.compose.ui.test.performKeyPress
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextInputSelection
 import androidx.compose.ui.test.pressKey
@@ -93,23 +109,18 @@ class ComposerViewTest {
     // ---- pure rules ----
 
     @Test
-    fun enterSubmitsRule() {
-        assertTrue(enterSubmits(true, shift = false, repeatCount = 0, ComposerMode.SEND, busy = false))
-        assertTrue(enterSubmits(true, shift = false, repeatCount = 0, ComposerMode.STEER, busy = false))
-        assertFalse(enterSubmits(true, shift = true, repeatCount = 0, ComposerMode.SEND, busy = false))
-        assertFalse(enterSubmits(true, shift = false, repeatCount = 1, ComposerMode.SEND, busy = false))
-        assertFalse(enterSubmits(true, shift = false, repeatCount = 0, ComposerMode.STOP, busy = false))
-        assertFalse(enterSubmits(true, shift = false, repeatCount = 0, ComposerMode.SEND_DISABLED, busy = false))
-        assertFalse(enterSubmits(true, shift = false, repeatCount = 0, ComposerMode.SEND, busy = true))
-        assertFalse(enterSubmits(true, shift = false, repeatCount = 0, ComposerMode.STEER, busy = true))
-        assertFalse(enterSubmits(false, shift = false, repeatCount = 0, ComposerMode.SEND, busy = false))
-        // Every other combination is false too.
-        for (e in listOf(true, false)) for (s in listOf(true, false)) for (r in 0..2) for (m in ComposerMode.entries) for (b in listOf(true, false)) {
-            val expected = e && !s && r == 0 && !b && (m == ComposerMode.SEND || m == ComposerMode.STEER)
-            assertEquals("$e $s $r $m $b", expected, enterSubmits(e, s, r, m, b))
+    fun enterKeyRule() {
+        // Off, or another key: the field gets it.
+        for (down in listOf(true, false)) for (r in 0..2) for (shift in listOf(true, false)) {
+            assertEquals(EnterKey.FIELD, enterKey(enterToSend = false, enter = true, down = down, repeatCount = r, shift = shift))
+            assertEquals(EnterKey.FIELD, enterKey(enterToSend = true, enter = false, down = down, repeatCount = r, shift = shift))
         }
-        assertTrue(canSubmit(ComposerMode.SEND, false) && canSubmit(ComposerMode.STEER, false))
-        assertFalse(canSubmit(ComposerMode.STOP, false) || canSubmit(ComposerMode.SEND_DISABLED, false) || canSubmit(ComposerMode.SEND, true))
+        assertEquals(EnterKey.SEND, enterKey(true, enter = true, down = true, repeatCount = 0, shift = false))
+        assertEquals(EnterKey.FIELD, enterKey(true, enter = true, down = true, repeatCount = 0, shift = true)) // Shift+Enter: a newline
+        for (shift in listOf(true, false)) {
+            assertEquals(EnterKey.CONSUME, enterKey(true, enter = true, down = true, repeatCount = 1, shift = shift)) // repeats
+            assertEquals(EnterKey.CONSUME, enterKey(true, enter = true, down = false, repeatCount = 0, shift = shift)) // key-ups
+        }
     }
 
     @Test
@@ -129,27 +140,42 @@ class ComposerViewTest {
     private var busy by mutableStateOf(false)
     private var enter by mutableStateOf(false)
     private var expanded by mutableStateOf(false)
-    private var sends = 0
+    private var accept = true // what the test's holder answers
+    private var sends = 0 // send attempts
     private var stops = 0
+    private val sentTexts = ArrayList<String>()
     private val edits = ArrayList<String>()
-    private var onSendHook: () -> Unit = { sends++ }
+    private var ancestorEnters = 0 // Enter events that reached a handler above the composer
+    private var onSendHook: () -> Boolean = {
+        sends++
+        sentTexts += draft
+        accept
+    }
 
-    private fun show(expandedHeight: Dp = Dp.Unspecified, writeBack: Boolean = true, fontScale: Float = 1f, rtl: Boolean = false, theme: ThemeMode = ThemeMode.LIGHT) {
+    private fun show(expandedHeight: Dp = Dp.Unspecified, writeBack: Boolean = true, fontScale: Float = 1f, rtl: Boolean = false, theme: ThemeMode = ThemeMode.LIGHT, height: Dp? = null) {
         rule.setContent {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale), LocalLayoutDirection provides if (rtl) LayoutDirection.Rtl else LayoutDirection.Ltr) {
                 ApofisTheme(theme, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                     Box(Modifier.fillMaxSize().testTag("root"), contentAlignment = Alignment.BottomCenter) {
-                        Composer(
-                            draft, mode,
-                            onDraftChange = {
-                                edits += it
-                                if (writeBack) draft = it
+                        Box(
+                            (if (height != null) Modifier.fillMaxWidth().height(height) else Modifier.fillMaxWidth()).testTag("slot").onKeyEvent {
+                                if (it.key == Key.Enter || it.key == Key.NumPadEnter) ancestorEnters++
+                                false
                             },
-                            onSend = { onSendHook() },
-                            onStop = { stops++ },
-                            busy = busy, enterToSend = enter, expanded = expanded, onExpandedChange = { expanded = it }, expandedHeight = expandedHeight,
-                        )
+                            contentAlignment = Alignment.BottomCenter,
+                        ) {
+                            Composer(
+                                draft, mode,
+                                onDraftChange = {
+                                    edits += it
+                                    if (writeBack) draft = it
+                                },
+                                onSend = { onSendHook() },
+                                onStop = { stops++ },
+                                busy = busy, enterToSend = enter, expanded = expanded, onExpandedChange = { expanded = it }, expandedHeight = expandedHeight,
+                            )
+                        }
                     }
                 }
             }
@@ -173,6 +199,28 @@ class ComposerViewTest {
         Snapshot.sendApplyNotifications()
         rule.mainClock.advanceTimeByFrame()
     }
+
+    private fun composeView(): View = (rule.activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as ViewGroup).getChildAt(0)
+
+    /** The platform input connection of the focused field, as a keyboard sees it. */
+    private fun connection(): InputConnection {
+        lateinit var ic: InputConnection
+        rule.runOnUiThread { ic = composeView().onCreateInputConnection(EditorInfo())!! }
+        return ic
+    }
+
+    private fun key(action: Int, code: Int = NativeKeyEvent.KEYCODE_ENTER, repeat: Int = 0, meta: Int = 0) = NativeKeyEvent(0L, 0L, action, code, repeat, meta)
+
+    /** Real key events through the view, in one UI turn: nothing is composed or drawn in between. */
+    private fun dispatch(vararg events: NativeKeyEvent) = rule.runOnUiThread { for (e in events) composeView().dispatchKeyEvent(e) }
+
+    private fun focusAtEnd() {
+        field().performClick()
+        field().performTextInputSelection(TextRange(draft.length))
+        rule.waitForIdle()
+    }
+
+    private fun lineHeights(n: Int) = px(n * 19.5f + 28f)
 
     @Test
     fun labelsFollowMode() {
@@ -216,39 +264,64 @@ class ComposerViewTest {
         for (tag in listOf(SEND_TAG, STOP_TAG)) for (node in nodes(tag)) assertEquals("$tag mid swap", 1, node.descs().size)
     }
 
+    /** A press begun on one action never lands on another: changing the action cancels it. */
     @Test
-    fun imeSendOnlyWhenSubmittable() {
-        enter = true
+    fun pressBegunOnOneActionIsCancelledWhenTheActionChanges() {
+        mode = ComposerMode.STOP
+        draft = ""
+        show()
+        val at = bounds(STOP_TAG).center
+        rule.onRoot().performTouchInput { down(at) }
+        draft = "dictated"
+        mode = ComposerMode.STEER // the filled button under the finger is now Steer
+        rule.waitForIdle()
+        rule.onRoot().performTouchInput { up() }
+        rule.waitForIdle()
+        assertEquals("a press begun on Stop sent", 0, sends)
+        assertEquals("and stopped nothing either", 0, stops)
+        rule.onNodeWithTag(STOP_TAG).performClick() // a fresh tap on each target works
+        rule.onNodeWithTag(SEND_TAG).performClick()
+        rule.waitForIdle()
+        assertEquals(1, stops)
+        assertEquals(1, sends)
+
+        val steer = bounds(SEND_TAG).center
+        rule.onRoot().performTouchInput { down(steer) }
+        draft = ""
+        mode = ComposerMode.STOP
+        rule.waitForIdle()
+        rule.onRoot().performTouchInput { up() }
+        rule.waitForIdle()
+        assertEquals("a press begun on Steer stopped the run", 1, stops)
+        assertEquals(1, sends)
+        rule.onNodeWithTag(STOP_TAG).performClick()
+        rule.waitForIdle()
+        assertEquals(2, stops)
+    }
+
+    /** The keyboard's Send action sends only with Enter to send on, whatever action the keyboard reports. */
+    @Test
+    fun imeActionSendsOnlyWithEnterToSend() {
         draft = "hi"
         show()
-        assertEquals(ImeAction.Send, field().fetchSemanticsNode().config[SemanticsProperties.ImeAction])
-        for ((m, b, expected) in listOf(
-            Triple(ComposerMode.SEND, false, 1), Triple(ComposerMode.STEER, false, 1), Triple(ComposerMode.STOP, false, 0),
-            Triple(ComposerMode.SEND, true, 0), Triple(ComposerMode.STEER, true, 0), Triple(ComposerMode.SEND_DISABLED, false, 0),
-        )) {
-            mode = m
-            busy = b
-            rule.waitForIdle()
-            sends = 0
-            field().performImeAction()
-            rule.waitForIdle()
-            assertEquals("$m busy=$b", expected, sends)
-            assertEquals(0, stops)
-        }
-        assertEquals("the IME action never edits the draft", emptyList<String>(), edits)
-        // Off: Return is a newline key, no Send action.
-        enter = false
-        rule.waitForIdle()
+        focusAtEnd()
         assertEquals(ImeAction.Default, field().fetchSemanticsNode().config[SemanticsProperties.ImeAction])
-    }
-
-    private fun focusAtEnd() {
-        field().performClick()
-        field().performTextInputSelection(TextRange(draft.length))
+        val off = connection()
+        rule.runOnUiThread { off.performEditorAction(EditorInfo.IME_ACTION_SEND) }
         rule.waitForIdle()
+        assertEquals("Send from the keyboard with Enter to send off", 0, sends)
+        enter = true
+        rule.waitForIdle()
+        assertEquals(ImeAction.Send, field().fetchSemanticsNode().config[SemanticsProperties.ImeAction])
+        val on = connection()
+        rule.runOnUiThread { on.performEditorAction(EditorInfo.IME_ACTION_SEND) }
+        rule.waitForIdle()
+        assertEquals(1, sends)
+        field().performImeAction()
+        rule.waitForIdle()
+        assertEquals(2, sends)
+        assertEquals("the IME action never edits the draft", emptyList<String>(), edits)
     }
-
-    private fun enterDown(repeat: Int) = KeyEvent(NativeKeyEvent(0L, 0L, NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_ENTER, repeat))
 
     @Test
     fun hardwareEnter() {
@@ -260,62 +333,71 @@ class ComposerViewTest {
         rule.waitForIdle()
         assertEquals(1, sends)
         assertEquals("Enter that sends inserts nothing", emptyList<String>(), edits)
+        assertEquals("the down and the up of Enter stay with the composer", 0, ancestorEnters)
 
         field().performKeyInput { withKeyDown(Key.ShiftLeft) { pressKey(Key.Enter) } }
         rule.waitForIdle()
         assertEquals(1, sends)
-        assertEquals(listOf("hi\n"), edits)
+        assertEquals("Shift+Enter inserts one line", listOf("hi\n"), edits)
+        assertEquals("two lines show no Expand", 0, rule.onAllNodes(hasContentDescription("Expand the editor")).fetchSemanticsNodes().size)
 
-        edits.clear()
-        field().performKeyPress(enterDown(repeat = 3)) // a held key's repeats
+        field().performKeyInput { pressKey(Key.NumPadEnter) } // keypad Enter is the same key
         rule.waitForIdle()
-        assertEquals(1, sends)
-        assertEquals(emptyList<String>(), edits)
+        assertEquals(2, sends)
 
-        mode = ComposerMode.STOP
+        dispatch(key(NativeKeyEvent.ACTION_DOWN, repeat = 3)) // a held key's repeats
         rule.waitForIdle()
-        field().performKeyInput { pressKey(Key.Enter) }
-        rule.waitForIdle()
-        assertEquals("STOP: Enter neither sends", 1, sends)
-        assertEquals("nor stops", 0, stops)
-        assertEquals("and with Enter to send on it is consumed", emptyList<String>(), edits)
+        assertEquals(2, sends)
+        assertEquals(1, edits.size)
+        assertEquals(0, ancestorEnters)
 
         enter = false
         rule.waitForIdle()
         field().performKeyInput { pressKey(Key.Enter) }
         rule.waitForIdle()
-        assertEquals("off, in STOP: a newline", 1, edits.size)
-        mode = ComposerMode.SEND
-        rule.waitForIdle()
-        field().performKeyInput { pressKey(Key.Enter) }
-        rule.waitForIdle()
-        assertEquals("off: Enter never sends", 1, sends)
-        assertEquals("hi\n\n\n", draft)
+        assertEquals("off: Enter never sends", 2, sends)
+        assertEquals("off: Return is a newline", "hi\n\n", draft)
     }
 
-    /** A word the IME is still composing is never sent by Enter: the first Enter finishes it, the next one sends it whole. */
+    /** Held Enter with Shift pressed mid-hold and another key in between: no newline and no second send. */
     @Test
-    fun composingTextIsFinishedBeforeEnterSends() {
+    fun heldEnterAcrossShiftAndOtherKeys() {
+        enter = true
+        draft = "hi"
+        show()
+        focusAtEnd()
+        val shift = NativeKeyEvent.META_SHIFT_ON or NativeKeyEvent.META_SHIFT_LEFT_ON
+        dispatch(
+            key(NativeKeyEvent.ACTION_DOWN),
+            key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_SHIFT_LEFT, meta = shift),
+            key(NativeKeyEvent.ACTION_DOWN, repeat = 1, meta = shift),
+            key(NativeKeyEvent.ACTION_DOWN, NativeKeyEvent.KEYCODE_NUMPAD_ENTER, repeat = 1, meta = shift),
+            key(NativeKeyEvent.ACTION_DOWN, repeat = 2, meta = shift),
+            key(NativeKeyEvent.ACTION_UP, meta = shift),
+            key(NativeKeyEvent.ACTION_UP, NativeKeyEvent.KEYCODE_NUMPAD_ENTER, meta = shift),
+            key(NativeKeyEvent.ACTION_UP, NativeKeyEvent.KEYCODE_SHIFT_LEFT),
+        )
+        rule.waitForIdle()
+        assertEquals(1, sends)
+        assertEquals("no newline from a held Enter", emptyList<String>(), edits)
+        assertEquals("no Enter event leaked to the parent", 0, ancestorEnters)
+    }
+
+    /** Text the keyboard is still composing is part of the draft: Enter sends it, once. */
+    @Test
+    fun composingTextPlusEnterSendsItOnce() {
         enter = true
         draft = ""
         show()
         field().performClick()
         rule.waitForIdle()
-        val content = rule.activity.findViewById<ViewGroup>(android.R.id.content)
-        val view = (content.getChildAt(0) as ViewGroup).getChildAt(0)
-        lateinit var ic: android.view.inputmethod.InputConnection
-        rule.runOnUiThread { ic = view.onCreateInputConnection(EditorInfo())!! }
+        val ic = connection()
         rule.runOnUiThread { ic.setComposingText("wor", 1) }
         rule.waitForIdle()
         assertEquals("wor", draft)
         field().performKeyInput { pressKey(Key.Enter) }
         rule.waitForIdle()
-        assertEquals("composing text was sent", 0, sends)
-        assertEquals("composing text was lost or changed", "wor", draft)
-        field().performKeyInput { pressKey(Key.Enter) }
-        rule.waitForIdle()
-        assertEquals(1, sends)
-        assertEquals("wor", draft)
+        assertEquals(listOf("wor"), sentTexts)
         assertTrue("no edit added a newline", edits.none { '\n' in it })
     }
 
@@ -355,39 +437,80 @@ class ComposerViewTest {
         assertTrue("focus left the field", field().fetchSemanticsNode().config[SemanticsProperties.Focused])
     }
 
+    /** Collapse happens only when the holder takes the draft; a refused attempt changes nothing. */
     @Test
-    fun collapsesOnAcceptedSubmission() {
+    fun collapsesOnlyWhenTheHolderAccepts() {
         draft = "x"
         expanded = true
-        show()
-        val collapsed = px(48f) + 1
-        assertTrue(bounds(FIELD_TAG).height > px(300f))
-        rule.mainClock.autoAdvance = false
-        rule.onNodeWithTag(SEND_TAG).performClick() // onSend counts only: nothing clears the draft
-        frames(1)
-        assertFalse(expanded)
-        assertEquals(1, sends)
-        assertTrue("collapsed at once: ${bounds(FIELD_TAG).height}", bounds(FIELD_TAG).height <= collapsed)
-
-        // The IME's send collapses too; a refused submission (nothing to send) does not.
-        rule.mainClock.autoAdvance = true
         enter = true
-        expanded = true
-        rule.waitForIdle()
-        rule.mainClock.autoAdvance = false
+        show()
+        assertTrue(bounds(FIELD_TAG).height > px(300f))
+        accept = false
+        rule.onNodeWithTag(SEND_TAG).performClick()
         field().performImeAction()
+        rule.waitForIdle()
+        assertEquals(2, sends)
+        assertTrue("a refused send collapsed the editor", expanded)
+        assertTrue(bounds(FIELD_TAG).height > px(300f))
+        accept = true
+        rule.mainClock.autoAdvance = false
+        rule.onNodeWithTag(SEND_TAG).performClick()
         frames(1)
         assertFalse(expanded)
-        assertTrue(bounds(FIELD_TAG).height <= collapsed)
+        assertEquals("collapsed at once: ${bounds(FIELD_TAG).height}", lineHeights(1), bounds(FIELD_TAG).height, 2f)
         rule.mainClock.autoAdvance = true
-        mode = ComposerMode.SEND_DISABLED
         expanded = true
         rule.waitForIdle()
         field().performImeAction()
         rule.waitForIdle()
-        assertTrue("refused: still expanded", expanded)
-        assertEquals(2, sends)
+        assertFalse(expanded)
         assertEquals(emptyList<String>(), edits)
+    }
+
+    /** Expanding grows from the current collapsed height and never dips below it; collapsing ends at the current text's height. */
+    @Test
+    fun expandAndCollapseUseTheCurrentHeights() {
+        draft = (1..5).joinToString("\n") { "line $it" }
+        show()
+        val five = bounds(FIELD_TAG).height
+        assertEquals(lineHeights(5), five, 2f)
+        rule.mainClock.autoAdvance = false
+        expanded = true
+        var last = 0f
+        repeat(Motion.COMPOSER_EXPAND / 16 + 2) {
+            frames(1)
+            val h = bounds(FIELD_TAG).height
+            assertTrue("frame $it: $h below the collapsed $five", h >= five - 2)
+            assertTrue("frame $it: $h shrank from $last", h >= last - 1)
+            last = h
+        }
+        rule.mainClock.autoAdvance = true
+        draft = (1..8).joinToString("\n") { "line $it" } // more text while expanded
+        rule.waitForIdle()
+        expanded = false
+        rule.waitForIdle()
+        assertEquals(lineHeights(5), bounds(FIELD_TAG).height, 2f)
+        expanded = true
+        rule.waitForIdle()
+        draft = "one" // less text while expanded
+        rule.waitForIdle()
+        expanded = false
+        rule.waitForIdle()
+        assertEquals(lineHeights(1), bounds(FIELD_TAG).height, 2f)
+    }
+
+    /** With room for one 48 dp target only, Expand is dropped and Send keeps its full target. */
+    @Test
+    fun expandIsDroppedBeforeSend() {
+        draft = (1..4).joinToString("\n") { "line $it" }
+        show(height = 120.dp) // the card's row gets 88 dp: one target
+        val placedExpand = rule.onAllNodes(hasContentDescription("Expand the editor"), useUnmergedTree = true).fetchSemanticsNodes().filter { it.layoutInfo.isPlaced }
+        assertEquals("Expand shown without room for two targets", 0, placedExpand.size)
+        val send = bounds(SEND_TAG)
+        val slot = bounds("slot")
+        assertTrue("send $send", send.height >= px(48f) - 0.5f && send.top >= slot.top && send.bottom <= slot.bottom)
+        val f = bounds(FIELD_TAG)
+        assertTrue("field $f inside its slot $slot", f.top >= slot.top && f.bottom <= slot.bottom)
     }
 
     /** Two presses in one frame, before the composer redraws: the holder takes the draft once. */
@@ -397,7 +520,7 @@ class ComposerViewTest {
         val holder = DraftHolder(scope)
         holder.edit("k", "hello", holder.current("k").revision)
         var stores = 0
-        onSendHook = { holder.send("k") { stores++; awaitCancellation() } }
+        onSendHook = { holder.send("k") { stores++; awaitCancellation() } != null }
         draft = "hello"
         enter = true
         show()
@@ -414,19 +537,21 @@ class ComposerViewTest {
 
     @Test
     fun draftsOfAnySizeStayBounded() {
-        draft = "x".repeat(100_000)
+        draft = (1..6).joinToString("\n") { "line $it" }
         show()
-        val fiveLines = px(5 * 19.5f + 28f) + 2
-        assertTrue("100k chars: ${bounds(FIELD_TAG).height}", bounds(FIELD_TAG).height <= fiveLines)
+        assertEquals("six lines show five", lineHeights(5), bounds(FIELD_TAG).height, 2f)
+        draft = "x".repeat(100_000)
+        rule.waitForIdle()
+        assertEquals("100k chars", lineHeights(5), bounds(FIELD_TAG).height, 2f)
         rule.onNodeWithContentDescription("Expand the editor").assertExists()
         draft = (1..10_000).joinToString("\n") { "line $it" }
         rule.waitForIdle()
-        assertTrue("10k lines: ${bounds(FIELD_TAG).height}", bounds(FIELD_TAG).height <= fiveLines)
+        assertEquals("10k lines", lineHeights(5), bounds(FIELD_TAG).height, 2f)
         expanded = true
         rule.waitForIdle()
-        val root = bounds("root")
+        val slot = bounds("slot")
         val f = bounds(FIELD_TAG)
-        assertTrue("expanded stays inside the window: $f", f.top >= root.top && f.bottom <= root.bottom)
+        assertTrue("expanded stays inside its room: $f", f.top >= slot.top && f.bottom <= slot.bottom)
         val before = draft
         field().performTextInputSelection(TextRange(before.length))
         field().performTextInput("!")
@@ -489,10 +614,9 @@ class ComposerViewTest {
         show(fontScale = 2f)
         for (desc in listOf("Rozwiń edytor", "Zatrzymaj", "Wyślij do trwającej odpowiedzi")) rule.onNodeWithContentDescription(desc).assertExists()
         val layout = layoutOf(FIELD_TAG)
-        assertFalse(layout.didOverflowWidth)
         val f = bounds(FIELD_TAG)
         assertEquals(3, layout.lineCount)
-        assertTrue("all three lines at 2.0 show: ${f.height}", f.height >= layout.getLineBottom(2) + px(28f) - 1)
+        assertTrue("all three lines at 2.0 show: ${f.height}", f.height >= layout.getLineBottom(2) + px(8f) - 1) // at 2.0 the padding shrinks to about 4 dp
         // The buttons stay inside the card's column, below and beside each other, never over the field.
         assertFalse(described("Rozwiń edytor").overlaps(bounds(SEND_TAG)))
         assertFalse(described("Rozwiń edytor").overlaps(f))
@@ -520,7 +644,7 @@ class ComposerViewTest {
             val (theme, seed) = cases[case]
             ApofisTheme(theme, dynamicColor = seed != null, pureBlack = false, reduceMotion = true, blur = false, seed = seed) {
                 Box(Modifier.testTag("probe").background(MaterialTheme.colorScheme.onSurface).padding(vertical = 24.dp)) {
-                    Composer("", ComposerMode.SEND_DISABLED, {}, {}, {})
+                    Composer("", ComposerMode.SEND_DISABLED, {}, { false }, {})
                 }
             }
         }
@@ -555,16 +679,24 @@ class ComposerViewTest {
 
     private var ui by mutableStateOf(ChatUiState("apofis-1", "Composer", StatusLine.IDLE, history, ComposerMode.SEND, "a", "hermes.example", draftRevision = 1))
     private val recorded = ArrayList<Pair<String, Long>>()
+    private var chatSends = 0
     private val chatActions = object : ChatActions {
         override fun onDraftChange(text: String, basedOnRevision: Long) {
             recorded += text to basedOnRevision
         }
-    }
 
-    private fun showChat(restoration: StateRestorationTester? = null) {
+        override fun onSendClick(): Boolean {
+            chatSends++
+            return true
+        }
+    }
+    private lateinit var list: LazyListState
+
+    private fun showChat(restoration: StateRestorationTester? = null, actions: ChatActions = chatActions, enterToSend: Boolean = false) {
         val content: @androidx.compose.runtime.Composable () -> Unit = {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
-                ChatScreen(ui, chatActions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+                list = androidx.compose.foundation.lazy.rememberLazyListState()
+                ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, enterToSend = enterToSend)
             }
         }
         if (restoration != null) restoration.setContent(content) else rule.setContent(content)
@@ -594,6 +726,67 @@ class ComposerViewTest {
         assertEquals("put back!" to 3L, recorded.last())
     }
 
+    private val scope = CoroutineScope(Job() + Dispatchers.Unconfined)
+    private val holder = DraftHolder(scope)
+    private val stores = ArrayList<String>()
+
+    /** The real draft holder behind the screen; [ui] is set from it once, so the screen draws the last frame's snapshot. */
+    private fun showWithHolder(initial: String) {
+        val k = ui.sessionKey
+        holder.edit(k, initial, holder.current(k).revision)
+        val s = holder.current(k)
+        ui = ui.copy(draft = s.draft, draftRevision = s.revision, composer = if (s.draft.isBlank()) ComposerMode.SEND_DISABLED else ComposerMode.SEND)
+        val actions = object : ChatActions {
+            override fun onDraftChange(text: String, basedOnRevision: Long) = holder.edit(k, text, basedOnRevision)
+            override fun onSendClick(): Boolean = holder.send(k) { stores += it; awaitCancellation() } != null
+        }
+        showChat(actions = actions, enterToSend = true)
+    }
+
+    /** The first character and Enter in one UI turn, before the screen redraws: the holder sends it, once. */
+    @Test
+    fun firstCharacterThenEnterInOneTurnSends() {
+        showWithHolder("")
+        field().performClick()
+        rule.waitForIdle()
+        val ic = connection()
+        rule.runOnUiThread {
+            ic.commitText("x", 1)
+            composeView().dispatchKeyEvent(key(NativeKeyEvent.ACTION_DOWN))
+            composeView().dispatchKeyEvent(key(NativeKeyEvent.ACTION_UP))
+            ic.performEditorAction(EditorInfo.IME_ACTION_SEND) // the keyboard's Send too: the draft is already taken
+        }
+        rule.waitForIdle()
+        assertEquals(listOf("x"), stores)
+        scope.cancel()
+    }
+
+    /** The last character deleted and Enter or Send in one UI turn: nothing is sent, the editor stays, the reader stays. */
+    @Test
+    fun lastCharacterDeletedThenEnterInOneTurnChangesNothing() {
+        showWithHolder("\n\nx") // three lines, so it can expand; blank once the x goes
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        rule.waitForIdle()
+        rule.runOnIdle { runBlocking { list.scrollToItem(6) } } // a reader scrolled up
+        rule.waitForIdle()
+        field().performClick()
+        field().performTextInputSelection(TextRange(3))
+        rule.waitForIdle()
+        val ic = connection()
+        rule.runOnUiThread {
+            ic.deleteSurroundingText(1, 0)
+            composeView().dispatchKeyEvent(key(NativeKeyEvent.ACTION_DOWN))
+            composeView().dispatchKeyEvent(key(NativeKeyEvent.ACTION_UP))
+            ic.performEditorAction(EditorInfo.IME_ACTION_SEND)
+        }
+        rule.waitForIdle()
+        assertEquals("\n\n", holder.current(ui.sessionKey).draft)
+        assertEquals("a blank draft was sent", emptyList<String>(), stores)
+        rule.onNodeWithContentDescription("Collapse the editor").assertExists()
+        assertEquals("the reader was moved", 6, list.firstVisibleItemIndex)
+        scope.cancel()
+    }
+
     @Test
     fun backCollapsesBeforeLeaving() {
         ui = ui.copy(draft = "one\ntwo\nthree")
@@ -610,23 +803,78 @@ class ComposerViewTest {
         assertTrue("collapsed, Back leaves", rule.activity.isFinishing)
     }
 
-    /** Expanded survives rotation and process recreation (saved state); another chat starts collapsed. The text is always the holder's. */
+    /** With the drawer over the chat, Back closes the drawer first; the editor stays expanded with its draft, the next Back collapses it. */
+    @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
     @Test
-    fun expandedSurvivesRecreationAndResetsInAnotherChat() {
+    fun backClosesTheDrawerBeforeCollapsing() {
+        ui = ui.copy(draft = "one\ntwo\nthree")
+        lateinit var drawer: DrawerState
+        lateinit var drawerScope: CoroutineScope
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                drawer = rememberDrawerState(DrawerValue.Closed)
+                drawerScope = rememberCoroutineScope()
+                // As AppNav does: the drawer's Back first in composition, the chat told when it is covered.
+                BackHandler(drawer.isOpen) { drawerScope.launch { drawer.close() } }
+                ModalNavigationDrawer(drawerContent = { ModalDrawerSheet { Text("Chats") } }, drawerState = drawer) {
+                    ChatScreen(ui, chatActions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, covered = drawer.isOpen)
+                }
+            }
+        }
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        rule.waitForIdle()
+        rule.runOnIdle { drawerScope.launch { drawer.open() } }
+        rule.waitForIdle()
+        assertTrue(drawer.isOpen)
+        rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }
+        rule.waitForIdle()
+        assertTrue("Back did not close the drawer", drawer.isClosed)
+        rule.onNodeWithContentDescription("Collapse the editor").assertExists()
+        assertEquals("one\ntwo\nthree", shownText())
+        rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Expand the editor").assertExists()
+        assertFalse(rule.activity.isFinishing)
+        assertEquals(emptyList<Pair<String, Long>>(), recorded)
+    }
+
+    /**
+     * Expanded is not saved: recreation starts collapsed. In another chat on the same screen it starts collapsed too, and
+     * Expand, Back and an accepted send all work there (the remembered slot writes the screen's one state).
+     */
+    @Test
+    fun expandedResetsOnRecreationAndWorksInAnotherChat() {
         ui = ui.copy(draft = "one\ntwo\nthree")
         val tester = StateRestorationTester(rule)
         showChat(tester)
         rule.onNodeWithContentDescription("Expand the editor").performClick()
         rule.waitForIdle()
+        rule.onNodeWithContentDescription("Collapse the editor").assertExists()
         ui = ui.copy(draft = "one\ntwo\nthree\nfour", draftRevision = 2) // the holder changed while the activity was away
         tester.emulateSavedInstanceStateRestore()
         rule.waitForIdle()
-        rule.onNodeWithContentDescription("Collapse the editor").assertExists()
+        rule.onNodeWithContentDescription("Expand the editor").assertExists()
         assertEquals("one\ntwo\nthree\nfour", shownText())
-        ui = ui.copy(sessionKey = "apofis-2", draft = "other\nchat\ndraft")
+
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        rule.waitForIdle()
+        ui = ui.copy(sessionKey = "apofis-2", draft = "other\nchat\ndraft") // the same screen, another chat
         rule.waitForIdle()
         rule.onNodeWithContentDescription("Expand the editor").assertExists()
         assertEquals("other\nchat\ndraft", shownText())
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Collapse the editor").assertExists()
+        rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }
+        rule.waitForIdle()
+        rule.onNodeWithContentDescription("Expand the editor").assertExists()
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithTag(SEND_TAG).performClick()
+        rule.waitForIdle()
+        assertEquals(1, chatSends)
+        rule.onNodeWithContentDescription("Expand the editor").assertExists()
         assertEquals(emptyList<Pair<String, Long>>(), recorded)
     }
 

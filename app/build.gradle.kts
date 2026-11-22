@@ -57,6 +57,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true // BuildConfig.DEBUG keeps test probes out of release
     }
 
     // Third-party license texts ship verbatim from the repository's licenses/ directory.

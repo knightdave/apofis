@@ -202,8 +202,9 @@ class ChromeInputsTest {
         ui = chat().copy(composer = ComposerMode.SEND, draft = "hi")
         var sends = 0
         actions = object : ChatActions {
-            override fun onSendClick() {
+            override fun onSendClick(): Boolean {
                 sends++
+                return true
             }
         }
         show()

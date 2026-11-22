@@ -37,7 +37,7 @@ class ComposerScreenshotTest {
                 Modifier.padding(16.dp),
                 color = MaterialTheme.colorScheme.onSurface,
             )
-            Composer(draft, mode, {}, {}, {}, Modifier.align(Alignment.BottomCenter), expanded = expanded, expandedHeight = expandedHeight)
+            Composer(draft, mode, {}, { false }, {}, Modifier.align(Alignment.BottomCenter), expanded = expanded, expandedHeight = expandedHeight)
         }
     }
 

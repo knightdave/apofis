@@ -82,7 +82,8 @@ interface ChatActions {
     fun onDraftChange(text: String, basedOnRevision: Long) {}
 
     /** Sends the current draft; ignored while a send is being stored. */
-    fun onSendClick() {}
+    /** Asks the draft holder to send the draft now; true when it took it (nothing to send, or a send in flight: false). */
+    fun onSendClick(): Boolean = false
     /** [runId]: the run the Stop button was drawn for. */
     fun onStopClick(runId: String) {}
     fun onRetry(idempotencyKey: String) {}
@@ -224,7 +225,7 @@ class ChatViewModel(
         if (local.value.composerNote != null) local.update { it.copy(composerNote = null) }
     }
 
-    override fun onSendClick() {
+    override fun onSendClick(): Boolean {
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.send(sessionKey) { text ->
             // The field empties only once the text is stored; delivery problems after that show on the bubble.
@@ -235,6 +236,7 @@ class ChatViewModel(
             local.update { it.copy(composerNote = null) }
             accepted.tryEmit(Unit)
         }
+        return started != null
     }
 
     override fun onStopClick(runId: String) = request { follower.stop(sessionKey, runId) }
