@@ -272,8 +272,12 @@ class PushRegistrar(
     /** Recomputes the shown state in turn with the operations: under the registrar's lock, off the main thread, no network. */
     suspend fun refreshNow() = withContext(Dispatchers.IO) { mutex.withLock { state.value = compute() } }
 
-    /** The record's endpoint for a test push of [owner], or null when [owner] is no longer the current registration (one read). */
-    fun testEndpoint(owner: String): String? = PushStore.locked { endpoint?.takeIf { testOwner(epoch(), currentInstance()) == owner } }
+    /**
+     * The record's endpoint for a test push of [owner], in one read: only while [owner] is the current registration and its
+     * journaled registration (that epoch and instance) owns the published endpoint; otherwise null.
+     */
+    fun testEndpoint(owner: String): String? =
+        PushStore.locked { endpoint?.takeIf { testOwner(epoch(), currentInstance()) == owner && it == confirmed() } }
 
     /** Recomputes the shown state, e.g. after the receiver failed to store an endpoint. */
     fun refresh() {
@@ -309,7 +313,7 @@ class PushRegistrar(
                 } finally {
                     live = { true }
                     if (server && !stale && recordThis) runCatching { recordOutcome(a != null, error) }.onFailure(::logFailure)
-                    state.value = compute()
+                    runCatching { state.value = compute() }.onFailure(::logFailure) // never replaces the operation's own outcome or cancellation
                 }
             }
         }

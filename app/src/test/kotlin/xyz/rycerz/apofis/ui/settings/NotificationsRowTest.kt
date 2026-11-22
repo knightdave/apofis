@@ -9,6 +9,7 @@ import android.content.SharedPreferences
 import android.provider.Settings
 import android.content.pm.PackageManager
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.semantics.Role
@@ -951,6 +952,98 @@ class NotificationsRowTest {
         for (r in listOf(TestPushResult.SEND_FAILED, TestPushResult.WAKE_ARRIVED, TestPushResult.NO_WAKE)) {
             assertFalse(r.name, ticks(open = true, last = TestOutcome(owner, r)))
         }
+    }
+
+    // ---- Fix round 3 ----
+
+    @Test
+    fun aDroppedOffOfOneConnectionIsNotShownOnTheNext() {
+        turnedOn()
+        var conn by mutableStateOf(0L)
+        themed { key(conn) { NotificationsSetting({ registrar }, { testPush }, notifyPrefs, heldScope, conn) } }
+        waitReady()
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        runBlocking { withTimeout(WATCHDOG_MS) { registrar.prepareSwitch() } }
+        turnOffViaDialog()
+        val inside = Gate().also { apiGate = it }
+        (held.poll(WATCHDOG_MS, TimeUnit.MILLISECONDS) ?: throw AssertionError("no dispatch came")).run() // admitted for A
+        await(inside.entered)
+
+        conn = 1 // Settings entered on the next connection while A's Off is held
+        waitReady()
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).assertIsEnabled() // A's busy is not B's
+        connection++
+        epoch++
+        inside.open.complete(Unit)
+        runHeld(::commandsDone) // A's Off is dropped
+        current = apiB
+        runBlocking { withTimeout(WATCHDOG_MS) { registrar.reconcileLocal() } }
+        rule.waitForIdle()
+        assertTrue("A's failure line is not B's", rule.onAllNodes(hasText(text(R.string.settings_notif_turn_off_failed))).fetchSemanticsNodes().isEmpty())
+
+        turnOffViaDialog() // B's own command runs
+        runHeld(::commandsDone)
+        waitInSheet(text(R.string.settings_notif_off))
+        assertFalse(subscribed("g2") || prefs.getBoolean(Keys.ENABLED, false))
+    }
+
+    @Test
+    fun aCommandCancelledBeforeItsFirstDispatchFreesTheGuard() {
+        turnedOn()
+        setting(scope = heldScope)
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        rule.onNodeWithText(text(R.string.settings_notif_test)).performClick()
+        commands.children.single().cancel() // before its first dispatch: its body never runs
+        (held.poll(WATCHDOG_MS, TimeUnit.MILLISECONDS) ?: throw AssertionError("no dispatch came")).run() // it only completes the job
+        rule.waitForIdle()
+        rule.onNode(hasText(text(R.string.settings_notif_test)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).assertIsEnabled().performClick()
+        runHeld(::commandsDone)
+        assertEquals(listOf(VALID), sent)
+    }
+
+    @Test
+    fun theSheetSendsTheOwnerItDrewEvenWhenTheStateMovedOn() {
+        turnedOn()
+        val drawn = registrar.ui.value // what the sheet drew: A
+        switchToB()
+        endpointArrives(VALID2)
+        runBlocking { withTimeout(WATCHDOG_MS) { registrar.publishPending() } }
+        val b = registrar.ui.value.testOwner!!
+        runBlocking { withTimeout(WATCHDOG_MS) { testPush.send(VALID2, b) } } // B's own test window is open
+        elapsed += 10_000 // past the throttle: a stale tap could start a new send
+        val allowed = NotificationAccess(Runtime.GRANTED, true, true, true)
+        themed {
+            // A's sheet, still on screen when the state is already B; the callback is NotificationsSetting's.
+            NotificationsSheet(NotificationsUi(allowed, drawn, null), onTest = { owner ->
+                runBlocking { withTimeout(WATCHDOG_MS) { registrar.testEndpoint(owner!!)?.let { testPush.send(it, owner) } } }
+            }, onRetry = {}, onTurnOff = {}, onSystemSettings = {}, onDismiss = {})
+        }
+        rule.onNode(hasText(text(R.string.settings_notif_test)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).performClick()
+        assertEquals("no POST for the stale tap", listOf(VALID2), sent)
+        assertEquals("B's window and result are untouched", TestOutcome(b, TestPushResult.SENT), testPush.lastResult.value)
+        testPush.onWake(b)
+        assertEquals(TestOutcome(b, TestPushResult.WAKE_ARRIVED), testPush.lastResult.value)
+    }
+
+    @Test
+    fun anEpochChangeBeforeRecoveryGivesNoTarget() {
+        turnedOn()
+        connection++
+        runBlocking {
+            withTimeout(WATCHDOG_MS) {
+                registrar.prepareSwitch()
+                // A queued worker registers g2 under the old epoch, its endpoint arrives, and it publishes the record.
+                registrar.publishPending()
+                endpointArrives(VALID2)
+                registrar.publishPending()
+            }
+        }
+        assertEquals(VALID2, registrar.endpoint)
+        epoch++ // the marker advances the epoch before recovery replaces g2
+        assertNull("g2 is journaled under the old epoch: not the owner of a target", registrar.testEndpoint("1:g2"))
+        assertNull(registrar.testEndpoint("0:g2"))
+        assertTrue(sent.isEmpty())
     }
 
     @Test

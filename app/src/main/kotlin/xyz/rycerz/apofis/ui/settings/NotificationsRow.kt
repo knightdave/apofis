@@ -116,21 +116,20 @@ internal fun ticks(open: Boolean, last: TestOutcome?) = open && last?.result == 
  * Admission runs on the main thread; the command runs in a scope that outlives the screen.
  */
 internal class PushCommands : ViewModel() {
-    var busy by mutableStateOf(false)
+    /** The connection of the screen that admitted the running command; null when none runs. */
+    var running by mutableStateOf<Long?>(null)
         private set
-    var message by mutableStateOf<Int?>(null)
 
-    fun run(scope: CoroutineScope, block: suspend () -> Unit) {
-        if (busy) return
-        busy = true
+    /** A message for the screen of one connection: (connection, string). */
+    var message by mutableStateOf<Pair<Long, Int>?>(null)
+
+    /** One command at a time, whichever screen admitted it; released when its job completes in any way. */
+    fun run(scope: CoroutineScope, connection: Long, block: suspend () -> Unit) {
+        if (running != null) return
+        running = connection
         message = null
-        scope.launch {
-            try {
-                block()
-            } finally {
-                busy = false
-            }
-        }
+        val job = scope.launch { block() }
+        job.invokeOnCompletion { running = null } // also when cancelled before its first dispatch
     }
 }
 
@@ -167,7 +166,7 @@ private fun ErrorLine(message: Int, modifier: Modifier) = Text(
 @Composable
 fun NotificationsSheet(
     ui: NotificationsUi,
-    onTest: () -> Unit,
+    onTest: (owner: String?) -> Unit,
     onRetry: () -> Unit,
     onTurnOff: () -> Unit,
     onSystemSettings: () -> Unit,
@@ -205,7 +204,8 @@ fun NotificationsSheet(
             val enabled = !busy
             for (action in actionsOf(ui)) {
                 when (action) {
-                    SheetAction.TEST -> SheetRow(R.drawable.lucide_bell, stringResource(R.string.settings_notif_test), onTest, enabled = enabled)
+                    // The owner this sheet drew, not whatever the state holds when the click runs.
+                    SheetAction.TEST -> SheetRow(R.drawable.lucide_bell, stringResource(R.string.settings_notif_test), { onTest(ui.push.testOwner) }, enabled = enabled)
                     SheetAction.RETRY -> SheetRow(R.drawable.lucide_server, stringResource(R.string.settings_notif_retry), onRetry, enabled = enabled)
                     SheetAction.SYSTEM_SETTINGS -> SheetRow(R.drawable.lucide_settings, stringResource(R.string.settings_notif_system), onSystemSettings, enabled = enabled)
                     SheetAction.TURN_OFF -> SheetRow(R.drawable.lucide_bell_off, stringResource(R.string.settings_notif_turn_off), { confirmOff = true }, enabled = enabled)
@@ -250,7 +250,7 @@ private fun DialogButton(onClick: () -> Unit, enabled: Boolean = true, content: 
  * its outcome shows in the sheet.
  */
 @Composable
-fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, notifyPrefs: SharedPreferences, scope: CoroutineScope) {
+fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, notifyPrefs: SharedPreferences, scope: CoroutineScope, connection: Long = 0) {
     val context = LocalContext.current
     val local = rememberCoroutineScope()
     var parts by remember { mutableStateOf<Pair<PushRegistrar, TestPush>?>(null) }
@@ -281,10 +281,16 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
     // A result counts only for the registration it was sent for, which the registrar reports with its state.
     val ui = NotificationsUi(a, pushUi, last?.takeIf { it.owner == pushUi.testOwner }?.result)
     var open by rememberSaveable { mutableStateOf(false) }
-    fun command(block: suspend () -> Unit) = commands.run(scope, block)
+    // Busy and messages belong to the connection whose screen admitted them: a screen entered on another never shows them.
+    val busy = commands.running == connection
+    val message = commands.message?.takeIf { it.first == connection }?.second
+    fun command(block: suspend () -> Unit) = commands.run(scope, connection, block)
+    fun say(text: Int?) {
+        commands.message = text?.let { connection to it }
+    }
     fun start(failure: Int, activity: () -> Unit) {
-        commands.message = null
-        if (runCatching(activity).isFailure) commands.message = failure // no app for it: say so, stay here
+        say(null)
+        if (runCatching(activity).isFailure) say(failure) // no app for it: say so, stay here
     }
     val uriHandler = LocalUriHandler.current
     val ntfyUrl = stringResource(R.string.settings_ntfy_url)
@@ -294,7 +300,7 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
         }
     }
     NotificationsRow(ui) {
-        if (!commands.busy) commands.message = null
+        if (!busy) say(null)
         when (tapOf(ui)) {
             RowTap.ASK -> ask()
             RowTap.SYSTEM_SETTINGS -> systemSettings()
@@ -303,7 +309,7 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
             RowTap.ENABLE -> command { p.enableNow() } // awaited, so a second tap meanwhile is refused
         }
     }
-    if (!open) commands.message?.let { ErrorLine(it, Modifier.padding(start = 48.dp, end = 12.dp, bottom = 11.dp)) }
+    if (!open) message?.let { ErrorLine(it, Modifier.padding(start = 48.dp, end = 12.dp, bottom = 11.dp)) }
     if (ticks(open, last)) {
         // Resumed only; the first tick on every resume closes a window that expired meanwhile.
         LifecycleResumeEffect(t) {
@@ -319,21 +325,20 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
     if (open) {
         NotificationsSheet(
             ui,
-            onTest = {
-                val shown = pushUi.testOwner.orEmpty() // the registration the sheet showed when tapped
+            onTest = { shown ->
                 // Its endpoint in one read with the owner: a tap for a registration that is no longer current sends nothing.
-                command { p.testEndpoint(shown)?.let { t.send(it, shown) } }
+                if (shown != null) command { p.testEndpoint(shown)?.let { t.send(it, shown) } }
             },
             onRetry = { command { p.verify(force = true) } },
             // The outcome is disable()'s own; a cancellation or an exception reports nothing.
-            onTurnOff = { command { if (!p.disable()) commands.message = R.string.settings_notif_turn_off_failed } },
+            onTurnOff = { command { if (!p.disable()) say(R.string.settings_notif_turn_off_failed) } },
             onSystemSettings = systemSettings,
             onDismiss = {
                 open = false
-                if (!commands.busy) commands.message = null
+                if (!busy) say(null)
             },
-            busy = commands.busy,
-            message = commands.message,
+            busy = busy,
+            message = message,
         )
     }
 }

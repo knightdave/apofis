@@ -852,6 +852,27 @@ class PushRegistrarTest {
         }
     }
 
+    @Test
+    fun aCancellationIsNotReplacedByAFailedRecompute() = runTest { // Task 5, fix round 3
+        with(World()) {
+            turnedOn(registrar())
+            var breakCompute = false
+            val policy = object : PushPolicy by TestPolicy() {
+                override fun distributors(c: android.content.Context): Set<String> =
+                    if (breakCompute) throw IllegalStateException("recompute failed") else setOf(NTFY_PACKAGE)
+            }
+            val cancelling = object : UnifiedPushPort by port {
+                override fun unregister(c: android.content.Context, r: Registration, connector: Boolean) {
+                    breakCompute = true
+                    throw kotlinx.coroutines.CancellationException("cancelled while unregistering")
+                }
+            }
+            val r = PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, policy, cancelling, { epoch }) { scheduled++ }
+            val thrown = runCatching { r.disable() }.exceptionOrNull()
+            assertTrue("the cancellation propagates, not the recompute's failure: $thrown", thrown is kotlinx.coroutines.CancellationException)
+        }
+    }
+
     // Fix round 4.
 
     @Test
