@@ -446,10 +446,9 @@ internal fun pageEnd(text: CharSequence, start: Int): Int {
  * The one cut for every cap in this task: the last grapheme boundary of [text] at or before [cap], so a cap is never
  * exceeded. [from] must be a grapheme boundary (0 or an earlier cut): ICU's character BreakIterator reads only from
  * [from] to one code point past [cap], so flags, ZWJ sequences, combining marks and CRLF stay whole. When no boundary
- * lies after [from] (one cluster longer than the window), the cut is the last code point boundary at or before [cap],
- * or [from] itself when [orFrom] (a caller that may show nothing more rather than half a grapheme).
+ * lies after [from] (one cluster longer than the window), the cut is the last code point boundary at or before [cap].
  */
-internal fun cutAt(text: CharSequence, from: Int, cap: Int, orFrom: Boolean = false): Int {
+internal fun cutAt(text: CharSequence, from: Int, cap: Int): Int {
     if (cap >= text.length) return text.length
     if (cap <= from) return from
     val after = cap + if (Character.isHighSurrogate(text[cap]) && cap + 1 < text.length) 2 else 1 // what follows the cap
@@ -457,7 +456,6 @@ internal fun cutAt(text: CharSequence, from: Int, cap: Int, orFrom: Boolean = fa
     graphemes.setText(text.subSequence(from, after).toString())
     val boundary = graphemes.preceding(cap - from + 1)
     if (boundary != BreakIterator.DONE && boundary > 0) return from + boundary
-    if (orFrom) return from
     return if (Character.isLowSurrogate(text[cap]) && Character.isHighSurrogate(text[cap - 1])) cap - 1 else cap
 }
 

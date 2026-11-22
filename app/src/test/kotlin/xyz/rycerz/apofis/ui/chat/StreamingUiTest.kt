@@ -785,4 +785,49 @@ class StreamingUiTest {
     fun theStaticIndicatorsStayStill() {
         assertEquals(listOf(0, 0, 0), motionShows(reduceMotion = true))
     }
+
+    // ---- fix round 3 ----
+
+    @Test
+    fun aJoiningDeltaCausesNoExtraParse() {
+        // Five closed paragraphs and an open one ending on a thumbs-up, caught up; then its skin tone arrives.
+        val base = (1..5).joinToString("") { "Paragraph $it.\n\n" } + "Open \uD83D\uDC4D"
+        var items by mutableStateOf(liveItems(base))
+        var live by mutableStateOf<LiveReply?>(run("A", base))
+        rule.setContent { Themed { Messages(items, live) } }
+        frame(3)
+        val parses = Work.markdownParses
+        val next = base + "\uD83C\uDFFD"
+        items = liveItems(next)
+        live = run("A", next)
+        frame(3)
+        assertTrue("parses ${Work.markdownParses - parses}: only the open block, not the whole reply", Work.markdownParses - parses <= 1)
+    }
+
+    /** A list that counts reads of its elements. */
+    private class Counting(private val inner: List<ChatItem>) : AbstractList<ChatItem>() {
+        var reads = 0
+        override val size get() = inner.size
+        override fun get(index: Int): ChatItem {
+            reads++
+            return inner[index]
+        }
+    }
+
+    @Test
+    fun revealTicksReadNoStoredItem() {
+        val head = Counting(List(200) { UserMessage("u$it", "question $it", false, FIXED_NOW) })
+        var items by mutableStateOf<List<ChatItem>>(Joined(head, listOf(AssistantReply("live", emptyList(), "Go", FIXED_NOW, live = true))))
+        var live by mutableStateOf<LiveReply?>(run("A", "Go"))
+        rule.setContent { Themed { Messages(items, live) } }
+        frame(3)
+        val long = "Go" + letters.repeat(80)
+        items = Joined(head, listOf(AssistantReply("live", emptyList(), long, FIXED_NOW, live = true)))
+        live = run("A", long)
+        frame()
+        val reads = head.reads
+        frame(30) // reveal ticks only
+        assertTrue(shown("live").length > 2)
+        assertEquals("stored items read by reveal ticks", reads, head.reads)
+    }
 }

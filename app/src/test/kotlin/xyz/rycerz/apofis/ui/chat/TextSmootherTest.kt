@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.ui.chat
 
-import java.text.BreakIterator
+import android.icu.text.BreakIterator
+import kotlin.random.Random
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -133,7 +134,8 @@ class TextSmootherTest {
         val next = ri.repeat(6)
         s.accept(next, snap = false)
         val whole = BreakIterator.getCharacterInstance().apply { setText(next) }
-        assertTrue("clamped to ${s.shown}", whole.isBoundary(s.shown))
+        assertTrue("moved to ${s.shown}", whole.isBoundary(s.shown))
+        assertEquals("forward to the end of the completed flag, never back", 4, s.shown)
         // Every step and every new target of a growing mixed text ends on a boundary of that text.
         val unit = "\uD83C\uDDF5\uD83C\uDDF1e\u0301\u0301\uD83D\uDC68\u200D\uD83D\uDC69\r\nab"
         val full = unit.repeat(40)
@@ -190,25 +192,84 @@ class TextSmootherTest {
     private fun boundaryOf(text: String, at: Int) = BreakIterator.getCharacterInstance().apply { setText(text) }.isBoundary(at)
 
     @Test
-    fun aClampOntoItsAnchorStillChecksTheNextTarget() {
-        // Re-review I2 (a): the clamp retreats onto its anchor, then another target arrives before any tick.
-        val s = TextSmoother("a")
-        assertEquals("ab", s.step("ab"))
-        s.accept("ab\u0301", snap = false) // the b takes a mark: back to "a"
-        assertEquals("a", s.visible)
-        val next = "a\u0301z" // now the a takes a mark: 1 is no boundary any more
+    fun aSurrogatePairCompletedAtTheShownEdge() {
+        // Re-review 2, I2 (a): one regional indicator, then the high surrogate of a second one (caught up), then its pair.
+        val p = "\uD83C\uDDF5"
+        val s = TextSmoother(p)
+        s.step(p + "\uD83C")
+        val next = p + "\uD83C\uDDF1"
         s.accept(next, snap = false)
         assertTrue("shown ${s.shown} of '$next'", boundaryOf(next, s.shown))
+        assertTrue("the whole flag or none of it", s.shown == 0 || s.shown == 4)
+    }
+
+    @Test
+    fun anAsciiBacklogRevealsTheSliceExactly() {
+        // Re-review 2, I2 (b): shown 3 after a slice of 3, then a backlog of 1,100: the 1.5 x cap allows 4 more, not all.
+        val s = TextSmoother("")
+        assertEquals(3, s.step("a".repeat(12)).length)
+        assertEquals(7, s.step("a".repeat(1103)).length)
     }
 
     @Test
     fun aTickNeverCutsALongCluster() {
-        // Re-review I2 (b): a slice of 4 after a slice of 3, into "b" plus 1099 combining marks (backlog 1100, under the
-        // budget, longer than the cut's lookahead).
+        // "b" plus 1,099 combining marks after shown 3: the cut is never inside it.
         val s = TextSmoother("")
         assertEquals(3, s.step("a".repeat(12)).length)
         val next = "aaa" + "b" + "\u0301".repeat(1099)
         s.step(next)
         assertTrue("shown ${s.shown} of ${next.length}", boundaryOf(next, s.shown))
+    }
+
+    @Test
+    fun aJoiningDeltaOnACaughtUpReplyNeverShortensIt() {
+        // Combining mark, U+FE0F, a skin tone, ZWJ, a second flag half, LF after CR: each joins the last grapheme.
+        val cases = listOf(
+            "e" to "\u0301",
+            "\u2764" to "\uFE0F",
+            "\uD83D\uDC4D" to "\uD83C\uDFFD",
+            "\uD83D\uDC68" to "\u200D\uD83D\uDC69",
+            "\uD83C\uDDF5" to "\uD83C\uDDF1",
+            "\r" to "\n",
+        )
+        for ((last, join) in cases) {
+            val before = "Hello " + last
+            val s = TextSmoother(before)
+            val next = before + join + " more"
+            s.accept(next, snap = false)
+            assertTrue("'$last' + join: shown ${s.shown} < ${before.length}", s.shown >= before.length)
+            assertTrue("'$last' + join: shown ${s.shown} on a boundary", boundaryOf(next, s.shown))
+        }
+    }
+
+    @Test
+    fun randomDeltasKeepEveryInvariant() {
+        val pool = listOf(
+            "abc ", "Za\u017C\u00F3\u0142\u0107 g\u0119\u015Bl\u0105 ", "e\u0301", "o\u0308\u0301", "\uD83C\uDDF5\uD83C\uDDF1",
+            "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67", "\uD83D\uDC4D\uD83C\uDFFD", "\u2764\uFE0F", "\r\n", "x\n",
+            "\u0915\u094D\u0937\u093F", "\u0928\u092E\u0938\u094D\u0924\u0947", "\u0E19\u0E49\u0E33", "\u0E01\u0E33",
+        )
+        for (seed in listOf(1L, 7L, 42L, 2026L, 31337L)) {
+            val r = Random(seed)
+            val full = buildString { while (length < 1500) append(pool[r.nextInt(pool.size)]) }
+            val s = TextSmoother("")
+            var end = 0
+            var target = ""
+            repeat(800) { step ->
+                val before = s.visible
+                val oldShown = s.shown
+                if (r.nextInt(3) == 0 || end >= full.length) {
+                    s.step()
+                } else {
+                    end = minOf(full.length, end + 1 + r.nextInt(40)) // any UTF-16 offset, also between surrogates
+                    target = full.substring(0, end)
+                    s.accept(target, snap = false)
+                }
+                val where = "seed $seed, step $step, end $end"
+                assertTrue("$where: visible is a prefix", target.startsWith(s.visible))
+                assertTrue("$where: shown ${s.shown} is a boundary of the whole target", s.shown == target.length || boundaryOf(target, s.shown))
+                if (target.startsWith(before)) assertTrue("$where: shown went back from $oldShown to ${s.shown}", s.shown >= oldShown)
+            }
+        }
     }
 }

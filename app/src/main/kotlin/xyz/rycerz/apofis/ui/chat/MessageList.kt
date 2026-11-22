@@ -981,7 +981,7 @@ internal fun MessageList(
     // a stored item added (polling shows the stored transcript), the newest stored reply's text or steps, the live text
     // as revealed, its steps, a new pending request. A new run's first values are a baseline, not growth.
     @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
-    val newest = stored.lastOrNull { it is AssistantReply } as AssistantReply?
+    val newest = remember(stored) { stored.lastOrNull { it is AssistantReply } as AssistantReply? } // once per stored list, not per tick
     val bottom = live?.let {
         Bottom(it.runId, stored.size, newest?.key, newest?.text?.length ?: 0, newest?.steps?.size ?: 0, liveText?.length ?: 0, liveItem?.steps?.size ?: 0, it.pending != null)
     }

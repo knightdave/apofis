@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
+import android.icu.text.BreakIterator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -26,7 +27,9 @@ private const val MEAN_OF = 10
 
 /**
  * The streamed text revealed in slices, one [step] per [Motion.SMOOTH_TICK] ms. Presentation only: the shown text is
- * always a prefix of [target] ending on a grapheme boundary. A deterministic state machine: no clock.
+ * always a prefix of [target], and its length is a grapheme boundary of the whole target (as ICU segments it) or the
+ * target's end. While the shown text stays a prefix its length only grows, so the renderer only ever sees appends. A
+ * deterministic state machine: no clock.
  */
 class TextSmoother(initial: String) {
     var target: String = initial
@@ -38,22 +41,20 @@ class TextSmoother(initial: String) {
 
     val visible: String get() = if (shown == target.length) target else target.substring(0, shown)
 
-    private var anchor = 0 // a grapheme boundary of target at or below shown, where a cut may start reading
     private val history = ArrayDeque<Int>()
     private var previous = 0
 
     /**
      * The one check after a target change: the shown length for [next], or null when [next] is shown whole (on [snap],
-     * past [SMOOTH_MAX_SHOWN], or when the shown text is not a prefix of [next]). A kept length is clamped down to the
-     * last grapheme boundary of [next] at or below it, so text that joins the shown end (a second flag half, a
-     * combining mark) never leaves a cut inside a grapheme. Pure; reads at most the shown text once.
+     * past [SMOOTH_MAX_SHOWN], or when the shown text is not a prefix of [next]). A kept length moves forward to the
+     * first grapheme boundary of [next] at or after it, so text that joins the shown end (a second flag half, a
+     * combining mark) is shown with it, never cut and never taken back. Pure.
      */
     private fun kept(next: String, snap: Boolean): Int? {
         if (snap || shown > SMOOTH_MAX_SHOWN) return null
         if (next === target) return shown
         if (shown > next.length || !next.regionMatches(0, target, 0, shown)) return null
-        // A cut that retreated onto its anchor is no known boundary of [next]: read from 0 then (at most the shown text).
-        return cutAt(next, if (anchor < shown) anchor else 0, shown, orFrom = true)
+        return boundaryAtOrAfter(next, shown)
     }
 
     /** What [accept] would show for [next], without changing anything (read in composition). */
@@ -68,7 +69,6 @@ class TextSmoother(initial: String) {
 
     private fun showAll(next: String) {
         shown = next.length
-        anchor = 0 // a boundary below is not known
         history.clear()
         previous = 0
     }
@@ -85,11 +85,8 @@ class TextSmoother(initial: String) {
         if (previous > 2) slice = minOf(slice, (previous * 1.5).toInt())
         slice = slice.coerceIn(minOf(2, backlog), minOf(MAX_SLICE, backlog))
         previous = slice
-        // pieceEnd is exact only when its lookahead reaches the end of the text; past that it may cut a long cluster.
-        if (backlog > slice + GRAPHEME_SLACK) return showAll(target)
-        val end = pieceEnd(target, shown, slice)
+        val end = boundaryAtOrAfter(target, shown + slice)
         if (end > SMOOTH_MAX_SHOWN && end < target.length) return showAll(target)
-        anchor = shown
         shown = end
     }
 
@@ -99,6 +96,13 @@ class TextSmoother(initial: String) {
         step()
         return visible
     }
+}
+
+/** The first grapheme boundary of the whole [text] at or after [at], or its end: ICU segments with the left context. */
+private fun boundaryAtOrAfter(text: String, at: Int): Int {
+    if (at >= text.length) return text.length
+    val graphemes = BreakIterator.getCharacterInstance().apply { setText(text) }
+    return if (graphemes.isBoundary(at)) at else graphemes.following(at)
 }
 
 /**
