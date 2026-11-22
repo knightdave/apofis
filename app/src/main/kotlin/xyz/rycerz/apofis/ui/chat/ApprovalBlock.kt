@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui.chat
 
+import xyz.rycerz.apofis.ui.theme.keepSidewaysDrags
+import xyz.rycerz.apofis.ui.theme.sidewaysScroll
 import androidx.annotation.StringRes
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -21,7 +23,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -77,7 +78,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             CodeSurface {
                 Text(
                     command,
-                    Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+                    Modifier.sidewaysScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
                     style = ChatText.code,
                     color = MaterialTheme.colorScheme.onSurface,
                     softWrap = false,
@@ -130,7 +131,7 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
             OutlinedTextField(
                 answer,
                 { answer = it },
-                Modifier.weight(1f),
+                Modifier.weight(1f).keepSidewaysDrags(),
                 placeholder = { Text(stringResource(R.string.chat_clarify_hint)) },
                 maxLines = 5,
                 enabled = !answering,

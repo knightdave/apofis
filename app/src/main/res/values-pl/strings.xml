@@ -171,6 +171,7 @@
     <string name="settings_link_no_app">Na tym telefonie nie ma aplikacji, która otworzy link</string>
     <string name="drawer_open">Otwórz listę czatów</string>
     <string name="drawer_close">Zamknij listę czatów</string>
+    <string name="drawer_title">Lista czatów</string>
     <string name="drawer_new_chat">Nowy czat</string>
     <string name="drawer_search_hint">Szukaj czatów</string>
     <string name="drawer_no_match">Brak pasujących czatów</string>

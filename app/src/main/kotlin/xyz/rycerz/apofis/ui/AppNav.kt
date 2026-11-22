@@ -16,6 +16,8 @@ import xyz.rycerz.apofis.ui.drawer.DrawerContent
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
 import xyz.rycerz.apofis.ui.drawer.PromptHost
 import xyz.rycerz.apofis.ui.drawer.PushDrawer
+import xyz.rycerz.apofis.ui.drawer.PushDrawerState
+import kotlinx.coroutines.CoroutineScope
 import xyz.rycerz.apofis.ui.drawer.rememberPushDrawerState
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -183,13 +185,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     }
     val askNotifications = rememberAskNotificationsOnce(container.notifyPrefs) // this activity's launcher
 
-    val open = object : DrawerActions by drawer {
-        override fun onSelect(key: String) {
-            drawer.onSelect(key)
-            showArchived = false
-            scope.launch { drawerState.close() }
-        }
-    }
+    val open = closingOnSelect(drawer, drawerState, scope) { showArchived = false }
     val drawerButton: @Composable () -> Unit = {
         DrawerButton(Modifier.focusRequester(drawerButtonFocus)) { scope.launch { drawerState.open() } }
     }
@@ -233,6 +229,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                     navigationIcon = drawerButton,
                     appBarActions = newChatButton,
                     dragArea = dragArea,
+                    covered = drawerState.covered,
                 )
             } else {
                 key(sessionKey) {
@@ -250,7 +247,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                         container.chatShown(conn.generation, sessionKey, true)
                         onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
                     }
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, dragArea = dragArea)
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, dragArea = dragArea, covered = drawerState.covered)
                 }
             }
         }
@@ -265,6 +262,19 @@ internal fun DrawerButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
         Icon(painterResource(R.drawable.lucide_menu), contentDescription = null, Modifier.size(20.dp))
     }
 }
+
+/**
+ * The drawer's actions with selection that also closes [drawer] (and runs [onSelected]): every row, archived ones too.
+ * The gesture never selects; only this does.
+ */
+internal fun closingOnSelect(delegate: DrawerActions, drawer: PushDrawerState, scope: CoroutineScope, onSelected: () -> Unit): DrawerActions =
+    object : DrawerActions by delegate {
+        override fun onSelect(key: String) {
+            delegate.onSelect(key)
+            onSelected()
+            scope.launch { drawer.close() }
+        }
+    }
 
 /** The drawer of [conn], held by [owner]; the same instance wherever it is asked for. */
 @Composable

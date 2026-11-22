@@ -68,6 +68,7 @@ class ChromeInputsTest {
     })
     private var currentState by mutableStateOf<(() -> ChatUiState)?>(null)
     private var dragArea by mutableStateOf<Modifier>(Modifier)
+    private var covered by mutableStateOf(false)
 
     private class FakeClipboard : Clipboard {
         val writes = ArrayList<String?>()
@@ -84,7 +85,7 @@ class ChromeInputsTest {
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                 CompositionLocalProvider(LocalBlur provides blur, LocalUriHandler provides uri, LocalClipboard provides clipboard) {
-                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState, dragArea = dragArea)
+                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState, dragArea = dragArea, covered = covered)
                 }
             }
         }
@@ -213,5 +214,27 @@ class ChromeInputsTest {
         rule.onNodeWithTag("composer.field").performTouchInput { click(center) }
         assertEquals("the composer carries the drag area", onList, hits[1])
         assertEquals("the old drag area is still used", before, hits[0])
+    }
+
+    /** `covered` is read when an action fires: covered drops the tap, uncovered lets the next one through. */
+    @Test
+    fun replacedCoveredReachesTheGate() {
+        ui = chat(listOf(UserMessage("u1", "Failed one", false, FIXED_NOW, SendState.FAILED, "k1", error = "unconfirmed", attempted = true)))
+        val got = ArrayList<String>()
+        actions = object : ChatActions {
+            override fun onRetry(idempotencyKey: String) {
+                got += idempotencyKey
+            }
+        }
+        covered = true
+        show()
+        rule.onNodeWithText("Retry").performClick()
+        rule.waitForIdle()
+        assertEquals(emptyList<String>(), got)
+        covered = false
+        rule.waitForIdle()
+        rule.onNodeWithText("Retry").performClick()
+        rule.waitForIdle()
+        assertEquals(listOf("k1"), got)
     }
 }

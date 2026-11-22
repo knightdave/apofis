@@ -27,16 +27,17 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.remember
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Constraints
+import xyz.rycerz.apofis.ui.theme.keepSidewaysDrags
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.graphicsLayer
-import xyz.rycerz.apofis.ui.theme.EaseOutCubic
-import xyz.rycerz.apofis.ui.theme.Motion
 import xyz.rycerz.apofis.ui.theme.transparent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
@@ -94,79 +95,103 @@ fun DrawerContent(
     modifier: Modifier = Modifier,
 ) {
     val empty = rows.isEmpty() && query.isEmpty() && !hasArchived
-    val seenHeaders = remember { HashSet<GroupLabel>() } // headers already shown in this drawer's lifetime appear without motion
+    val minList = with(LocalDensity.current) { (48 * fontScale).dp.roundToPx() } // one row at the current text size
     // The drawer moves focus into its sheet when it opens, which would focus the search field and raise the keyboard.
     // That programmatic entry is refused; moving focus in with a keyboard (Tab, arrows) still works.
-    Column(
+    BoxWithConstraints(
         modifier
             .fillMaxHeight()
             .focusProperties { onEnter = { if (requestedFocusDirection == FocusDirection.Enter) cancelFocusChange() } }
             .focusGroup(),
     ) {
-        Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp)) {
-            if (refreshFailed) {
-                Text(
-                    stringResource(R.string.drawer_refresh_failed),
-                    Modifier.padding(start = 14.dp, bottom = 4.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.error,
+        val viewport = constraints.maxHeight
+        // Header, list and footer fill the panel; when that leaves the list less than one row (keyboard, landscape,
+        // large text) the list keeps one row and the whole column scrolls, so results and Settings stay reachable.
+        Layout(
+            content = {
+                Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp)) {
+                    if (refreshFailed) {
+                        Text(
+                            stringResource(R.string.drawer_refresh_failed),
+                            Modifier.padding(start = 14.dp, bottom = 4.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    if (!empty) SearchField(query, onQuery)
+                    Box(Modifier.padding(top = 8.dp)) { IconRow(R.drawable.lucide_square_pen, stringResource(R.string.drawer_new_chat), onNewChat) }
+                }
+                ChatList(rows, query, hasArchived, actions, onArchived)
+                val surface = MaterialTheme.colorScheme.surface
+                Box(
+                    Modifier
+                        .drawBehind { // the list fades out under the footer over 20 dp
+                            val fade = 20.dp.toPx()
+                            drawRect(Brush.verticalGradient(listOf(surface.transparent(), surface), startY = -fade, endY = 0f), Offset(0f, -fade), Size(size.width, fade))
+                        }
+                        .padding(start = 16.dp, top = 10.dp, end = 16.dp, bottom = 12.dp),
+                ) {
+                    IconRow(R.drawable.lucide_settings, stringResource(R.string.settings_title), onSettings)
+                }
+            },
+            modifier = Modifier.verticalScroll(rememberScrollState()),
+        ) { measurables, constraints ->
+            val width = constraints.maxWidth
+            val loose = Constraints(maxWidth = width)
+            val header = measurables[0].measure(loose)
+            val footer = measurables[2].measure(loose)
+            val listHeight = maxOf(viewport - header.height - footer.height, minList)
+            val list = measurables[1].measure(Constraints.fixed(width, listHeight))
+            layout(width, header.height + listHeight + footer.height) {
+                header.place(0, 0)
+                list.place(0, header.height)
+                footer.place(0, header.height + listHeight)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChatList(rows: List<DrawerRow>, query: String, hasArchived: Boolean, actions: DrawerActions, onArchived: () -> Unit) {
+    LazyColumn(
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        var pinned = false
+        val labelled = rows.map { row ->
+            if (row is DrawerRow.Header) pinned = row.label == GroupLabel.Pinned
+            row to pinned
+        }
+        items(labelled, key = { (row, _) -> if (row is DrawerRow.Chat) row.key else (row as DrawerRow.Header).label.toString() }) { (row, isPinned) ->
+            when (row) {
+                is DrawerRow.Header -> GroupHeader(row.label)
+                is DrawerRow.Chat -> ChatRow(
+                    row,
+                    onClick = { actions.onSelect(row.key) },
+                    onLongPress = { actions.onLongPress(row.key) },
+                    a11yActions = listOf(
+                        stringResource(R.string.drawer_rename) to { actions.onRenameRequest(row.key) },
+                        stringResource(if (isPinned) R.string.drawer_unpin else R.string.drawer_pin) to { actions.onPin(row.key, !isPinned) },
+                        stringResource(R.string.drawer_archive) to { actions.onArchive(row.key, true) },
+                        stringResource(R.string.drawer_delete) to { actions.onDeleteRequest(row.key) },
+                    ),
                 )
             }
-            if (!empty) SearchField(query, onQuery)
-            Box(Modifier.padding(top = 8.dp)) { IconRow(R.drawable.lucide_square_pen, stringResource(R.string.drawer_new_chat), onNewChat) }
         }
-        LazyColumn(
-            Modifier.weight(1f),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            var pinned = false
-            val labelled = rows.map { row ->
-                if (row is DrawerRow.Header) pinned = row.label == GroupLabel.Pinned
-                row to pinned
-            }
-            items(labelled, key = { (row, _) -> if (row is DrawerRow.Chat) row.key else (row as DrawerRow.Header).label.toString() }) { (row, isPinned) ->
-                when (row) {
-                    is DrawerRow.Header -> GroupHeader(row.label, seenHeaders)
-                    is DrawerRow.Chat -> ChatRow(
-                        row,
-                        onClick = { actions.onSelect(row.key) },
-                        onLongPress = { actions.onLongPress(row.key) },
-                        a11yActions = listOf(
-                            stringResource(R.string.drawer_rename) to { actions.onRenameRequest(row.key) },
-                            stringResource(if (isPinned) R.string.drawer_unpin else R.string.drawer_pin) to { actions.onPin(row.key, !isPinned) },
-                            stringResource(R.string.drawer_archive) to { actions.onArchive(row.key, true) },
-                            stringResource(R.string.drawer_delete) to { actions.onDeleteRequest(row.key) },
-                        ),
-                    )
-                }
-            }
-            if (query.isNotEmpty() && rows.isEmpty()) {
-                item {
-                    Text(
-                        stringResource(R.string.drawer_no_match),
-                        Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-            if (hasArchived) {
-                item(key = "archived") {
-                    Box(Modifier.padding(top = 8.dp)) { IconRow(R.drawable.lucide_archive, stringResource(R.string.drawer_archived), onArchived, chevron = true) }
-                }
+        if (query.isNotEmpty() && rows.isEmpty()) {
+            item {
+                Text(
+                    stringResource(R.string.drawer_no_match),
+                    Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
-        val surface = MaterialTheme.colorScheme.surface
-        Box(
-            Modifier
-                .drawBehind { // the list fades out under the footer over 20 dp
-                    val fade = 20.dp.toPx()
-                    drawRect(Brush.verticalGradient(listOf(surface.transparent(), surface), startY = -fade, endY = 0f), Offset(0f, -fade), Size(size.width, fade))
-                }
-                .padding(start = 16.dp, top = 10.dp, end = 16.dp, bottom = 12.dp),
-        ) {
-            IconRow(R.drawable.lucide_settings, stringResource(R.string.settings_title), onSettings)
+        if (hasArchived) {
+            item(key = "archived") {
+                Box(Modifier.padding(top = 8.dp)) { IconRow(R.drawable.lucide_archive, stringResource(R.string.drawer_archived), onArchived, chevron = true) }
+            }
         }
     }
 }
@@ -181,7 +206,7 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
     LaunchedEffect(state) { snapshotFlow { state.text.toString() }.collect { latest(it) } }
     BasicTextField(
         state,
-        Modifier.fillMaxWidth().heightIn(min = 48.dp).semantics { contentDescription = hint },
+        Modifier.fillMaxWidth().heightIn(min = 48.dp).keepSidewaysDrags().semantics { contentDescription = hint },
         textStyle = style,
         lineLimits = TextFieldLineLimits.SingleLine,
         cursorBrush = SolidColor(scheme.primary),
@@ -204,11 +229,7 @@ private fun SearchField(query: String, onQuery: (String) -> Unit) {
 }
 
 @Composable
-private fun GroupHeader(label: GroupLabel, seen: MutableSet<GroupLabel>) {
-    val first = remember(label) { seen.add(label) }
-    val reduceMotion = ApofisTheme.reduceMotion
-    val shown = remember(label) { Animatable(if (first && !reduceMotion) 0f else 1f) }
-    LaunchedEffect(shown) { shown.animateTo(1f, tween(Motion.GROUP_HEADER, easing = EaseOutCubic)) }
+private fun GroupHeader(label: GroupLabel) {
     val text = when (label) {
         GroupLabel.Pinned -> stringResource(R.string.drawer_pinned)
         GroupLabel.Today -> stringResource(R.string.chat_today)
@@ -220,13 +241,7 @@ private fun GroupHeader(label: GroupLabel, seen: MutableSet<GroupLabel>) {
     }
     Text(
         text,
-        Modifier
-            .graphicsLayer {
-                alpha = shown.value
-                translationY = (1f - shown.value) * 4.dp.toPx() // fades in and slides up 4 dp
-            }
-            .padding(start = 14.dp, top = 6.dp, bottom = 6.dp)
-            .semantics { heading() },
+        Modifier.padding(start = 14.dp, top = 6.dp, bottom = 6.dp).semantics { heading() },
         style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
         color = MaterialTheme.colorScheme.primary,
     )
