@@ -8,6 +8,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import java.time.ZoneOffset
+import kotlin.coroutines.CoroutineContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
@@ -30,7 +31,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -90,8 +95,14 @@ class DrawerViewModelTest {
             }
         }
         server.start()
+        build()
+    }
+
+    /** The graph under test; [queryContext], when given, runs Room's queries and invalidation checks (see [onTestScheduler]). */
+    private fun build(queryContext: CoroutineContext? = null) {
         db = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
             .allowMainThreadQueries()
+            .apply { if (queryContext != null) setQueryCoroutineContext(queryContext) }
             .build()
         val api = HermesApi(server.url("/").toString(), "secret-key")
         lateinit var f: RunFollower
@@ -102,11 +113,26 @@ class DrawerViewModelTest {
         connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, f, AtomicBoolean(true), scope)
     }
 
+    private var scheduler: TestCoroutineScheduler? = null
+
+    /**
+     * Room's queries and invalidation checks and the view models' Main work all run on this test's scheduler, so
+     * [TestScope.advanceUntilIdle] returns only once a write has been delivered to every observer. Call first.
+     */
+    private fun TestScope.onTestScheduler() {
+        scheduler = testScheduler
+        val onScheduler = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(onScheduler)
+        db.close()
+        build(onScheduler)
+    }
+
     @After
     fun tearDown() {
         assertFalse("a held response timed out", gaveUp.get())
         val scopes = created.map { it.viewModelScope.coroutineContext.job }
         store.clear()
+        scheduler?.advanceUntilIdle() // after onTestScheduler the view models end only when that scheduler runs
         runBlocking { withTimeout(60_000) { scopes.joinAll() } } // the view models' work ends before Room closes
         follower.pauseAll()
         runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
@@ -595,6 +621,7 @@ class DrawerViewModelTest {
 
     @Test
     fun archivingTheChatOfAnOpenSheetDoesNotCloseIt() = runTest {
+        onTestScheduler()
         addSession("apofis-a", "Kept")
         val vm = vm()
         vm.rows.await { it.chats().size == 1 }
@@ -603,6 +630,7 @@ class DrawerViewModelTest {
         val prompt = vm.prompt.value!!
         db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(archived = true)) // archived elsewhere: still here
         vm.rows.await { it.chats().isEmpty() }
+        advanceUntilIdle() // the archive has reached every observer, the prompt's row watcher included
         assertEquals(prompt, vm.prompt.value)
     }
 

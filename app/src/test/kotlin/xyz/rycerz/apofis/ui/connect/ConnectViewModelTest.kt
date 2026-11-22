@@ -67,14 +67,17 @@ class ConnectViewModelTest {
 
     @Test
     fun privateAddressAsksFirstAndTriesEvenWhenRefused() {
+        var probes = 0
         val vm = ConnectViewModel(
             null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { false },
-            check = { awaitCancellation() }, // cancelled where it runs: no probe still unwinds on another thread
+            check = { probes++; awaitCancellation() }, // cancelled where it runs: no probe still unwinds on another thread
         )
         vm.submit("http://10.0.2.2:18642", "k")
         assertEquals(ConnectState.NeedsLocalNetwork, vm.state)
+        assertEquals(0, probes) // asking first: nothing tried yet
         val job = vm.onLocalNetworkResult() // refused: a VPN route may still work, so the check starts anyway
-        assertEquals(ConnectState.Testing, vm.state) // not waited for, it would go to the network
+        assertEquals(ConnectState.Testing, vm.state)
+        assertEquals(1, probes) // the probe was entered (the unconfined test Main runs it up to its first suspension)
         vm.cancel()
         assertTrue(job!!.isCompleted) // nothing still runs on another thread when the test resets Main
         assertTrue(saved.isEmpty())
@@ -105,14 +108,16 @@ class ConnectViewModelTest {
 
     @Test
     fun grantedLocalNetworkIsNotAskedAgain() {
+        var probes = 0
         val vm = ConnectViewModel(
             null, willClearCache = { false }, save = { saved += it }, localNetworkGranted = { true },
-            check = { awaitCancellation() }, // cancelled where it runs: no probe still unwinds on another thread
+            check = { probes++; awaitCancellation() }, // cancelled where it runs: no probe still unwinds on another thread
         )
         vm.onUrlChange("http://192.168.1.5:8642")
         vm.onKeyChange("k")
         val job = vm.connect()
         assertEquals(ConnectState.Testing, vm.state)
+        assertEquals(1, probes) // tried at once, without asking
         vm.cancel()
         assertTrue(job!!.isCompleted) // nothing still runs on another thread when the test resets Main
     }

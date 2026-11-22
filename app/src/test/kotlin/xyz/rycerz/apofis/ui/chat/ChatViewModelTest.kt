@@ -542,9 +542,10 @@ class ChatViewModelTest {
         store.clear() // the user switched chats before the message was stored
         held.complete(Unit)
 
-        awaitTrue { runBlocking { db.pendingSendDao().rows(KEY).isNotEmpty() } }
+        // Two events: the row commits, then the field empties (onStored). Real time: the send runs on real threads.
+        withContext(Dispatchers.Default) { withTimeout(10_000) { db.pendingSendDao().observe(KEY).first { it.isNotEmpty() } } }
         assertEquals(listOf("Remember the milk"), db.pendingSendDao().rows(KEY).map { it.text })
-        awaitTrue { connected.composer.current(KEY).draft.isEmpty() } // the field empties just after the row commits
+        withContext(Dispatchers.Default) { withTimeout(10_000) { connected.composer.state(KEY).first { it.draft.isEmpty() } } }
         assertEquals("", connected.composer.current(KEY).draft)
     }
 
