@@ -27,7 +27,7 @@ class ApofisApp : Application(), SendQueueProvider, PushSinkProvider, WakeProvid
 
     override val sendQueue: SendQueue? get() = container.connected()?.sendQueue
     override val pushSink: PushSink get() = Wake
-    override val wakeTarget: WakeTarget? get() = container.connected()?.let { WakeTarget(it, it.generation, container.notifier, System::currentTimeMillis) }
+    override val wakeTarget: WakeTarget? get() = container.connected()?.let { WakeTarget(it, it.generation, container.notifier) }
     override val testPush: TestPush get() = container.testPush
     override val pushRegistrar: PushRegistrar get() = container.push
 }

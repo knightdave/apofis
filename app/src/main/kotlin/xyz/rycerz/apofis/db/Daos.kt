@@ -177,6 +177,12 @@ interface ActiveRunDao {
     @Query("SELECT * FROM ActiveRunEntity ORDER BY startedAt")
     suspend fun all(): List<ActiveRunEntity>
 
+    @Query("SELECT EXISTS(SELECT 1 FROM ActiveRunEntity)")
+    fun observeAny(): Flow<Boolean>
+
+    @Query("SELECT EXISTS(SELECT 1 FROM ActiveRunEntity)")
+    suspend fun any(): Boolean
+
     @Query("SELECT * FROM ActiveRunEntity WHERE runId = :runId")
     suspend fun get(runId: String): ActiveRunEntity?
 

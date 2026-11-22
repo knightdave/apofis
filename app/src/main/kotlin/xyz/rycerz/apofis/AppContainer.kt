@@ -26,7 +26,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -165,8 +164,8 @@ class AppContainer(
     private val cachePrefs = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
 
     init {
-        // The fallback check runs while any run is stored, push on or off; the first emission reconciles at cold start.
-        scope.launch { db.activeRunDao().observeAll().map { it.isNotEmpty() }.distinctUntilChanged().collect { if (it) Wake.schedulePeriodic(app) else Wake.cancelPeriodic(app) } }
+        // The fallback check runs while any run is stored, push on or off; also reconciled when a connection is published.
+        scope.launch { db.activeRunDao().observeAny().distinctUntilChanged().collect { Wake.reconcilePeriodic(app, epoch(), it) } }
     }
 
     // Guarded by this.
@@ -405,7 +404,7 @@ class AppContainer(
         } else {
             credentials.load()?.let(::build)?.also {
                 scope.launch { scheduleQueuedSends() }
-                scope.launch { notifier.replayOutbox() } // notices a process death left between the commit and the post
+                scope.launch { notifier.replayOutbox(it.generation) } // notices a process death left between the commit and the post
             }
         }
         // Another epoch's leftovers (a switch a death interrupted); reads nothing about chats, posts nothing.
@@ -432,8 +431,16 @@ class AppContainer(
     private suspend fun afterSwitch() {
         runCatching { PublishWorker.recover(app) }.onFailure(::logFailure) // push work skipped while the switch ran
         if (current != null) scheduleQueuedSends()
+        if (current != null) onPublished()
         foreground.refresh()
     }
+
+    // A connection was published: a wake pending for its epoch is served now, with no further push; its periodic check
+    // is created from the stored runs (the switch cancelled the old one).
+    private suspend fun onPublished() = runCatching {
+        Wake.recover(app)
+        Wake.reconcilePeriodic(app, epoch(), db.activeRunDao().any())
+    }.onFailure(::logFailure)
 
     // On every start with a connection and after every switch, so a process death between cancelling the durable
     // work and enqueueing it again cannot strand queued sends. Idempotent: unique work, KEEP.

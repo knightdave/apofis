@@ -15,13 +15,10 @@ import org.unifiedpush.android.connector.data.PushEndpoint
 import org.unifiedpush.android.connector.data.PushMessage
 import org.unifiedpush.android.connector.keys.KeyManager
 
-// The `wake` prefs Task 4's sink keeps: monotonic demand and done counters, wakes lost to a failed commit, and the
-// connection epoch the demand belongs to.
+// The `wake` prefs: the epoch a wake is pending for (absent: none), and wakes lost to a failed commit.
 internal const val WAKE_PREFS = "wake"
-internal const val WAKE_DEMAND = "demand"
-internal const val WAKE_DONE = "done"
+internal const val WAKE_PENDING = "pending"
 internal const val WAKE_LOST = "lost"
-internal const val WAKE_EPOCH = "epoch"
 
 /** Every broadcast's pending result is finished at most this long after receipt (Android allows 10 s in the foreground). */
 internal const val BUDGET_MS = 8_000L
@@ -34,9 +31,9 @@ private val REVOCATIONS = setOf("org.unifiedpush.android.connector.UNREGISTERED"
 /**
  * Takes a delivered push, which carries no body here. [onPush] runs under the push lock, after the receiver checked that
  * the registration belongs to [epoch], the persisted connection epoch (`connection_epoch`), which only changes under
- * that lock. It returns true only after a checked durable commit of the wake demand for that epoch; a false return leaves
+ * that lock. It returns true only after a checked durable commit of the wake mark for that epoch; a false return leaves
  * nothing of it for a later commit to persist. [recover] runs at every process start, and after each handed-off push
- * outside the lock, and hands on demand of the current epoch that is not done yet.
+ * outside the lock, and hands on a wake pending for the current epoch.
  */
 fun interface PushSink {
     fun onPush(context: Context, epoch: Long): Boolean
