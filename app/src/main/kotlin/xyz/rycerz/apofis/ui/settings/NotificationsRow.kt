@@ -26,6 +26,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
@@ -120,12 +121,14 @@ class PushCommands(private val scope: CoroutineScope) {
     /** A message for the screen of one connection: (connection generation, string). */
     var message by mutableStateOf<Pair<Long, Int>?>(null)
 
-    fun run(block: suspend () -> Unit) {
-        if (busy) return
+    /** Admits [block] unless a command runs; false when it was not admitted. */
+    fun run(block: suspend () -> Unit): Boolean {
+        if (busy) return false
         busy = true
         message = null
         val job = scope.launch { block() }
         job.invokeOnCompletion { busy = false } // also when cancelled before its first dispatch
+        return true
     }
 }
 
@@ -142,7 +145,13 @@ internal fun iconOf(ui: NotificationsUi): Int = if (ui.state is PushState.On && 
 fun NotificationsRow(ui: NotificationsUi, enabled: Boolean = true, onClick: () -> Unit) {
     val haptics = ApofisTheme.haptics
     val value = lines(stringResource(valueOf(ui)), summaryOf(ui)?.let { stringResource(it) })
-    RowLayout(Modifier.clickable(enabled = enabled, role = Role.Button) { haptics.selection(); onClick() }, iconOf(ui), stringResource(R.string.settings_notifications), value) {
+    // Unavailable: faded as a disabled sheet row is (0.38), its value and fallback line still there to read.
+    RowLayout(
+        Modifier.clickable(enabled = enabled, role = Role.Button) { haptics.selection(); onClick() }.alpha(if (enabled) 1f else 0.38f),
+        iconOf(ui),
+        stringResource(R.string.settings_notifications),
+        value,
+    ) {
         Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

@@ -21,6 +21,8 @@ import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.room.Room
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.ui.Modifier
@@ -1103,6 +1105,44 @@ class NotificationsRowTest {
         assertEquals("B's window and result untouched", TestOutcome(b, TestPushResult.SENT), testPush.lastResult.value)
         testPush.onWake(b)
         assertEquals(TestOutcome(b, TestPushResult.WAKE_ARRIVED), testPush.lastResult.value)
+    }
+
+    // ---- Fix round 5 ----
+
+    @Test
+    fun theEnableRowLooksUnavailableWhileACommandRuns() {
+        setting()
+        val row = rule.onNode(hasText(text(R.string.settings_notifications)) and SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
+        val normal = row.captureToImage().asAndroidBitmap()
+        val registering = Gate().also { registerGate = it }
+        row.performClick() // enable: the command is held at REGISTER, push still shows Off
+        await(registering.entered)
+        rule.waitForIdle()
+        row.assertIsNotEnabled()
+            .assert(hasText(text(R.string.settings_notifications), substring = true)) // still labelled
+            .assert(hasText(text(R.string.settings_notif_off), substring = true)) // its value and fallback still readable
+            .assert(hasText(text(R.string.settings_notif_fallback), substring = true))
+        assertFalse("drawn unavailable", normal.sameAs(row.captureToImage().asAndroidBitmap()))
+        registering.open.complete(Unit)
+        joinCommands()
+        waitFor(text(R.string.settings_notif_registering))
+        row.assertIsEnabled().assert(hasClickAction())
+    }
+
+    @Test
+    fun theContainerRefusesASecondCommandWhileOneRuns() {
+        turnedOn()
+        val posting = Gate().also { postGate = it }
+        assertTrue(uiCommands.run { testPush.send(VALID, registrar.ui.value.testOwner!!) })
+        await(posting.entered) // the first command's POST is on the wire
+        var secondRan = false
+        assertFalse("not admitted", uiCommands.run { secondRan = true; testPush.send(VALID, registrar.ui.value.testOwner!!) })
+        assertEquals("no second job", 1, commands.children.count())
+        posting.open.complete(Unit)
+        joinCommands()
+        assertFalse(secondRan)
+        assertEquals("one request", 1, sent.size)
+        assertTrue("admitted again once it ended", uiCommands.run {})
     }
 
     @Test
