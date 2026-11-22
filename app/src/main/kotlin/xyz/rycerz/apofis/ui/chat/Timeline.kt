@@ -58,6 +58,9 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.EaseOutCubic
 import xyz.rycerz.apofis.ui.theme.Motion
+import xyz.rycerz.apofis.ui.theme.dotWave
+import xyz.rycerz.apofis.ui.theme.rememberTimeMs
+import xyz.rycerz.apofis.ui.theme.waveDot
 
 private const val MIN_SHOWN_DURATION_S = 0.1
 
@@ -125,14 +128,14 @@ internal fun TimelineCard(
     val open = remember { { i: Int -> click(i) } } // stable, so streamed text recomposes no step row
     val last = remember { arrayOfNulls<StepsRef>(1) }
     val ref = last[0]?.takeIf { it.steps === reply.steps } ?: StepsRef(reply.steps).also { last[0] = it }
-    Steps(reply.key, ref, tag, open, initiallyExpanded, initiallyOpenReasoning)
+    Steps(reply.key, ref, tag, open, initiallyExpanded, initiallyOpenReasoning, reply.live)
 }
 
 /** A steps list compared by identity: a new list is a new value, found without visiting its steps. */
 private class StepsRef(val steps: List<Step>)
 
 @Composable
-private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) -> Unit, initiallyExpanded: Boolean, initiallyOpenReasoning: Set<Int>) {
+private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) -> Unit, initiallyExpanded: Boolean, initiallyOpenReasoning: Set<Int>, live: Boolean) {
     val steps = ref.steps
     var expanded by rememberSaveable(replyKey) { mutableStateOf(initiallyExpanded) }
     var page by rememberSaveable(replyKey) { mutableIntStateOf(NEWEST) } // the one saved paging state
@@ -161,7 +164,7 @@ private fun Steps(replyKey: String, ref: StepsRef, tag: String, onStep: (Int) ->
             key(i, step is ReasoningStep, (step as? ToolStep)?.callId, (step as? ToolStep)?.takeIf { it.callId.isEmpty() }?.name) {
                 val rail = Rail(above = position > 0, below = position < last)
                 when (step) {
-                    is ToolStep -> ToolRow(step, rail, Modifier.testTag("$tag:$i:${step.name}")) { onStep(i) }
+                    is ToolStep -> ToolRow(step, rail, Modifier.testTag("$tag:$i:${step.name}"), live) { onStep(i) }
                     is ReasoningStep -> ReasoningRow(step, rail, i, i in opened, Modifier.testTag("$tag:$i")) {
                         opened = if (i in opened) opened - i else opened + i
                     }
@@ -212,7 +215,7 @@ private fun ExpandRow(expanded: Boolean, more: Int, onToggle: () -> Unit) {
 }
 
 @Composable
-private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, onClick: () -> Unit) {
+private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, live: Boolean, onClick: () -> Unit) {
     val colors = ApofisTheme.colors
     val scheme = MaterialTheme.colorScheme
     val state = when {
@@ -226,7 +229,7 @@ private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, onClick: () 
         modifier.clickable(onClick = onClick).semantics(mergeDescendants = true) { if (state != null) stateDescription = state },
         icon = {
             when {
-                step.running -> MiniDots()
+                step.running -> MiniDots(animate = live) // only a step of the live run is the active one
                 step.error -> Icon(painterResource(R.drawable.lucide_triangle_exclamation_point), null, Modifier.size(18.dp), tint = scheme.error)
                 else -> Icon(painterResource(R.drawable.lucide_wrench), null, Modifier.size(18.dp), tint = colors.timelineStrong)
             }
@@ -322,12 +325,25 @@ private fun StepRow(
     }
 }
 
-/** Three 3 dp dots in [MaterialTheme.colorScheme.primary]: a running tool step. Static here. */
+/**
+ * Three 3 dp dots in [MaterialTheme.colorScheme.primary]: a running tool step, in the [dotWave] of the reply's dots
+ * while [animate] (the step belongs to the live run). Otherwise, and under reduced motion, all three are solid, as in
+ * milestone 1 (so its goldens keep their pixels): a stored call without a result in an idle chat stays still.
+ */
 @Composable
-internal fun MiniDots(modifier: Modifier = Modifier) {
+internal fun MiniDots(modifier: Modifier = Modifier, animate: Boolean = true) {
     val primary = MaterialTheme.colorScheme.primary
+    val still = ApofisTheme.reduceMotion || !animate
+    val time = rememberTimeMs(Motion.DOTS_PERIOD, active = animate)
     Row(modifier, horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
-        repeat(3) { Box(Modifier.size(3.dp).background(primary, CircleShape)) }
+        repeat(3) { i ->
+            val dot = if (still) {
+                Modifier.background(primary, CircleShape)
+            } else {
+                Modifier.drawBehind { waveDot(primary, dotWave(time.value, i)) } // read in the draw phase only
+            }
+            Box(Modifier.size(3.dp).then(dot))
+        }
     }
 }
 
