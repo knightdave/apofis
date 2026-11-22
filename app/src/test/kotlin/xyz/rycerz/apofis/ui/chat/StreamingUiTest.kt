@@ -829,5 +829,19 @@ class StreamingUiTest {
         frame(30) // reveal ticks only
         assertTrue(shown("live").length > 2)
         assertEquals("stored items read by reveal ticks", reads, head.reads)
+        // An equal but distinct head arrives with a changed tail (the merger rebuilds it): after that remap, neither
+        // the old head nor the new one is read again while the reveal advances.
+        val equal = Counting(List(200) { UserMessage("u$it", "question $it", false, FIXED_NOW) })
+        val longer = long + letters.repeat(60)
+        items = Joined(equal, listOf(AssistantReply("live", emptyList(), longer, FIXED_NOW, live = true)))
+        live = run("A", longer)
+        frame()
+        val readsA = head.reads
+        val readsB = equal.reads
+        val shownBefore = shown("live").length
+        frame(30)
+        assertTrue("the reveal advanced", shown("live").length > shownBefore)
+        assertEquals("old head read by reveal ticks", readsA, head.reads)
+        assertEquals("new head read by reveal ticks", readsB, equal.reads)
     }
 }

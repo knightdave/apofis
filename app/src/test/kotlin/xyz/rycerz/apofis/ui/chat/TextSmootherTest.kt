@@ -272,4 +272,43 @@ class TextSmootherTest {
             }
         }
     }
+
+    // ---- fix round 4 ----
+
+    @Test
+    fun aTickIntoAClusterStopsAtItsEnd() {
+        // Shown 3 after a slice of 3; the next slice (4) lands inside "b" + 500 marks: the tick ends after the cluster,
+        // not after everything (604) and not where it was (3).
+        val s = TextSmoother("")
+        assertEquals(3, s.step("a".repeat(12)).length)
+        val next = "aaa" + "b" + "\u0301".repeat(500) + "z".repeat(100)
+        s.step(next)
+        assertEquals(504, s.shown)
+    }
+
+    @Test
+    fun aJoiningBurstOverTheBudgetSnapsAndClearsTheHistory() {
+        // Caught up on "e"; then its mark arrives with 1,200 more: 1,201 behind before any rounding, so all of it.
+        val s = TextSmoother("")
+        assertEquals("e", s.step("e"))
+        val next = "e\u0301" + "x".repeat(1200)
+        assertEquals(next.length, s.shownFor(next, snap = false))
+        s.accept(next, snap = false)
+        assertSame(next, s.visible)
+        // The history was cleared: a backlog of 12 now shows its own raw slice, 3 (with the old 1 kept it would be 2).
+        assertEquals(next.length + 3, s.step(next + "y".repeat(12)).length)
+        // An ordinary backlog of exactly 1,200 is still sliced.
+        assertEquals(240, TextSmoother("").step("w".repeat(SMOOTH_LAG_BUDGET)).length)
+    }
+
+    @Test
+    fun movingForwardPastTheShownCapShowsAll() {
+        val before = "a".repeat(19_999) + "e" // 20,000 shown, caught up
+        val s = TextSmoother(before)
+        val next = before + "\u0301xyz"
+        assertEquals("before any tick", next.length, s.shownFor(next, snap = false))
+        s.accept(next, snap = false)
+        assertSame(next, s.visible)
+        assertEquals("the identical target needs no reveal", next.length, s.shownFor(next, snap = false))
+    }
 }

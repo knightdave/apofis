@@ -981,7 +981,9 @@ internal fun MessageList(
     // a stored item added (polling shows the stored transcript), the newest stored reply's text or steps, the live text
     // as revealed, its steps, a new pending request. A new run's first values are a baseline, not growth.
     @Suppress("UNCHECKED_CAST") val stored = (items as? Joined<ChatItem>)?.head ?: items
-    val newest = remember(stored) { stored.lastOrNull { it is AssistantReply } as AssistantReply? } // once per stored list, not per tick
+    // Once per stored list instance (by reference: an equal but distinct list is a new instance), never per token or tick.
+    val head = remember { HeadFacts() }.of(stored)
+    val newest = head.newest
     val bottom = live?.let {
         Bottom(it.runId, stored.size, newest?.key, newest?.text?.length ?: 0, newest?.steps?.size ?: 0, liveText?.length ?: 0, liveItem?.steps?.size ?: 0, it.pending != null)
     }
@@ -997,7 +999,7 @@ internal fun MessageList(
     val currentNow by rememberUpdatedState(current)
     val rowActions = remember { RowActions({ currentNow?.invoke() ?: latest }, { onSelectNow(it) }) }
     // No reply has actions while a run is live or unsettled: once per transcript, not per token.
-    val active = live != null || remember(stored) { unsettled(stored) }
+    val active = live != null || head.anyUnsettled
     Box(modifier.fillMaxSize()) {
         LazyColumn(Modifier.fillMaxSize(), state = listState, reverseLayout = true, contentPadding = contentPadding) {
             items(
@@ -1036,6 +1038,24 @@ internal fun MessageList(
             }
         }
         RunEndAnnouncer(live?.runId, contentPadding.calculateTopPadding())
+    }
+}
+
+/** Facts about the stored head, found once per list instance: compared by reference, the new instance is kept. */
+private class HeadFacts {
+    private var list: List<ChatItem>? = null
+    var newest: AssistantReply? = null
+        private set
+    var anyUnsettled = false // see [unsettled]
+        private set
+
+    fun of(stored: List<ChatItem>): HeadFacts {
+        if (stored !== list) {
+            list = stored
+            newest = stored.lastOrNull { it is AssistantReply } as AssistantReply?
+            anyUnsettled = unsettled(stored)
+        }
+        return this
     }
 }
 

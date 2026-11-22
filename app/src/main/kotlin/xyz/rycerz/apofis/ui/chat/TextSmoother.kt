@@ -53,8 +53,10 @@ class TextSmoother(initial: String) {
     private fun kept(next: String, snap: Boolean): Int? {
         if (snap || shown > SMOOTH_MAX_SHOWN) return null
         if (next === target) return shown
+        if (next.length - shown > SMOOTH_LAG_BUDGET) return null // a burst, judged before any rounding or segmentation
         if (shown > next.length || !next.regionMatches(0, target, 0, shown)) return null
-        return boundaryAtOrAfter(next, shown)
+        val forward = boundaryAtOrAfter(next, shown)
+        return forward.takeUnless { it > SMOOTH_MAX_SHOWN && it < next.length } // never a partial prefix above the cap
     }
 
     /** What [accept] would show for [next], without changing anything (read in composition). */
