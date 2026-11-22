@@ -5,6 +5,7 @@ import android.app.Application
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.provider.Settings
 import android.content.pm.PackageManager
 import androidx.compose.runtime.getValue
@@ -48,6 +49,7 @@ import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -104,6 +106,7 @@ import xyz.rycerz.apofis.push.TestPolicy
 import xyz.rycerz.apofis.push.TestPush
 import xyz.rycerz.apofis.push.TestPushResult
 import xyz.rycerz.apofis.push.VALID
+import xyz.rycerz.apofis.push.VALID2
 import xyz.rycerz.apofis.push.registrationOf
 import xyz.rycerz.apofis.push.validateEndpoint
 import xyz.rycerz.apofis.settings.ThemeMode
@@ -148,6 +151,8 @@ class NotificationsRowTest {
     private var policyGate: Gate? = null
     private var apiGate: Gate? = null
     private var postGate: Gate? = null
+    private var registerGate: Gate? = null
+    private var computed: CompletableDeferred<Unit>? = null // completed by the next calculation of the registrar's state
     private val gatedPort = object : UnifiedPushPort by fakePort {
         override fun distributors(c: Context): List<String> {
             distributorsGate?.let { distributorsGate = null; it.pass() }
@@ -157,10 +162,15 @@ class NotificationsRowTest {
             unregisterGate?.let { unregisterGate = null; it.pass() }
             fakePort.unregister(c, r, connector)
         }
+        override fun register(c: Context, instance: String, journal: (String, String) -> Unit) {
+            registerGate?.let { registerGate = null; it.pass() }
+            fakePort.register(c, instance, journal)
+        }
     }
     private val gatedPolicy = object : PushPolicy by TestPolicy() {
         override fun distributors(c: Context): Set<String> {
             policyGate?.let { policyGate = null; it.pass() }
+            computed?.complete(Unit)
             return setOf(NTFY_PACKAGE)
         }
     }
@@ -232,10 +242,13 @@ class NotificationsRowTest {
     }
 
     /** The setting, once it has resolved the registrar and read the access off the main thread. */
-    private fun setting(scope: CoroutineScope = uiScope, push: () -> PushRegistrar = { registrar }) {
-        themed { NotificationsSetting(push, { testPush }, notifyPrefs, scope) }
-        rule.waitUntil(WATCHDOG_MS) { rule.onAllNodes(hasText(text(R.string.settings_notifications)) and hasClickAction()).fetchSemanticsNodes().isNotEmpty() }
+    private fun setting(scope: CoroutineScope = uiScope, push: () -> PushRegistrar = { registrar }, prefs: SharedPreferences = notifyPrefs) {
+        themed { NotificationsSetting(push, { testPush }, prefs, scope) }
+        waitReady()
     }
+
+    private fun waitReady() =
+        rule.waitUntil(WATCHDOG_MS) { rule.onAllNodes(hasText(text(R.string.settings_notifications)) and hasClickAction()).fetchSemanticsNodes().isNotEmpty() }
 
     /** Nodes with [what] inside the sheet's own window. */
     private fun inSheet(what: String) =
@@ -264,8 +277,8 @@ class NotificationsRowTest {
 
     private fun joinCommands() = runBlocking { commands.children.forEach { it.join() } }
 
-    private fun endpointArrives() {
-        assertTrue(prefs.edit().putString(Keys.ENDPOINT_NEW, VALID).putString(Keys.ENDPOINT_NEW_TOKEN, registrationOf(prefs)?.token).commit())
+    private fun endpointArrives(url: String = VALID) {
+        assertTrue(prefs.edit().putString(Keys.ENDPOINT_NEW, url).putString(Keys.ENDPOINT_NEW_TOKEN, registrationOf(prefs)?.token).commit())
     }
 
     private fun turnedOn() = runBlocking {
@@ -559,9 +572,9 @@ class NotificationsRowTest {
         (PushRegistrar::class.java.getDeclaredField("mutex").apply { isAccessible = true }.get(registrar) as Mutex).isLocked
 
     /** Every state the registrar published, with whether the distributor held a subscription at that moment. */
-    private fun watchPublications(): MutableList<Pair<PushState, Boolean>> {
-        val seen = Collections.synchronizedList(mutableListOf<Pair<PushState, Boolean>>())
-        background.launch(Dispatchers.Unconfined) { registrar.ui.collect { seen += it.state to fakePort.subscribed.isNotEmpty() } }
+    private fun watchPublications(): MutableList<Pair<PushUi, Boolean>> {
+        val seen = Collections.synchronizedList(mutableListOf<Pair<PushUi, Boolean>>())
+        background.launch(Dispatchers.Unconfined) { registrar.ui.collect { seen += it to fakePort.subscribed.isNotEmpty() } }
         return seen
     }
 
@@ -569,6 +582,7 @@ class NotificationsRowTest {
     fun aPausedRefreshCannotPublishOffOverAnEnable() {
         val r = registrar
         val seen = watchPublications()
+        epoch = 7 // behind the registrar's back: the refresh's result differs from the state it replaces (its owner)
         val paused = Gate().also { distributorsGate = it }
         val refresh = background.launch { r.refreshNow() }
         await(paused.entered) // inside its calculation
@@ -578,13 +592,17 @@ class NotificationsRowTest {
         runBlocking { withTimeout(WATCHDOG_MS) { refresh.join(); enable.join() } }
         assertTrue(subscribed("g1"))
         assertEquals(PushState.Registering, r.ui.value.state)
-        assertTrue("never Off while subscribed: $seen", seen.none { it.first == PushState.Off && it.second })
+        assertTrue("never Off while subscribed: $seen", seen.none { it.first.state == PushState.Off && it.second })
+        // Published in order: the state before, the paused refresh's result, then the enable's, which is the last.
+        assertEquals(listOf(PushUi(PushState.Off, "0:g0"), PushUi(PushState.Off, "7:g0"), PushUi(PushState.Registering, "7:g1")), seen.map { it.first })
     }
 
     @Test
     fun aPausedRefreshCannotPublishOffBeforeADisableHasUnregistered() {
         turnedOn()
         val r = registrar
+        // Behind the registrar's back: its next calculation gives ServerError, so the refresh's result can be seen.
+        assertTrue(prefs.edit().putBoolean(Keys.SERVER_UNDONE, true).commit())
         val seen = watchPublications()
         val paused = Gate().also { policyGate = it }
         val refresh = background.launch { r.refreshNow() }
@@ -595,7 +613,9 @@ class NotificationsRowTest {
         runBlocking { withTimeout(WATCHDOG_MS) { refresh.join(); disable.join() } }
         assertFalse(subscribed("g1"))
         assertEquals(PushState.Off, r.ui.value.state)
-        assertTrue("never Off while subscribed: $seen", seen.none { it.first == PushState.Off && it.second })
+        assertTrue("never Off while subscribed: $seen", seen.none { it.first.state == PushState.Off && it.second })
+        assertEquals("the state before, the paused refresh's result, then the disable's, which is the last",
+            listOf(on, error, PushState.Off), seen.map { it.first.state })
     }
 
     /** Off confirmed after the switch's preparation returned and admitted before its fence, run after it: dropped. */
@@ -722,23 +742,6 @@ class NotificationsRowTest {
     }
 
     @Test
-    fun anImmediateAnswerIsReadBackWithoutAResume() {
-        shadowOf(app).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
-        setting()
-        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
-        rule.waitUntil(WATCHDOG_MS) { shadowOf(rule.activity).lastRequestedPermission != null }
-        val request = shadowOf(rule.activity).lastRequestedPermission
-        rule.runOnUiThread {
-            rule.activity.onRequestPermissionsResult(request.requestCode, request.requestedPermissions, intArrayOf(PackageManager.PERMISSION_DENIED))
-        }
-        // Declined at once: the next tap opens the system settings instead of asking a helper that refuses to ask again.
-        rule.waitUntil(WATCHDOG_MS) {
-            rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
-            nextStarted()?.action == Settings.ACTION_APP_NOTIFICATION_SETTINGS
-        }
-    }
-
-    @Test
     fun aResultOnTheOldRegistrationIsNotShownOnTheNew() {
         turnedOn()
         setting()
@@ -815,6 +818,141 @@ class NotificationsRowTest {
         R.string.settings_notif_test_sent, R.string.settings_notif_test_failed, R.string.settings_notif_test_received, R.string.settings_notif_test_none,
     ).flatMap { inSheet(text(it)) }
 
+    // ---- Fix round 2 ----
+
+    @Test
+    fun twoEnableTapsAdmitOneCommand() {
+        setting()
+        val registering = Gate().also { registerGate = it }
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        await(registering.entered) // the first enable is outstanding; the row still offers enable
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        registering.open.complete(Unit)
+        joinCommands()
+        waitFor(text(R.string.settings_notif_registering))
+        assertEquals(1, fakePort.calls.count { it.startsWith("register") })
+    }
+
+    @Test
+    fun settingsRecreatedDuringAHeldThenDroppedOff() {
+        turnedOn()
+        val restoration = StateRestorationTester(rule)
+        restoration.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                CompositionLocalProvider(LocalHaptics provides counting) { NotificationsSetting({ registrar }, { testPush }, notifyPrefs, heldScope) }
+            }
+        }
+        waitReady()
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        runBlocking { withTimeout(WATCHDOG_MS) { registrar.prepareSwitch() } }
+        turnOffViaDialog()
+        val inside = Gate().also { apiGate = it }
+        (held.poll(WATCHDOG_MS, TimeUnit.MILLISECONDS) ?: throw AssertionError("no dispatch came")).run() // admitted
+        await(inside.entered)
+
+        restoration.emulateSavedInstanceStateRestore() // Settings is built again while the Off is held
+        waitReady()
+        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).assertIsNotEnabled() // Registering: the only action
+        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).performClick()
+        assertTrue("no second dialog", rule.onAllNodes(hasText(text(R.string.settings_notif_turn_off_text))).fetchSemanticsNodes().isEmpty())
+        assertEquals("one admission", 1, commands.children.count())
+
+        connection++
+        epoch++
+        inside.open.complete(Unit)
+        runHeld(::commandsDone)
+        waitInSheet(text(R.string.settings_notif_turn_off_failed)) // on the restored sheet
+        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasTestTag(SHEET_TAG))).assertIsEnabled()
+    }
+
+    @Test
+    fun anAppliedOffWhoseStateIsNotOffShowsNoFailure() {
+        turnedOn()
+        setting()
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        fakePort.installed.clear() // ntfy goes away: after Off the state is NoDistributor, not Off
+        turnOffViaDialog()
+        joinCommands()
+        waitInSheet(text(R.string.settings_notif_no_distributor))
+        assertEquals(PushState.NoDistributor, registrar.ui.value.state)
+        assertFalse(prefs.getBoolean(Keys.ENABLED, false))
+        assertTrue("applied: the outcome is disable()'s, not the state's", inSheet(text(R.string.settings_notif_turn_off_failed)).isEmpty())
+    }
+
+    @Test
+    fun aTestTapForAReplacedRegistrationSendsNothing() {
+        turnedOn()
+        setting(scope = heldScope)
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        rule.onNodeWithText(text(R.string.settings_notif_test)).performClick() // tapped while the sheet shows A
+        val a = registrar.ui.value.testOwner!!
+
+        switchToB() // replaced before the tap's dispatch comes
+        endpointArrives(VALID2)
+        runBlocking { withTimeout(WATCHDOG_MS) { registrar.publishPending() } }
+        assertNotEquals(a, registrar.ui.value.testOwner)
+        runHeld(::commandsDone)
+        assertEquals("A's tap went nowhere, not to B's endpoint", emptyList<String>(), sent)
+        assertNull(testPush.lastResult.value)
+
+        rule.waitForIdle()
+        rule.onNodeWithText(text(R.string.settings_notif_test)).performClick() // B's own test
+        runHeld(::commandsDone)
+        assertEquals(listOf(VALID2), sent)
+        val b = registrar.ui.value.testOwner!!
+        assertEquals(TestOutcome(b, TestPushResult.SENT), testPush.lastResult.value)
+        waitInSheet(text(R.string.settings_notif_test_sent))
+        testPush.onWake(b)
+        waitInSheet(text(R.string.settings_notif_test_received))
+    }
+
+    @Test
+    fun anOlderAccessReadNeverOverwritesANewerOne() {
+        shadowOf(app).denyPermissions(Manifest.permission.POST_NOTIFICATIONS) // never asked
+        var readGate: Gate? = null
+        val gated = object : SharedPreferences by notifyPrefs {
+            override fun getBoolean(key: String?, defValue: Boolean): Boolean {
+                val value = notifyPrefs.getBoolean(key, defValue)
+                if (key == "permission_asked") readGate?.let { readGate = null; it.pass() } // sampled, then held
+                return value
+            }
+        }
+        setting(prefs = gated)
+        val old = Gate().also { readGate = it }
+        rule.activityRule.scenario.moveToState(Lifecycle.State.STARTED)
+        rule.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        await(old.entered) // the resume's read has sampled "never asked" and is held
+
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick() // asks
+        rule.waitUntil(WATCHDOG_MS) { shadowOf(rule.activity).lastRequestedPermission != null && notifyPrefs.contains("permission_asked") }
+        shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+        val request = shadowOf(rule.activity).lastRequestedPermission
+        rule.runOnUiThread {
+            rule.activity.onRequestPermissionsResult(request.requestCode, request.requestedPermissions, intArrayOf(PackageManager.PERMISSION_GRANTED))
+        }
+        waitFor(text(R.string.settings_notif_off)) // the newer read published: granted, push off
+
+        val done = CompletableDeferred<Unit>().also { computed = it }
+        old.open.complete(Unit) // the older read finishes now
+        await(done) // its resume job went on to the refresh, so the read was handled
+        rule.waitForIdle()
+        rule.onNodeWithText(text(R.string.settings_notifications)).performClick() // once
+        joinCommands()
+        waitFor(text(R.string.settings_notif_registering))
+        assertEquals("enabled, not asked again", 1, fakePort.calls.count { it.startsWith("register") })
+    }
+
+    @Test
+    fun theTickerRunsOnlyWithTheSheetOpenAndAWindowOpen() {
+        val owner = "1:g1"
+        assertTrue(ticks(open = true, last = TestOutcome(owner, TestPushResult.SENT)))
+        assertFalse(ticks(open = false, last = TestOutcome(owner, TestPushResult.SENT)))
+        assertFalse(ticks(open = true, last = null))
+        for (r in listOf(TestPushResult.SEND_FAILED, TestPushResult.WAKE_ARRIVED, TestPushResult.NO_WAKE)) {
+            assertFalse(r.name, ticks(open = true, last = TestOutcome(owner, r)))
+        }
+    }
+
     @Test
     @Config(qualifiers = "pl-w320dp-h420dp-xhdpi")
     fun shortWindowLargeFontLongestPolish() {
@@ -825,8 +963,8 @@ class NotificationsRowTest {
         rule.onNodeWithText("Powiadomienia").assertHeightIsAtLeast(32.dp) // the large font took effect (a 16 sp title)
         // Taller than half the window, the sheet opens half way, as every sheet does: the user drags it up.
         rule.onNodeWithText("Powiadomienia").performTouchInput { swipeUp() }
-        rule.onNodeWithText("Nie dotarło żadne powiadomienie push").performScrollTo().assertIsDisplayed()
-        rule.onNodeWithText("Wyślij testowe powiadomienie").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        rule.onNodeWithText("Żaden push nie dotarł").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("Wyślij testowy push").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         rule.onNodeWithText("Wyłącz push").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
         rule.onNodeWithText("Wyłączyć push?").assertIsDisplayed()
         rule.onNodeWithText("Odpowiedzi nadal będą sprawdzane mniej więcej co 15 minut, gdy któraś trwa.").assertIsDisplayed()

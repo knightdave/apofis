@@ -36,7 +36,9 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -50,6 +52,7 @@ import xyz.rycerz.apofis.notify.rememberAskNotificationsOnce
 import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.PushState
 import xyz.rycerz.apofis.push.PushUi
+import xyz.rycerz.apofis.push.TestOutcome
 import xyz.rycerz.apofis.push.TestPush
 import xyz.rycerz.apofis.push.TestPushResult
 import xyz.rycerz.apofis.ui.theme.ApofisSheet
@@ -103,6 +106,33 @@ internal fun actionsOf(ui: NotificationsUi): List<SheetAction> = buildList {
 }
 
 private fun lines(value: String, summary: String?) = listOfNotNull(value, summary).joinToString("\n")
+
+/** The test window's ticker runs only while the sheet is open and a test window is: SENT is the only result with one. */
+internal fun ticks(open: Boolean, last: TestOutcome?) = open && last?.result == TestPushResult.SENT
+
+/**
+ * Settings' push commands at the lifetime of the command, not of the screen: one admitted at a time, and its busy state
+ * and a message not shown yet survive rotation and leaving Settings (the activity's view model store holds this).
+ * Admission runs on the main thread; the command runs in a scope that outlives the screen.
+ */
+internal class PushCommands : ViewModel() {
+    var busy by mutableStateOf(false)
+        private set
+    var message by mutableStateOf<Int?>(null)
+
+    fun run(scope: CoroutineScope, block: suspend () -> Unit) {
+        if (busy) return
+        busy = true
+        message = null
+        scope.launch {
+            try {
+                block()
+            } finally {
+                busy = false
+            }
+        }
+    }
+}
 
 /** The bell only for push On with every part of access allowed. */
 internal fun iconOf(ui: NotificationsUi): Int = if (ui.state is PushState.On && ui.allowed) R.drawable.lucide_bell else R.drawable.lucide_bell_off
@@ -225,17 +255,24 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
     val local = rememberCoroutineScope()
     var parts by remember { mutableStateOf<Pair<PushRegistrar, TestPush>?>(null) }
     var access by remember { mutableStateOf<NotificationAccess?>(null) }
-    val readAccess: () -> Unit = { local.launch { access = withContext(Dispatchers.IO) { notificationAccess(context, notifyPrefs) } } }
+    // Resume, the dialog's answer and the stored mark each read the access; only the latest read started may publish.
+    val reads = remember { intArrayOf(0) }
+    suspend fun readAccess() {
+        val read = ++reads[0]
+        val got = withContext(Dispatchers.IO) { notificationAccess(context, notifyPrefs) }
+        if (read == reads[0]) access = got
+    }
     LifecycleResumeEffect(Unit) {
         val job = local.launch {
             val (p, _) = parts ?: withContext(Dispatchers.IO) { push() to testPush() }.also { parts = it }
-            access = withContext(Dispatchers.IO) { notificationAccess(context, notifyPrefs) }
+            readAccess()
             p.refreshNow()
         }
         onPauseOrDispose { job.cancel() }
     }
     // The dialog's answer and the stored mark are read back at once, so the next tap acts on them.
-    val ask = rememberAskNotificationsOnce(notifyPrefs, onSettled = readAccess)
+    val ask = rememberAskNotificationsOnce(notifyPrefs, onSettled = { local.launch { readAccess() } })
+    val commands = viewModel { PushCommands() }
     val (p, t) = parts ?: return PendingRow()
     val a = access ?: return PendingRow()
 
@@ -244,23 +281,10 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
     // A result counts only for the registration it was sent for, which the registrar reports with its state.
     val ui = NotificationsUi(a, pushUi, last?.takeIf { it.owner == pushUi.testOwner }?.result)
     var open by rememberSaveable { mutableStateOf(false) }
-    var busy by remember { mutableStateOf(false) }
-    var message by remember { mutableStateOf<Int?>(null) }
-    fun command(block: suspend () -> Unit) {
-        if (busy) return
-        busy = true
-        message = null
-        scope.launch {
-            try {
-                block()
-            } finally {
-                busy = false
-            }
-        }
-    }
+    fun command(block: suspend () -> Unit) = commands.run(scope, block)
     fun start(failure: Int, activity: () -> Unit) {
-        message = null
-        if (runCatching(activity).isFailure) message = failure // no app for it: say so, stay here
+        commands.message = null
+        if (runCatching(activity).isFailure) commands.message = failure // no app for it: say so, stay here
     }
     val uriHandler = LocalUriHandler.current
     val ntfyUrl = stringResource(R.string.settings_ntfy_url)
@@ -270,45 +294,46 @@ fun NotificationsSetting(push: () -> PushRegistrar, testPush: () -> TestPush, no
         }
     }
     NotificationsRow(ui) {
-        message = null
+        if (!commands.busy) commands.message = null
         when (tapOf(ui)) {
             RowTap.ASK -> ask()
             RowTap.SYSTEM_SETTINGS -> systemSettings()
             RowTap.SHEET -> open = true
             RowTap.GET_NTFY -> start(R.string.settings_link_no_app) { uriHandler.openUri(ntfyUrl) }
-            RowTap.ENABLE -> p.enable()
+            RowTap.ENABLE -> command { p.enableNow() } // awaited, so a second tap meanwhile is refused
         }
     }
-    if (!open) message?.let { ErrorLine(it, Modifier.padding(start = 48.dp, end = 12.dp, bottom = 11.dp)) }
-    if (open) {
-        if (last?.result == TestPushResult.SENT) {
-            // Only while a window is open and the sheet is on screen; the first tick on every resume closes one that expired.
-            LifecycleResumeEffect(t) {
-                val ticker = local.launch {
-                    while (true) {
-                        t.tick()
-                        delay(1_000)
-                    }
+    if (!open) commands.message?.let { ErrorLine(it, Modifier.padding(start = 48.dp, end = 12.dp, bottom = 11.dp)) }
+    if (ticks(open, last)) {
+        // Resumed only; the first tick on every resume closes a window that expired meanwhile.
+        LifecycleResumeEffect(t) {
+            val ticker = local.launch {
+                while (true) {
+                    t.tick()
+                    delay(1_000)
                 }
-                onPauseOrDispose { ticker.cancel() }
             }
+            onPauseOrDispose { ticker.cancel() }
         }
+    }
+    if (open) {
         NotificationsSheet(
             ui,
             onTest = {
-                val sentFor = pushUi.testOwner.orEmpty() // the registration tapped for, not the one current when the send runs
-                val endpoint = p.endpoint.orEmpty() // no record: fails validation, "Test not sent", nothing leaves the phone
-                command { t.send(endpoint, sentFor) }
+                val shown = pushUi.testOwner.orEmpty() // the registration the sheet showed when tapped
+                // Its endpoint in one read with the owner: a tap for a registration that is no longer current sends nothing.
+                command { p.testEndpoint(shown)?.let { t.send(it, shown) } }
             },
             onRetry = { command { p.verify(force = true) } },
-            onTurnOff = { command { if (!p.disable()) message = R.string.settings_notif_turn_off_failed } },
+            // The outcome is disable()'s own; a cancellation or an exception reports nothing.
+            onTurnOff = { command { if (!p.disable()) commands.message = R.string.settings_notif_turn_off_failed } },
             onSystemSettings = systemSettings,
             onDismiss = {
                 open = false
-                message = null
+                if (!commands.busy) commands.message = null
             },
-            busy = busy,
-            message = message,
+            busy = commands.busy,
+            message = commands.message,
         )
     }
 }

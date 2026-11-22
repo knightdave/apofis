@@ -186,14 +186,20 @@ class PushRegistrar(
      */
     suspend fun disable(): Boolean {
         var applied = false
-        withContext(NonCancellable) { // the user confirmed Off: a cancelled caller does not undo it
-            op { _ ->
-                if (enabled()) commitLive { beginRevocation(off = true) }
-                applied = true
-                finishRevocations()
+        try {
+            withContext(NonCancellable) { // the user confirmed Off: a cancelled caller does not undo it
+                op { _ ->
+                    if (enabled()) commitLive { beginRevocation(off = true) }
+                    applied = true
+                    finishRevocations()
+                }
             }
+            afterUserOp()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logFailure(e) // finalising or scheduling failed: the outcome already decided stands
         }
-        afterUserOp()
         return applied
     }
 
@@ -265,6 +271,9 @@ class PushRegistrar(
 
     /** Recomputes the shown state in turn with the operations: under the registrar's lock, off the main thread, no network. */
     suspend fun refreshNow() = withContext(Dispatchers.IO) { mutex.withLock { state.value = compute() } }
+
+    /** The record's endpoint for a test push of [owner], or null when [owner] is no longer the current registration (one read). */
+    fun testEndpoint(owner: String): String? = PushStore.locked { endpoint?.takeIf { testOwner(epoch(), currentInstance()) == owner } }
 
     /** Recomputes the shown state, e.g. after the receiver failed to store an endpoint. */
     fun refresh() {

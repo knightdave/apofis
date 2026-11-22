@@ -63,5 +63,5 @@ class NotificationsScreenshotTest {
     @Test
     @Config(qualifiers = "pl-w360dp-h760dp-xhdpi")
     fun settings_notifications_sheet_pl() =
-        rule.windowShot("settings_notifications_sheet_pl", hasText("Nie dotarło żadne powiadomienie push")) { OnSheet(TestPushResult.NO_WAKE) }
+        rule.windowShot("settings_notifications_sheet_pl", hasText("Żaden push nie dotarł")) { OnSheet(TestPushResult.NO_WAKE) }
 }

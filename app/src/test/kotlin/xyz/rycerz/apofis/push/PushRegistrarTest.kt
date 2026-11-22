@@ -547,7 +547,7 @@ class PushRegistrarTest {
             turnedOn(r)
             port.calls.clear()
             prefs.onCommit = { false } // the disk stops taking writes
-            r.disable()
+            assertFalse("not applied: the Off commit did not reach the disk", r.disable())
             assertNull(prefs.disk[Keys.REVOKE])
             assertEquals("not confirmed while memory and disk differ", PushState.Registering, r.ui.value.state)
             r.publishPending()
@@ -827,12 +827,28 @@ class PushRegistrarTest {
             }
             val withFailingPort = PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, TestPolicy(), failing) { scheduled++ }
             scheduled = 0
-            withFailingPort.disable()
+            assertTrue("applied: Off is on disk, its unregister is retried", withFailingPort.disable())
             assertTrue(prefs.contains(Keys.REVOKE))
             assertEquals(PushState.Registering, withFailingPort.ui.value.state)
             assertTrue(scheduled > 0)
             registrar().publishPending()
             assertEquals(PushState.Off, registrar().ui.value.state)
+        }
+    }
+
+    @Test
+    fun aDecidedOffSurvivesAFailedScheduling() = runTest { // Task 5, fix round 2
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            val failing = object : UnifiedPushPort by port {
+                override fun unregister(c: android.content.Context, r: Registration, connector: Boolean) = throw IllegalStateException("broadcast failed")
+            }
+            val unscheduled = PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, TestPolicy(), failing) {
+                throw IllegalStateException("not scheduled")
+            }
+            assertTrue("the Off commit decided it", unscheduled.disable())
+            assertTrue(!prefs.getBoolean(Keys.ENABLED, false) && prefs.contains(Keys.REVOKE))
         }
     }
 

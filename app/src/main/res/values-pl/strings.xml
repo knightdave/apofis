@@ -163,11 +163,11 @@
     <string name="settings_notif_fallback">Bez push aplikacja sprawdza mniej więcej co 15 minut, gdy trwa odpowiedź</string>
     <string name="settings_notif_retry">Spróbuj teraz</string>
     <string name="settings_notif_system">Otwórz ustawienia systemu</string>
-    <string name="settings_notif_test">Wyślij testowe powiadomienie</string>
+    <string name="settings_notif_test">Wyślij testowy push</string>
     <string name="settings_notif_test_sent">Wysłano test, czekam</string>
     <string name="settings_notif_test_failed">Nie wysłano testu</string>
-    <string name="settings_notif_test_received">Powiadomienie push dotarło</string>
-    <string name="settings_notif_test_none">Nie dotarło żadne powiadomienie push</string>
+    <string name="settings_notif_test_received">Push dotarł</string>
+    <string name="settings_notif_test_none">Żaden push nie dotarł</string>
     <string name="settings_notif_turn_off">Wyłącz push</string>
     <string name="settings_notif_turn_off_text">Odpowiedzi nadal będą sprawdzane mniej więcej co 15 minut, gdy któraś trwa.</string>
     <string name="settings_notif_turn_off_title">Wyłączyć push?</string>
