@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.push
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Application
 import android.app.Notification
 import android.app.NotificationManager
@@ -12,10 +13,12 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.Configuration
 import androidx.work.ListenableWorker
 import androidx.work.NetworkType
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerFactory
 import androidx.work.WorkerParameters
+import androidx.work.impl.WorkManagerImpl
 import androidx.work.testing.SynchronousExecutor
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
@@ -79,13 +82,18 @@ private class WakeCtx(base: Context, private val target: () -> WakeTarget?) : Co
     override fun getApplicationContext(): Context = this
 }
 
+/** A wake job's input as WorkManager handed it to the worker (or holds it for a queued job). */
+private data class Input(val epoch: Long, val cause: String?, val followUp: Int)
+
 /**
  * The wake against a real container, notifier and follower, a fake server that records every request, and the test
- * WorkManager running the real enqueued work (its factory supplies the test graph; [TestDriver] releases delays and
- * constraints). Direct worker runs are used only for single outcomes.
+ * WorkManager running the real enqueued work: its factory supplies the test graph and records each worker's input;
+ * [TestDriver] releases delays and constraints; receipts (`wakeStep`, request arrivals, WorkManager's flows) order the
+ * steps. Direct worker runs are used only for single outcomes.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [37], application = Application::class)
+@SuppressLint("RestrictedApi") // the queued WorkSpec's expedited flag and input, which WorkInfo does not expose
 class WakeWorkerTest {
     private val app = ApplicationProvider.getApplicationContext<Application>()
     private val nm = app.getSystemService(NotificationManager::class.java)
@@ -98,6 +106,10 @@ class WakeWorkerTest {
     private val arrived = Channel<String>(Channel.UNLIMITED)
     private val auth = CopyOnWriteArrayList<String>()
     private val containers = CopyOnWriteArrayList<AppContainer>()
+    private val started = CopyOnWriteArrayList<Input>()
+    private val steps = CopyOnWriteArrayList<String>()
+    private val stepReceipts = Channel<String>(Channel.UNLIMITED)
+    @Volatile private var barrier: suspend (String) -> Unit = {}
     @Volatile private lateinit var container: AppContainer
     @Volatile private var disconnected = false
     private val ctx = WakeCtx(app) {
@@ -109,14 +121,23 @@ class WakeWorkerTest {
     @Before
     fun setUp() = runTest {
         val factory = object : WorkerFactory() {
-            override fun createWorker(appContext: Context, workerClassName: String, workerParameters: WorkerParameters): ListenableWorker? =
-                if (workerClassName == WakeWorker::class.java.name) WakeWorker(ctx, workerParameters) else null
+            override fun createWorker(appContext: Context, workerClassName: String, workerParameters: WorkerParameters): ListenableWorker? {
+                if (workerClassName != WakeWorker::class.java.name) return null
+                started += workerParameters.inputData.let { Input(it.getLong(EPOCH, -1), it.getString(CAUSE), it.getInt(FOLLOW_UP, 0)) }
+                return WakeWorker(ctx, workerParameters)
+            }
         }
         WorkManagerTestInitHelper.initializeTestWorkManager(
             app,
             Configuration.Builder().setExecutor(SynchronousExecutor()).setTaskExecutor(SynchronousExecutor()).setWorkerFactory(factory).build(),
         )
-        wakeStep = {}
+        wakeStep = { step ->
+            steps += step
+            stepReceipts.trySend(step)
+            barrier(step)
+        }
+        Wake.laneStep = {}
+        Wake.beforeInstall = {}
         ShadowLog.clear()
         shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
         ensureChannels(app)
@@ -132,11 +153,15 @@ class WakeWorkerTest {
         server.start()
         container = newContainer()
         container.connect(Credentials(url(), "key"))
+        Wake.idle()
     }
 
     @After
     fun tearDown() {
         wakeStep = {}
+        Wake.laneStep = {}
+        Wake.beforeInstall = {}
+        Wake.idle()
         wm.cancelAllWork().result.get()
         containers.forEach { it.scope.cancel() } // before the shared database closes
         db.close()
@@ -145,13 +170,21 @@ class WakeWorkerTest {
 
     private fun url() = server.url("/").toString()
     private fun newContainer() = AppContainer(app, store) { db }.also { containers += it }
+
+    /** A new process on the same disk: the old container's scope (its collector among it) ends first. */
+    private fun restart() {
+        container.scope.cancel()
+        container = newContainer()
+    }
+
     private fun epoch() = connectionEpoch(app)
     private fun target() = container.connected()!!.let { WakeTarget(it, it.generation, container.notifier) }
 
-    /** A delivered push as the receiver hands it off: the mark under the push lock, then the request. */
+    /** A delivered push as the receiver hands it off: the mark under the push lock, then the lane's request. */
     private fun push() {
         assertTrue(PushStore.locked { Wake.onPush(app, epoch()) })
         Wake.recover(app)
+        Wake.idle()
     }
 
     /** Waits in real time (a watchdog only) for a state change made on other threads. */
@@ -160,24 +193,39 @@ class WakeWorkerTest {
     private fun jobs(name: String = WAKE_WORK) = wm.getWorkInfosForUniqueWork(name).get()
     private fun live(name: String = WAKE_WORK) = jobs(name).filter { !it.state.isFinished }
     private suspend fun awaitWork(name: String = WAKE_WORK, until: (List<WorkInfo>) -> Boolean) = real { wm.getWorkInfosForUniqueWorkFlow(name).first(until) }
+    private fun spec(id: UUID) = WorkManagerImpl.getInstance(app).workDatabase.workSpecDao().getWorkSpec(id.toString())!!
+    private fun input(id: UUID) = spec(id).input.let { Input(it.getLong(EPOCH, -1), it.getString(CAUSE), it.getInt(FOLLOW_UP, 0)) }
+    private fun expedited(id: UUID) = spec(id).let { it.expedited && it.outOfQuotaPolicy == OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST }
 
-    /**
-     * Releases the one queued wake job (its delay and its network constraint) and waits until WorkManager recorded its
-     * end: finished, replaced, or back in the queue for a retry.
-     */
-    private suspend fun runJob(): WorkInfo {
-        val job = live().single()
+    /** Releases a queued job (its delay and its network constraint) without waiting. */
+    private fun release(job: WorkInfo) {
         if (job.initialDelayMillis > 0 || job.runAttemptCount > 0) driver.setInitialDelayMet(job.id)
         driver.setAllConstraintsMet(job.id)
-        return real { wm.getWorkInfoByIdFlow(job.id).first { it == null || it.state.isFinished || (it.state == WorkInfo.State.ENQUEUED && it.runAttemptCount > job.runAttemptCount) } } ?: job
+    }
+
+    /** Waits until WorkManager recorded the end of [id]: finished, removed, or back in the queue for a retry. */
+    private suspend fun awaitEnd(id: UUID, attempts: Int = 0): WorkInfo? =
+        real { wm.getWorkInfoByIdFlow(id).first { it == null || it.state.isFinished || (it.state == WorkInfo.State.ENQUEUED && it.runAttemptCount > attempts) } }
+
+    /** Runs the one queued wake job to its end, then lets the lane handle what it asked for. */
+    private suspend fun runJob(): WorkInfo {
+        val job = live().single()
+        release(job)
+        val end = awaitEnd(job.id, job.runAttemptCount) ?: job
+        Wake.idle()
+        return end
     }
 
     private suspend fun runWake(cause: String = CAUSE_PUSH, attempt: Int = 0, epoch: Long = epoch(), followUp: Int = 0): ListenableWorker.Result =
         TestListenableWorkerBuilder.from(ctx, WakeWorker::class.java)
             .setInputData(workDataOf(EPOCH to epoch, CAUSE to cause, FOLLOW_UP to followUp)).setRunAttemptCount(attempt).build().doWork()
+            .also { Wake.idle() }
 
     /** The next [n] requests to arrive, as receipts. */
     private suspend fun awaitRequests(n: Int) = real { repeat(n) { arrived.receive() } }
+
+    /** Receives step receipts until [step] has arrived [count] times in total. */
+    private suspend fun awaitStep(step: String, count: Int = 1) = real { while (steps.count { it == step } < count) stepReceipts.receive() }
 
     private fun json(body: String, code: Int = 200) = MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build()
 
@@ -192,16 +240,20 @@ class WakeWorkerTest {
         routes["/api/sessions/$key/messages"] = { json("""{"session_id":"$key","data":[{"id":10,"role":"user","content":"hi","timestamp":1.0}]}""") }
     }
 
+    private suspend fun session(key: String) = db.sessionDao().upsert(
+        SessionEntity(key, key, "", "Chat $key", pinned = false, archived = false, startedAt = 1.0, lastActiveAt = null, messageCount = 0, preview = null, stale = false, existsOnServer = true),
+    )
+
     private suspend fun stored(run: String, key: String = A, startedAt: Long = 1L, status: String = "running") {
-        db.sessionDao().upsert(
-            SessionEntity(key, key, "", "Chat $key", pinned = false, archived = false, startedAt = 1.0, lastActiveAt = null, messageCount = 0, preview = null, stale = false, existsOnServer = true),
-        )
+        session(key)
         db.activeRunDao().upsert(ActiveRunEntity(run, key, null, status, startedAt))
     }
 
     private suspend fun shown(key: String) = container.notifier.idle().let { nm.activeNotifications.filter { it.tag == key } }
     private suspend fun text(key: String) = shown(key).single().notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+    private fun silent(n: Notification) = n.groupAlertBehavior == Notification.GROUP_ALERT_SUMMARY && n.group != null
     private fun statusReads() = requests.filter { it.startsWith("/v1/runs/") }.map { it.removePrefix("/v1/runs/") }
+    private fun summaries() = ShadowLog.getLogsForTag("ApofisWake").map { it.msg }
 
     // Single outcomes, run directly.
 
@@ -230,8 +282,7 @@ class WakeWorkerTest {
         requests.clear()
         db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:run_old", A, "run_old", 5L, "FINISHED", epoch(), 0))
         runWake()
-        val n = shown(A).single().notification
-        assertTrue("silent replay", n.groupAlertBehavior == Notification.GROUP_ALERT_SUMMARY && n.group != null)
+        assertTrue("silent replay", silent(shown(A).single().notification))
         assertTrue(requests.isEmpty())
     }
 
@@ -244,7 +295,33 @@ class WakeWorkerTest {
         push()
         assertEquals(ListenableWorker.Result.success(), runWake())
         assertEquals(listOf("run_a"), statusReads())
-        assertTrue("no follow-up after a refused key", live().all { it.initialDelayMillis == 0L })
+        assertTrue("no follow-up after a refused key", live().none { it.initialDelayMillis > 0 })
+    }
+
+    @Test
+    fun oneSummaryLinePerCheck() = runTest {
+        // A 401 after a partial batch.
+        stored("run_1", startedAt = 1)
+        stored("run_2", startedAt = 2)
+        stored("run_3", startedAt = 3)
+        on("run_1", A, "running")
+        routes["/v1/runs/run_2"] = { json("""{"error":"unauthorized"}""", 401) }
+        on("run_3", A, "running")
+        check(ctx, target())
+        assertEquals(listOf("cause=push runs=3 settled=1 failed=1 outcome=DONE"), summaries())
+        // Several per-run failures.
+        ShadowLog.clear()
+        routes["/v1/runs/run_2"] = { MockResponse.Builder().code(503).build() }
+        routes["/v1/runs/run_3"] = { MockResponse.Builder().code(503).build() }
+        check(ctx, target(), CAUSE_PERIODIC)
+        assertEquals(listOf("cause=periodic runs=3 settled=1 failed=2 outcome=RETRY"), summaries())
+        // An early failure, before any run.
+        ShadowLog.clear()
+        db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:run_old", A, "run_old", 5L, "FINISHED", epoch(), 0))
+        container.notifier.beforePost = { throw IllegalStateException("tray") }
+        runCatching { check(ctx, target()) }
+        assertEquals(listOf("cause=push runs=0 settled=0 failed=0 outcome=none"), summaries())
+        assertTrue("no ids, no other lines", ShadowLog.getLogsForTag("ApofisWake").none { "run_" in it.msg || A in it.msg })
     }
 
     @Test
@@ -287,16 +364,14 @@ class WakeWorkerTest {
         assertEquals("the other runs are read", ids.drop(2), statusReads().filter { it != "run_1" && it != "run_2" })
         assertEquals(ListenableWorker.Result.retry(), runWake(attempt = 1))
         assertEquals("the third execution ends", ListenableWorker.Result.success(), runWake(attempt = 2))
-        assertEquals("and asks for a follow-up", 10_000L, live().single().initialDelayMillis)
         on("run_1", A, "running") // only the 503 left: it alone retries
         assertEquals(ListenableWorker.Result.retry(), runWake(attempt = 0))
     }
 
     @Test
     fun aFailedCheckRetries() = runTest {
+        session(A)
         db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:run_old", A, "run_old", 5L, "FINISHED", epoch(), 0))
-        stored("run_x") // a session row for the replay to name
-        db.activeRunDao().delete("run_x")
         container.notifier.beforePost = { throw IllegalStateException("tray") }
         assertEquals(ListenableWorker.Result.retry(), runWake())
     }
@@ -315,6 +390,7 @@ class WakeWorkerTest {
             batches += statusReads()
         }
         assertEquals(listOf(ids.subList(0, 8), ids.subList(8, 16), ids.subList(16, 20) + ids.subList(0, 4), ids.subList(4, 12)), batches)
+        assertTrue("nothing of the cursor in the mark's file", wakePrefs(app).all.keys.none { it != WAKE_PENDING && it != WAKE_LOST })
     }
 
     @Test
@@ -322,17 +398,20 @@ class WakeWorkerTest {
         stored("run_a")
         val approval = """{"kind":"approval","prompt_id":"p1","execution_generation":2,"command":"rm x","question":null}"""
         routes["/v1/runs/run_a"] = { status("run_a", A, "waiting_for_approval", approval) }
-        runWake()
+        push()
+        runJob()
         assertEquals(app.getString(R.string.notif_needs_answer), text(A))
-        assertEquals("a follow-up is due", 10_000L, live().single().initialDelayMillis)
+        assertEquals("a follow-up is due", Input(epoch(), CAUSE_RECHECK, 1), input(live().single().id))
     }
 
     @Test
-    fun foregroundCheckLeavesTheFollowersAlone() = runTest {
-        db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:run_old", A, "run_old", 5L, "FINISHED", epoch(), 0))
-        target().connected.follower.resumeAll() // shown: the followers own runs and notices
+    fun foregroundReplaysAnOutboxRowOfAnotherChat() = runTest {
+        session(B)
+        db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:run_old", B, "run_old", 5L, "FINISHED", epoch(), 0))
+        target().connected.follower.resumeAll() // the app is shown, another chat open
         runWake()
-        assertEquals("not replayed silently under the followers", 1, db.noticeOutboxDao().all(epoch()).size)
+        assertTrue("replayed, not left behind", db.noticeOutboxDao().all(epoch()).isEmpty())
+        assertTrue(silent(shown(B).single().notification))
     }
 
     @Test
@@ -360,7 +439,7 @@ class WakeWorkerTest {
         for (absent in listOf("FOREGROUND_SERVICE", "SystemForegroundService", "RaiseToForegroundService")) assertFalse(absent, absent in manifest)
     }
 
-    // The mark.
+    // The mark and the cursor.
 
     @Test
     fun markReadersWaitForAFailingCommit() = runTest {
@@ -381,11 +460,16 @@ class WakeWorkerTest {
         val watchdog = System.nanoTime() + 10_000_000_000
         while (reader.state != Thread.State.BLOCKED && System.nanoTime() < watchdog) Thread.yield()
         assertEquals("the reader waits for the push lock", Thread.State.BLOCKED, reader.state)
+        // Meanwhile a check advances its cursor: it writes its own file, not the mark's.
+        stored("run_a")
+        on("run_a", A, "running")
+        check(failingCtx, target())
         release.countDown()
         pushing.join(10_000)
         reader.join(10_000)
         assertNull("rolled back before it could be read", seen)
-        assertNull(failing.disk[WAKE_PENDING])
+        assertEquals(emptyMap<String, Any?>(), failing.disk)
+        assertEquals("run_a", app.getSharedPreferences(CURSOR_PREFS, Context.MODE_PRIVATE).getString(CURSOR_ID, null))
         failing.onCommit = { true }
         assertTrue(PushStore.locked { Wake.onPush(failingCtx, epoch()) })
         assertEquals(epoch(), pendingWake(failingCtx))
@@ -396,8 +480,30 @@ class WakeWorkerTest {
         push()
         assertEquals(Cleared.STALE, clearPendingWake(app, epoch() - 1))
         assertEquals(epoch(), pendingWake(app))
-        assertEquals(Cleared.CLEARED, clearPendingWake(app, epoch()))
+        assertEquals(Cleared.REMOVED, clearPendingWake(app, epoch()))
+        assertEquals(Cleared.NONE, clearPendingWake(app, epoch()))
         assertNull(pendingWake(app))
+    }
+
+    @Test
+    fun aLateLastSettleAcrossASwitchLeavesTheNewCursor() = runTest {
+        val ids = (1..10).map { "run_%02d".format(it) }
+        ids.forEachIndexed { i, id ->
+            stored(id, startedAt = i + 1L)
+            on(id, A, "running")
+        }
+        val held = CompletableDeferred<Unit>()
+        barrier = { if (it == "settled run_08") withTimeout(10_000) { held.await() } }
+        val old = target()
+        val checking = async(Dispatchers.Default) { check(ctx, old) }
+        awaitStep("settled run_08")
+        container.connect(Credentials(url(), "key-2")) // same server: the runs are kept
+        held.complete(Unit) // the old check returns from its last settle and writes its cursor
+        real { checking.await() }
+        barrier = {}
+        requests.clear()
+        check(ctx, target())
+        assertEquals("the new connection starts at its own beginning", ids.subList(0, 8), statusReads())
     }
 
     // The status store across a switch.
@@ -410,7 +516,7 @@ class WakeWorkerTest {
         val old = container.connected()!!
         val paused = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
-        old.follower.beforeStatusStore = { if (!paused.isCompleted) { paused.complete(Unit); release.await() } }
+        old.follower.beforeStatusStore = { if (!paused.isCompleted) { paused.complete(Unit); withTimeout(10_000) { release.await() } } }
         val checking = async(Dispatchers.Default) { check(ctx, WakeTarget(old, old.generation, container.notifier)) }
         real { paused.await() }
         container.connect(Credentials(url(), "key-2")) // same server, new key: run_a is kept
@@ -431,18 +537,22 @@ class WakeWorkerTest {
         stored("run_a")
         on("run_a", A, "completed")
         PushStore.locked { Wake.onPush(app, epoch()) } // the process dies right after the hand-off
-        // A new process: a fresh container on the same disk; its start hands the mark on.
-        container = newContainer()
+        restart()
         recoverPush(app, Wake)
-        assertEquals(1, live().size)
+        Wake.idle()
+        val job = live().single()
+        assertEquals(Input(epoch(), CAUSE_PUSH, 0), input(job.id))
+        assertTrue(expedited(job.id))
+        var atEntry: Pair<Long?, Int>? = null
+        barrier = { if (it == "entered") atEntry = pendingWake(app) to requests.size }
         assertEquals(WorkInfo.State.SUCCEEDED, runJob().state)
+        assertEquals("the mark is gone before the check's first request", null to 0, atEntry)
         awaitRequests(3)
         assertEquals(listOf("/api/sessions", "/api/sessions/$A/messages", "/v1/runs/run_a"), requests.sorted())
         assertEquals(app.getString(R.string.notif_reply_finished), text(A))
-        assertNull(pendingWake(app))
         assertTrue("nothing left to do", live().isEmpty())
-        val lines = ShadowLog.getLogsForTag("ApofisWake").map { it.msg }
-        assertEquals(listOf("cause=push runs=1"), lines)
+        assertEquals(listOf(Input(epoch(), CAUSE_PUSH, 0)), started)
+        assertEquals(listOf("cause=push runs=1 settled=1 failed=0 outcome=DONE"), summaries())
     }
 
     @Test
@@ -451,9 +561,33 @@ class WakeWorkerTest {
         on("run_a", A, "completed")
         PushStore.locked { Wake.onPush(app, epoch()) } // dies before the request
         assertTrue(jobs().isEmpty())
+        restart()
         recoverPush(app, Wake) // the next process start, with no further push
+        Wake.idle()
         runJob()
         assertEquals(1, shown(A).size)
+    }
+
+    @Test
+    fun aJobStoppedAfterClearingTheMarkRunsAgainAfterARestart() = runTest {
+        stored("run_a")
+        on("run_a", A, "completed")
+        push()
+        val held = CompletableDeferred<Unit>()
+        barrier = { if (it == "cleared") withTimeout(10_000) { held.await() } }
+        release(live().single())
+        awaitStep("cleared")
+        assertNull("cleared", pendingWake(app))
+        // The process dies here. WorkManager reruns the persisted spec (the test WorkManager cannot reset a running
+        // spec after a death, so the rerun gets that spec's input, as recorded by the factory).
+        val persisted = started.single()
+        barrier = {}
+        restart()
+        TestListenableWorkerBuilder.from(ctx, WakeWorker::class.java)
+            .setInputData(workDataOf(EPOCH to persisted.epoch, CAUSE to persisted.cause, FOLLOW_UP to persisted.followUp)).build().doWork()
+        assertEquals("checked with no mark left", listOf("run_a"), statusReads())
+        assertEquals(1, shown(A).size)
+        held.complete(Unit)
     }
 
     @Test
@@ -461,11 +595,34 @@ class WakeWorkerTest {
         stored("run_a")
         on("run_a", A, "completed")
         push() // the network is away: the job waits
-        repeat(3) { recoverPush(app, Wake) } // three process starts before it returns
+        repeat(3) {
+            restart()
+            recoverPush(app, Wake) // three process starts before it returns
+            Wake.idle()
+        }
         assertEquals(1, live().size)
         runJob()
         assertEquals(listOf("run_a"), statusReads())
         assertTrue(live().isEmpty())
+    }
+
+    @Test
+    fun aFailedInstallIsTriedOnceMoreThenTheMarkStays() = runTest {
+        stored("run_a")
+        on("run_a", A, "completed")
+        var failures = 1
+        Wake.beforeInstall = { if (failures-- > 0) throw IllegalStateException("database full") }
+        push()
+        assertEquals("installed on the second try", 1, live().size)
+        wm.cancelAllWork().result.get()
+        failures = 2
+        push()
+        assertTrue("nothing installed", live().isEmpty())
+        assertEquals("the mark stays for the next trigger", epoch(), pendingWake(app))
+        Wake.recover(app) // say, the next process start
+        Wake.idle()
+        runJob()
+        assertEquals(1, shown(A).size)
     }
 
     @Test
@@ -477,10 +634,12 @@ class WakeWorkerTest {
         push()
         val failed = runJob()
         assertEquals("in backoff", WorkInfo.State.ENQUEUED, failed.state)
+        assertEquals(1, failed.runAttemptCount)
         push()
         val next = live().single()
         assertNotEquals("replaced by a fresh job", failed.id, next.id)
         assertEquals(0, next.runAttemptCount)
+        assertTrue("expedited", expedited(next.id))
         runJob()
         assertEquals(1, shown(A).size)
     }
@@ -494,9 +653,9 @@ class WakeWorkerTest {
         push()
         val first = live().single().id
         var pushed = false
-        wakeStep = { if (it == "settled run_a" && !pushed) { pushed = true; push() } }
+        barrier = { if (it == "settled run_a" && !pushed) { pushed = true; push() } }
         driver.setAllConstraintsMet(first)
-        val replaced = real { wm.getWorkInfoByIdFlow(first).first { it == null || it.state.isFinished } }
+        val replaced = awaitEnd(first)
         assertTrue(replaced == null || replaced.state == WorkInfo.State.CANCELLED)
         assertEquals("the replaced check went no further", listOf("run_a"), statusReads())
         runJob()
@@ -508,22 +667,55 @@ class WakeWorkerTest {
     }
 
     @Test
-    fun aPushAfterTheLastScanGetsItsOwnCheck() = runTest {
+    fun aPushAfterTheLastScanGetsAnImmediateFreshJob() = runTest {
         stored("run_a")
         on("run_a", A, "running", "completed")
         push()
         val first = live().single().id
         var pushed = false
-        wakeStep = { if (it == "checked" && !pushed) { pushed = true; push() } } // after the last scan, before the return
+        // After the last scan: the receiver's commit only (its request comes later, from another thread).
+        barrier = { if (it == "checked" && !pushed) { pushed = true; PushStore.locked { Wake.onPush(app, epoch()) } } }
         driver.setAllConstraintsMet(first)
-        real { wm.getWorkInfoByIdFlow(first).first { it == null || it.state.isFinished } }
+        awaitEnd(first)
+        Wake.idle() // the finishing job's follow-up request meets the pending mark
         assertEquals(epoch(), pendingWake(app))
         val next = live().single()
-        assertNotEquals(first, next.id)
-        assertEquals("a push job, not a delayed follow-up", 0L, next.initialDelayMillis)
+        assertEquals("the mark wins over the follow-up", Input(epoch(), CAUSE_PUSH, 0), input(next.id))
+        assertEquals(0L, next.initialDelayMillis)
+        assertTrue(expedited(next.id))
+        Wake.recover(app) // the receiver's request
+        Wake.idle()
         runJob()
         assertEquals(listOf("run_a", "run_a"), statusReads())
         assertEquals(1, shown(A).size)
+    }
+
+    @Test
+    fun aFollowUpFromAReplacedJobChangesNothing() = runTest {
+        stored("run_a")
+        on("run_a", A, "running")
+        push()
+        val j1 = live().single().id
+        // J1 is replaced by a fresh push before it ran; its late request meets the push's pending mark.
+        push()
+        Wake.post(app, WakeRequest.FollowUp(1, j1))
+        Wake.idle()
+        val j2 = live().single()
+        assertEquals(Input(epoch(), CAUSE_PUSH, 0), input(j2.id))
+        assertTrue(expedited(j2.id))
+        assertEquals(0L, j2.initialDelayMillis)
+        // J2 runs and clears the mark; J1's late request arrives during its check and must not replace it.
+        val held = CompletableDeferred<Unit>()
+        barrier = { if (it == "entered") withTimeout(10_000) { held.await() } }
+        release(j2)
+        awaitStep("entered")
+        Wake.post(app, WakeRequest.FollowUp(1, j1))
+        Wake.idle()
+        held.complete(Unit)
+        assertEquals("J2 ran to its end", WorkInfo.State.SUCCEEDED, awaitEnd(j2.id)?.state ?: WorkInfo.State.SUCCEEDED)
+        Wake.idle()
+        assertEquals(listOf("run_a"), statusReads())
+        assertEquals("J2's own follow-up", Input(epoch(), CAUSE_RECHECK, 1), input(live().single().id))
     }
 
     @Test
@@ -538,6 +730,7 @@ class WakeWorkerTest {
         }
         container.connect(Credentials(url(), "key-2")) // same server: run_a is kept
         container.afterSwitchMarker = {}
+        Wake.idle()
         assertTrue("requested at publication, with no further push", live().isNotEmpty())
         runJob()
         assertEquals(listOf("run_a"), statusReads())
@@ -550,21 +743,65 @@ class WakeWorkerTest {
         stored("run_a")
         on("run_a", A, "running")
         push()
-        val delays = mutableListOf<Long>()
+        val queued = mutableListOf<Pair<Input, Long>?>()
         repeat(4) {
             runJob()
-            delays += live().singleOrNull()?.initialDelayMillis ?: -1
+            queued += live().singleOrNull()?.let { input(it.id) to it.initialDelayMillis }
         }
-        assertEquals(listOf(10_000L, 30_000L, 90_000L, -1L), delays)
+        val e = epoch()
+        assertEquals(listOf(Input(e, CAUSE_RECHECK, 1) to 10_000L, Input(e, CAUSE_RECHECK, 2) to 30_000L, Input(e, CAUSE_RECHECK, 3) to 90_000L, null), queued)
+        assertEquals(listOf(Input(e, CAUSE_PUSH, 0), Input(e, CAUSE_RECHECK, 1), Input(e, CAUSE_RECHECK, 2), Input(e, CAUSE_RECHECK, 3)), started)
         assertEquals(4, statusReads().size)
         push()
         runJob()
         runJob()
         assertEquals("30 s follow-up pending", 30_000L, live().single().initialDelayMillis)
+        assertFalse("a follow-up is not expedited", expedited(live().single().id))
         push() // replaces the waiting follow-up
-        assertEquals(0L, live().single().initialDelayMillis)
+        assertEquals(Input(e, CAUSE_PUSH, 0), input(live().single().id))
         runJob()
-        assertEquals("the sequence starts again", 10_000L, live().single().initialDelayMillis)
+        assertEquals("the sequence starts again", Input(e, CAUSE_RECHECK, 1), input(live().single().id))
+    }
+
+    @Test
+    fun aThirdFollowUpThatClearsAFreshMarkStartsAFreshSequence() = runTest {
+        stored("run_a")
+        on("run_a", A, "running")
+        push()
+        repeat(3) { runJob() }
+        val third = live().single()
+        assertEquals(Input(epoch(), CAUSE_RECHECK, 3), input(third.id))
+        PushStore.locked { Wake.onPush(app, epoch()) } // a push lands; its request has not come yet
+        runJob()
+        assertNull(pendingWake(app))
+        assertEquals("a fresh budget: the sequence starts again", Input(epoch(), CAUSE_RECHECK, 1), input(live().single().id))
+    }
+
+    @Test
+    fun checksNeverOverlapAndAFinishKeepsItsAlert() = runTest {
+        stored("run_a")
+        on("run_a", A, "completed")
+        val inFinish = CompletableDeferred<Unit>()
+        val held = CompletableDeferred<Unit>()
+        target().connected.follower.afterOutboxWrite = { if (!inFinish.isCompleted) { inFinish.complete(Unit); withTimeout(10_000) { held.await() } } }
+        push()
+        val j1 = live().single().id
+        release(live().single())
+        real { inFinish.await() } // J1 is in its finish transaction, not cancellable
+        push() // replaces J1
+        val j2 = live().single()
+        assertNotEquals(j1, j2.id)
+        release(j2) // the successor's constraints are released at once
+        awaitStep("cleared", 2)
+        assertEquals("no second check enters while the first is in its finish", 1, steps.count { it == "entered" })
+        held.complete(Unit)
+        awaitEnd(j2.id)
+        Wake.idle()
+        assertEquals(2, steps.count { it == "entered" })
+        val n = shown(A).single().notification
+        assertFalse("the normal alert, not a silent replay", silent(n))
+        assertTrue(db.noticeOutboxDao().all(epoch()).isEmpty())
+        assertTrue(live().isEmpty())
     }
 
     @Test
@@ -592,6 +829,10 @@ class WakeWorkerTest {
         driver.setAllConstraintsMet(periodic.id)
         driver.setPeriodDelayMet(periodic.id)
         awaitWork { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
+        val job = live().single()
+        assertEquals(Input(epoch(), CAUSE_PERIODIC, 0), input(job.id))
+        assertFalse("a tick spends no expedited quota", expedited(job.id))
         runJob()
         assertEquals(app.getString(R.string.notif_reply_finished), text(A))
     }
@@ -603,45 +844,132 @@ class WakeWorkerTest {
         assertEquals(TimeUnit.MINUTES.toMillis(15), w.periodicityInfo!!.repeatIntervalMillis)
         assertEquals(TimeUnit.MINUTES.toMillis(15), w.initialDelayMillis)
         assertEquals(NetworkType.CONNECTED, w.constraints.requiredNetworkType)
+        assertEquals(Input(epoch(), CAUSE_TICK, 0), input(w.id))
         db.activeRunDao().delete("run_a")
         awaitWork(CHECK_WORK) { it.none { w -> !w.state.isFinished } }
         stored("run_b", B)
         awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
         // Cold start: a run is stored, no check is scheduled (lost with the last process).
-        Wake.reconcilePeriodic(app, epoch(), false)
-        container = newContainer()
-        container.connected()
+        wm.cancelUniqueWork(CHECK_WORK).result.get()
+        restart()
         awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
         // A switch to another server clears the stored runs, and with them the check.
         container.connect(Credentials("https://b.example/", "key-b"))
+        Wake.idle()
         assertTrue(live(CHECK_WORK).isEmpty())
     }
 
+    /** Holds the lane at each request [hold] selects, one at a time, with a receipt when it arrives there. */
+    private inner class LaneGate(private val hold: (WakeRequest) -> Boolean) {
+        val arrived = Channel<WakeRequest>(Channel.UNLIMITED)
+        private val go = java.util.concurrent.LinkedBlockingQueue<Unit>()
+        init {
+            Wake.laneStep = { r -> if (hold(r)) { arrived.trySend(r); go.poll(10, TimeUnit.SECONDS) } }
+        }
+        suspend fun next(): WakeRequest = real { arrived.receive() }
+        fun release() = go.put(Unit)
+    }
+
     @Test
-    fun oldWorkAfterAKeyChangeDoesNothingAndTheNewEpochKeepsItsCheck() = runTest {
+    fun aStaleCollectorDecisionLastStillLeavesTheNewEpochsCheck() = runTest {
         stored("run_a")
-        on("run_a", A, "running")
-        val before = awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }.single { !it.state.isFinished }
-        val old = epoch()
-        Wake.request(app, old, CAUSE_RECHECK, 1) // a follow-up of the old connection, waiting
-        container.connect(Credentials(url(), "key-2")) // same server: run_a is kept
-        assertTrue("the old wake work is cancelled", live().isEmpty())
-        val after = live(CHECK_WORK).single()
-        assertNotEquals("a periodic check of the new epoch, from the kept run, with no push", before.id, after.id)
-        // The old connection's tick, follow-up and push job: no effect.
-        assertEquals(ListenableWorker.Result.success(), runWake(CAUSE_TICK, epoch = old))
-        assertEquals(ListenableWorker.Result.success(), runWake(CAUSE_RECHECK, epoch = old, followUp = 1))
-        assertEquals(ListenableWorker.Result.success(), runWake(CAUSE_PUSH, epoch = old))
-        assertTrue(requests.isEmpty())
-        assertTrue(live().isEmpty())
-        // The new epoch's tick checks the kept run with the new key.
-        driver.setInitialDelayMet(after.id)
-        driver.setAllConstraintsMet(after.id)
-        driver.setPeriodDelayMet(after.id)
+        awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
+        // The collector's request is held at the lane while the key changes (the run is kept); the switch's cancel
+        // waits behind it. The held request decides from what is current when it runs, not when it was posted.
+        val gate = LaneGate { it is WakeRequest.Reconcile || it == WakeRequest.Cancel }
+        Wake.post(app, WakeRequest.Reconcile { db.activeRunDao().any() })
+        assertTrue(gate.next() is WakeRequest.Reconcile)
+        container.connect(Credentials(url(), "key-2"))
+        gate.release()
+        assertEquals(WakeRequest.Cancel, gate.next()) // the held reconcile is done
+        assertEquals("it installed the current epoch's timer", Input(epoch(), CAUSE_TICK, 0), input(live(CHECK_WORK).single().id))
+        gate.release()
+        assertTrue(gate.next() is WakeRequest.Reconcile) // publication's
+        gate.release()
+        Wake.idle()
+        Wake.laneStep = {}
+        val periodic = live(CHECK_WORK).single()
+        assertEquals("the timer belongs to the current epoch, with no push", Input(epoch(), CAUSE_TICK, 0), input(periodic.id))
+        on("run_a", A, "completed")
+        driver.setInitialDelayMet(periodic.id)
+        driver.setAllConstraintsMet(periodic.id)
+        driver.setPeriodDelayMet(periodic.id)
         awaitWork { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
         runJob()
         assertEquals(listOf("run_a"), statusReads())
         assertEquals(listOf("Bearer key-2"), auth.distinct())
+    }
+
+    @Test
+    fun aStalePublicationCancelLastStillLeavesTheCheck() = runTest {
+        assertTrue(live(CHECK_WORK).isEmpty())
+        // Publication's reconcile is held at the lane while no run is stored; a run is inserted meanwhile. The held
+        // request reads the stored runs when it runs, so it installs the timer itself (before the collector's own).
+        val gate = LaneGate { it is WakeRequest.Reconcile }
+        container.connect(Credentials(url(), "key-2"))
+        gate.next()
+        stored("run_a")
+        gate.release()
+        gate.next() // the collector's: the held one is done
+        assertEquals(Input(epoch(), CAUSE_TICK, 0), input(live(CHECK_WORK).single().id))
+        gate.release()
+        Wake.idle()
+        Wake.laneStep = {}
+        assertEquals(Input(epoch(), CAUSE_TICK, 0), input(live(CHECK_WORK).single().id))
+    }
+
+    @Test
+    fun oldWorkAfterAKeyChangeDoesNothingAndTheNewConnectionIsServed() = runTest {
+        stored("run_a")
+        on("run_a", A, "running")
+        val epochA = epoch()
+        push()
+        val oldJob = live().single().id
+        container.connect(Credentials(url(), "key-2")) // same server: run_a is kept; the old wake work is cancelled
+        Wake.idle()
+        assertNull(jobs().firstOrNull { it.id == oldJob && !it.state.isFinished })
+        // The new connection's push, then the old connection's producers, each released only now.
+        push()
+        val pushJob = live().single()
+        Wake.recover(app)
+        Wake.post(app, WakeRequest.Tick)
+        Wake.post(app, WakeRequest.FollowUp(1, oldJob))
+        Wake.idle()
+        val job = live().single()
+        assertEquals("still the new connection's push job", Input(epoch(), CAUSE_PUSH, 0), input(job.id))
+        assertTrue(expedited(job.id))
+        // Stale inputs of the old epoch (A, then B, then A's URL again as C): no effect at all.
+        assertEquals(ListenableWorker.Result.success(), runWake(CAUSE_TICK, epoch = epochA))
+        assertEquals(ListenableWorker.Result.success(), runWake(CAUSE_RECHECK, epoch = epochA, followUp = 1))
+        assertEquals(ListenableWorker.Result.success(), runWake(CAUSE_PUSH, epoch = epochA))
+        assertTrue(requests.isEmpty())
+        assertEquals(epoch(), pendingWake(app))
+        assertEquals(job.id, live().single().id)
+        assertNotEquals(pushJob.id, oldJob)
+        runJob()
+        assertNull(pendingWake(app))
+        assertEquals(listOf("run_a"), statusReads())
+        assertEquals(listOf("Bearer key-2"), auth.distinct())
+    }
+
+    @Test
+    fun anAbaReturnLeavesOldInputsWithoutEffect() = runTest {
+        stored("run_a")
+        on("run_a", A, "completed")
+        val epochA = epoch()
+        container.connect(Credentials("https://b.example/", "key-b"))
+        container.connect(Credentials(url(), "key")) // A's URL again, a third epoch
+        assertEquals(epochA + 2, epoch())
+        stored("run_a")
+        push()
+        val current = live().single().id
+        assertEquals(ListenableWorker.Result.success(), runWake(CAUSE_PUSH, epoch = epochA))
+        assertTrue(requests.isEmpty())
+        assertEquals(current, live().single().id)
+        runJob()
+        assertEquals(listOf("run_a"), statusReads())
     }
 
     @Test
@@ -650,13 +978,14 @@ class WakeWorkerTest {
         stored("run_a")
         on("run_a", A, "completed")
         PushStore.locked { Wake.onPush(app, epoch()) }
-        container = newContainer() // process death; the cold load reads the epoch and keeps it
+        restart() // process death; the cold load reads the epoch and keeps it
         assertEquals(e, container.connected()!!.generation)
         assertEquals(e, epoch())
         assertEquals("a job of the previous epoch: nothing", ListenableWorker.Result.success(), runWake(epoch = e - 1))
         assertTrue(requests.isEmpty())
         assertEquals(e, pendingWake(app))
         recoverPush(app, Wake) // the start of that process hands the mark on
+        Wake.idle()
         runJob()
         assertEquals(1, shown(A).size)
     }

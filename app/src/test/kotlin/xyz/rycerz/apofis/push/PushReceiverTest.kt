@@ -342,32 +342,23 @@ class PushReceiverTest {
         assertTrue(ctx.sent.any { it.action == "org.unifiedpush.android.distributor.MESSAGE_ACK" })
     }
 
-    /**
-     * Stands in for the wake sink: the mark with its epoch, handed on as the one wake job (REPLACE) when it belongs to
-     * the current connection. Its job, [HandedOn], waits for the network like the real one.
-     */
-    private var epoch = 0L // the current connection epoch, as the stand-in's recovery sees it
-    private var wakeStore = wake // a restart reads it back from disk
+    private var epoch = 0L // a stand-in connection epoch for the lock-ordering test
+
+    /** The real wake sink, with a step logged where it hands on, so a death can be placed there. */
     private val wakeSink = object : PushSink {
-        override fun onPush(context: Context, epoch: Long) = wakeStore.edit().putLong(WAKE_PENDING, epoch).commit()
+        override fun onPush(context: Context, epoch: Long) = Wake.onPush(context, epoch)
         override fun recover(context: Context) {
             log.step("wake")
-            if (wakeStore.contains(WAKE_PENDING) && wakeStore.getLong(WAKE_PENDING, -1) == epoch) {
-                WorkManager.getInstance(context).enqueueUniqueWork("apofis-wake", androidx.work.ExistingWorkPolicy.REPLACE,
-                    androidx.work.OneTimeWorkRequestBuilder<HandedOn>().setConstraints(
-                        androidx.work.Constraints.Builder().setRequiredNetworkType(androidx.work.NetworkType.CONNECTED).build(),
-                    ).build())
-            }
+            Wake.recover(context)
+            Wake.idle()
         }
     }
 
-    private fun wakeJobs() = WorkManager.getInstance(app).getWorkInfosForUniqueWork("apofis-wake").get()
-    private fun runHandedOn() = wakeJobs().filter { !it.state.isFinished }.forEach { WorkManagerTestInitHelper.getTestDriver(app)!!.setAllConstraintsMet(it.id) }
+    private fun liveWakeJobs() = WorkManager.getInstance(app).getWorkInfosForUniqueWork(WAKE_WORK).get().filter { !it.state.isFinished }
 
     @Test
     fun deathAfterAck() = runTest {
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
-        HandedOn.runs.set(0)
         val (_, token) = enabled()
         val withWake = object : ContextWrapperWithWake(LogContext(app, log, prefs, wakeSink)) {}
         // MESSAGE: the mark is on disk before the ACK; the process dies after the ACK, before the first schedule.
@@ -378,19 +369,20 @@ class PushReceiverTest {
                 finish = { log.step("finish") }, schedule = schedule)
         }
         log.killAt = 0
+        Wake.idle()
         assertEquals(listOf("broadcast MESSAGE_ACK to $NTFY_PACKAGE", "death before wake"), log.events.take(2))
-        assertEquals(0L, wake.disk[WAKE_PENDING])
-        assertTrue("nothing scheduled before the death", wakeJobs().isEmpty())
-        // Restart: the process start hands the mark on; its job runs once the network is there.
-        wakeStore = wake.restart()
+        assertEquals(0L, wake.restart().disk[WAKE_PENDING])
+        assertTrue("nothing scheduled before the death", liveWakeJobs().isEmpty())
+        // Restart: the process start hands the mark on as the wake job (the real worker checks it; WakeWorkerTest).
         recoverPush(object : ContextWrapperWithWake(LogContext(app, log, prefs.restart(), wakeSink)) {}, wakeSink)
-        runHandedOn()
-        assertEquals("handed on and run once", 1, HandedOn.runs.get())
-        // A wake of the old connection is not handed on to the new one.
+        assertEquals(1, liveWakeJobs().size)
+        // A mark of the old connection is not handed on to the new one.
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
-        epoch++
-        wakeSink.recover(app)
-        assertTrue(wakeJobs().isEmpty())
+        val cache = app.getSharedPreferences(xyz.rycerz.apofis.CACHE_PREFS, Context.MODE_PRIVATE)
+        cache.edit().putLong(xyz.rycerz.apofis.CONNECTION_EPOCH, 1).commit()
+        wakeSink.recover(withWake)
+        assertTrue(liveWakeJobs().isEmpty())
+        cache.edit().putLong(xyz.rycerz.apofis.CONNECTION_EPOCH, 0).commit()
         // NEW_ENDPOINT: a process start schedules the publish, which completes it.
         log.killAt = log.count() + 3 // commit, ACK, death at schedule
         runCatching { deliver(intent("NEW_ENDPOINT", token) { putExtra("endpoint", VALID); putExtra("id", "m2") }) }
@@ -400,25 +392,6 @@ class PushReceiverTest {
         val restarted = registrar()
         assertTrue(restarted.publishPending())
         assertEquals(PushState.On(NTFY_PACKAGE), restarted.ui.value.state)
-    }
-
-    @Test
-    fun aPersistedJobHeldAcrossARestartRunsOnce() = runTest {
-        WorkManagerTestInitHelper.initializeTestWorkManager(app)
-        HandedOn.runs.set(0)
-        val (_, token) = enabled()
-        val withWake = object : ContextWrapperWithWake(LogContext(app, log, prefs, wakeSink)) {}
-        PushReceiver().receive(withWake, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule)
-        assertEquals("persisted, waiting for the network", 1, wakeJobs().count { !it.state.isFinished })
-        // Two restarts while it waits: each start hands the same mark on.
-        repeat(2) {
-            wakeStore = wake.restart()
-            recoverPush(object : ContextWrapperWithWake(LogContext(app, log, prefs.restart(), wakeSink)) {}, wakeSink)
-        }
-        assertEquals(0, HandedOn.runs.get())
-        assertEquals("still one job", 1, wakeJobs().count { !it.state.isFinished })
-        runHandedOn()
-        assertEquals(1, HandedOn.runs.get())
     }
 
     @Test
@@ -460,12 +433,14 @@ class PushReceiverTest {
         assertEquals(1L, wake.disk[WAKE_LOST])
         assertNull("the loss count's commit did not persist the failed mark", wake.disk[WAKE_PENDING])
         Wake.recover(real) // a process start now: nothing to hand on
+        Wake.idle()
         assertTrue("nothing to recover", WorkManager.getInstance(app).getWorkInfosForUniqueWork(WAKE_WORK).get().isEmpty())
         // The next push works.
         wake.onCommit = { true }
         PushReceiver().receive(real, intent("MESSAGE", token) { putExtra("bytesMessage", byteArrayOf(1)) }, {}, schedule)
         assertEquals(0L, wake.disk[WAKE_PENDING])
         assertEquals(1L, wake.disk[WAKE_LOST])
+        Wake.idle()
         assertEquals("its job is scheduled after the hand-off", 1, WorkManager.getInstance(app).getWorkInfosForUniqueWork(WAKE_WORK).get().size)
     }
 
@@ -588,6 +563,7 @@ class PushReceiverTest {
             }
         }
         recoverPush(counting, Wake) // as the app starts: no WorkManager, no database
+        Wake.idle() // the wake lane reads the epoch and the mark
         assertEquals(listOf(PUSH_PREFS, xyz.rycerz.apofis.CACHE_PREFS, WAKE_PREFS), read)
     }
 
@@ -632,10 +608,3 @@ class PushReceiverTest {
 }
 
 /** The stand-in wake job. */
-class HandedOn(context: Context, params: androidx.work.WorkerParameters) : androidx.work.Worker(context, params) {
-    override fun doWork() = Result.success().also { runs.incrementAndGet() }
-
-    companion object {
-        val runs = java.util.concurrent.atomic.AtomicInteger()
-    }
-}

@@ -101,9 +101,6 @@ class RunFollower(
     private val jobs = HashMap<String, Job>() // by run id; it also guards [foreground] and [stopping]
     private val stopping = HashMap<String, Job>() // cancelled jobs still completing, by run id; waited for before a restart
     @Volatile private var foreground = false // opened by resumeAll, closed by pauseAll; no follower starts while closed
-
-    /** True while the followers own the runs (the app is shown): a background check leaves them and their notices alone. */
-    val inForeground: Boolean get() = foreground
     private val seqs = ConcurrentHashMap<String, Long>() // last applied seq by run id; matches the live text across pauseAll
     private val rejected = MutableStateFlow(false)
     private val refreshers = ConcurrentHashMap<String, Refresher>() // by run id

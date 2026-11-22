@@ -46,6 +46,7 @@ import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.RealUnifiedPush
 import xyz.rycerz.apofis.push.UnifiedPushPort
 import xyz.rycerz.apofis.push.Wake
+import xyz.rycerz.apofis.push.WakeRequest
 import xyz.rycerz.apofis.push.TestPush
 import xyz.rycerz.apofis.push.pushPolicy
 import xyz.rycerz.apofis.push.pushPrefs
@@ -162,10 +163,11 @@ class AppContainer(
     // One database for the app's lifetime; it outlives credential changes.
     private val db by lazy(openDatabase)
     private val cachePrefs = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
+    private val reconcile = WakeRequest.Reconcile { db.activeRunDao().any() } // read by the wake lane when it acts
 
     init {
         // The fallback check runs while any run is stored, push on or off; also reconciled when a connection is published.
-        scope.launch { db.activeRunDao().observeAny().distinctUntilChanged().collect { Wake.reconcilePeriodic(app, epoch(), it) } }
+        scope.launch { db.activeRunDao().observeAny().distinctUntilChanged().collect { Wake.post(app, reconcile) } }
     }
 
     // Guarded by this.
@@ -334,7 +336,7 @@ class AppContainer(
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
-                Wake.cancelAll(app) // before the epoch moves on, so no job of the new connection can be cancelled
+                Wake.post(app, WakeRequest.Cancel) // ordered in the wake lane before anything of the new connection
                 // The one place the epoch advances: with the marker, in one commit, inside the notifier's lane (so no
                 // notice, clear or tap of the old one is accepted afterwards, and its notifications and rows go) and
                 // under the push lock (so no wake or registration check falls between). A death here is finished by
@@ -437,10 +439,10 @@ class AppContainer(
 
     // A connection was published: a wake pending for its epoch is served now, with no further push; its periodic check
     // is created from the stored runs (the switch cancelled the old one).
-    private suspend fun onPublished() = runCatching {
+    private fun onPublished() {
         Wake.recover(app)
-        Wake.reconcilePeriodic(app, epoch(), db.activeRunDao().any())
-    }.onFailure(::logFailure)
+        Wake.post(app, reconcile)
+    }
 
     // On every start with a connection and after every switch, so a process death between cancelling the durable
     // work and enqueueing it again cannot strand queued sends. Idempotent: unique work, KEEP.
