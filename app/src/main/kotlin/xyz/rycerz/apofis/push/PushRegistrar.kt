@@ -1,0 +1,527 @@
+package xyz.rycerz.apofis.push
+
+import android.annotation.SuppressLint
+import android.app.BroadcastOptions
+import android.app.PendingIntent
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.content.SharedPreferences
+import android.os.Build
+import android.os.Bundle
+import android.util.Log
+import java.io.IOException
+import java.security.SecureRandom
+import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import org.unifiedpush.android.connector.UnifiedPush
+import xyz.rycerz.apofis.api.ApiError
+
+internal fun recordId(installId: String, seq: Int) = "apofis-push-$installId-$seq"
+internal const val VERIFY_EVERY_MS = 3_600_000L
+internal const val ROTATE_AFTER_MS = 30L * 24 * 3_600_000L
+internal const val MAX_SEQ = 999_999
+private const val MAX_CREATES = 3
+private const val REQUEST_TIMEOUT_MS = 15_000L
+private const val TAG = "Apofis"
+private const val ACTION_REGISTER = "org.unifiedpush.android.distributor.REGISTER"
+private const val ACTION_UNREGISTER = "org.unifiedpush.android.distributor.UNREGISTER"
+
+/** The connector calls the registrar needs; every one passes [PlainKeyManager]. */
+interface UnifiedPushPort {
+    fun distributors(c: Context): List<String>
+    fun saved(c: Context): String?
+    fun acked(c: Context): String?
+    fun save(c: Context, d: String)
+
+    /** [journal] (distributor, token) runs before each REGISTER broadcast; if it throws, nothing is sent. */
+    fun register(c: Context, instance: String, journal: (String, String) -> Unit)
+
+    /**
+     * Unregisters [r] from its journaled token; with [connector], also its instance through the connector. A token the
+     * current instance replaced is unregistered without [connector], which would drop the replacement too.
+     */
+    fun unregister(c: Context, r: Registration, connector: Boolean)
+}
+
+object RealUnifiedPush : UnifiedPushPort {
+    override fun distributors(c: Context): List<String> = UnifiedPush.getDistributors(c)
+    override fun saved(c: Context) = UnifiedPush.getSavedDistributor(c)
+    override fun acked(c: Context) = UnifiedPush.getAckDistributor(c)
+    override fun save(c: Context, d: String) = UnifiedPush.saveDistributor(c, d)
+    override fun register(c: Context, instance: String, journal: (String, String) -> Unit) =
+        UnifiedPush.register(Journaling(c, journal), instance, null, null, PlainKeyManager)
+
+    override fun unregister(c: Context, r: Registration, connector: Boolean) {
+        // The connector deletes its token before broadcasting (U/UnifiedPush.kt:320-336), so a death there would lose the
+        // UNREGISTER; ours goes first from the journal. Distributors ignore a repeated UNREGISTER.
+        if (r.distributor != null && r.token != null) broadcastUnregister(c, r.distributor, r.token)
+        if (connector) UnifiedPush.unregister(c, r.instance, PlainKeyManager)
+    }
+
+    // As the connector sends it (U/UnifiedPush.kt:338-361).
+    private fun broadcastUnregister(c: Context, distributor: String, token: String) {
+        val pi = PendingIntent.getBroadcast(c, 0, Intent("org.unifiedpush.dummy_app"), PendingIntent.FLAG_IMMUTABLE)
+        val intent = Intent(ACTION_UNREGISTER).setPackage(distributor).putExtra("token", token).putExtra("pi", pi)
+        if (Build.VERSION.SDK_INT >= 34) {
+            c.sendBroadcast(intent, null, BroadcastOptions.makeBasic().setShareIdentityEnabled(true).toBundle())
+        } else {
+            c.sendBroadcast(intent)
+        }
+    }
+}
+
+/** Runs the journal before the connector's REGISTER broadcast leaves the app. */
+private class Journaling(base: Context, private val journal: (String, String) -> Unit) : ContextWrapper(base) {
+    private fun before(i: Intent) {
+        if (i.action == ACTION_REGISTER) journal(i.`package` ?: error("no distributor"), i.getStringExtra("token") ?: error("no token"))
+    }
+    override fun sendBroadcast(intent: Intent) = before(intent).also { super.sendBroadcast(intent) }
+    override fun sendBroadcast(intent: Intent, receiverPermission: String?) = before(intent).also { super.sendBroadcast(intent, receiverPermission) }
+    override fun sendBroadcast(intent: Intent, receiverPermission: String?, options: Bundle?) =
+        before(intent).also { super.sendBroadcast(intent, receiverPermission, options) }
+}
+
+/** The connection changed during an operation: it ends without another request or result. */
+private class Stale : Exception()
+
+/**
+ * Every call checks [live] (connection and connection epoch unchanged) under the push lock, so atomically with the
+ * epoch's advance, right before it starts and before its result, value or error, is used.
+ */
+private class Guarded(private val a: RecordApi, live: () -> Boolean) : RecordApi {
+    private val live = { PushStore.locked(live) }
+    override val server get() = a.server
+    private suspend fun <T> g(block: suspend () -> T): T {
+        if (!live()) throw Stale()
+        val result = try {
+            // Bounded: a hung server does not hold the registrar (and so a switch or Off) for the client's 120 s.
+            try {
+                withTimeout(REQUEST_TIMEOUT_MS) { block() }
+            } catch (_: TimeoutCancellationException) {
+                throw IOException("push record request timed out")
+            }
+        } catch (e: Exception) {
+            if (!live() && e !is CancellationException) throw Stale()
+            throw e
+        }
+        if (!live()) throw Stale()
+        return result
+    }
+    override suspend fun create(id: String, title: String, prompt: String) = g { a.create(id, title, prompt) }
+    override suspend fun read(id: String) = g { a.read(id) }
+    override suspend fun hide(id: String) = g { a.hide(id) }
+}
+
+/**
+ * Registers this install with an allowed distributor and keeps its endpoint in one hidden record on the connected
+ * server. Off and a server switch take effect on the phone: the old registration is committed for revocation before
+ * any other step and then unregistered at the distributor, so its endpoint leads nowhere. The app never deletes a
+ * record; old ones stay hidden on their server and the hook prefers the newest per install. A record is created under
+ * a reserved id and a per-operation title, and adopted after an uncertain create only when that title and the
+ * `api_server` source prove it is ours. Every operation finishes the persisted intents first ([reconcile]), runs one
+ * at a time off the main thread, and ends as soon as the connection it was started under changes.
+ */
+@SuppressLint("UseKtx") // the KTX edit drops commit()'s result, which every write here must check
+class PushRegistrar(
+    private val context: Context,
+    private val prefs: SharedPreferences,
+    private val api: () -> RecordApi?,
+    private val connectionGeneration: () -> Long,
+    private val clock: () -> Long,
+    private val scope: CoroutineScope,
+    private val policy: PushPolicy = pushPolicy,
+    private val port: UnifiedPushPort = RealUnifiedPush,
+    /** The persisted connection epoch (`connection_epoch`); registrations journal it. */
+    private val epoch: () -> Long = { 0 },
+    /** Schedules PublishWorker; called when a user-started operation leaves persisted work behind. */
+    private val scheduleWork: () -> Unit = {},
+) {
+    private val mutex = Mutex()
+    @Volatile private var failed = false
+    @Volatile private var registeredThisProcess = false
+    private val state = MutableStateFlow(compute())
+
+    val ui: StateFlow<PushUi> = state.asStateFlow()
+
+    /** The published record's endpoint (for the test push); null without a record. */
+    val endpoint: String? get() = prefs.getString(Keys.ENDPOINT, null)?.takeIf { prefs.contains(Keys.RECORD) }
+
+    fun currentInstance() = instanceOf(prefs)
+
+    fun enable() {
+        scope.launch { enableNow() }
+    }
+
+    internal suspend fun enableNow() {
+        op { a ->
+            reconcile(a)
+            if (!enabled()) {
+                if (allowed().isEmpty()) return@op
+                commitLive { putBoolean(Keys.ENABLED, true).putLong(Keys.GENERATION, generation() + 1) }
+            }
+            register()
+        }
+        afterUserOp()
+    }
+
+    /** Off is committed (with the registration to revoke) before anything else happens. */
+    suspend fun disable() {
+        withContext(NonCancellable) { // the user confirmed Off: a cancelled caller does not undo it
+            op { _ ->
+                if (enabled()) rotate(off = true) else finishRevocations()
+            }
+        }
+        afterUserOp()
+    }
+
+    /** Finishes persisted intents and publishes. True when nothing is left for this connection to retry. */
+    suspend fun publishPending(): Boolean = op(server = true) { a ->
+        reconcile(a)
+        if (a == null) return@op !failed && !needsServer()
+        if (enabled()) publish(a, force = false)
+        !failed && !prefs.contains(Keys.PENDING_ID)
+    } ?: false
+
+    /** Hourly unless [force]: distributor still there and answering, record present, hidden and current. */
+    suspend fun verify(force: Boolean = false) {
+        verifyNow(force)
+        afterUserOp()
+    }
+
+    /**
+     * [verify] without scheduling work: the network job runs it itself. True when the verification succeeded or was not
+     * due; false when a required server read or repair failed (then it is not stamped, and the job retries).
+     */
+    internal suspend fun verifyNow(force: Boolean): Boolean = op(server = true) { a ->
+        val last = prefs.getLong(Keys.VERIFIED_AT, 0)
+        if (!force && prefs.contains(Keys.VERIFIED_AT) && clock() - last in 0 until VERIFY_EVERY_MS) {
+            recordThis = false // not due: it proved nothing, so it leaves the outcome as it was
+            return@op true
+        }
+        val registered = reconcile(a)
+        if (enabled()) {
+            if (allowed().isEmpty()) {
+                rotate(off = true) // the distributor was uninstalled
+            } else {
+                // Idempotent, and at most once per verification: also notices a subscription the distributor lost.
+                if (!registered) register()
+                if (a != null) {
+                    publish(a, force = false)
+                    check(a)
+                }
+            }
+        }
+        !failed
+    } ?: false
+
+    /**
+     * First half of a server switch, called by AppContainer.connect before its switch marker: commits the revocation of
+     * the current registration and a fresh instance (a new ntfy topic). Throws when that cannot be committed; the switch
+     * must not go on without it. The local revocation job (or any later start) performs it; the switch never sends it.
+     */
+    suspend fun prepareSwitch() {
+        withContext(Dispatchers.IO) {
+            mutex.withLock {
+                try {
+                    flushOrThrow()
+                    if (enabled() || prefs.contains(Keys.REGISTRATION) || prefs.contains(Keys.RECORD)) {
+                        if (!PushStore.locked { PushStore.commit(prefs) { beginRevocation() } }) throw IOException("push prefs not written")
+                    }
+                } finally {
+                    state.value = compute()
+                }
+            }
+        }
+    }
+
+    /** The local half of recovery (no network): revocations, receiver events, registration. True when no revocation is left. */
+    suspend fun reconcileLocal(): Boolean = op { _ ->
+        reconcile(null)
+        !prefs.contains(Keys.REVOKE)
+    } ?: false
+
+    /** Recomputes the shown state, e.g. after the receiver failed to store an endpoint. */
+    fun refresh() {
+        state.value = compute()
+    }
+
+    /** [server]: a server-facing operation (verify, publish), whose outcome it records in [Keys.SERVER_UNDONE]. */
+    private suspend fun <T> op(server: Boolean = false, block: suspend (RecordApi?) -> T): T? {
+        val start = connectionGeneration() // at admission: an operation queued across a switch belongs to the old connection
+        return withContext(Dispatchers.IO) {
+            val startEpoch = epoch() // the connection epoch it was admitted under: a request goes only to that epoch's server
+            mutex.withLock {
+                failed = false // every operation derives the outcome afresh; it decides only what the worker returns
+                recordThis = true
+                live = { connectionGeneration() == start && epoch() == startEpoch }
+                var error: Exception? = null
+                var stale = false
+                var a: RecordApi? = null
+                try {
+                    flushOrThrow()
+                    a = api()?.let { api -> Guarded(api, live) } // building the connection may throw: then a failure, not a crash
+                    block(a)
+                } catch (_: Stale) {
+                    stale = true
+                    null
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logFailure(e)
+                    failed = true
+                    error = e
+                    null
+                } finally {
+                    live = { true }
+                    if (server && !stale && recordThis) runCatching { recordOutcome(a != null, error) }.onFailure(::logFailure)
+                    state.value = compute()
+                }
+            }
+        }
+    }
+
+    /**
+     * The one place [Keys.SERVER_UNDONE] is written: set when a server-facing operation failed, except when the server was
+     * only unreachable while the proof stands (that proves nothing); removed when it had an API and did not fail.
+     */
+    private fun recordOutcome(hadApi: Boolean, error: Exception?) {
+        val unreachable = error is ApiError.Network || error is ApiError.Unavailable || error is IOException
+        when {
+            failed && unreachable && prefs.contains(Keys.VERIFIED_AT) -> Unit
+            failed -> if (!prefs.contains(Keys.SERVER_UNDONE)) PushStore.commit(prefs) { putBoolean(Keys.SERVER_UNDONE, true) }
+            hadApi -> if (prefs.contains(Keys.SERVER_UNDONE)) PushStore.commit(prefs) { remove(Keys.SERVER_UNDONE) }
+        }
+    }
+
+    private var recordThis = true
+
+    // The running operation's connection check; applying any result commits only while it holds.
+    private var live: () -> Boolean = { true }
+
+    private fun afterUserOp() {
+        if (needsWork(prefs, policy.distributors(context), epoch())) scheduleWork()
+    }
+
+    private fun enabled() = prefs.getBoolean(Keys.ENABLED, false)
+    private fun generation() = prefs.getLong(Keys.GENERATION, 0)
+
+    /** The policy's distributors that are installed, in policy order; read at every use, never from storage. */
+    private fun allowed(): List<String> = port.distributors(context).let { installed -> policy.distributors(context).filter { it in installed } }
+
+    private fun confirmed() = confirmedEndpoint(prefs, policy.distributors(context), epoch())
+
+    private fun needsServer() = prefs.contains(Keys.PENDING_ID) || (enabled() && (prefs.contains(Keys.SERVER_UNDONE) ||
+        confirmed().let { it != null && (it != prefs.getString(Keys.ENDPOINT, null) || unproven()) }))
+
+    /** A record without the server's proof. */
+    private fun unproven() = prefs.contains(Keys.RECORD) && !prefs.contains(Keys.VERIFIED_AT)
+
+    private fun flushOrThrow() {
+        if (!PushStore.flush(prefs)) throw IOException("push prefs not written")
+    }
+
+    /** A commit that applies a result: under the push lock, only while the operation's connection is still current. */
+    private fun commitLive(edit: SharedPreferences.Editor.() -> Unit) {
+        val ok = PushStore.locked {
+            if (!live()) throw Stale()
+            PushStore.commit(prefs, edit)
+        }
+        if (!ok) throw IOException("push prefs not written")
+    }
+
+    /**
+     * Walks every persisted intent: revocations, the receiver's events, push on without a usable registration. True when
+     * it sent a REGISTER.
+     */
+    private suspend fun reconcile(a: RecordApi?): Boolean {
+        finishRevocations()
+        if (prefs.contains(Keys.UNREGISTERED_INSTANCE)) {
+            if (prefs.getString(Keys.UNREGISTERED_INSTANCE, null) == currentInstance() && enabled()) rotate(off = true)
+            else commitLive { remove(Keys.UNREGISTERED_INSTANCE) }
+        }
+        if (!enabled()) return false
+        val r = registrationOf(prefs)
+        if (r?.instance == currentInstance() && (r.distributor !in policy.distributors(context) || r.epoch != epoch())) {
+            // Journaled by a build with another policy, or under another connection epoch (its topic may be known to that
+            // epoch's server): revoke it and register a new instance, with a new token and topic.
+            rotate(off = false)
+            return true
+        } else if (!registeredThisProcess || confirmed() == null) {
+            // Once per process, and until the distributor confirms: an endpoint update lost to a failed commit is resent.
+            register()
+            return true
+        }
+        return false
+    }
+
+    private fun register() {
+        val r = registrationOf(prefs)
+        // A registration of another connection epoch is never carried into this one, not even its token.
+        if (r != null && r.instance == currentInstance() && r.epoch != epoch()) return rotate(off = false)
+        val d = allowed().firstOrNull() ?: return
+        val instance = currentInstance()
+        port.save(context, d)
+        port.register(context, instance) { distributor, token ->
+            check(distributor in policy.distributors(context)) { "distributor not allowed" }
+            commitLive {
+                // A token this replaces may still be subscribed: it is revoked, in the same commit.
+                val held = registrationOf(prefs)
+                check(held == null || held.instance != instance || held.token != token || held.epoch == epoch()) { "token of another epoch" }
+                val displaced = held?.takeIf { it.token != null && it.token != token }
+                if (displaced != null) putString(Keys.REVOKE, (revocationsOf(prefs) + displaced).joinToString("\n") { it.encode() })
+                putString(Keys.REGISTRATION, Registration(instance, distributor, token, epoch()).encode())
+            }
+        }
+        registeredThisProcess = true
+        finishRevocations()
+    }
+
+    /**
+     * One commit, before any other step: the current registration joins the revocations, the instance advances (a fresh
+     * topic), the record is left behind, and a revocation the receiver committed for this instance is consumed with it.
+     */
+    private fun SharedPreferences.Editor.beginRevocation(off: Boolean = false) {
+        val revoke = registrationOf(prefs)?.takeIf { it.instance == currentInstance() } ?: Registration(currentInstance(), null, null)
+        putString(Keys.REVOKE, (revocationsOf(prefs) + revoke).joinToString("\n") { it.encode() })
+        putLong(Keys.GENERATION, generation() + 1)
+        if (off || prefs.getString(Keys.UNREGISTERED_INSTANCE, null) == currentInstance()) putBoolean(Keys.ENABLED, false)
+        for (k in listOf(Keys.VERIFIED_AT, Keys.SERVER_UNDONE, Keys.REGISTRATION, Keys.RECORD, Keys.RECORD_TITLE, Keys.ENDPOINT, Keys.PUBLISHED_AT, Keys.PENDING_ID,
+            Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE, Keys.ENDPOINT_NEW, Keys.ENDPOINT_NEW_TOKEN, Keys.UNREGISTERED_INSTANCE)) remove(k)
+    }
+
+    private fun rotate(off: Boolean) {
+        commitLive { beginRevocation(off) }
+        finishRevocations()
+        if (enabled()) register()
+    }
+
+    /** Unregisters every committed revocation, then clears them. Repeating is harmless. */
+    private fun finishRevocations() {
+        val pending = revocationsOf(prefs)
+        if (pending.isEmpty()) return
+        for (r in pending) port.unregister(context, r, connector = r.instance != currentInstance())
+        commitLive { remove(Keys.REVOKE) }
+    }
+
+    /** Our title and source, and no turn ever ran in it: a hide reaches only this row (Hermes applies flags to a lineage). */
+    private fun pristine(row: RecordRow, title: String?) = row.title == title && row.source == "api_server" &&
+        row.messageCount == 0 && row.parent == null && row.endReason == null
+
+    private suspend fun check(a: RecordApi) {
+        val record = prefs.getString(Keys.RECORD, null) ?: return
+        val row = a.read(record) // a read that throws proves nothing: the last proof stands
+        val ours = row != null && pristine(row, prefs.getString(Keys.RECORD_TITLE, null))
+        if (ours && row!!.hidden && !row.pinned) {
+            commitLive { putLong(Keys.VERIFIED_AT, clock()) } // the server's answer about the current record is good
+        } else {
+            // Unusable as it is: the proof goes before any repair, so a failed repair can never show as On.
+            commitLive { remove(Keys.VERIFIED_AT) }
+            // Gone, retitled, or a turn ran in it: left alone, a new record replaces it. Ours but visible: hidden again.
+            if (!ours) return publish(a, force = true)
+            a.hide(record)
+            commitLive { putLong(Keys.VERIFIED_AT, clock()) }
+        }
+        if (!fresh()) publish(a, force = true)
+    }
+
+    private suspend fun publish(a: RecordApi, force: Boolean) {
+        val target = confirmed() ?: return // waiting for this registration's NEW_ENDPOINT
+        val checked = checkEndpoint(target, policy.origins(context), policy.loopbackOrigin(context))
+        val endpoint = checked.url ?: return fail("endpoint refused: ${checked.reason}")
+        if (!force && fresh() && prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.ENDPOINT, null) == endpoint) return
+        if (prefs.contains(Keys.PENDING_ID) && prefs.getString(Keys.PENDING_ENDPOINT, null) != endpoint) commitLive { removePending() }
+        repeat(MAX_CREATES) {
+            val id = prefs.getString(Keys.PENDING_ID, null) ?: reserve(endpoint) ?: return fail("no id left")
+            val title = prefs.getString(Keys.PENDING_TITLE, null)!!
+            val ours = try {
+                // Adopted after an uncertain create only if a fresh read shows it is still our own pristine record.
+                a.create(id, title, prompt(endpoint)) || a.read(id)?.let { pristine(it, title) } == true
+            } catch (e: ApiError.Conflict) {
+                if (e.code != "session_deleted") throw e
+                false // retired: never reused
+            }
+            if (ours) return finish(a, id, title, endpoint)
+            commitLive { removePending() } // a stranger's row holds the id, or it is retired: never adopted
+        }
+        fail("no free id")
+    }
+
+    /** The record is younger than the rotation age (a publication time in the future counts as due too). */
+    private fun fresh() = clock() - prefs.getLong(Keys.PUBLISHED_AT, 0) in 0 until ROTATE_AFTER_MS
+
+    private fun SharedPreferences.Editor.removePending() {
+        for (k in listOf(Keys.PENDING_ID, Keys.PENDING_ENDPOINT, Keys.PENDING_TITLE)) remove(k)
+    }
+
+    private fun reserve(endpoint: String): String? {
+        val seq = prefs.getInt(Keys.SEQ, 0) + 1
+        if (seq > MAX_SEQ) return null
+        val install = prefs.getString(Keys.INSTALL_ID, null) ?: UUID.randomUUID().toString()
+        val id = recordId(install, seq)
+        val marker = ByteArray(8).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) }
+        val title = policy.recordTitle(context, id, marker)
+        commitLive {
+            putString(Keys.INSTALL_ID, install).putInt(Keys.SEQ, seq)
+            putString(Keys.PENDING_ID, id).putString(Keys.PENDING_ENDPOINT, endpoint).putString(Keys.PENDING_TITLE, title)
+            policy.recordIntent(prefs, this, id, title)
+        }
+        return id
+    }
+
+    private suspend fun finish(a: RecordApi, id: String, title: String, endpoint: String) {
+        a.hide(id)
+        commitLive {
+            putString(Keys.RECORD, id).putString(Keys.RECORD_TITLE, title).putString(Keys.ENDPOINT, endpoint)
+            putLong(Keys.PUBLISHED_AT, clock()).putLong(Keys.VERIFIED_AT, clock()) // created and hidden: proven
+            removePending()
+        }
+    }
+
+    private fun prompt(endpoint: String) = buildJsonObject { put("v", 1); put("endpoint", endpoint) }.toString()
+
+    private fun fail(reason: String) {
+        Log.w(TAG, "Push not published: $reason")
+        failed = true
+    }
+
+    private fun compute(): PushUi {
+        val distributor = registrationOf(prefs)?.distributor?.takeIf { it in policy.distributors(context) }
+            ?: allowed().firstOrNull() ?: NTFY_PACKAGE
+        // Read once: compute also runs on the receiver's thread, where a revocation may remove it meanwhile.
+        val endpoint = prefs.getString(Keys.ENDPOINT, null)
+        val matching = endpoint != null && prefs.contains(Keys.RECORD) && !prefs.contains(Keys.PENDING_ID) && confirmed() == endpoint
+        val accepted = endpoint != null && validateEndpoint(endpoint, policy.origins(context), policy.loopbackOrigin(context)) != null
+        val s = when {
+            PushStore.isDirty(prefs) || prefs.contains(Keys.REVOKE) -> PushState.Registering // not on disk, or not yet handed to the distributor
+            !enabled() -> if (allowed().isEmpty()) PushState.NoDistributor else PushState.Off
+            // From stored values and the running policy only (never the in-memory failure).
+            prefs.contains(Keys.SERVER_UNDONE) -> PushState.ServerError(distributor) // the last server step left work undone
+            unproven() -> PushState.ServerError(distributor) // the server last said this record is not usable
+            // The record holds the endpoint the distributor confirmed for the current token, the server proved it, and the
+            // running policy accepts it. A transport failure does not change a proven On.
+            matching && accepted -> PushState.On(distributor)
+            matching -> PushState.ServerError(distributor) // the running policy refuses the stored endpoint
+            else -> PushState.Registering
+        }
+        return PushUi(s)
+    }
+
+
+    // Server and transport text can carry the endpoint or ids: only the class name is ever logged.
+    private fun logFailure(e: Throwable) = Log.w(TAG, "Push step failed: ${e.javaClass.name}")
+}

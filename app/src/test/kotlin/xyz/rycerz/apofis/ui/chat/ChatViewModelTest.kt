@@ -263,6 +263,22 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun onlyAnAcceptedSendIsReported() = runTest {
+        addSession()
+        val vm = vm()
+        var accepted = 0
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.sendAccepted.collect { accepted++ } }
+        vm.onSendClick() // a stale enabled button with nothing to send: the composer takes nothing
+        assertEquals(0, accepted)
+
+        vm.onDraftChange("hello")
+        vm.await { it.draft.isNotEmpty() }
+        vm.onSendClick()
+        vm.await { it.draft.isEmpty() }
+        assertEquals(1, accepted)
+    }
+
+    @Test
     fun steerClearsDraftAndKeepsRunning() = runTest {
         addSession()
         routes["/v1/runs/$RUN/steer"] = json(fixture("steer_response.json"))
