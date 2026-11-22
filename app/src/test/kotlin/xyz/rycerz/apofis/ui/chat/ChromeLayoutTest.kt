@@ -986,4 +986,12 @@ class ChromeLayoutTest {
     @Test
     @Config(qualifiers = "w360dp-h254dp-hdpi")
     fun expandAt230dpHdpiKeepsEveryPixel() = expandNeverShortensTheField(status = 36, lines = 4) // 29.25 px lines
+
+    @Test
+    @Config(qualifiers = "w360dp-h254dp-280dpi")
+    fun expandAt230dp280dpiKeepsEveryPixel() = expandNeverShortensTheField(status = 42, lines = 4) // 34.125 px lines, 6.5 px padding a side
+
+    @Test
+    @Config(qualifiers = "w360dp-h254dp-440dpi")
+    fun expandAt230dp440dpiKeepsEveryPixel() = expandNeverShortensTheField(status = 66, lines = 4) // 53.625 px lines
 }

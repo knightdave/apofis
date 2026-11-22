@@ -343,6 +343,7 @@ class ComposerViewTest {
         rule.onRoot().performTouchInput { down(at) }
         subject = "run-B" // still Stop, another run
         rule.waitForIdle()
+        rule.onRoot().performTouchInput { moveBy(androidx.compose.ui.geometry.Offset(1f, 0f)) } // a move after the change is no press-down
         rule.onRoot().performTouchInput { up() }
         rule.waitForIdle()
         assertEquals("run B was stopped by a press begun on run A", emptyList<Any?>(), stopped)
@@ -451,6 +452,7 @@ class ComposerViewTest {
             dispatch(key(NativeKeyEvent.ACTION_DOWN, code))
             subject = "chat-$code"
             rule.waitForIdle()
+            dispatch(key(NativeKeyEvent.ACTION_DOWN, code, repeat = 1)) // a repeat after the change is no press-down
             dispatch(key(NativeKeyEvent.ACTION_UP, code))
             rule.waitForIdle()
             assertEquals("key $code: held across a change", expected, sends)

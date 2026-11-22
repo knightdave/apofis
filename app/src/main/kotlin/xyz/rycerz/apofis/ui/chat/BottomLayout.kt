@@ -28,7 +28,7 @@ internal data class BottomDims(
 }
 
 /** Field padding (above and below together): one line as tall as a 48 dp target, 4 to 14 dp a side (14 dp at scale 1). */
-internal fun Density.fieldPaddingPx(line: Float): Int = (((48.dp.toPx() - line) / 2).coerceIn(4.dp.toPx(), 14.dp.toPx()) * 2).let { ceil(it).toInt() }
+internal fun Density.fieldPaddingPx(line: Float): Int = ceil(((48.dp.toPx() - line) / 2).coerceIn(4.dp.toPx(), 14.dp.toPx())).toInt() * 2 // each side a whole pixel, as Compose rounds it
 
 internal fun Density.lineHeightPx(style: TextStyle): Float =
     if (style.lineHeight.isEm) style.lineHeight.value * style.fontSize.toPx() else style.lineHeight.toPx()
