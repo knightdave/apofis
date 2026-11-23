@@ -34,6 +34,8 @@ import javax.crypto.KeyGenerator
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -1042,21 +1044,26 @@ class WakeWorkerTest {
     fun aFailedPeriodicInstallIsNotRememberedAsApplied() = runTest {
         stored("run_a")
         awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
+        // The only producer of reconciles, the container's collector, stops here (its scope ends and is joined), so
+        // nothing but this test posts until the fresh collector below; the row, the epoch and the lane's memory stay.
+        real { container.scope.coroutineContext[Job]!!.cancelAndJoin() }
         Wake.idle()
         // The timer is removed (through the lane, so its memory says "removed"; a removal behind the lane's back would
         // leave it remembering "installed" and skip the install this test is about).
         Wake.post(app, WakeRequest.Reconcile { false })
         Wake.idle()
         assertTrue(live(CHECK_WORK).isEmpty())
-        // Its install fails twice: only this request installs while the hook throws.
+        // Its install fails twice: this is the only request while the hook throws.
         var failures = 2
         Wake.beforeInstall = { if (failures-- > 0) throw IllegalStateException("database full") }
         Wake.post(app, WakeRequest.Reconcile { true })
         Wake.idle()
         Wake.beforeInstall = {}
+        assertEquals("both tries failed", 0, failures)
         assertTrue("not installed", live(CHECK_WORK).isEmpty())
-        // An emission with the same decision arrives: the lane must not treat the failed install as applied.
-        db.activeRunDao().upsert(ActiveRunEntity("run_a", A, 3L, "running", 1L))
+        // A fresh collector on the same database: its first emission carries the same decision (runs stored), and the
+        // lane must not treat the failed install as applied.
+        newContainer()
         awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
         Wake.idle()
         assertEquals(Input(epoch(), CAUSE_TICK, 0), input(live(CHECK_WORK).single().id))
