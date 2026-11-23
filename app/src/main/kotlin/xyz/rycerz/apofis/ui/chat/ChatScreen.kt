@@ -60,7 +60,8 @@ import androidx.compose.ui.platform.LocalDensity
 import xyz.rycerz.apofis.ui.theme.backdropSource
 import xyz.rycerz.apofis.ui.theme.rememberBackdropState
 import xyz.rycerz.apofis.ui.theme.transparent
-import androidx.compose.material3.AlertDialog
+import xyz.rycerz.apofis.ui.theme.ApofisDialog
+import xyz.rycerz.apofis.ui.theme.LocalChatFontScale
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -130,6 +131,7 @@ fun ChatScreen(
     dragArea: Modifier = Modifier, // where a horizontal drag may start (the push drawer): the top bar and the transcript, never the composer
     covered: Boolean = false, // the drawer covers the chat and owns Back (for composition)
     coveredNow: () -> Boolean = { covered }, // the same, read live when an action fires: every action is dropped while true
+    chatFontScale: Float = 1f, // the chat text size setting: the message list and the Select view only
 ) {
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
@@ -179,6 +181,7 @@ fun ChatScreen(
     // Read by the transcript slot only: the app passes a new lambda with every state, which must not reach the composer.
     val current = rememberUpdatedState(currentState)
     val drag = rememberUpdatedState(dragArea)
+    val fontScale = rememberUpdatedState(chatFontScale) // read by the transcript slot only: never the header or the composer
 
     val barHidden = remember { BarHidden() }
     val barSlot = remember {
@@ -323,38 +326,40 @@ fun ChatScreen(
                         )
                     }
                     Uncovered(barHeight, bottomArea, fullScreen = true, dragArea) {
-                        MessageList(
-                            state.items,
-                            state.live,
-                            state.notes,
-                            state.answering,
-                            c.actions,
-                            onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
-                            onStep = { step -> gate.pass { detail = step } },
-                            listState = listState,
-                            contentPadding = padding,
-                            zone = c.zone,
-                            today = c.today,
-                            modifier = Modifier
-                                .backdropSource(backdrop, surface)
-                                .drawWithContent {
-                                    drawContent()
-                                    // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
-                                    // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom
-                                    // edge (above the insets and the card's outer margin, Composer.kt) and below it: text
-                                    // and controls at the bottom are never washed out, text passing behind the composer fades.
-                                    val rest = size.height - bottomArea - 8.dp.toPx()
-                                    val edge = size.height - (bottomArea - bottomContent) - COMPOSER_MARGIN.toPx()
-                                    if (edge > rest) {
-                                        drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
-                                    }
-                                    drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
-                                },
-                            onLink = { url -> gate.pass { linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure } },
-                            onSelect = { key -> gate.pass { selectKey = key } },
-                            current = current.value?.let { now -> { now().items } },
-                            onRevealGrew = follow::onGrew, // the follower read through the objects holder above
-                        )
+                        CompositionLocalProvider(LocalChatFontScale provides fontScale.value) {
+                            MessageList(
+                                state.items,
+                                state.live,
+                                state.notes,
+                                state.answering,
+                                c.actions,
+                                onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
+                                onStep = { step -> gate.pass { detail = step } },
+                                listState = listState,
+                                contentPadding = padding,
+                                zone = c.zone,
+                                today = c.today,
+                                modifier = Modifier
+                                    .backdropSource(backdrop, surface)
+                                    .drawWithContent {
+                                        drawContent()
+                                        // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
+                                        // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom
+                                        // edge (above the insets and the card's outer margin, Composer.kt) and below it: text
+                                        // and controls at the bottom are never washed out, text passing behind the composer fades.
+                                        val rest = size.height - bottomArea - 8.dp.toPx()
+                                        val edge = size.height - (bottomArea - bottomContent) - COMPOSER_MARGIN.toPx()
+                                        if (edge > rest) {
+                                            drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
+                                        }
+                                        drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
+                                    },
+                                onLink = { url -> gate.pass { linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure } },
+                                onSelect = { key -> gate.pass { selectKey = key } },
+                                current = current.value?.let { now -> { now().items } },
+                                onRevealGrew = follow::onGrew, // the follower read through the objects holder above
+                            )
+                        }
                     }
                     // Only where its 48 dp target fits in the uncovered band: otherwise not composed at all, so a button
                     // that kept keyboard focus gives it up and no key reaches it; it returns unfocused.
@@ -436,6 +441,7 @@ fun ChatScreen(
                     dismiss = R.string.chat_keep,
                     onConfirm = { actions.onConfirmCancel(id, mayHaveSentShown = attempted) },
                     onDismiss = { actions.onDismissCancel(id) },
+                    destructive = true,
                 )
             }
         }
@@ -450,6 +456,7 @@ fun ChatScreen(
                 dismiss = R.string.chat_keep,
                 onConfirm = { actions.onConfirmDiscard(unsent.id) },
                 onDismiss = actions::onDismissDiscard,
+                destructive = true,
             )
         }
     }
@@ -483,7 +490,7 @@ fun ChatScreen(
         LaunchedEffect(text == null, state.loaded) { if (text == null && state.loaded) selectKey = null }
         if (text != null) {
             Dialog(onDismissRequest = { selectKey = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-                SelectTextScreen(text, onBack = { selectKey = null })
+                CompositionLocalProvider(LocalChatFontScale provides chatFontScale) { SelectTextScreen(text, onBack = { selectKey = null }) }
             }
         }
     }
@@ -535,21 +542,14 @@ private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: (
 }
 
 @Composable
-private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, dismiss: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(title)) },
-        text = {
-            Column {
-                // The message itself, so a dialog for another message is visibly another dialog.
-                Text(quote, style = MaterialTheme.typography.bodyMedium, fontStyle = FontStyle.Italic, maxLines = 3, overflow = TextOverflow.Ellipsis)
-                Text(stringResource(text), Modifier.padding(top = 12.dp))
-            }
-        },
-        confirmButton = { WashTextButton(confirm, onConfirm) },
-        dismissButton = { WashTextButton(dismiss, onDismiss) },
-    )
-}
+private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, dismiss: Int, onConfirm: () -> Unit, onDismiss: () -> Unit, destructive: Boolean = false) =
+    ApofisDialog(stringResource(title), stringResource(confirm), onConfirm, stringResource(dismiss), onDismiss, destructive) {
+        Column {
+            // The message itself, so a dialog for another message is visibly another dialog.
+            Text(quote, style = MaterialTheme.typography.bodyMedium, fontStyle = FontStyle.Italic, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            Text(stringResource(text), Modifier.padding(top = 12.dp))
+        }
+    }
 
 @Composable
 private fun WashTextButton(label: Int, onClick: () -> Unit) {

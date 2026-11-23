@@ -18,6 +18,7 @@ import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.room.Room
@@ -326,8 +327,7 @@ class NotificationsRowTest {
     private fun turnOffViaDialog() {
         rule.onNodeWithText(text(R.string.settings_notif_turn_off)).performScrollTo().performClick()
         rule.onAllNodes(hasText(text(R.string.settings_notif_turn_off_text))).fetchSemanticsNodes().single()
-        // The dialog's confirm button is the second node with the action's label (the first is the sheet row).
-        rule.onAllNodes(hasText(text(R.string.settings_notif_turn_off)))[1].performClick()
+        rule.onNode(hasText(text(R.string.settings_notif_turn_off)) and hasAnyAncestor(hasAnyDescendant(hasText(text(R.string.settings_notif_turn_off_title))))).performClick()
     }
 
     // ---- the table ----
@@ -540,12 +540,12 @@ class NotificationsRowTest {
         rule.onNodeWithText(text(R.string.settings_notif_turn_off)).assertHeightIsAtLeast(48.dp).performClick()
         assertEquals(3, haptics)
         rule.onNodeWithText(text(R.string.cancel)).assertHeightIsAtLeast(48.dp).performClick()
-        assertEquals(4, haptics)
+        assertEquals("a dialog answer gives no feedback (ApofisDialog, as every dialog)", 3, haptics)
         turnOffViaDialog()
-        assertEquals(6, haptics)
+        assertEquals("the sheet row's selection only", 4, haptics)
         joinCommands()
         waitFor(text(R.string.settings_notif_off))
-        assertEquals(6, haptics)
+        assertEquals(4, haptics)
     }
 
     @Test
@@ -1164,7 +1164,7 @@ class NotificationsRowTest {
         rule.onNodeWithText("Wyłącz push").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
         rule.onNodeWithText("Wyłączyć push?").assertIsDisplayed()
         rule.onNodeWithText("Odpowiedzi nadal będą sprawdzane mniej więcej co 15 minut, gdy któraś trwa.").assertIsDisplayed()
-        rule.onAllNodes(hasText("Wyłącz push"))[1].assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        rule.onNode(hasText("Wyłącz push") and hasAnyAncestor(hasAnyDescendant(hasText("Wyłączyć push?")))).assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         rule.onNodeWithText("Anuluj").assertIsDisplayed()
     }
 }

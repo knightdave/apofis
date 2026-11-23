@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
             val mode by prefs.themeMode.collectAsState()
             val dynamicColor by prefs.dynamicColor.collectAsState()
             val pureBlack by prefs.pureBlack.collectAsState()
+            val blur by prefs.blur.collectAsState()
             val dark = isDarkTheme(mode)
             // System bar icons follow the app theme, which may differ from the system one.
             DisposableEffect(dark) {
@@ -63,9 +64,8 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 onDispose {}
             }
-            // Glass draws its fill only. The blur path stays in the code; whether it ships is decided by trying it on a
-            // phone (a Settings switch), not by an automated measurement.
-            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }, blur = false) {
+            // Frosted glass is the user's switch (off by default): its cost is judged on a phone, not measured here.
+            ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }, blur = blur) {
                 // Test tags become resource ids, so the end-to-end tests find chat items by their opaque keys.
                 Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
             }
