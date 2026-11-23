@@ -30,6 +30,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.runBlocking
@@ -121,12 +122,16 @@ class RunFollowerTest {
 
     /**
      * Cancels every follower coroutine and waits for all of them, at most 10 s in real time. The wait runs off the test
-     * dispatcher and cannot be cancelled, so a cancelled or timed-out caller still waits. Returns the failure, if any.
+     * dispatcher and cannot be cancelled, so a cancelled or timed-out caller still waits; its result comes back into
+     * the protected context without a dispatcher change, so a cancelled caller still receives it. Returns the failure,
+     * if any.
      */
     private suspend fun endFollowers(): AssertionError? {
         followerScopes.forEach { it.coroutineContext.job.cancelChildren() }
         val children = followerScopes.flatMap { it.coroutineContext.job.children }
-        val ended = withContext(NonCancellable + Dispatchers.Default) { withTimeoutOrNull(10_000) { children.joinAll() } } != null
+        val ended = withContext(NonCancellable) {
+            withContext(Dispatchers.Default) { withTimeoutOrNull(10_000) { children.joinAll() } }
+        } != null
         return if (ended) null else AssertionError("a follower did not end within 10 s after its test")
     }
 
@@ -2242,26 +2247,65 @@ class RunFollowerTest {
         follower() // registers the scope the cleanup ends
         val holding = CompletableDeferred<Unit>()
         val release = CountDownLatch(1)
-        lateinit var cleanup: Job
-        var cleanupEndedFirst = true
+        var opened = false
         backgroundScope.launch {
             // A follower in a non-cancellable step under the repository lock that resumes from a real thread.
             withContext(NonCancellable) {
                 withRepositoryLock {
                     holding.complete(Unit)
-                    withContext(Dispatchers.IO) { release.await(10, TimeUnit.SECONDS) }
+                    opened = withContext(Dispatchers.IO) { release.await(10, TimeUnit.SECONDS) }
                 }
-                cleanupEndedFirst = cleanup.isCompleted
             }
         }
         holding.await()
 
-        cleanup = launch(start = CoroutineStart.UNDISPATCHED) { endFollowers() }
-        cleanup.cancel() // as runTest cancels a timed-out body during its cleanup
-        release.countDown()
+        val cleanup = launch(start = CoroutineStart.UNDISPATCHED) { endFollowers() }
+        try {
+            cleanup.cancel() // as runTest cancels a timed-out body during its cleanup
+            testScheduler.runCurrent() // a cancellable wait would end here, with the follower still held
+            assertFalse("the cleanup ended before the follower", cleanup.isCompleted)
+        } finally {
+            release.countDown()
+        }
         cleanup.join()
 
-        assertFalse("the cleanup ended before the follower", cleanupEndedFirst)
+        assertTrue("the follower's latch expired instead of being opened", opened)
         withRepositoryLock { } // free again before Room closes
+    }
+
+    @Test
+    fun bodyFailureSurvivesItsOwnCancellation() {
+        val release = CountDownLatch(1)
+        var opened = false
+        var followerEnded = false
+        val failure = runCatching {
+            runFollowerTest {
+                follower() // registers the scope the cleanup ends
+                // The follower's latch opens only once the test job's cancellation has reached this child, so the
+                // follower is suspended through that cancellation.
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        release.countDown()
+                    }
+                }
+                val holding = CompletableDeferred<Unit>()
+                backgroundScope.launch {
+                    withContext(NonCancellable) {
+                        holding.complete(Unit)
+                        opened = withContext(Dispatchers.IO) { release.await(10, TimeUnit.SECONDS) }
+                        followerEnded = true
+                    }
+                }
+                holding.await()
+                cancel() // as runTest's timeout cancels the body
+                throw AssertionError("body sentinel") // without suspending
+            }
+        }.exceptionOrNull()
+
+        assertTrue("the follower's latch expired instead of being opened", opened)
+        assertTrue("the cleanup did not wait for the follower", followerEnded)
+        assertTrue("got $failure", failure is AssertionError && failure.message == "body sentinel")
     }
 }
