@@ -600,6 +600,9 @@ cp "$t/ledger.before" "$L"
 printf 'reserve %s X#y 1\nsomething else\n' $R3 >>"$L"
 check "ledger: a malformed line refuses every reservation" '! ledger_total "$L" >/dev/null && ! ledger_reserve "$L" 8 $R2 X#y=1 && ! grep -q $R2 "$L"'
 cp "$t/ledger.before" "$L"
+printf 'spent %s X#y 1\n' $R3 >>"$L"
+check "ledger: a well-formed line of another kind refuses too" '! ledger_reserve "$L" 8 $R2 X#y=1'
+cp "$t/ledger.before" "$L"
 printf 'reserve %s PushE2eTest#pushWakesKilledApp 1\n' $R1 >>"$L"
 check "ledger: a second reservation of one run's method is ambiguous: refused" '! ledger_reserve "$L" 8 $R2 X#y=1'
 cp "$t/ledger.before" "$L"
@@ -639,6 +642,12 @@ check "listing: an empty namespace lists nothing" 'o=$(push_listing $IA) && [ -z
 row "apofis-push-$IA-1" api_server "apofis-push-$IA-1 op-0123456789abcdef e2e-$nonce"
 check "listing: a record under the install is listed by id only" 'o=$(push_listing $IA) && [ "$o" = "apofis-push-$IA-1" ] && o=$(push_listing $IB) && [ -z "$o" ]'
 check "listing: a failed listing (no database) fails, never empty" '! (LIVE_DB=$t/live/missing.db push_listing $IA)'
+python3 -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.executemany("INSERT INTO sessions (id, source, hidden, started_at) VALUES (?, ?, 1, 0)", [("apofis-push-%s-%d" % (sys.argv[2], i), "api_server") for i in range(1, 34)]); c.commit()' "$LIVE_DB" "$IB"
+check "listing: an incomplete listing (more than 32 records, exit 4) fails" '! push_listing $IB >/dev/null'
+printf 'print("apofis-push-%s-1\\tt\\tapi_server\\t1")\n' "$IA" >"$t/noheader.py"
+check "listing: output without the read-only header fails, whatever the exit" '! (PUSH_SCRIPT=$t/noheader.py push_listing $IA)'
+printf 'import sys\nprint("python 3\\nSSL_CERT_FILE unset\\norigins none\\ndb opened read-only")\nsys.exit(3)\n' >"$t/badexit.py"
+check "listing: a failing exit fails, even after a complete-looking header" '! (PUSH_SCRIPT=$t/badexit.py push_listing $IA)'
 check "listing: the run-private home stays empty" '[ -z "$(ls -A "$push_dir/check-home")" ]'
 # shellcheck disable=SC2329 # the namespace check before launch, with a listing that finds a record
 nonempty_case() { push=(connectorLifecycle hostilePushes); tmp=$t/prov; mkdir -p "$tmp"; push_listing() { [ "$1" != "${install_of[hostilePushes]:-}" ] || echo "apofis-push-$1-1"; }; provision_push; }

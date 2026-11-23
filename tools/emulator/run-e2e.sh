@@ -797,7 +797,7 @@ select_tests() {
       tests=$a
       if [[ $a == PushE2eTest* ]]; then
         t=${a#PushE2eTest#}
-        [[ $a == PushE2eTest#* ]] && printf '%s\n' "${PUSH_ALL[@]}" | grep -qxF -- "$t" || return 1
+        printf '%s\n' "${PUSH_ALL[@]}" | grep -qxF -- "$t" || return 1 # also refuses PushE2eTest alone
         push=("$t")
       fi
       [ -z "${MODEL_BOUND[$a]+x}" ] || models=("$a") ;;
