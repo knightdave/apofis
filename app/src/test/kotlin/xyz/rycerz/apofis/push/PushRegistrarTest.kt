@@ -444,7 +444,7 @@ class PushRegistrarTest {
             }
             assertEquals("kill at $k", emptySet<String>(), w.port.registered)
             assertNull(w.prefs.getString(Keys.REVOKE, null))
-            assertEquals(PushUi(PushState.Off), restarted.ui.value)
+            assertEquals(PushState.Off, restarted.ui.value.state)
             if (!died) break
             k++
         }
@@ -547,7 +547,7 @@ class PushRegistrarTest {
             turnedOn(r)
             port.calls.clear()
             prefs.onCommit = { false } // the disk stops taking writes
-            r.disable()
+            assertFalse("not applied: the Off commit did not reach the disk", r.disable())
             assertNull(prefs.disk[Keys.REVOKE])
             assertEquals("not confirmed while memory and disk differ", PushState.Registering, r.ui.value.state)
             r.publishPending()
@@ -556,7 +556,7 @@ class PushRegistrarTest {
             prefs.onCommit = { true } // the disk recovers: the intent is written first, then acted on
             r.publishPending()
             assertEquals("unregister g1 tok-g1", port.calls.first())
-            assertEquals(PushUi(PushState.Off), r.ui.value)
+            assertEquals(PushState.Off, r.ui.value.state)
         }
         with(World()) { // a restart instead reads the disk, where push is still on
             val r = registrar()
@@ -739,7 +739,7 @@ class PushRegistrarTest {
             connection++
             r.switch()
             assertTrue(port.calls.none { it.startsWith("register") })
-            assertEquals(PushUi(PushState.Off), r.ui.value)
+            assertEquals(PushState.Off, r.ui.value.state)
         }
     }
 
@@ -827,12 +827,49 @@ class PushRegistrarTest {
             }
             val withFailingPort = PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, TestPolicy(), failing) { scheduled++ }
             scheduled = 0
-            withFailingPort.disable()
+            assertTrue("applied: Off is on disk, its unregister is retried", withFailingPort.disable())
             assertTrue(prefs.contains(Keys.REVOKE))
             assertEquals(PushState.Registering, withFailingPort.ui.value.state)
             assertTrue(scheduled > 0)
             registrar().publishPending()
-            assertEquals(PushUi(PushState.Off), registrar().ui.value)
+            assertEquals(PushState.Off, registrar().ui.value.state)
+        }
+    }
+
+    @Test
+    fun aDecidedOffSurvivesAFailedScheduling() = runTest { // Task 5, fix round 2
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            val failing = object : UnifiedPushPort by port {
+                override fun unregister(c: android.content.Context, r: Registration, connector: Boolean) = throw IllegalStateException("broadcast failed")
+            }
+            val unscheduled = PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, TestPolicy(), failing) {
+                throw IllegalStateException("not scheduled")
+            }
+            assertTrue("the Off commit decided it", unscheduled.disable())
+            assertTrue(!prefs.getBoolean(Keys.ENABLED, false) && prefs.contains(Keys.REVOKE))
+        }
+    }
+
+    @Test
+    fun aCancellationIsNotReplacedByAFailedRecompute() = runTest { // Task 5, fix round 3
+        with(World()) {
+            turnedOn(registrar())
+            var breakCompute = false
+            val policy = object : PushPolicy by TestPolicy() {
+                override fun distributors(c: android.content.Context): Set<String> =
+                    if (breakCompute) throw IllegalStateException("recompute failed") else setOf(NTFY_PACKAGE)
+            }
+            val cancelling = object : UnifiedPushPort by port {
+                override fun unregister(c: android.content.Context, r: Registration, connector: Boolean) {
+                    breakCompute = true
+                    throw kotlinx.coroutines.CancellationException("cancelled while unregistering")
+                }
+            }
+            val r = PushRegistrar(app, prefs, { current }, { connection }, { now }, backgroundScope, policy, cancelling, { epoch }) { scheduled++ }
+            val thrown = runCatching { r.disable() }.exceptionOrNull()
+            assertTrue("the cancellation propagates, not the recompute's failure: $thrown", thrown is kotlinx.coroutines.CancellationException)
         }
     }
 

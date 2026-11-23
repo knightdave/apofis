@@ -8,4 +8,5 @@ sealed interface PushState {
     data class ServerError(val distributor: String) : PushState
 }
 
-data class PushUi(val state: PushState)
+/** [testOwner]: the registration this state describes, for the test push (epoch and instance, nothing secret). */
+data class PushUi(val state: PushState, val testOwner: String? = null)

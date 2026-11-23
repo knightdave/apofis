@@ -55,6 +55,12 @@ import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
+import xyz.rycerz.apofis.notify.NotificationAccess
+import xyz.rycerz.apofis.notify.Runtime
+import xyz.rycerz.apofis.push.PushState
+import xyz.rycerz.apofis.push.PushUi
+import xyz.rycerz.apofis.ui.settings.NotificationsRow
+import xyz.rycerz.apofis.ui.settings.NotificationsUi
 import xyz.rycerz.apofis.ui.theme.SeedSchemes
 
 @RunWith(RobolectricTestRunner::class)
@@ -105,6 +111,7 @@ class ScreenshotTest {
         dynamicColor = true,
         pureBlack = false,
         versionName = "0.1.0",
+        notifications = { NotificationsRow(NotificationsUi(NotificationAccess(Runtime.GRANTED, true, true, true), PushUi(PushState.NoDistributor), null)) {} },
         onConnection = {},
         onThemeMode = {},
         onDynamicColor = {},
