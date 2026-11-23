@@ -49,7 +49,9 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   replyOfAnotherTurnOrWithoutTheMarkerDoesNotCount replyTextJoinsOnlyThatReplysRows
   stepMustBeOfThatReplyRunningAndShowExactlyTheCommand chatKeyIsReadFromTheChatScreensTagOnly
   steerReplyIsTheFinalReplyOfThisTurnOnly steeredTurnOnTheServerMustBeInOrderAndAlone
-  terminalCommandsComeFromToolCallArguments interruptedResultMustBelongToTheCommandsOwnCall steerRowsAreUnwrapped)
+  terminalCommandsComeFromToolCallArguments interruptedResultMustBelongToTheCommandsOwnCall steerRowsAreUnwrapped
+  pushIdentityCountsOnlyWhenReadBackWhole pushIntentsAreJournaledOrMissingForEveryInstall wakeSummariesOfHostilePushesMustShowNoRun
+  pushProofNeedsItsPreconditionsAndOnePushSettlement settingsRowValueIsAWholeSegment)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
 # Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
 # tunnel. Gate 1's start no model run.

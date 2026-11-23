@@ -187,4 +187,76 @@ class HarnessSelfTest {
         assertTrue(SurvivalE2eTest.BANANA.containsMatchIn("Done apofis-e2e-6. BANANA."))
         assertFalse(SurvivalE2eTest.BANANA.containsMatchIn("Done apofis-e2e-6. NOBANANA"))
     }
+    // ---- the push scenarios' decisions (PushE2eTest.kt)
+
+    private val install = "0f8fad5b-d9cb-469f-a165-70867728950e"
+    private val origin = "http://127.0.0.1:18650"
+
+    private fun prefsXml(vararg kv: Pair<String, String>) = "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n" +
+        kv.joinToString("") { (k, v) -> "    <string name=\"$k\">$v</string>\n" } + "</map>\n"
+
+    @Test
+    fun pushIdentityCountsOnlyWhenReadBackWhole() {
+        val whole = prefsXml("install_id" to install, "e2e_nonce" to "0a1b2c3d", "e2e_origin" to origin)
+        assertTrue(injectionConfirmed(whole, install, "0a1b2c3d", origin))
+        assertFalse("an interrupted write, cut off", injectionConfirmed(whole.dropLast(8), install, "0a1b2c3d", origin))
+        assertFalse("nothing written", injectionConfirmed("", install, "0a1b2c3d", origin))
+        assertFalse("run-as refused", injectionConfirmed("run-as: package not debuggable", install, "0a1b2c3d", origin))
+        assertFalse("another install", injectionConfirmed(whole, "1f8fad5b-d9cb-469f-a165-70867728950e", "0a1b2c3d", origin))
+        assertFalse("a value missing", injectionConfirmed(prefsXml("install_id" to install, "e2e_nonce" to "0a1b2c3d"), install, "0a1b2c3d", origin))
+    }
+
+    @Test
+    fun pushIntentsAreJournaledOrMissingForEveryInstall() {
+        val id1 = "apofis-push-$install-1"
+        val id2 = "apofis-push-$install-2"
+        val intents = "$id1\t$id1 op-0123456789abcdef e2e-0a1b2c3d&#10;$id2\t$id2 op-fedcba9876543210 e2e-0a1b2c3d"
+        val read = prefsXml("install_id" to install, "test_intents" to intents) + "\n@@READ\n"
+        val both = listOf("a", "b")
+        assertEquals(listOf("pushintent $id1 $id1 op-0123456789abcdef e2e-0a1b2c3d", "pushintent $id2 $id2 op-fedcba9876543210 e2e-0a1b2c3d"), pushIntentLines(read, both))
+        assertTrue(pushIntentLines(read, both).all(PUSH_INTENT::matches))
+        assertEquals("no file: nothing to export", emptyList<String>(), pushIntentLines("@@NONE\n", both))
+        assertEquals("no intent yet", emptyList<String>(), pushIntentLines(prefsXml("install_id" to install) + "@@READ", both))
+        val missing = listOf("pushintent-missing a", "pushintent-missing b")
+        assertEquals("run-as failed", missing, pushIntentLines("run-as: unknown package\n", both))
+        assertEquals("cut off before its end mark", missing, pushIntentLines(read.substringBefore("@@READ").dropLast(10), both))
+        assertEquals("a malformed file", missing, pushIntentLines("<map><string name=\"test_intents\">x\n@@READ", both))
+        val forged = prefsXml("test_intents" to "$id1\tapofis-push-$install-9 op-0123456789abcdef e2e-0a1b2c3d") + "@@READ"
+        assertEquals("an intent whose title names another id", missing, pushIntentLines(forged, both))
+    }
+
+    @Test
+    fun wakeSummariesOfHostilePushesMustShowNoRun() {
+        assertTrue(noRunChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=0 settled=0 failed=0 outcome=DONE")))
+        assertFalse("no line at all", noRunChecked(emptyList()))
+        assertFalse("a run taken", noRunChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=1 settled=0 failed=0 outcome=DONE")))
+        assertFalse("a line of another form", noRunChecked(listOf("cause=push runs=0 settled=0 failed=0")))
+        assertEquals(WakeLine("periodic", 3, 1, 2), wakeLine("cause=periodic runs=3 settled=1 failed=2 outcome=RETRY"))
+    }
+
+    @Test
+    fun pushProofNeedsItsPreconditionsAndOnePushSettlement() {
+        assertTrue(wakePreconditionsHold(1, listOf("failed"), 0))
+        assertFalse("a queued send", wakePreconditionsHold(1, listOf("queued"), 0))
+        assertFalse("a send going out", wakePreconditionsHold(1, listOf("sending"), 0))
+        assertFalse("no stored run", wakePreconditionsHold(0, emptyList(), 0))
+        assertFalse("an outbox row", wakePreconditionsHold(1, emptyList(), 1))
+        val settled = "cause=push runs=1 settled=1 failed=0 outcome=DONE"
+        assertTrue(provedByPush(listOf(settled)))
+        assertTrue("a check that settled nothing does not count", provedByPush(listOf("cause=push runs=1 settled=0 failed=0 outcome=DONE", settled)))
+        assertFalse("settled by the periodic check", provedByPush(listOf("cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("settled by a recheck", provedByPush(listOf("cause=recheck runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("two settling checks", provedByPush(listOf(settled, "cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("no settling check", provedByPush(listOf("cause=push runs=1 settled=0 failed=0 outcome=DONE")))
+        assertFalse("an unparsed line", provedByPush(listOf(settled, "something else")))
+    }
+
+    @Test
+    fun settingsRowValueIsAWholeSegment() {
+        val off = segments(listOf("Notifications, Off\nWithout push, the app checks about every 15 minutes while a reply is running"))
+        assertEquals(listOf("Notifications", "Off"), off.take(2))
+        val missing = segments(listOf("Notifications", "ntfy is not installed"))
+        assertFalse("ntfy" in missing.drop(1))
+        assertTrue("ntfy" in segments(listOf("Notifications, ntfy")).drop(1))
+    }
 }

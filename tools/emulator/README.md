@@ -31,6 +31,8 @@ shell user. Tests:
   for stop, that call's own result interrupted; for steer, in this order: the prompt, the command, exactly one steer
   row of exactly the steering text, then the last final answer ending with BANANA, with no other user turn). The
   harness never approves anything: an approval block on screen fails the scenario without being touched.
+- `PushE2eTest` (Milestone 3, see "Push" below): `connectorLifecycle`, `hostilePushes` and `permissionAndTestPush` (no
+  model run), and `pushWakesKilledApp` (one model run). `--full` never runs them: they need push provisioning.
 
 ## The two hosts
 
@@ -64,7 +66,7 @@ shell user. Tests:
    whose device shell reads it and passes it to `am instrument -w -r -e apofisKey ...`. The key is never on a host
    command line, in an environment, in a file or in a long-lived shell variable on the emulator host. Every shell on
    either host that can receive key bytes runs with `ulimit -c 0` (checked) before the key is read.
-6. Always, also on failure or interrupt: pulls the device files and a filtered logcat (tags `ApofisE2e`,
+6. Always, also on failure or interrupt: pulls the device files and a filtered logcat (tags `ApofisE2e`, `ApofisWake`,
    `TestRunner`, `AndroidRuntime`), reports the session journal (only exact lines, a complete file, with a count),
    stops the emulator and adb server (every stop and check under `timeout` with a kill fallback), deletes the AVD (the
    app's storage, the only place the key rests, goes with it). Only when every writer is gone, it stages a fixed
@@ -125,7 +127,9 @@ way and still waits for its cleanup and checks.
 tools/emulator/run-e2e.sh --smoke                      # SmokeE2eTest and HarnessSelfTest, no model run
 tools/emulator/run-e2e.sh --scenario stopDuringRun     # one survival scenario, one model run
 tools/emulator/run-e2e.sh --test 'SmokeE2eTest#connectViaLoopback'
-tools/emulator/run-e2e.sh --full                       # every e2e test: about 7 model runs, 15 minutes
+tools/emulator/run-e2e.sh --full                       # every e2e test but PushE2eTest: about 7 model runs, 15 minutes
+tools/emulator/run-e2e.sh --push                       # the push scenarios with a local fake ntfy, no model run
+tools/emulator/run-e2e.sh --push-model                 # pushWakesKilledApp, connectAndChat, replySurvivesProcessDeath
 tools/emulator/run-e2e-selftest.sh                     # the script's own safeguards, locally: no host, no key
 ```
 
@@ -144,6 +148,56 @@ minutes) and Gradle's dependencies into `~/tmp/apofis-e2e/.state/gradle`. Later 
 - Tests create Hermes sessions only through the app (ids start with `apofis-`), and the build host deletes only
   sessions whose identity it has proved (step 8). Prompts only run `sleep N # apofis-e2e-<n>` (the marker is a shell
   comment, so the command stays one segment and the app's running step shows it whole).
+
+## Push (Milestone 3)
+
+The push pass runs before the owner installs the hook, against Hermes as it is, with a local fake ntfy. Nothing it runs
+contacts ntfy.sh or any other push host.
+
+| Invocation | Selects | Push provisioning | Model starts |
+|---|---|---|---|
+| `--smoke` | `SmokeE2eTest`, `HarnessSelfTest` | no | 0 |
+| `--full`, `--scenario <name>` | as before (never `PushE2eTest`), outside the ledger | no | as before |
+| `--push` | `PushE2eTest` `connectorLifecycle`, `hostilePushes`, `permissionAndTestPush` | yes | 0 |
+| `--push-model` | `PushE2eTest#pushWakesKilledApp`, `SurvivalE2eTest#connectAndChat`, `SurvivalE2eTest#replySurvivesProcessDeath` | the push method | at most 3 |
+| `--test <Class#method>` | a push method or one of those three: as its row; any other test: as before | per row | per row |
+| anything else (`--test PushE2eTest`, an unknown method) | refused before any action | | |
+
+- **Identities.** Before anything else the build host mints one install id (a random UUID) per push scenario, the topic
+  (`up` and 12 random letters and digits) and, once the tunnel port is known, a port free on both hosts. For each
+  install it lists the server's records with `apofis_push.py check --state-db ~/.hermes/state.db --only-install <id>
+  --ids --log -` and a run-private `HERMES_HOME`: the listing must succeed and be empty, or the run stops. This listing
+  is the only thing that opens the live database, read-only.
+- **The fake ntfy** (`fake_ntfy.py`) runs on the build host with a minimal environment in a run-private directory,
+  listens on `127.0.0.1:<port>` only, and reaches the device through a second reverse tunnel and `adb reverse`. It
+  queues messages for the topic (`POST /<topic>`, at most 64 of at most 4096 bytes) and hands the oldest to the tests
+  (`GET /<topic>/poll`); at most 8 requests at once. `POST /trigger` (gate 2, at most 3 times) runs the real hook with a
+  fixed anonymous approval event against `fixture.db`, a synthetic database it builds in its directory with one hidden
+  record of `pushWakesKilledApp`'s install naming the fake; it answers once the hook's detached child has released its
+  slot (killing its process group past 30 s), and on stop it kills any child still holding one. The cleanup stops it,
+  requires "stopped: child released|killed" and its port closed here; the postcheck covers the tunnel's port there.
+- **The distributor** is the e2e APK (`FakeDistributor`, accepted only by debug builds): it answers the app's REGISTER
+  with `NEW_ENDPOINT http://127.0.0.1:<port>/<topic>?up=1` and sends MESSAGE, UNREGISTERED and TEMP_UNAVAILABLE for the
+  tests. `AppDriver.freshStart` writes the scenario's `install_id`, `e2e_nonce` (the run nonce) and `e2e_origin` into the
+  cleared app's `shared_prefs/push.xml` and reads them back before the launch; anything else fails the scenario before
+  push can be turned on. The debug app then titles every record `<id> op-<marker> e2e-<nonce>` and commits each create
+  intent with the id's reservation.
+- **Intents and cleanup (rule C3).** At each push scenario's end (also on failure) and before every `pm clear`, the tests
+  journal `pushintent <id> <title>` for every intent in the app's prefs, or `pushintent-missing <scenario>` when they
+  cannot be read. The app never deletes a push record, so the harness's cleanup is what removes them: for each journaled
+  intent whose id is of one of this run's installs and whose title ends with this run's nonce, `GET` (404: nothing to
+  do), then only for `source == "api_server"` and exactly the journaled title, `DELETE` and `GET` 404. An install with a
+  missing export is not cleaned; nothing is ever deleted without an intent. Then every install is listed again: any
+  record left fails the run with "push records may remain", naming it, without deleting it.
+- **The ledger.** `--push-model` and its `--test` selections first reserve their proved upper bounds (1 per method) in
+  `~/.local/state/apofis-e2e/model-budget-m3`, shared by every worktree and appended under `flock`
+  (`reserve <run id> <method> <bound>`), and refuse when the reserved and observed starts would pass 8 or the ledger is
+  unreadable or ambiguous. After the run each method's starts, counted on the server as the user turns of its journaled
+  chat, are appended (`observed <run id> <method> <n>`); an unknown count leaves the reservation's bound. Every
+  model-capable run prints how often `apofis_push.py` appears in `~/.hermes/config.yaml` and the allowlist (count only):
+  with the hook installed, each model run can send one contentless wake naming a test chat to the owner's ntfy endpoint.
+- **Logs.** The exported logcat adds the app's debug tag `ApofisWake` (one line per wake check: cause, runs, settled,
+  failed, outcome; no ids).
 
 ## Cleaning up by hand
 
@@ -170,7 +224,7 @@ nix develop .#emulator -c env ANDROID_AVD_HOME="$PWD/.state/avd" avdmanager dele
 
 ## Known limits
 
-An emulator cannot test real push delivery, haptics, blur and rendering quality on real GPUs, OEM battery
+An emulator cannot test real push delivery through ntfy (the fake stands in for it), haptics, blur and rendering quality on real GPUs, OEM battery
 optimisation and app killers, real mobile network handovers, or biometric hardware. Airplane mode and screen-off
 are simulated through `cmd connectivity` and key events, which is close to, but not the same as, a phone in a
 pocket: airplane mode cuts the emulator's virtual Wi-Fi and cellular, so the app really loses the path to
