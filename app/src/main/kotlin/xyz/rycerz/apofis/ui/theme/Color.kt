@@ -143,19 +143,11 @@ internal fun deriveScheme(base: ColorScheme, dark: Boolean, page: Color): ColorS
 /** The disabled send fill: translucent on purpose (allowed by the token rules), over whatever is behind it. */
 internal val ColorScheme.disabledFill: Color get() = onSurface.copy(alpha = 0.12f)
 
-/**
- * Extra tokens over the page of a derived [scheme]. With [blur] the glass shows blurred content of any color instead of
- * a page backplate, so its fills are raised from the UI map's alpha to the smallest one at which every foreground drawn
- * on that glass keeps its floor over any content, and the expand icon takes the placeholder's tone (as in the map).
- */
-internal fun apofisColors(scheme: ColorScheme, dark: Boolean, blur: Boolean = false): ApofisColors {
+/** Extra tokens over the page of a derived [scheme]. */
+internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
     val page = scheme.surface
     val on = scheme.onSurface
     val muted = on.at(0.7f, page)
-    val expandIcon = if (blur) muted else on.at(if (dark) 0.45f else 0.49f, page) // light 0.49: the smallest alpha that reaches 3:1
-    val glassTint = if (dark) on.at(0.07f, page) else scheme.primary.at(0.02f, page)
-    val glassAlpha = if (dark) 0.74f else 0.82f
-    val buttonAlpha = if (dark) 0.40f else 0.85f
     val timelineFill = scheme.primaryContainer.at(if (dark) 0.25f else 0.30f, page)
     val timelineBody = scheme.secondary.at(if (dark) 0.7f else 0.9f, timelineFill)
     val codeHeaderFill = scheme.surfaceContainerHighest.at(0.8f, page)
@@ -190,14 +182,12 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean, blur: Boolean = fa
         tableHeaderFill = on.at(0.05f, page),
         tableBody = on.at(0.88f, page),
         actionIcon = on.at(0.9f, page),
-        expandIcon = expandIcon,
+        expandIcon = on.at(if (dark) 0.45f else 0.49f, page), // light 0.49: the smallest alpha that reaches 3:1
         switchOffTrack = on.at(0.08f, page),
         switchOffThumb = if (dark) scheme.onSurfaceVariant else White,
-        glassFill = glassTint.copy(
-            alpha = if (!blur) glassAlpha else glassAlpha(glassTint, glassAlpha, on to 4.5, muted to 4.5, expandIcon to 3.0, scheme.primary to 3.0),
-        ),
+        glassFill = (if (dark) on.at(0.07f, page) else scheme.primary.at(0.02f, page)).copy(alpha = if (dark) 0.74f else 0.82f),
         glassBorder = if (dark) on.copy(alpha = 0.10f) else scheme.outline.copy(alpha = 0.20f),
-        glassButtonFill = page.copy(alpha = if (!blur) buttonAlpha else glassAlpha(page, buttonAlpha, on to 3.0)), // the arrow
+        glassButtonFill = page.copy(alpha = if (dark) 0.40f else 0.85f),
         glassButtonBorder = if (dark) on.copy(alpha = 0.12f) else scheme.outline.copy(alpha = 0.20f),
         scrim = on.copy(alpha = 0.12f),
         pressWash = on.copy(alpha = if (dark) 0.14f else 0.12f),
@@ -206,21 +196,41 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean, blur: Boolean = fa
     )
 }
 
-/**
- * The smallest alpha, from [design] up in 1 % steps, at which [tint] keeps each foreground at its floor over any content
- * ([worstContrast]); opaque when none does.
- */
-private fun glassAlpha(tint: Color, design: Float, vararg floors: Pair<Color, Double>): Float =
-    ((design * 100).roundToInt()..100).map { it / 100f }
-        .firstOrNull { a -> floors.all { (fg, min) -> worstContrast(fg, tint.copy(alpha = a)) >= min } } ?: 1f
+/** Material's text selection background (primary at 0.40), drawn over the composer's glass under selected text. */
+internal val ColorScheme.selectionBackground: Color get() = primary.copy(alpha = 0.4f)
 
 /**
- * The lowest contrast of [foreground] on [glass] (translucent) over content of any color: the glass over black and over
- * white bound the luminance it can show, and every luminance between occurs, so a foreground inside that range has 1:1.
+ * The tokens with blur on, or null when blur must not be drawn. The glass then shows blurred content of any color instead
+ * of a page backplate, so each fill is raised from the UI map's alpha to the smallest translucent one at which every
+ * resting foreground on it keeps its floor over any content: the composer's text (also on the selection background),
+ * placeholder and primary controls, and the scroll button's arrow. The expand icon takes the placeholder's tone, as in
+ * the map. When no translucent fill passes for either surface, null: the theme keeps the blur-off tokens and no blur.
  */
-internal fun worstContrast(foreground: Color, glass: Color): Double {
-    val overBlack = glass.compositeOver(Black)
-    val overWhite = glass.compositeOver(White)
+internal fun blurredColors(scheme: ColorScheme, dark: Boolean): ApofisColors? {
+    val c = apofisColors(scheme, dark)
+    val on = scheme.onSurface
+    val card = glassAlpha(c.glassFill, Floor(on, 4.5), Floor(on, 4.5, scheme.selectionBackground), Floor(c.muted, 4.5), Floor(scheme.primary, 3.0)) ?: return null
+    val button = glassAlpha(c.glassButtonFill, Floor(on, 3.0)) ?: return null
+    return c.copy(expandIcon = c.muted, glassFill = c.glassFill.copy(alpha = card), glassButtonFill = c.glassButtonFill.copy(alpha = button))
+}
+
+/** A foreground that must keep [min] on the glass, seen through a translucent layer [over] drawn on it (none by default). */
+internal class Floor(val foreground: Color, val min: Double, val over: Color = Color.Transparent)
+
+/** The smallest alpha, from [glass]'s own up in 1 % steps and below 1, at which every floor holds over any content; null if none. */
+private fun glassAlpha(glass: Color, vararg floors: Floor): Float? =
+    ((glass.alpha * 100).roundToInt()..99).map { it / 100f }
+        .firstOrNull { a -> floors.all { worstContrast(it.foreground, glass.copy(alpha = a), it.over) >= it.min } }
+
+/**
+ * The lowest contrast of [foreground] on [glass] (translucent), seen through [over], over content of any color. Each
+ * channel of the result is linear in the content's, so content black and white bound the luminance it can show and every
+ * luminance between occurs: a foreground inside that range has 1:1.
+ */
+internal fun worstContrast(foreground: Color, glass: Color, over: Color = Color.Transparent): Double {
+    fun on(content: Color) = over.compositeOver(glass.compositeOver(content))
+    val overBlack = on(Black)
+    val overWhite = on(White)
     if (foreground.luminance() in overBlack.luminance()..overWhite.luminance()) return 1.0
     return min(contrastRatio(foreground, overBlack), contrastRatio(foreground, overWhite))
 }

@@ -33,7 +33,7 @@ const val TITLE_MAX = 120
 
 enum class PromptKind { ACTIONS, RENAME, DELETE }
 
-/** Why an action failed, shown as one line in the sheet or dialog that started it. */
+/** Why an action failed, shown (wrapping, never cut) in the sheet or dialog that started it. */
 enum class ActionError { NETWORK, KEY_REJECTED, NOT_FOUND, CLOSED, FAILED }
 
 /**

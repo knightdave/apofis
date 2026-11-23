@@ -109,8 +109,10 @@ fun ApofisTheme(
     }
     val scheme = remember(base, dark, pureBlack) { deriveScheme(base, dark, pageFor(base, dark, pureBlack)) }
     val view = LocalView.current
-    val glassBlurs = blur && view.isHardwareAccelerated
-    val colors = remember(scheme, dark, glassBlurs) { apofisColors(scheme, dark, glassBlurs) }
+    // Blur is drawn only where it can be (hardware rendering) and where a translucent glass keeps every floor.
+    val wantsBlur = blur && view.isHardwareAccelerated
+    val blurred = remember(scheme, dark, wantsBlur) { if (wantsBlur) blurredColors(scheme, dark) else null }
+    val colors = remember(scheme, dark, blurred) { blurred ?: apofisColors(scheme, dark) }
     val enabled by rememberUpdatedState(hapticsEnabled)
     val haptics = remember(view) { ViewHaptics(view::performHapticFeedback) { enabled() } }
     MaterialTheme(colorScheme = scheme, typography = ApofisTypography, shapes = ApofisShapes) {
@@ -121,7 +123,7 @@ fun ApofisTheme(
             LocalIndication provides WashIndication,
             LocalHaptics provides haptics,
             LocalReduceMotion provides reduceMotion,
-            LocalBlur provides glassBlurs,
+            LocalBlur provides (blurred != null),
             content = content,
         )
     }

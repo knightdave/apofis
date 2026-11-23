@@ -3,12 +3,8 @@ package xyz.rycerz.apofis.settings
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
@@ -33,7 +29,6 @@ class Preferences(context: Context) {
     private val enter = MutableStateFlow(prefs.getBoolean(ENTER_TO_SEND, false))
     private val frosted = MutableStateFlow(prefs.getBoolean(BLUR, false))
     private val fontScale = MutableStateFlow(chatFontScaleStep(prefs.getFloat(CHAT_FONT_SCALE, 1f)))
-    private val writes = Mutex() // first come, first stored: the last write asked for is the one kept and shown
 
     // StateFlows so the first frame already has the stored theme.
     val themeMode: StateFlow<ThemeMode> = mode
@@ -44,22 +39,23 @@ class Preferences(context: Context) {
     val blur: StateFlow<Boolean> = frosted // frosted glass behind the composer and the scroll button
     val chatFontScale: StateFlow<Float> = fontScale // the message list's text size
 
-    suspend fun setThemeMode(value: ThemeMode) = write(mode, value) { putString(THEME_MODE, value.name) }
-    suspend fun setDynamicColor(value: Boolean) = write(dynamic, value) { putBoolean(DYNAMIC_COLOR, value) }
-    suspend fun setPureBlack(value: Boolean) = write(black, value) { putBoolean(PURE_BLACK, value) }
-    suspend fun setHaptics(value: Boolean) = write(vibrate, value) { putBoolean(HAPTICS, value) }
-    suspend fun setEnterToSend(value: Boolean) = write(enter, value) { putBoolean(ENTER_TO_SEND, value) }
-    suspend fun setBlur(value: Boolean) = write(frosted, value) { putBoolean(BLUR, value) }
-    suspend fun setChatFontScale(value: Float) = chatFontScaleStep(value).let { write(fontScale, it) { putFloat(CHAT_FONT_SCALE, it) } }
+    fun setThemeMode(value: ThemeMode) = write(mode, value) { putString(THEME_MODE, value.name) }
+    fun setDynamicColor(value: Boolean) = write(dynamic, value) { putBoolean(DYNAMIC_COLOR, value) }
+    fun setPureBlack(value: Boolean) = write(black, value) { putBoolean(PURE_BLACK, value) }
+    fun setHaptics(value: Boolean) = write(vibrate, value) { putBoolean(HAPTICS, value) }
+    fun setEnterToSend(value: Boolean) = write(enter, value) { putBoolean(ENTER_TO_SEND, value) }
+    fun setBlur(value: Boolean) = write(frosted, value) { putBoolean(BLUR, value) }
+    fun setChatFontScale(value: Float) = chatFontScaleStep(value).let { write(fontScale, it) { putFloat(CHAT_FONT_SCALE, it) } }
 
     /** The chat open last, restored after the process was killed when it still exists. */
     var lastChat: String?
         get() = prefs.getString(LAST_CHAT, null)
         set(value) = prefs.edit { putString(LAST_CHAT, value) }
 
-    /** Shown only once stored: a write the storage refuses leaves the flow at the stored value. */
-    private suspend fun <T> write(flow: MutableStateFlow<T>, value: T, put: SharedPreferences.Editor.() -> Unit) = writes.withLock {
-        if (withContext(Dispatchers.IO) { prefs.edit().apply(put).commit() }) flow.value = value
+    /** Shown at once and stored in the background: the shown value and the memory cache are always the same. */
+    private fun <T> write(flow: MutableStateFlow<T>, value: T, put: SharedPreferences.Editor.() -> Unit) {
+        flow.value = value
+        prefs.edit(action = put)
     }
 
     private companion object {

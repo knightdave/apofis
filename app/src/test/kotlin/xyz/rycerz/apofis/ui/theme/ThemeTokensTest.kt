@@ -110,31 +110,50 @@ class ThemeTokensTest {
     @Test
     fun blurredGlassKeepsItsFloorsOverAnyContent() {
         val failures = mutableListOf<String>()
-        val table = StringBuilder("theme | composer alpha | text | placeholder | expand | primary | button alpha | arrow\n")
+        val withoutBlur = mutableListOf<String>()
+        val table = StringBuilder("theme | composer alpha | text | selected text | placeholder | expand | primary | button alpha | arrow\n")
         for ((name, scheme, _) in themes) {
             val dark = scheme.surface.luminance() < 0.5f
-            val c = apofisColors(scheme, dark, blur = true)
             val contents = listOf(Color.Black, Color.White, scheme.onSurface, scheme.primary) + (0..255).map { Color(it, it, it) }
-            fun worst(fg: Color, glass: Color) = contents.minOf { contrastRatio(fg, glass.compositeOver(it)) }
+            fun worst(fg: Color, glass: Color, over: Color = Color.Transparent) =
+                contents.minOf { content -> contrastRatio(fg, over.compositeOver(glass.compositeOver(content))) }
+            val selection = scheme.primary.copy(alpha = 0.4f) // Material's text selection background
+            val c = blurredColors(scheme, dark)
+            if (c == null) {
+                // No blur for this palette: even the most opaque translucent glass misses a floor.
+                val off = apofisColors(scheme, dark)
+                val g = off.glassFill.copy(alpha = 0.99f)
+                val best = listOf(worst(scheme.onSurface, g, selection) / 4.5, worst(off.muted, g) / 4.5, worst(scheme.primary, g) / 3.0).min()
+                if (best >= 1.0) failures += "$name: blur refused although glass at 0.99 passes"
+                withoutBlur += name
+                table.append("$name | no blur: at 0.99 text %.2f, selected text %.2f, placeholder %.2f; blur off: selected text %.2f\n".format(
+                    worst(scheme.onSurface, g), worst(scheme.onSurface, g, selection), worst(off.muted, g),
+                    contrastRatio(scheme.onSurface, selection.compositeOver(off.glassFill.compositeOver(scheme.surface))),
+                ))
+                continue
+            }
             val pairs = listOf(
                 Triple("text", scheme.onSurface to c.glassFill, 4.5),
+                Triple("selected text", scheme.onSurface to c.glassFill, 4.5),
                 Triple("placeholder", c.muted to c.glassFill, 4.5),
                 Triple("expand icon", c.expandIcon to c.glassFill, 3.0),
                 Triple("send fill and stop outline", scheme.primary to c.glassFill, 3.0),
                 Triple("scroll arrow", scheme.onSurface to c.glassButtonFill, 3.0),
             )
             val ratios = pairs.map { (what, colors, min) ->
-                val ratio = worst(colors.first, colors.second)
+                val ratio = if (what == "selected text") worst(colors.first, colors.second, selection) else worst(colors.first, colors.second)
                 if (ratio < min) failures += "$name: $what is %.2f:1 over some content, needs $min".format(ratio)
                 ratio
             }
             for ((what, glass) in listOf("composer" to c.glassFill, "scroll button" to c.glassButtonFill)) {
                 if (glass.alpha >= 1f) failures += "$name: the $what glass is opaque"
             }
-            table.append("$name | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f\n".format(c.glassFill.alpha, ratios[0], ratios[1], ratios[2], ratios[3], c.glassButtonFill.alpha, ratios[4]))
+            table.append("$name | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f\n".format(c.glassFill.alpha, ratios[0], ratios[1], ratios[2], ratios[3], ratios[4], c.glassButtonFill.alpha, ratios[5]))
         }
         println(table)
         assertEquals(emptyList<String>(), failures)
+        // Material's selection (primary at 0.40) on purple dark leaves selected text near 4.5:1 even on an opaque glass.
+        assertEquals(listOf("purple dark=true pure=false"), withoutBlur)
         // Without blur nothing changes: the glass keeps the UI map's alpha over its page backplate.
         for ((_, scheme, c) in themes) {
             val dark = scheme.surface.luminance() < 0.5f

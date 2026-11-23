@@ -135,5 +135,5 @@ private fun ErrorLine(error: ActionError?, modifier: Modifier = Modifier) {
         ActionError.CLOSED -> R.string.drawer_error_closed
         ActionError.FAILED -> R.string.chat_error_http_error
     }
-    Text(stringResource(text), modifier, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    Text(stringResource(text), modifier, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error)
 }

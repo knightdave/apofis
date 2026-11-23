@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,6 +59,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.settings.CHAT_FONT_SCALE_MAX
 import xyz.rycerz.apofis.settings.CHAT_FONT_SCALE_MIN
+import xyz.rycerz.apofis.settings.Preferences
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.settings.chatFontScaleStep
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
@@ -185,6 +187,39 @@ fun SettingsScreen(
     }
 }
 
+/** [SettingsScreen] bound to [prefs]: every row shows the stored value, and a choice is stored and shown at once. */
+@Composable
+fun SettingsScreen(
+    prefs: Preferences,
+    serverUrl: String,
+    versionName: String,
+    notifications: @Composable () -> Unit,
+    onConnection: () -> Unit,
+    onLicenses: () -> Unit,
+    onBack: () -> Unit,
+) = SettingsScreen(
+    serverUrl = serverUrl,
+    themeMode = prefs.themeMode.collectAsState().value,
+    dynamicColor = prefs.dynamicColor.collectAsState().value,
+    pureBlack = prefs.pureBlack.collectAsState().value,
+    blur = prefs.blur.collectAsState().value,
+    chatFontScale = prefs.chatFontScale.collectAsState().value,
+    enterToSend = prefs.enterToSend.collectAsState().value,
+    haptics = prefs.haptics.collectAsState().value,
+    versionName = versionName,
+    notifications = notifications,
+    onConnection = onConnection,
+    onThemeMode = prefs::setThemeMode,
+    onDynamicColor = prefs::setDynamicColor,
+    onPureBlack = prefs::setPureBlack,
+    onBlur = prefs::setBlur,
+    onChatFontScale = prefs::setChatFontScale,
+    onEnterToSend = prefs::setEnterToSend,
+    onHaptics = prefs::setHaptics,
+    onLicenses = onLicenses,
+    onBack = onBack,
+)
+
 private fun themeLabel(mode: ThemeMode) = when (mode) {
     ThemeMode.SYSTEM -> R.string.settings_theme_system
     ThemeMode.LIGHT -> R.string.settings_theme_light
@@ -198,9 +233,9 @@ private fun themeIcon(mode: ThemeMode) = when (mode) {
 }
 
 /**
- * The chat text size: a row with the value, a 13 position slider and a preview line under it at the chosen size. While
- * dragged the slider shows the step under the finger; each step it moves gives one selection and one write, never one
- * per frame. Released, it shows the stored value. The preview keeps the height of its largest size, so moving the slider
+ * The chat text size: a row with the value, a 14 position slider and a preview line under it at the chosen size. During
+ * a gesture the slider shows its own step; each new step gives one selection and one write, never one per frame or per
+ * repeated key. With no gesture it shows the stored value. The preview keeps the height of its largest size, so moving the slider
  * never moves the slider.
  */
 @Composable
@@ -210,7 +245,7 @@ private fun FontScaleRows(stored: Float, onChange: (Float) -> Unit) {
     val shown = dragged ?: stored
     val label = stringResource(R.string.settings_chat_font_size)
     val percent = stringResource(R.string.settings_percent, (shown * 100).roundToInt())
-    RowLayout(Modifier, R.drawable.lucide_type, label, percent) {}
+    RowLayout(Modifier.clearAndSetSemantics {}, R.drawable.lucide_type, label, percent) {} // the slider says both
     val source = remember { MutableInteractionSource() }
     val primary = MaterialTheme.colorScheme.primary
     val onPrimary = MaterialTheme.colorScheme.onPrimary
@@ -221,8 +256,16 @@ private fun FontScaleRows(stored: Float, onChange: (Float) -> Unit) {
     state.value = shown // as Material's value overload does: the caller's value is the one shown
     Slider(
         state,
-        // Material calls this once per step the thumb reaches, never per frame: one feedback and one write each.
-        onValueChange = { value: Float -> dragged = chatFontScaleStep(value).also { haptics.selection(); onChange(it) } },
+        // Material calls this for a drag, a key or an accessibility action, also without a change (Home or End at the end):
+        // only a new step gives feedback and a write. The step is kept here, at once, for the length of the gesture.
+        onValueChange = { value: Float ->
+            val step = chatFontScaleStep(value)
+            if (step != (dragged ?: stored)) {
+                haptics.selection()
+                onChange(step)
+            }
+            dragged = step
+        },
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp)

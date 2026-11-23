@@ -37,6 +37,13 @@ import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.click
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.test.performKeyInput
+import androidx.compose.ui.test.pressKey
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.test.core.app.ApplicationProvider
+import xyz.rycerz.apofis.settings.Preferences
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -79,20 +86,23 @@ class SettingsUiTest {
     private var hapticsOn = true
     private val calls = mutableListOf<Int>() // feedback constants performed on the view
     private val events = mutableListOf<Any>() // callbacks, in order
+    private var switchedOn by mutableStateOf(setOf("dynamic", "haptics")) // the switch settings that are on
+    private var direction by mutableStateOf(LayoutDirection.Ltr)
 
     @Composable
     private fun Screen(storeScale: Boolean = true) =
         ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
             CompositionLocalProvider(LocalHaptics provides ViewHaptics({ calls += it; true }, { hapticsOn })) {
+                CompositionLocalProvider(LocalLayoutDirection provides direction) {
                 SettingsScreen(
                     serverUrl = "https://hermes.example:8642/",
                     themeMode = themeMode,
-                    dynamicColor = true,
-                    pureBlack = false,
-                    blur = false,
+                    dynamicColor = "dynamic" in switchedOn,
+                    pureBlack = "pure" in switchedOn,
+                    blur = "blur" in switchedOn,
                     chatFontScale = scale,
-                    enterToSend = false,
-                    haptics = true,
+                    enterToSend = "enter" in switchedOn,
+                    haptics = "haptics" in switchedOn,
                     versionName = "0.1.0",
                     notifications = {},
                     onConnection = { events += "connection" },
@@ -106,6 +116,7 @@ class SettingsUiTest {
                     onLicenses = { events += "licenses" },
                     onBack = { events += "back" },
                 )
+                }
             }
         }
 
@@ -221,7 +232,10 @@ class SettingsUiTest {
         slider().performSemanticsAction(SemanticsActions.SetProgress) { it(1.12f) }
         assertEquals(listOf<Any>(1.5f, 1.1f), events)
         assertEquals("110 %", state(slider()))
-        rule.onNodeWithText("110 %").assertExists() // the row's value
+        // The row above the slider is not a second stop: the slider itself says the label and the percentage.
+        val stops = rule.onAllNodes(hasText("Chat text size") or hasText("110 %")).fetchSemanticsNodes()
+        assertTrue("$stops ${stops.map { it.config }}", stops.isEmpty())
+        assertEquals("Chat text size", slider().fetchSemanticsNode().config[SemanticsProperties.ContentDescription].single())
     }
 
     /** A drag across the whole track writes each step once, in order, with one selection each, never one per frame. */
@@ -254,7 +268,6 @@ class SettingsUiTest {
         rule.waitForIdle()
         assertEquals(listOf(1.2f, 1.25f, 1.3f, 1.35f, 1.4f, 1.45f, 1.5f), events)
         assertEquals("100 %", state(slider()))
-        rule.onNodeWithText("100 %").assertExists()
     }
 
     /** The preview line keeps the height of its largest size: nothing under it moves, and the slider stays put. */
@@ -270,6 +283,129 @@ class SettingsUiTest {
             assertEquals("slider at $s", slider, top(slider()))
             assertEquals("next section at $s", below, top(rule.onNodeWithText("Behaviour")))
         }
+    }
+
+    /** Each switch row shows its own setting: one on at a time, every other row off. */
+    @Test
+    fun eachSwitchRowShowsItsOwnSetting() {
+        switchedOn = emptySet()
+        show()
+        val rows = mapOf("dynamic" to "Dynamic color", "pure" to "Pure background", "blur" to "Frosted glass", "enter" to "Enter sends", "haptics" to "Vibration feedback")
+        for (on in rows.keys) {
+            switchedOn = setOf(on)
+            rule.waitForIdle()
+            for ((key, text) in rows) {
+                row(text).assert(SemanticsMatcher.expectValue(SemanticsProperties.ToggleableState, if (key == on) ToggleableState.On else ToggleableState.Off))
+            }
+        }
+    }
+
+    private fun focusedSlider() = slider().performScrollTo().also { it.performSemanticsAction(SemanticsActions.RequestFocus) }
+
+    /** Material calls back for End, and for Right, at the end; nothing is written and nothing ticks. */
+    @Test
+    fun endAtTheEndWritesNothing() {
+        scale = 1.5f
+        show()
+        focusedSlider().performKeyInput { pressKey(Key.MoveEnd) }
+        slider().performKeyInput { pressKey(Key.DirectionRight) }
+        rule.waitForIdle()
+        assertEquals(emptyList<Any>(), events)
+        assertEquals(emptyList<Int>(), calls)
+    }
+
+    @Test
+    fun oneKeyStepWritesOnce() {
+        show()
+        focusedSlider().performKeyInput { pressKey(Key.DirectionRight) }
+        rule.waitForIdle()
+        assertEquals(listOf<Any>(1.05f), events)
+        assertEquals(listOf(selection), calls)
+        assertEquals("105 %", state(slider()))
+    }
+
+    /** Mirrored: in a right-to-left layout Left raises the size, and End at the end is still a no-op. */
+    @Test
+    fun keysAreMirroredRightToLeft() {
+        direction = LayoutDirection.Rtl
+        show()
+        focusedSlider().performKeyInput { pressKey(Key.DirectionLeft) }
+        rule.waitForIdle()
+        assertEquals(listOf<Any>(1.05f), events)
+        assertEquals(listOf(selection), calls)
+        scale = 1.5f
+        rule.waitForIdle()
+        slider().performKeyInput { pressKey(Key.MoveEnd) }
+        rule.waitForIdle()
+        assertEquals(listOf<Any>(1.05f), events)
+        assertEquals(listOf(selection), calls)
+    }
+
+    @Test
+    fun setProgressToTheCurrentValueWritesNothing() {
+        show()
+        slider().performScrollTo().performSemanticsAction(SemanticsActions.SetProgress) { it(1f) }
+        rule.waitForIdle()
+        assertEquals(emptyList<Any>(), events)
+        assertEquals(emptyList<Int>(), calls)
+    }
+
+    /** A drag past the end of the track and back: one write and one tick per step reached, none while beyond the end. */
+    @Test
+    fun aDragBeyondTheTrackAndBackWritesOncePerStep() {
+        show()
+        slider().performScrollTo().performTouchInput {
+            down(center)
+            repeat(40) { moveBy(Offset(width / 40f, 0f)) } // from the middle to half a width past the end
+            repeat(20) { moveBy(Offset(-width / 40f, 0f)) } // back to the end of the track
+            repeat(19) { moveBy(Offset(-width / 40f, 0f)) } // and back to just short of the middle (1.2)
+            up()
+        }
+        rule.waitForIdle()
+        val steps = events.map { it as Float }
+        assertEquals("$steps", listOf(1.2f, 1.25f, 1.3f, 1.35f, 1.4f, 1.45f, 1.5f, 1.45f, 1.4f, 1.35f, 1.3f, 1.25f, 1.2f), steps.take(13))
+        // Every write is a new step next to the last one: none repeated while beyond the end or on the way back.
+        steps.zipWithNext().forEach { (a, b) -> assertEquals("$steps", 0.05f, kotlin.math.abs(a - b), 0.001f) }
+        assertEquals(List(events.size) { selection }, calls)
+    }
+
+    // ---- the real wiring: SettingsScreen bound to Preferences, as the app shows it ----
+
+    private val prefs by lazy { Preferences(ApplicationProvider.getApplicationContext()) }
+
+    @Composable
+    private fun Bound(onBack: () -> Unit = {}) =
+        ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+            CompositionLocalProvider(LocalHaptics provides ViewHaptics({ calls += it; true }, { true })) {
+                SettingsScreen(prefs, "https://hermes.example:8642/", "0.1.0", notifications = {}, onConnection = {}, onLicenses = {}, onBack = onBack)
+            }
+        }
+
+    /** Two taps are two toggles: each toggles from what is shown, and each ticks once. */
+    @Test
+    fun twoTapsOnASwitchAreTwoToggles() {
+        rule.setContent { Bound() }
+        row("Enter sends").performClick()
+        row("Enter sends").performClick()
+        row("Enter sends").assert(SemanticsMatcher.expectValue(SemanticsProperties.ToggleableState, ToggleableState.Off))
+        assertFalse(prefs.enterToSend.value)
+        assertFalse(Preferences(ApplicationProvider.getApplicationContext()).enterToSend.value)
+        assertEquals(listOf(selection, selection), calls)
+    }
+
+    /** A choice made as Settings is left in the same turn is what the app's flow and storage hold. */
+    @Test
+    fun aChoiceMadeWhileLeavingIsKept() {
+        var inSettings by mutableStateOf(true)
+        rule.setContent { if (inSettings) Bound() }
+        val tap = row("Enter sends").fetchSemanticsNode().config[SemanticsActions.OnClick].action!!
+        rule.runOnUiThread {
+            tap()
+            inSettings = false // the same turn: no frame between the tap and leaving
+        }
+        rule.waitForIdle()
+        assertTrue(prefs.enterToSend.value)
+        assertTrue(Preferences(ApplicationProvider.getApplicationContext()).enterToSend.value)
     }
 
     /** The longest Polish strings at double font size in a 320 dp window: no text is cut, every control stays 48 dp. */
