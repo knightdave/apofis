@@ -34,7 +34,6 @@ import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.HoldingQueue
 import xyz.rycerz.apofis.api.ChatModel
-import xyz.rycerz.apofis.api.MAX_BODY_BYTES
 import xyz.rycerz.apofis.api.buildRunBody
 import xyz.rycerz.apofis.api.expandedSize
 import xyz.rycerz.apofis.api.fixture
@@ -75,10 +74,11 @@ class SendQueueTest {
     private val sizes = HashMap<String, Long>()
     @Volatile private var onRead: () -> Unit = {}
     private var schedules = 0
+    private val sizeAsked = mutableListOf<String>()
 
     private fun imageQueue(db: AppDatabase, active: () -> Boolean = { true }) = SendQueue(
         api, db, { key, run -> started += key to run }, { clock }, schedule = { schedules++ }, active = active,
-        readImage = { onRead(); files[it] }, imageSize = { sizes[it] ?: files[it]?.size?.toLong() },
+        readImage = { onRead(); files[it] }, imageSize = { sizeAsked += it; sizes[it] ?: files[it]?.size?.toLong() },
     )
 
     @After
@@ -1105,7 +1105,11 @@ class SendQueueTest {
         addSession("apofis-a")
         running("apofis-a")
         val d = photo(1, 2, 3)
-        ChatRepository(api, db, { clock }, queue).send("apofis-a", "look", listOf(d))
+        var atCommit = ""
+        ChatRepository(api, db, { clock }, queue).send("apofis-a", "look", listOf(d)) {
+            db.openHelper.readableDatabase.query("SELECT state || ',' || IFNULL(runId, '') FROM PendingSendEntity").use { it.moveToFirst(); atCommit = it.getString(0) }
+        }
+        assertEquals("queued,", atCommit) // stored as a run send, not as a steer that delivery later repairs
         val row = rows("apofis-a").single()
         assertEquals("queued", row.state) // behind the running reply (decision 5)
         assertNull(row.runId)
@@ -1141,10 +1145,8 @@ class SendQueueTest {
         addSession("apofis-a")
         running("apofis-a") // a stored row waits behind the reply: nothing is read or sent
         val d = sha(byteArrayOf(9))
-        sizes[d] = 6_000_000L
-        val bare = expandedSize(buildRunBody("apofis-a", "", listOf(d)), listOf(6_000_000L))
-        val fits = "x".repeat((MAX_BODY_BYTES - bare).toInt())
-        assertEquals(MAX_BODY_BYTES.toLong(), expandedSize(buildRunBody("apofis-a", fits, listOf(d)), listOf(6_000_000L)))
+        val (size, fits) = atWireCap(d)
+        sizes[d] = size
         try {
             queue.submit("apofis-a", fits + "x", images = listOf(d))
             fail("stored a body one byte over the cap")
@@ -1398,5 +1400,150 @@ class SendQueueTest {
             assertTrue(it.createStarted)
             assertFalse(it.existsOnServer)
         }
+    }
+
+    // The admission budgets as ruled, measured on a body with an empty session id and the default choice.
+    private fun rowSize(text: String, images: List<String>) = text.encodeToByteArray().size + buildRunBody("", text, images).encodeToByteArray().size
+
+    /** A caption whose row (text plus body) is exactly [target] bytes: "x" adds 2, a control character 1 + 6. */
+    private fun captionOfRow(target: Int, images: List<String>): String {
+        val extra = target - rowSize("", images)
+        val text = if (extra % 2 == 0) "x".repeat(extra / 2) else "\u0001" + "x".repeat((extra - 7) / 2)
+        assertEquals(target, rowSize(text, images))
+        return text
+    }
+
+    /** A file size and a caption whose expanded body is exactly 9,000,000 bytes. */
+    private fun atWireCap(d: String): Pair<Long, String> {
+        val base = expandedSize(buildRunBody("", "", listOf(d)), listOf(0L))
+        val size = 3L * ((9_000_000 - base) / 4)
+        val text = "x".repeat((9_000_000 - expandedSize(buildRunBody("", "", listOf(d)), listOf(size))).toInt())
+        assertEquals(9_000_000L, expandedSize(buildRunBody("", text, listOf(d)), listOf(size)))
+        return size to text
+    }
+
+    private suspend fun assertRefused(images: List<String>, text: String = "look", expected: Class<out Exception>) {
+        try {
+            queue.submit("apofis-a", text, images = images)
+            fail("stored a send that admission refuses")
+        } catch (e: Exception) {
+            assertEquals(expected, e.javaClass)
+        }
+        assertTrue(rows("apofis-a").isEmpty())
+        assertEquals(0, schedules)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun tenImagesAcceptedElevenRefusedWithoutFileAccess() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        val photos = (1..11).map { photo(it.toByte()) }
+        assertRefused(photos, expected = IllegalArgumentException::class.java)
+        assertTrue(sizeAsked.isEmpty())
+        queue.submit("apofis-a", "ten", images = photos.take(10))
+        assertEquals(photos.take(10).joinToString(","), rows("apofis-a").single().images)
+    }
+
+    @Test
+    fun badDigestRefusedWithoutFileAccess() = runTest {
+        addSession("apofis-a")
+        val good = photo(1)
+        for (bad in listOf("", good.uppercase(), good.dropLast(1), good + "0", good.dropLast(1) + ",", "g" + good.drop(1))) {
+            assertRefused(listOf(good, bad), expected = IllegalArgumentException::class.java)
+        }
+        assertTrue(sizeAsked.isEmpty())
+    }
+
+    @Test
+    fun rowBudgetHoldsForTextAndImageSends() = runTest {
+        addSession("apofis-a")
+        // Busy but not steerable: a stored row waits, text included, and nothing is sent.
+        db.activeRunDao().upsert(ActiveRunEntity("run_1", "apofis-a", null, "waiting_for_approval", 1L))
+        for (images in listOf(emptyList(), listOf(photo(1, 2, 3)))) {
+            assertRefused(images, captionOfRow(1_500_001, images), SendTooLarge::class.java)
+            val fits = captionOfRow(1_500_000, images)
+            queue.submit("apofis-a", fits, images = images)
+            assertEquals(fits, rows("apofis-a").single().text)
+            db.pendingSendDao().delete(rows("apofis-a").single().idempotencyKey)
+            schedules = 0
+        }
+    }
+
+    @Test
+    fun hugeCaptionRefusedBeforeAnyWork() = runTest {
+        addSession("apofis-a")
+        assertRefused(listOf(photo(1)), "\u0001".repeat(1_500_001), SendTooLarge::class.java)
+        assertTrue(sizeAsked.isEmpty()) // refused before any file or body
+    }
+
+    @Test
+    fun choiceSetBetweenSendsDoesNotChangeAdmission() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        val d = sha(byteArrayOf(9))
+        val (size, fits) = atWireCap(d)
+        sizes[d] = size
+        val repo = ChatRepository(api, db, { clock }, queue)
+        repo.send("apofis-a", fits, listOf(d))
+        clock += 1
+        repo.setChoice("apofis-a", ChatModel("m".repeat(256), "p".repeat(256), "r".repeat(256), true))
+        repo.send("apofis-a", fits, listOf(d))
+        val (first, second) = rows("apofis-a")
+        assertEquals(buildRunBody("apofis-a", fits, listOf(d)), first.requestBody)
+        assertEquals(buildRunBody("apofis-a", fits, listOf(d), ChatModel("m".repeat(256), "p".repeat(256), "r".repeat(256), true)), second.requestBody)
+    }
+
+    @Test
+    fun setChoiceRefusesLongNames() = runTest {
+        addSession("apofis-a")
+        val repo = ChatRepository(api, db, { clock }, queue)
+        for (choice in listOf(ChatModel(model = "m".repeat(257)), ChatModel(provider = "p".repeat(257)), ChatModel(reasoning = "r".repeat(257)))) {
+            try {
+                repo.setChoice("apofis-a", choice)
+                fail("stored $choice")
+            } catch (_: IllegalArgumentException) {
+            }
+        }
+        assertEquals(ChatModel(), db.sessionDao().get("apofis-a")!!.choice())
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun fileLargerThanItsReportedSizeSendsNothing() = runTest {
+        addSession("apofis-a")
+        val big = ByteArray(6_800_000) { (it % 251).toByte() } // hashes to its digest, but expands past 9,000,000
+        val d = sha(big)
+        files[d] = big
+        sizes[d] = 1L // measured while a truncated copy stood under that name
+        respond(runStart("run_1"), 202) // only for a build that would post it
+        queue.submit("apofis-a", "look", images = listOf(d))
+        assertEquals(0, server.requestCount)
+        assertImageMissing()
+    }
+
+    @Test
+    fun throwingReaderFailsLikeMissingAndOtherChatsStillSend() = runTest {
+        addSession("apofis-a")
+        addSession("apofis-b")
+        val d = photo(1, 2, 3)
+        db.pendingSendDao().upsert(PendingSendEntity("ka", "apofis-a", "look", buildRunBody("apofis-a", "look", listOf(d)), clock, "queued", null, null, images = d))
+        db.pendingSendDao().upsert(PendingSendEntity("kb", "apofis-b", "hi", buildRunBody("apofis-b", "hi"), clock + 1, "queued", null, null))
+        onRead = { throw java.io.IOException("unreadable") }
+        respond(runStart("run_b"), 202)
+        assertTrue(queue.drain())
+        assertImageMissing()
+        assertEquals("/v1/runs", take().target)
+        assertEquals("sending", pending("kb").state)
+    }
+
+    @Test
+    fun legacyTextBodyIsPostedByteForByte() = runTest {
+        addSession("apofis-a")
+        val legacy = """{ "input" : "hi",  "session_id":"apofis-a" }""" // not the builder's spacing or key order
+        db.pendingSendDao().upsert(PendingSendEntity("k", "apofis-a", "hi", legacy, clock, "queued", null, null))
+        respond(runStart("run_1"), 202)
+        assertTrue(queue.drain())
+        assertEquals(legacy, take().body!!.utf8())
     }
 }

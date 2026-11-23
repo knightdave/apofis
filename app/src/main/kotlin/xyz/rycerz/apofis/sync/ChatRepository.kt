@@ -34,6 +34,7 @@ import xyz.rycerz.apofis.db.SessionEntity
 private const val SESSION_PAGE = 200
 private const val MESSAGE_PAGE = 500
 private const val MAX_PAGES = 100
+private const val MAX_CHOICE_CHARS = 256
 
 // Process-wide: the app has a single database, so every repository instance must share one lock.
 private val lock = Mutex()
@@ -308,9 +309,13 @@ class ChatRepository(
         queue().submit(sessionKey, text, onStored, images)
     }
 
-    /** Stores the chat's model choice on this phone only (no server call); sends stored from now on carry it. */
+    /**
+     * Stores the chat's model choice on this phone only (no server call); sends stored from now on carry it. A name over
+     * [MAX_CHOICE_CHARS] is refused (IllegalArgumentException): the size margins of a send assume it.
+     */
     suspend fun setChoice(sessionKey: String, choice: ChatModel) {
         requireAppKey(sessionKey)
+        require(listOfNotNull(choice.model, choice.provider, choice.reasoning).all { it.length <= MAX_CHOICE_CHARS }) { "choice too long" }
         lock.withLock {
             ensureOpen()
             val session = sessionDao.get(sessionKey) ?: return

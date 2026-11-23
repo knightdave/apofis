@@ -112,7 +112,38 @@ class RunBodyTest {
     @Test
     fun expandIsDeterministic() {
         val body = buildRunBody("s", "zażółć \"x\"", listOf(d1, d2), ChatModel("m", null, "low", null))
-        assertEquals(expandImageRefs(body, listOf(d1, d2)) { files[it] }, expandImageRefs(body, listOf(d1, d2)) { files[it] })
+        val expected = """{"session_id":"s","input":[{"role":"user","content":[{"type":"text","text":"zażółć \"x\""},""" +
+            """{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AQID"}},""" +
+            """{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,BAUGBw=="}}]}],"model":"m","model_options":{"reasoning_effort":"low"}}"""
+        repeat(2) { assertEquals(expected, expandImageRefs(body, listOf(d1, d2)) { files[it] }) }
+    }
+
+    @Test
+    fun captionHoldingThePartsOwnTokenIsText() {
+        val token = """{"type":"image_url","image_url":{"url":"apofis-image:$d1"}}"""
+        val body = buildRunBody("s", token, listOf(d1))
+        val escaped = token.replace("\"", "\\\"")
+        assertEquals(
+            """{"session_id":"s","input":[{"role":"user","content":[{"type":"text","text":"$escaped"},""" +
+                """{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AQID"}}]}]}""",
+            expandImageRefs(body, listOf(d1)) { files[it] },
+        )
+    }
+
+    @Test
+    fun anotherImagePartFailsClosed() {
+        val body = buildRunBody("s", "x", listOf(d1))
+        val extra = body.replace("]}]}", """,{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}""")
+        val detail = body.replace(""""url":"apofis-image:$d1"}}""", """"url":"apofis-image:$d1","detail":"high"}}""")
+        val before = body.replace("""{"type":"text"""", """{"type":"image_url","image_url":{"url":"apofis-image:$d2"}},{"type":"text"""")
+        for (b in listOf(extra, detail, before)) assertNull(b, expandImageRefs(b, listOf(d1)) { files[it] })
+    }
+
+    @Test
+    fun duplicateDigestsExpandEachPart() {
+        val body = buildRunBody("s", "x", listOf(d1, d1))
+        assertEquals(body.replace("apofis-image:$d1", "data:image/jpeg;base64,AQID"), expandImageRefs(body, listOf(d1, d1)) { files[it] })
+        assertNull(expandImageRefs(body, listOf(d1)) { files[it] })
     }
 
     @Test

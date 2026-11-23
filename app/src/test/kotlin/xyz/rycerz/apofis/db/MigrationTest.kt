@@ -1,6 +1,10 @@
 package xyz.rycerz.apofis.db
 
+import android.Manifest
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationManager
+import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
@@ -16,6 +20,11 @@ import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.notify.Notifier
+import xyz.rycerz.apofis.notify.ensureChannels
 
 private const val NAME = "migrate.db"
 
@@ -162,6 +171,7 @@ class MigrationTest {
         SessionEntity(key, currentId, "", null, false, false, 1.0, null, 0, null, false, true)
 
     @Test
+    @Config(sdk = [37])
     fun version3To4() = runTest {
         create(3, ::seedVersion3)
         val db = openAppDatabase(app, NAME)
@@ -191,6 +201,22 @@ class MigrationTest {
             // The new table works.
             db.imageBindingDao().upsert(ImageBindingEntity("apofis-a", 1, "d1,d2"))
             assertEquals(listOf(ImageBindingEntity("apofis-a", 1, "d1,d2")), db.imageBindingDao().forSession("apofis-a"))
+
+            // The production notifier replays the migrated outbox: the finish is posted once, silently, and consumed.
+            shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+            ensureChannels(app)
+            val nm = app.getSystemService(NotificationManager::class.java)
+            val notifier = Notifier(app, app.getSharedPreferences("migrate-notify", Context.MODE_PRIVATE), db, { 3L }, { null }, backgroundScope)
+            notifier.replayOutbox(3)
+            val shown = nm.activeNotifications.single()
+            assertEquals("apofis-a", shown.tag)
+            assertEquals(app.getString(R.string.notif_reply_finished), shown.notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString())
+            assertTrue(shown.notification.groupAlertBehavior == Notification.GROUP_ALERT_SUMMARY && shown.notification.group != null)
+            assertTrue(db.noticeOutboxDao().all(3).isEmpty())
+            assertEquals("run:run_1", db.noticeStateDao().get("apofis-a")!!.eventId)
+            nm.cancelAll()
+            notifier.replayOutbox(3)
+            assertTrue(nm.activeNotifications.isEmpty()) // nothing left to post
         } finally {
             db.close()
         }
