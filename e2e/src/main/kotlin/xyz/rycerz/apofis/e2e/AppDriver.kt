@@ -110,7 +110,7 @@ class AppDriver {
         shell("run-as $APP tee shared_prefs/push.xml", "$xml\n") // stdin passes through run-as, as for sqlite3
         val read = shell("run-as $APP cat shared_prefs/push.xml")
         if (!injectionConfirmed(read, install, nonce, origin)) {
-            log("push identity read back as: ${read.take(600).replace("\n", "\\n")}") // the injected values only, never the key
+            log("push identity: ${identityDiagnostic(read)}") // a fixed category: never the bytes read
             fail("The push identity was not read back as written; push stays off")
         }
         log("push identity written and read back")
@@ -122,19 +122,29 @@ class AppDriver {
      */
     fun exportPushIntents(ifUnreadable: Collection<String>) {
         val read = sh("run-as $APP sh -c 'if [ -e shared_prefs/push.xml ]; then cat shared_prefs/push.xml && echo && echo @@READ; else echo @@NONE; fi'")
-        val lines = pushIntentLines(read, ifUnreadable)
-        if (lines.any { it.startsWith("pushintent-missing") }) log("push prefs read as: ${read.take(600).replace("\n", "\\n")}")
-        lines.forEach(::journal)
+        log("push intents: ${exportDiagnostic(read)}") // a fixed category: never the bytes read
+        pushIntentLines(read, ifUnreadable).forEach(::journal)
     }
 
     /** The device clock in seconds, for `logcat -T`. */
     fun deviceTime(): String = sh("date +%s").trim().also { if (!Regex("\\d+").matches(it)) fail("Bad device time: $it") } + ".000"
 
-    /** The app's wake summaries (debug builds, tag ApofisWake) logged since [since]. */
-    fun wakeLines(since: String): List<String> = sh("logcat -d -v raw -T $since -s ApofisWake:I").lines().filter { it.startsWith("cause=") }
+    /**
+     * Every line the app's wake tag (debug builds, ApofisWake) logged since [since], in order, malformed ones included
+     * (the callers' parsers refuse them); fails when logcat itself failed.
+     */
+    fun wakeLines(since: String): List<String> {
+        val out = sh("logcat -d -v raw -T $since -s ApofisWake:I; echo rc=$?").trimEnd().lines()
+        if (out.lastOrNull() != "rc=0") fail("Not proved: the wake log could not be read")
+        return out.dropLast(1).filter { it.isNotBlank() && !it.startsWith("--------- beginning of") }
+    }
 
-    /** Crash lines of the app since [since]. */
-    fun crashes(since: String): List<String> = sh("logcat -d -b crash -v raw -T $since").lines().filter { APP in it }
+    /** Crash lines of the app since [since]; fails when the crash log could not be read (never taken as "no crash"). */
+    fun crashes(since: String): List<String> {
+        val out = sh("logcat -d -b crash -v raw -T $since; echo rc=$?").trimEnd().lines()
+        if (out.lastOrNull() != "rc=0") fail("The crash log could not be read")
+        return out.dropLast(1).filter { APP in it }
+    }
 
     /** The app's active notifications as `cmd notification list` keys; fails when the list cannot be read. */
     fun notifications(): List<String> {
@@ -143,8 +153,29 @@ class AppDriver {
         return out.dropLast(1).filter { "|$APP|" in it }
     }
 
-    /** The rows of [sql] on the app's database, one line each (read through run-as, never the key). */
-    fun query(sql: String): List<String> = shell("run-as $APP sqlite3 databases/apofis.db", "$sql\n").lines().filter(String::isNotBlank)
+    /**
+     * The rows of [sql] on the app's database, one line each (read through run-as, never the key); null when sqlite
+     * stopped on an error or the output ended early (-bail, then an end mark the output must end with).
+     */
+    fun query(sql: String): List<String>? {
+        val out = shell("run-as $APP sqlite3 -bail databases/apofis.db", "$sql\nSELECT '@@end';\n").lines().filter(String::isNotBlank)
+        return if (out.lastOrNull() == "@@end") out.dropLast(1) else null
+    }
+
+    /** The app's active notification keys whose tag is [tag] (the app tags a chat's notification with its session key). */
+    fun notificationsTagged(tag: String): List<String> = notifications().filter { it.split('|').getOrNull(3) == tag }
+
+    /** The push prefs file as read through run-as, for comparisons only: never logged (it holds the endpoint and token). */
+    fun pushPrefsRead(): String = shell("run-as $APP cat shared_prefs/push.xml")
+
+    /** The server's status of run [runId], after checking it belongs to session [session]. */
+    fun runStatus(runId: String, session: String): String {
+        if (!RUN_ID.matches(runId) || !SESSION_ID.matches(session)) fail("Not a run or session id")
+        val (code, body) = http("GET", "v1/runs/$runId")
+        val r = if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null
+        if (r?.optString("run_id") != runId || r.optString("session_id") != session) fail("GET run $runId answered $code without its session")
+        return r.optString("status")
+    }
 
     /** The server title of session [id], after proving it is this run's (as [serverMessages] does). */
     fun serverTitle(id: String): String {

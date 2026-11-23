@@ -160,8 +160,9 @@ contacts ntfy.sh or any other push host.
 | `--full`, `--scenario <name>` | as before (never `PushE2eTest`), outside the ledger | no | as before |
 | `--push` | `PushE2eTest` `connectorLifecycle`, `hostilePushes`, `permissionAndTestPush` | yes | 0 |
 | `--push-model` | `PushE2eTest#pushWakesKilledApp`, `SurvivalE2eTest#connectAndChat`, `SurvivalE2eTest#replySurvivesProcessDeath` | the push method | at most 3 |
-| `--test <Class#method>` | a push method or one of those three: as its row; any other test: as before | per row | per row |
-| anything else (`--test PushE2eTest`, an unknown method) | refused before any action | | |
+| `--test PushE2eTest#pushWakesKilledApp` | that method alone: gate 2 | the push method | at most 1 (reserves 1) |
+| `--test <Class#method>` | a push method or one of those three: as its row; any other test of the module: as before | per row | per row |
+| anything else (`--test PushE2eTest`, a suite name such as `--test push-model`, an unknown class, method or scenario, extra arguments) | refused before any action | | |
 
 - **Identities.** Before anything else the build host mints one install id (a random UUID) per push scenario, the topic
   (`up` and 12 random letters and digits) and, once the tunnel port is known, a port free on both hosts. For each
@@ -171,17 +172,29 @@ contacts ntfy.sh or any other push host.
 - **The fake ntfy** (`fake_ntfy.py`) runs on the build host with a minimal environment in a run-private directory,
   listens on `127.0.0.1:<port>` only, and reaches the device through a second reverse tunnel and `adb reverse`. It
   queues messages for the topic (`POST /<topic>`, at most 64 of at most 4096 bytes) and hands the oldest to the tests
-  (`GET /<topic>/poll`); at most 8 requests at once. `POST /trigger` (gate 2, at most 3 times) runs the real hook with a
-  fixed anonymous approval event against `fixture.db`, a synthetic database it builds in its directory with one hidden
-  record of `pushWakesKilledApp`'s install naming the fake; it answers once the hook's detached child has released its
-  slot (killing its process group past 30 s), and on stop it kills any child still holding one. The cleanup stops it,
-  requires "stopped: child released|killed" and its port closed here; the postcheck covers the tunnel's port there.
+  (`GET /<topic>/poll`); at most 8 requests at once. `POST /trigger` (gate 2, at most 3 times, one at a time, only with
+  an empty topic) runs the real hook in its private home with a fixed anonymous approval event against `fixture.db`, a
+  synthetic database it builds in its directory with one hidden record of `pushWakesKilledApp`'s install naming the
+  fake. It answers once the hook's detached child has released its slot and exited (killing its process group past
+  30 s), and 200 only with proof that this invocation's child posted exactly once to this fake (one new hook log line
+  `matched regs=1 <this origin>=200`, exactly one message received meanwhile, the fixed `{"kind":"needs_input"}`). On
+  stop it admits no further trigger, waits for a hook parent still starting, and kills any child still holding a slot.
+  Its stdin is a pipe the harness holds: if the harness dies without its cleanup, the fake stops by itself and removes
+  its files. The cleanup stops it, requires "stopped: child released|killed" and its port closed here (otherwise it
+  fails and keeps the private directory for inspection); the postcheck covers the tunnel's port there.
 - **The distributor** is the e2e APK (`FakeDistributor`, accepted only by debug builds): it answers the app's REGISTER
   with `NEW_ENDPOINT http://127.0.0.1:<port>/<topic>?up=1` and sends MESSAGE, UNREGISTERED and TEMP_UNAVAILABLE for the
   tests. `AppDriver.freshStart` writes the scenario's `install_id`, `e2e_nonce` (the run nonce) and `e2e_origin` into the
   cleared app's `shared_prefs/push.xml` and reads them back before the launch; anything else fails the scenario before
   push can be turned on. The debug app then titles every record `<id> op-<marker> e2e-<nonce>` and commits each create
-  intent with the id's reservation.
+  intent with the id's reservation. Nothing logs the push prefs, an endpoint or a token: diagnostics are fixed
+  categories, and the distributor logs only a known action from the app.
+- **What the scenarios claim.** The device checks the records it expects by id (exact id, source, hidden flag and title
+  against the app's own intent, and for the current record the app's stored record and endpoint), compared and never
+  logged; the exact namespace is the host's listing at the end of the run. For a foreign distributor's migration the
+  claim is: Off in Settings, an UNREGISTER with the old token, no further REGISTER at the test distributor and no stored
+  mention of the foreign package; where an outgoing REGISTER goes is covered by the app's unit tests. "No notification"
+  means none is active after the delivery. Every quiet delivery needs a new push-caused wake check that took no run.
 - **Intents and cleanup (rule C3).** At each push scenario's end (also on failure) and before every `pm clear`, the tests
   journal `pushintent <id> <title>` for every intent in the app's prefs, or `pushintent-missing <scenario>` when they
   cannot be read. The app never deletes a push record, so the harness's cleanup is what removes them: for each journaled
@@ -192,10 +205,14 @@ contacts ntfy.sh or any other push host.
 - **The ledger.** `--push-model` and its `--test` selections first reserve their proved upper bounds (1 per method) in
   `~/.local/state/apofis-e2e/model-budget-m3`, shared by every worktree and appended under `flock`
   (`reserve <run id> <method> <bound>`), and refuse when the reserved and observed starts would pass 8 or the ledger is
-  unreadable or ambiguous. After the run each method's starts, counted on the server as the user turns of its journaled
-  chat, are appended (`observed <run id> <method> <n>`); an unknown count leaves the reservation's bound. Every
-  model-capable run prints how often `apofis_push.py` appears in `~/.hermes/config.yaml` and the allowlist (count only):
-  with the hook installed, each model run can send one contentless wake naming a test chat to the owner's ntfy endpoint.
+  unreadable, ambiguous or torn, or a proposal repeats a run and method. After the run an observed count
+  (`observed <run id> <method> <n>`) replaces a reservation's bound only on positive proof: 0 when the key never left
+  the build host; otherwise only with a journal found complete, either the user turns in the server's whole record of
+  the method's journaled chat (a complete page for that session with at least its one turn) or 0 when that journal has
+  no send for it. Anything uncertain leaves the bound. Every model-capable run, ledgered or not (`--full`, `--scenario`,
+  model-capable `--test`), prints how often `apofis_push.py` appears in `~/.hermes/config.yaml` and the allowlist (count
+  only, "unknown" when a file cannot be read): with the hook installed, each model run can send one contentless wake
+  naming a test chat to the owner's ntfy endpoint.
 - **Logs.** The exported logcat adds the app's debug tag `ApofisWake` (one line per wake check: cause, runs, settled,
   failed, outcome; no ids).
 

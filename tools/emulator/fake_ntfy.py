@@ -397,7 +397,7 @@ def main(argv: list) -> int:
     orphaned = threading.Event()
     if o.owner_stdin:
         def watch_owner():
-            while sys.stdin.buffer.read(4096):
+            while os.read(0, 4096):  # the raw descriptor: a buffered read would block interpreter shutdown
                 pass
             orphaned.set()
             stop.set()

@@ -50,8 +50,9 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   stepMustBeOfThatReplyRunningAndShowExactlyTheCommand chatKeyIsReadFromTheChatScreensTagOnly
   steerReplyIsTheFinalReplyOfThisTurnOnly steeredTurnOnTheServerMustBeInOrderAndAlone
   terminalCommandsComeFromToolCallArguments interruptedResultMustBelongToTheCommandsOwnCall steerRowsAreUnwrapped
-  pushIdentityCountsOnlyWhenReadBackWhole pushIntentsAreJournaledOrMissingForEveryInstall wakeSummariesOfHostilePushesMustShowNoRun
-  pushProofNeedsItsPreconditionsAndOnePushSettlement settingsRowValueIsAWholeSegment)
+  pushIdentityCountsOnlyWhenReadBackWhole pushIntentsAreJournaledOrMissingForEveryInstall pushDiagnosticsNeverCarryTheBytesRead
+  quietDeliveriesNeedANewPushCheckThatTookNoRun wakePreconditionPassesTheStoredRunsSendingRowOnly
+  pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly settingsRowValueIsAWholeSegment)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
 # Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
 # tunnel. Gate 1's start no model run.
@@ -604,7 +605,7 @@ key='' nonce='' run_id='' tmp='' interrupted='' key_sent_local='' mode='' arg=''
 tun_fd='' tunnel_pid='' tunnel_port='' rin='' rout='' remote_pid='' remote_shell_pid='' last_line=''
 sessions_state='' journal=() published='' export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
 incoming='' wd_pid='' orig_out='' orig_err=''
-push=() models=() push_port='' push_topic='' push_installs='' push_dir='' fake_pid=''
+push=() models=() model_capable='' journal_complete='' keep_push='' fake_fd='' push_port='' push_topic='' push_installs='' push_dir='' fake_pid=''
 declare -A install_of=() starts=()
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
@@ -702,8 +703,9 @@ check_sessions() {
   if [ -n "$bad" ]; then
     log "FAILED: the session journal is missing a line, or a line is incomplete or unmatched; sessions this run created may remain on the server (only complete entries are checked and deleted)"
     ok=1
-  elif [ "${#journal[@]}" = 0 ]; then
-    log "sessions: the journal is complete and empty (nothing was sent)"
+  else
+    journal_complete=1 # positive evidence of what ran: the only state in which observed starts may lower a reservation
+    [ "${#journal[@]}" != 0 ] || log "sessions: the journal is complete and empty (nothing was sent)"
   fi
   body=$(mktemp)
   for l in "${entries[@]}"; do
@@ -720,11 +722,17 @@ check_sessions() {
         continue
       fi
       verified+=("$id")
-      if printf '%s\n' "${models[@]}" | grep -qx "[A-Za-z0-9]*#$scen"; then
-        # The model starts of a reserved method: the user turns of its chat on the server (every id of its lineage).
+      if [ "$id" = "${ids%%,*}" ] && grep -qx "[A-Za-z0-9]*#$scen" <<<"$(printf '%s\n' "${models[@]}")"; then
+        # The model starts of a reserved method: the user turns in the server's whole record of its chat (the current
+        # id answers with its lineage). Only a complete, matching answer with at least the one turn it sent counts.
         code=$(hermes GET "api/sessions/$id/messages?order=oldest&include_compacted=true" "$body") || code=error
-        if [ "$code" = 200 ] && n=$(jq -e '[.data[] | select(.role == "user")] | length' "$body" 2>/dev/null) &&
-          [[ ${starts[$scen]:-0} =~ ^[0-9]+$ ]]; then starts[$scen]=$((${starts[$scen]:-0} + n)); else starts[$scen]=unknown; fi
+        if [ "$code" = 200 ] && n=$(jq -e --arg id "$id" 'select(.object == "list" and .session_id == $id
+            and (.data | type) == "array" and .pagination.returned == (.data | length) and .pagination.returned < .pagination.limit)
+            | [.data[] | select(.role == "user")] | length' "$body" 2>/dev/null) && [ "$n" -ge 1 ]; then
+          starts[$scen]=$n
+        else
+          starts[$scen]=unknown
+        fi
       fi
       if [ "$scen" = steerDuringRun ]; then
         code=$(hermes GET "api/sessions/$id/messages?order=oldest&include_compacted=true" "$body") || code=error
@@ -781,29 +789,40 @@ check_sessions() {
 
 # ---------------------------------------------------------------- Milestone 3: selections, ledger, push records
 
-# The selection matrix. Sets tests (what the emulator host runs), push (the PushE2eTest methods: they get push
-# provisioning) and models (the model-starting methods, whose bounds the ledger reserves). --smoke, --full, --scenario and
-# --test of the other tests keep their behaviour; --full never selects a push test. Fails for anything else.
+# A test class of the e2e module, or one of its test methods: "<Class>" or "<Class>#<method>", by its source file.
+known_test() {
+  local src c=${1%%#*} m=${1#*#} f
+  src=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/e2e/src/main/kotlin/xyz/rycerz/apofis/e2e || return 1
+  [[ $1 =~ ^[A-Z][A-Za-z0-9]*(#[a-z][A-Za-z0-9]*)?$ ]] && f=$src/$c.kt && [ -f "$f" ] && grep -q '^ *@Test' "$f" || return 1
+  [[ $1 != *'#'* ]] || grep -A1 '^ *@Test' "$f" | grep -qE "^ *fun $m\("
+}
+
+# The selection matrix. Sets tests (what the emulator host runs: a suite name, or a class or method shown to exist),
+# push (the PushE2eTest methods: they get push provisioning), models (the model-starting methods, whose bounds the
+# ledger reserves) and model_capable (anything that can start a model run, ledgered or not, prints the hook warning).
+# --smoke, --full, --scenario and --test of the other tests keep their behaviour; --full never selects a push test; a
+# suite name is never a --test argument. Fails for anything else, before any side effect.
 select_tests() {
-  local m=$1 a=${2:-} t
-  push=() models=()
+  local m=$1 a=${2:-}
+  push=() models=() model_capable=1
   case $m in
-    smoke) tests=smoke ;;
+    smoke) tests=smoke model_capable='' ;;
     full) tests=all ;;
-    scenario) tests=SurvivalE2eTest#$a ;;
-    push) tests=push push=("${PUSH_TESTS[@]}") ;;
+    scenario) printf '%s\n' "${SCENARIOS[@]}" | grep -qxF -- "$a" || return 1; tests=SurvivalE2eTest#$a ;;
+    push) tests=push push=("${PUSH_TESTS[@]}") model_capable='' ;;
     push-model) tests=push-model push=(pushWakesKilledApp) models=("${PUSH_MODEL[@]}") ;;
     test)
+      known_test "$a" || return 1
       tests=$a
-      if [[ $a == PushE2eTest* ]]; then
-        t=${a#PushE2eTest#}
-        printf '%s\n' "${PUSH_ALL[@]}" | grep -qxF -- "$t" || return 1 # also refuses PushE2eTest alone
-        push=("$t")
-      fi
-      [ -z "${MODEL_BOUND[$a]+x}" ] || models=("$a") ;;
+      case $a in
+        PushE2eTest#*) push=("${a#PushE2eTest#}") ;;
+        PushE2eTest) return 1 ;; # the class would run the model method without its reservation
+      esac
+      [ -z "${MODEL_BOUND[$a]+x}" ] || models=("$a")
+      case $a in SmokeE2eTest | SmokeE2eTest#* | HarnessSelfTest | HarnessSelfTest#* | PushE2eTest#connectorLifecycle | \
+        PushE2eTest#hostilePushes | PushE2eTest#permissionAndTestPush) model_capable='' ;; esac ;;
     *) return 1 ;;
   esac
-  [[ $tests =~ ^[A-Za-z0-9_#-]+$ ]]
 }
 
 # <n> random letters and digits.
@@ -821,6 +840,7 @@ rand_alnum() {
 ledger_total() {
   if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo 0; return 0; fi
   [ -f "$1" ] && [ -r "$1" ] || return 1
+  [ ! -s "$1" ] || [ "$(tail -c1 "$1" | od -An -tx1 | tr -d ' ')" = 0a ] || return 1 # a torn last line
   awk -v run="^$RUNID_RE\$" '
     NF != 4 || $2 !~ run || $3 !~ /^[A-Za-z0-9]+#[A-Za-z0-9]+$/ || $4 !~ /^[0-9]{1,3}$/ { bad = 1; exit }
     $1 == "reserve" { k = $2 " " $3; if (k in r) { bad = 1; exit } r[k] = $4; next }
@@ -839,6 +859,9 @@ ledger_reserve() {
   (
     flock -w 30 9 || exit 1
     t=$(ledger_total "$f") && [ $((t + add)) -le "$limit" ] || exit 1
+    # No proposed run and method twice, nor one the ledger already holds.
+    [ "$(printf '%s\n' "${@%=*}" | sort | uniq -d)" = '' ] || exit 1
+    for p; do ! grep -qE "^reserve $run ${p%=*} " "$f" 2>/dev/null || exit 1; done
     for p; do printf 'reserve %s %s %s\n' "$run" "${p%=*}" "${p#*=}"; done >>"$f"
   ) 9>>"$f.lock"
 }
@@ -859,7 +882,9 @@ ledger_observe() {
 hook_warning() {
   local f n out=''
   for f in ~/.hermes/config.yaml ~/.hermes/shell-hooks-allowlist.json; do
-    if [ ! -e "$f" ]; then n=0; elif [ -r "$f" ]; then n=$(grep -c -F apofis_push.py -- "$f") || n=0; else n=unknown; fi
+    n=unknown
+    if [ ! -e "$f" ]; then n=0; elif n=$(grep -c -F apofis_push.py -- "$f" 2>/dev/null) || [ "$?" = 1 ]; then :; else n=unknown; fi
+    [[ $n =~ ^[0-9]+$ ]] || n=unknown
     out+=" ${f##*/}=$n"
   done
   log "WARNING: hook installation check (counts of apofis_push.py):$out. With the hook installed, each model run here can send one contentless wake naming a test chat to the owner's ntfy endpoint."
@@ -869,15 +894,16 @@ hook_warning() {
 # run-private HERMES_HOME (the one other thing allowed to open it is the named Step 0 check). Fails when the listing
 # failed, was incomplete or did not parse: never an empty answer then.
 push_listing() {
-  local out rc=0 l
+  local out rc=0 l rows
   out=$(bounded 30 env -i PATH="$PATH" HERMES_HOME="$push_dir/check-home" python3 -I "$PUSH_SCRIPT" check \
     --state-db "$LIVE_DB" --only-install "$1" --ids --log - 2>/dev/null) || rc=$?
   [ "$rc" = 0 ] && [ "$(sed -n 3,4p <<<"$out")" = "$(printf 'origins none\ndb opened read-only')" ] || return 1
+  rows=$(sed -n '5,$p' <<<"$out") || return 1
   while IFS= read -r l; do
     [ -n "$l" ] || continue
     [[ ${l%%$'\t'*} =~ ^apofis-push-$1-[[:graph:]]*$ ]] || return 1
     printf '%s\n' "${l%%$'\t'*}"
-  done < <(sed -n '5,$p' <<<"$out")
+  done <<<"$rows"
 }
 
 # Host-minted push identities: one install per push scenario (so no scenario's ids depend on another's), the topic,
@@ -902,8 +928,10 @@ provision_push() {
 start_fake() {
   local wake='' i
   [[ " ${push[*]} " == *" pushWakesKilledApp "* ]] && wake=${install_of[pushWakesKilledApp]}
-  setsid env -i PATH="$PATH" python3 -I tools/emulator/fake_ntfy.py --run-dir "$push_dir/fake" --port "$push_port" \
-    --topic "$push_topic" --script "$PUSH_SCRIPT" ${wake:+--wake-install "$wake"} </dev/null >"$push_dir/fake.log" 2>&1 7>&- &
+  # Its stdin is a pipe this script holds: when this script dies for any reason, the fake sees the end and stops.
+  exec {fake_fd}> >(exec setsid env -i PATH="$PATH" python3 -I tools/emulator/fake_ntfy.py --run-dir "$push_dir/fake" \
+    --port "$push_port" --topic "$push_topic" --script "$PUSH_SCRIPT" ${wake:+--wake-install "$wake"} --owner-stdin \
+    >"$push_dir/fake.log" 2>&1 7>&-)
   fake_pid=$!
   for i in $(seq 40); do
     [ "$(head -n1 "$push_dir/fake.log" 2>/dev/null)" = READY ] && return 0
@@ -920,11 +948,16 @@ stop_fake() {
   kill -TERM "$fake_pid" 2>/dev/null
   wait_gone 40 alive "$fake_pid" || { kill -KILL "$fake_pid" 2>/dev/null; rc=1; }
   wait "$fake_pid" 2>/dev/null || rc=1
-  fake_pid=''
+  [ -z "$fake_fd" ] || exec {fake_fd}>&-
+  fake_fd=''
+  alive "$fake_pid" || fake_pid=''
   grep -qxE 'stopped: child (released|killed)' "$push_dir/fake.log" 2>/dev/null || rc=1
   o=$(ss -Hltn "sport = :$push_port") && [ -z "$o" ] || rc=1
   if [ "$rc" = 0 ]; then log "fake ntfy stopped, every hook child accounted for, its port $push_port closed"
-  else log "FAILED: the fake ntfy did not stop cleanly (a hook child unaccounted for, or its port $push_port still open)"; fi
+  else
+    keep_push=1 # the evidence stays: the fake's log, its run directory and any child's files
+    log "FAILED: the fake ntfy did not stop cleanly (a hook child unaccounted for, or its port $push_port still open); kept for inspection: $push_dir"
+  fi
   return "$rc"
 }
 
@@ -933,7 +966,7 @@ stop_fake() {
 # exactly that title; then it must be gone. A missing intent never licenses a delete; an install whose intents could
 # not be read is not cleaned at all. Then every install is listed again: any record left fails the run, unremoved.
 check_push() {
-  local ok=0 l id title inst m code body refused=' ' left
+  local ok=0 l id title inst m code gone body refused=' ' left
   [ "${#push[@]}" -gt 0 ] || return 0
   if [ -n "$key_sent_local" ] && [ "$sessions_state" != ok ]; then
     log "FAILED: push: the journal is missing or unreadable, so no create intent is known; no push record is deleted"
@@ -947,7 +980,7 @@ check_push() {
     refused+="${install_of[$m]:-?} "
     ok=1
   done
-  body=$(mktemp)
+  body=$push_dir/body
   for l in "${journal[@]}"; do
     [[ $l == pushintent\ * ]] || continue
     read -r _ id title <<<"$l"
@@ -969,7 +1002,7 @@ check_push() {
     fi
     code=$(hermes DELETE "api/sessions/$id" "$body") || code=error
     if [ "$code" = 200 ] && jq -e --arg id "$id" '.id == $id and .deleted == true' "$body" >/dev/null 2>&1 &&
-      [ "$(hermes GET "api/sessions/$id" "$body")" = 404 ]; then
+      gone=$(hermes GET "api/sessions/$id" "$body") && [ "$gone" = 404 ]; then # the transfer's own exit counts too
       log "push: $id (title with nonce $nonce) deleted and verified gone"
     else
       log "FAILED: push: deleting $id answered $code; it may remain"
@@ -978,6 +1011,7 @@ check_push() {
   done
   rm -f "$body"
   for m in "${push[@]}"; do
+    [ -n "${install_of[$m]:-}" ] || continue # never minted (the run stopped before): nothing of it can exist
     if ! left=$(push_listing "${install_of[$m]}"); then
       log "FAILED: push records may remain: the listing of $m's install failed"
       ok=1
@@ -991,16 +1025,18 @@ check_push() {
   return "$ok"
 }
 
-# After the run: the observed starts of every reserved method, counted on the server by check_sessions (the user turns
-# of its journaled chat), or 0 when no app ran or the complete journal shows it never sent. Otherwise nothing is
-# written and the reservation's bound stands.
+# After the run, only on positive proof, the observed starts of every reserved method: 0 when the key never left this
+# host; with a journal check_sessions found complete, the user turns of the method's journaled chat in the server's
+# whole record (check_sessions), or 0 when that journal has no send for it. Anything else writes nothing and the
+# reservation's bound stands.
 observe_starts() {
   local m s n
   for m in "${models[@]}"; do
     s=${m#*#} n=''
-    if [ -z "$key_sent_local" ]; then n=0
+    if [ -z "$key_sent_local" ]; then n=0 # the key never left this host: no app ran
+    elif [ -z "$journal_complete" ]; then : # an incomplete or unverified journal proves nothing: the bound stands
     elif [[ ${starts[$s]:-} =~ ^[0-9]+$ ]]; then n=${starts[$s]}
-    elif [ -z "${starts[$s]:-}" ] && [ "$sessions_state" = ok ] && ! printf '%s\n' "${journal[@]}" | grep -q "^send [^ ]* $s$"; then n=0; fi
+    elif [ -z "${starts[$s]:-}" ] && ! grep -q "^send [^ ]* $s$" <<<"$(printf '%s\n' "${journal[@]}")"; then n=0; fi
     if [ -z "$n" ]; then log "ledger: observed starts of $m unknown; its reservation of ${MODEL_BOUND[$m]} stands"; continue; fi
     if ledger_observe "$LEDGER" "$run_id" "$m" "$n"; then log "ledger: $m reserved ${MODEL_BOUND[$m]}, observed $n"
     else log "FAILED: ledger: could not record the observed starts of $m"; return 1; fi
@@ -1098,13 +1134,14 @@ end_local() {
     wd_pid=''
   fi
   # The push directory (the fake's run directory, its log, the run-private homes) goes once the fake is gone.
-  if [ -n "$push_dir" ] && [ -z "$fake_pid" ]; then remove_tree "$push_dir" || { log "FAILED: could not remove $push_dir"; r=1; }; push_dir=''; fi
+  if [ -n "$push_dir" ] && [ -z "$fake_pid" ] && [ -z "$keep_push" ]; then remove_tree "$push_dir" || { log "FAILED: could not remove $push_dir"; r=1; }; push_dir=''; fi
   if [ -n "$tmp" ]; then rm -f "$tmp/in" "$tmp/out" "$tmp/wd" "$tmp/before.txt" "$tmp/after.txt" "$tmp/files"; rmdir "$tmp"; tmp=''; fi
   return "$r"
 }
 
 cleanup_overrun() {
   log "FAILED: the cleanup did not finish within ${TRAP_LIMIT}s and stopped there; sessions or emulator host checks may be incomplete"
+  [ "${#install_of[@]}" = 0 ] || log "FAILED: push records may remain under the installs ${install_of[*]}"
   [ -z "$lock_tried" ] || [ -n "$released" ] || lock_help "may still be held by this run ($run_id)"
   end_local
   key=''
@@ -1155,7 +1192,7 @@ local_cleanup() {
   [ -z "$key" ] || check_sessions || bad=1
   [ -z "$key" ] || check_push || bad=1
   observe_starts || bad=1
-  [ "${#models[@]}" = 0 ] || hook_warning
+  [ -z "$model_capable" ] || hook_warning
   if [ -n "$locked" ]; then
     if listing >"$tmp/after.txt"; then
       new=$(comm -13 <(sort "$tmp/before.txt") <(sort "$tmp/after.txt") | grep -c .)
@@ -1428,6 +1465,8 @@ main() {
     --in-shell) shift; in_shell "$@"; return ;;
     *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]> | --push | --push-model" >&2; exit 2 ;;
   esac
+  # The whole command line is checked before anything happens: one option, and its one argument where it takes one.
+  [ "$#" = "$([ -n "$arg" ] && echo 2 || echo 1)" ] || die "bad arguments: one selection, with its one argument"
   select_tests "$mode" "$arg" || die "not a selection of this harness: ${1} ${arg}"
   no_core_dumps || die "could not disable core dumps"
   # The first action: this host's lock, before anything else is touched here or on the emulator host.
@@ -1446,8 +1485,8 @@ main() {
   key=$(grep -E '^API_SERVER_KEY=' ~/.hermes/.env | cut -d= -f2- | tr -d "\"'")
   [ "${#key}" -ge 16 ] || die "API_SERVER_KEY not found in ~/.hermes/.env"
   log "run $run_id, nonce $nonce"
+  [ -z "$model_capable" ] || hook_warning
   if [ "${#models[@]}" -gt 0 ]; then
-    hook_warning
     for m in "${models[@]}"; do bounds+=("$m=${MODEL_BOUND[$m]}"); done
     ledger_reserve "$LEDGER" "$LEDGER_LIMIT" "$run_id" "${bounds[@]}" ||
       die "ledger: reserving ${bounds[*]} would pass $LEDGER_LIMIT model starts, or $LEDGER is unreadable or ambiguous; nothing started"

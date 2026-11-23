@@ -499,6 +499,27 @@ class RealTrigger(Base):
         self.assertEqual(204, request(f.port, "GET", "/%s/poll" % TOPIC)[0])
 
 
+    def test_term_with_an_owner_still_present_stops_cleanly(self):
+        with tempfile.TemporaryDirectory() as root:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "fake_ntfy.py"), "--run-dir", root, "--port",
+                                  str(port), "--topic", TOPIC, "--script", SCRIPT, "--owner-stdin"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertEqual(b"READY\n", p.stdout.readline())
+                p.send_signal(signal.SIGTERM)
+                self.assertEqual(0, p.wait(WATCHDOG))
+                self.assertEqual(b"stopped: child released\n", p.stdout.read())
+                self.assertEqual(b"", p.stderr.read())
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                for f in (p.stdin, p.stdout, p.stderr):
+                    f.close()
+
+
 class Cli(unittest.TestCase):
     def test_bad_arguments_refused(self):
         with tempfile.TemporaryDirectory() as d:

@@ -226,29 +226,98 @@ class HarnessSelfTest {
     }
 
     @Test
-    fun wakeSummariesOfHostilePushesMustShowNoRun() {
-        assertTrue(noRunChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=0 settled=0 failed=0 outcome=DONE")))
-        assertFalse("no line at all", noRunChecked(emptyList()))
-        assertFalse("a run taken", noRunChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=1 settled=0 failed=0 outcome=DONE")))
-        assertFalse("a line of another form", noRunChecked(listOf("cause=push runs=0 settled=0 failed=0")))
-        assertEquals(WakeLine("periodic", 3, 1, 2), wakeLine("cause=periodic runs=3 settled=1 failed=2 outcome=RETRY"))
+    fun pushDiagnosticsNeverCarryTheBytesRead() {
+        val secret = "SENTINELendpoint0123"
+        val token = "SENTINELtoken4567"
+        val prefs = prefsXml("install_id" to install, "endpoint" to "http://127.0.0.1:18650/$secret?up=1", "registration" to "g1\t$token")
+        val reads = listOf(prefs, prefs.dropLast(20), prefs.replace("<map>", "<map><string name=\"x\">$secret"), "$secret\n$token", "")
+        for (r in reads) {
+            for (d in listOf(identityDiagnostic(r), exportDiagnostic(r), exportDiagnostic("$r\n@@READ"))) {
+                assertFalse(d, secret in d || token in d || install in d)
+            }
+        }
+        assertEquals("malformed", exportDiagnostic(prefs.dropLast(20) + "\n@@READ"))
+        assertEquals("distributor: REGISTER from the app", distributorLog("org.unifiedpush.android.distributor.REGISTER", "xyz.rycerz.apofis"))
+        assertNull("an action from another app", distributorLog("org.unifiedpush.android.distributor.REGISTER", "com.example.$secret"))
+        assertNull("an unknown action", distributorLog("org.unifiedpush.android.distributor.$secret", "xyz.rycerz.apofis"))
     }
 
     @Test
-    fun pushProofNeedsItsPreconditionsAndOnePushSettlement() {
-        assertTrue(wakePreconditionsHold(1, listOf("failed"), 0))
-        assertFalse("a queued send", wakePreconditionsHold(1, listOf("queued"), 0))
-        assertFalse("a send going out", wakePreconditionsHold(1, listOf("sending"), 0))
-        assertFalse("no stored run", wakePreconditionsHold(0, emptyList(), 0))
-        assertFalse("an outbox row", wakePreconditionsHold(1, emptyList(), 1))
+    fun quietDeliveriesNeedANewPushCheckThatTookNoRun() {
+        assertTrue(quietPushChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=0 settled=0 failed=0 outcome=DONE")))
+        assertFalse("no line at all", quietPushChecked(emptyList()))
+        assertFalse("only a periodic check: the push was not seen", quietPushChecked(listOf("cause=periodic runs=0 settled=0 failed=0 outcome=DONE")))
+        assertFalse("a run taken", quietPushChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=1 settled=0 failed=0 outcome=DONE")))
+        assertFalse("a line of another form", quietPushChecked(listOf("cause=push runs=0 settled=0 failed=0")))
+        assertEquals(WakeLine("periodic", 3, 1, 2), wakeLine("cause=periodic runs=3 settled=1 failed=2 outcome=RETRY"))
+    }
+
+    /** The precondition's SQL against the app's real states, on an in-memory SQLite database, through its validator. */
+    @Test
+    fun wakePreconditionPassesTheStoredRunsSendingRowOnly() {
+        val key = "apofis-0a1b2c3d-0000-4000-8000-000000000001"
+        val run = "run_0123456789abcdef0123456789abcdef"
+        fun verdict(runs: List<String>, sends: List<String>, outbox: Int): String? {
+            val db = android.database.sqlite.SQLiteDatabase.create(null)
+            try {
+                db.execSQL("CREATE TABLE ActiveRunEntity (runId TEXT PRIMARY KEY, sessionKey TEXT NOT NULL)")
+                db.execSQL("CREATE TABLE PendingSendEntity (idempotencyKey TEXT PRIMARY KEY, sessionKey TEXT NOT NULL, state TEXT NOT NULL, runId TEXT)")
+                db.execSQL("CREATE TABLE NoticeOutboxEntity (eventId TEXT PRIMARY KEY)")
+                runs.forEach { db.execSQL("INSERT INTO ActiveRunEntity VALUES ('$it', '$key')") }
+                sends.forEachIndexed { i, st -> db.execSQL("INSERT INTO PendingSendEntity VALUES ('s$i', '$key', '$st', ${if (st == "sending") "'$run'" else "NULL"})") }
+                repeat(outbox) { db.execSQL("INSERT INTO NoticeOutboxEntity VALUES ('e$it')") }
+                db.execSQL("INSERT INTO PendingSendEntity VALUES ('other', 'apofis-0a1b2c3d-0000-4000-8000-000000000009', 'queued', NULL)")
+                return db.rawQuery(WAKE_PRECONDITION_SQL(key), null).use { c ->
+                    c.moveToFirst()
+                    listOf((0 until c.columnCount).joinToString("|") { c.getString(it) ?: "" })
+                }.let(::wakePrecondition)
+            } finally {
+                db.close()
+            }
+        }
+        assertEquals("the stored run with its own sending row: the healthy state passes", run, verdict(listOf(run), listOf("sending"), 0))
+        assertEquals(run, verdict(listOf(run), listOf("failed"), 0))
+        assertNull("a queued send", verdict(listOf(run), listOf("sending", "queued"), 0))
+        assertNull("a steering send", verdict(listOf(run), listOf("steering"), 0))
+        assertNull("no stored run", verdict(emptyList(), emptyList(), 0))
+        assertNull("two stored runs", verdict(listOf(run, "run_fedcba9876543210fedcba9876543210"), emptyList(), 0))
+        assertNull("an outbox row", verdict(listOf(run), emptyList(), 1))
+        assertNull("a failed query (no row)", wakePrecondition(emptyList()))
+        assertNull("unexpected output", wakePrecondition(listOf("1|$run|0|0", "extra")))
+        assertEquals(run, storedRun(listOf("1|$run|1|0")))
+    }
+
+    @Test
+    fun pushProofNeedsOnePushSettlementAfterTheDelivery() {
         val settled = "cause=push runs=1 settled=1 failed=0 outcome=DONE"
-        assertTrue(provedByPush(listOf(settled)))
-        assertTrue("a check that settled nothing does not count", provedByPush(listOf("cause=push runs=1 settled=0 failed=0 outcome=DONE", settled)))
-        assertFalse("settled by the periodic check", provedByPush(listOf("cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
-        assertFalse("settled by a recheck", provedByPush(listOf("cause=recheck runs=1 settled=1 failed=0 outcome=DONE")))
-        assertFalse("two settling checks", provedByPush(listOf(settled, "cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
-        assertFalse("no settling check", provedByPush(listOf("cause=push runs=1 settled=0 failed=0 outcome=DONE")))
-        assertFalse("an unparsed line", provedByPush(listOf(settled, "something else")))
+        val quiet = "cause=push runs=1 settled=0 failed=0 outcome=DONE"
+        assertTrue(provedByPush(emptyList(), listOf(settled)))
+        assertTrue("a check that settled nothing does not count", provedByPush(listOf(quiet), listOf(quiet, settled)))
+        assertFalse("settled by the periodic check", provedByPush(emptyList(), listOf("cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("settled by a recheck", provedByPush(emptyList(), listOf("cause=recheck runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("settled before the delivery", provedByPush(listOf(settled), listOf(settled)))
+        assertFalse("two settling checks", provedByPush(emptyList(), listOf(settled, "cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("no settling check", provedByPush(emptyList(), listOf(quiet)))
+        assertFalse("an unparsed line", provedByPush(emptyList(), listOf(settled, "something else")))
+    }
+
+    @Test
+    fun recordMatchesTheAppsOwnIntentExactly() {
+        val id = "apofis-push-$install-1"
+        val title = "$id op-0123456789abcdef e2e-0a1b2c3d"
+        val endpoint = "http://127.0.0.1:18650/upAbC123xyz09q?up=1"
+        val prefs = prefsXml("test_intents" to "$id\t$title", "record" to id, "endpoint" to endpoint)
+        fun server(i: String = id, src: String = "api_server", hidden: Boolean = true, t: String = title) =
+            JSONObject().put("id", i).put("source", src).put("hidden", hidden).put("title", t)
+        assertTrue(recordMatches(prefs, server(), id, endpoint, current = true))
+        assertFalse("another stored endpoint", recordMatches(prefs, server(), id, "http://127.0.0.1:18650/upOTHER0000000?up=1", current = true))
+        assertTrue("an earlier record: its endpoint is not compared", recordMatches(prefs, server(), id, "x", current = false))
+        assertFalse("another id answered", recordMatches(prefs, server(i = "apofis-push-$install-2"), id, endpoint, current = true))
+        assertFalse("another source", recordMatches(prefs, server(src = "cli"), id, endpoint, current = true))
+        assertFalse("visible", recordMatches(prefs, server(hidden = false), id, endpoint, current = true))
+        assertFalse("another operation marker", recordMatches(prefs, server(t = "$id op-ffffffffffffffff e2e-0a1b2c3d"), id, endpoint, current = true))
+        assertFalse("no intent for the id", recordMatches(prefsXml("record" to id, "endpoint" to endpoint), server(), id, endpoint, current = true))
+        assertFalse("not the current record", recordMatches(prefsXml("test_intents" to "$id\t$title", "record" to "apofis-push-$install-2", "endpoint" to endpoint), server(), id, endpoint, current = true))
     }
 
     @Test

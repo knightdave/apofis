@@ -5,10 +5,13 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
 private const val REGISTER = "org.unifiedpush.android.distributor.REGISTER"
+private const val UNREGISTER = "org.unifiedpush.android.distributor.UNREGISTER"
 private const val NEW_ENDPOINT = "org.unifiedpush.android.connector.NEW_ENDPOINT"
 private const val MESSAGE = "org.unifiedpush.android.connector.MESSAGE"
 private const val UNREGISTERED = "org.unifiedpush.android.connector.UNREGISTERED"
@@ -25,7 +28,7 @@ class FakeDistributor : BroadcastReceiver() {
         val from = if (Build.VERSION.SDK_INT >= 34) sentFromPackage else null
         val token = runCatching { intent.getStringExtra("token") }.getOrNull()
         synchronized(events) { events += Event(intent.action.orEmpty(), from, token) }
-        Log.i("ApofisE2e", "distributor: ${intent.action?.substringAfterLast('.')} from $from") // never the token or endpoint
+        distributorLog(intent.action, from)?.let { Log.i("ApofisE2e", it) }
         val endpoint = endpoint
         if (intent.action == REGISTER && from == APP && token != null && endpoint != null) {
             context.sendBroadcast(Intent(NEW_ENDPOINT).setPackage(APP).putExtra("token", token).putExtra("endpoint", endpoint))
@@ -42,6 +45,25 @@ class FakeDistributor : BroadcastReceiver() {
     }
 }
 
+/** A message body of at most 4096 bytes (the fake's own limit); more fails. */
+private fun readBounded(input: InputStream): ByteArray {
+    val out = ByteArrayOutputStream()
+    val buf = ByteArray(1024)
+    while (out.size() <= 4096) {
+        val n = input.read(buf)
+        if (n < 0) return out.toByteArray()
+        out.write(buf, 0, n)
+    }
+    fail("The fake ntfy answered more than 4096 bytes")
+}
+
+/**
+ * The log line for a broadcast the distributor received: only a known action from the accepted sender (the app), by a
+ * fixed name; nothing for anything else (an explicit broadcast from any app can reach this exported receiver).
+ */
+fun distributorLog(action: String?, from: String?): String? =
+    if (from == APP) mapOf(REGISTER to "REGISTER", UNREGISTER to "UNREGISTER")[action]?.let { "distributor: $it from the app" } else null
+
 /** The fake distributor's side of a push scenario: what the app registered, and the broadcasts a distributor sends. */
 class Push(private val app: AppDriver) {
     private val base = "http://127.0.0.1:${app.pushPort}"
@@ -54,6 +76,11 @@ class Push(private val app: AppDriver) {
     fun events(action: String) = synchronized(FakeDistributor.events) { FakeDistributor.events.filter { it.action == action && it.from == APP } }
 
     fun registrations() = events(REGISTER)
+
+    fun unregistrations() = events(UNREGISTER)
+
+    /** The endpoint the app is given, as the fake ntfy topic's loopback URL. */
+    val endpoint get() = "$base/${app.pushTopic}?up=1"
 
     /** The token of the app's last REGISTER: its current registration. */
     fun token(): String = registrations().lastOrNull()?.token ?: fail("The app never registered with the e2e distributor")
@@ -72,14 +99,15 @@ class Push(private val app: AppDriver) {
         app.log("distributor sent ${intent.action?.substringAfterLast('.')}")
     }
 
-    /** The oldest message the fake ntfy holds for the topic, removed there; null when there is none. */
+    /** The oldest message the fake ntfy holds for the topic, removed there; null when there is none. At most 4096 bytes. */
     fun poll(): ByteArray? {
         val c = URL("$base/${app.pushTopic}/poll").openConnection() as HttpURLConnection
+        c.instanceFollowRedirects = false
         c.connectTimeout = 10_000
         c.readTimeout = 10_000
         return try {
             when (val code = c.responseCode) {
-                200 -> c.inputStream.use { it.readBytes() }
+                200 -> c.inputStream.use(::readBounded)
                 204 -> null
                 else -> fail("The fake ntfy answered the poll with $code")
             }
@@ -88,10 +116,14 @@ class Push(private val app: AppDriver) {
         }
     }
 
-    /** Asks the fake ntfy to run the real hook once against its synthetic database (gate 2 only). */
+    /**
+     * Asks the fake ntfy to run the real hook once against its synthetic database (gate 2 only). It answers 200 only with
+     * proof that this invocation's child posted exactly once to it (fake_ntfy.py).
+     */
     fun trigger() {
         val c = URL("$base/trigger").openConnection() as HttpURLConnection
         c.requestMethod = "POST"
+        c.instanceFollowRedirects = false
         c.connectTimeout = 10_000
         c.readTimeout = 60_000
         try {

@@ -6,6 +6,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.StringReader
 import java.util.UUID
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
@@ -15,12 +16,13 @@ import org.junit.runner.RunWith
 import org.xmlpull.v1.XmlPullParser
 
 /**
- * Push on the emulator, before the owner installs the hook (run-e2e.sh --push, --push-model). Each scenario has its own
- * install id minted by the harness (so no scenario's record ids depend on another's), starts from cleared app data with
- * that identity injected, connects, and drives Settings, Notifications. The e2e APK is the distributor
- * ([FakeDistributor]); its endpoint is the harness's fake ntfy topic. The app never deletes a push record: every
- * scenario's records stay on the server until the harness's cleanup (rule C3) removes them from the journaled intents.
- * Gate 1 scenarios start no model run; [pushWakesKilledApp] starts exactly one.
+ * Push on the emulator, before the owner installs the hook (run-e2e.sh --push; gate 2 is
+ * `--test PushE2eTest#pushWakesKilledApp` alone). Each scenario has its own install id minted by the harness (so no
+ * scenario's record ids depend on another's), starts from cleared app data with that identity injected, connects, and
+ * drives Settings, Notifications. The e2e APK is the distributor ([FakeDistributor]); its endpoint is the harness's
+ * fake ntfy topic. The app never deletes a push record: every scenario's records stay on the server until the harness's
+ * cleanup (rule C3) removes them from the journaled intents. Gate 1 scenarios start no model run; [pushWakesKilledApp]
+ * starts exactly one. Nothing here logs the push prefs, an endpoint or a token.
  */
 @RunWith(AndroidJUnit4::class)
 class PushE2eTest {
@@ -53,25 +55,25 @@ class PushE2eTest {
     // ---- gate 1: no model run
 
     /**
-     * Enable, a cold wake with nothing stored, a foreign distributor's temp-unavailable and migration (never followed),
-     * enable again, and the distributor's unregistration. The records stay on the server throughout.
+     * Enable, a cold wake with nothing stored, a foreign distributor's temp-unavailable and migration, enable again, and
+     * the distributor's unregistration; the records stay on the server throughout. The emulator claim for the foreign
+     * package is narrow (ruling on I10): push Off after the migration, an UNREGISTER with the old token, no further
+     * REGISTER at this test distributor and no stored mention of the foreign package. Where an outgoing REGISTER goes
+     * is covered by Task 2's unit tests (PushReceiverTest, PushRegistrarTest).
      */
     @Test
     fun connectorLifecycle() {
         openSettings()
         enablePush()
-        assertRecord(1)
-        assertNoRecord(2) // exactly -1
+        assertRecord(1, current = true)
+        assertNoRecord(2) // the expected ids only; the exact namespace is the host's listing at the end of the run
         val first = push.token()
 
         // A cold delivery with no stored run and an empty outbox: the app starts, checks, posts nothing, does not crash.
         killInBackground()
         val since = app.deviceTime()
-        push.deliver("an arbitrary body".toByteArray())
-        app.waitFor("the app started by the delivery and its check logged", 60_000) {
-            app.pidof().first == 0 && app.wakeLines(since).isNotEmpty()
-        }
-        if (!noRunChecked(app.wakeLines(since))) fail("A check after the cold delivery found runs: ${app.wakeLines(since)}")
+        deliverQuietly(since, "an arbitrary body".toByteArray(), "the cold delivery")
+        if (app.pidof().first != 0) fail("The app is not running after the cold delivery")
         assertQuiet(since)
 
         app.launch()
@@ -84,42 +86,38 @@ class PushE2eTest {
         assertNoTrace(OTHER)
         push.migrate(OTHER)
         awaitRow("settings_notif_off") // the migration is taken as an unregistration
-        app.waitFor("the app unregistering its token at the e2e distributor", 15_000) {
-            push.events("org.unifiedpush.android.distributor.UNREGISTER").any { it.token == first }
-        }
+        app.waitFor("the app unregistering its old token at the e2e distributor", 15_000) { push.unregistrations().any { it.token == first } }
         assertNoTrace(OTHER)
-        if (push.registrations().size != registered) fail("The app registered again after the migration")
-        assertRecord(1) // the app never deletes a record
+        if (push.registrations().size != registered) fail("The app registered again at the test distributor after the migration")
+        assertRecord(1, current = false) // the app never deletes a record
 
-        // Enabling again reserves the next id of the same install (its sequence survives Off).
+        // Enabling again reserves the next id of the same install (its sequence survives Off), with a new token.
         enablePush()
-        assertRecord(2)
-        assertRecord(1)
+        if (push.token() == first) fail("The second enable reused the revoked token")
+        assertRecord(2, current = true)
+        assertRecord(1, current = false)
         push.unregister()
         awaitRow("settings_notif_off")
-        assertRecord(2)
-        assertRecord(1)
+        assertRecord(2, current = false)
+        assertRecord(1, current = false)
         app.screenshot(name.methodName)
     }
 
-    /** Hostile and odd pushes with push on and nothing stored: no crash, no notification, every check finds no run. */
+    /** Hostile and odd pushes with push on and nothing stored: same process, no crash, none posted, checks find no run. */
     @Test
     fun hostilePushes() {
         openSettings()
         enablePush()
         val since = app.deviceTime()
         val (rc, pid) = app.pidof()
-        if (rc != 0) fail("The app is not running before the pushes")
-        push.deliver(ByteArray(0))
-        push.deliver(ByteArray(4096) { 0xFF.toByte() })
-        push.deliver("""{"kind":7}""".toByteArray())
-        repeat(20) { push.deliver("""{"session_id":"apofis-${UUID.randomUUID()}","kind":"finished"}""".toByteArray()) }
-        app.waitFor("a check after the pushes", 60_000) { app.wakeLines(since).isNotEmpty() }
-        SystemClock.sleep(5_000) // a replacing job's line, if any, comes within this
-        val lines = app.wakeLines(since)
-        if (!noRunChecked(lines)) fail("A check after hostile pushes found runs: $lines")
+        if (rc != 0 || !Regex("\\d+").matches(pid)) fail("The app is not running before the pushes (exit $rc)")
+        deliverQuietly(since, ByteArray(0), "the hostile pushes") {
+            push.deliver(ByteArray(4096) { 0xFF.toByte() })
+            push.deliver("""{"kind":7}""".toByteArray())
+            repeat(20) { push.deliver("""{"session_id":"apofis-${UUID.randomUUID()}","kind":"finished"}""".toByteArray()) }
+        }
         val (after, pidAfter) = app.pidof()
-        app.log("pushes delivered; pid $pid before, $pidAfter after (exit $after)")
+        if (after != 0 || pidAfter != pid) fail("The app's process changed during the pushes (pid $pid, then \"$pidAfter\", exit $after)")
         assertQuiet(since)
         app.screenshot(name.methodName)
     }
@@ -133,17 +131,17 @@ class PushE2eTest {
         app.launch()
         openSettings()
         awaitRow("settings_notif_blocked")
-        // Never asked in the app (the harness granted it): the first tap asks; the dialog is dismissed (refused).
+        // Never asked in the app (the harness granted it): the first tap asks; the dialog's deny button refuses.
         tapRow()
-        app.waitFor("the system's notification permission dialog", 15_000) { app.device.currentPackageName != APP }
-        app.device.pressBack()
+        val deny = { app.nodes { it.viewIdResourceName?.endsWith(":id/permission_deny_button") == true && it.packageName?.endsWith("permissioncontroller") == true }.singleOrNull() }
+        app.waitFor("the system's notification permission dialog (its deny button)", 15_000) { deny() != null }
+        if (deny()?.performAction(AccessibilityNodeInfo.ACTION_CLICK) != true) fail("Tapping the permission dialog's deny button failed")
         app.waitFor("the app in front again", 15_000) { app.device.currentPackageName == APP }
         awaitRow("settings_notif_blocked")
         tapRow()
-        app.waitFor("the sheet offering system settings and Turn off push", 10_000) {
-            app.has(app.str("settings_notif_system")) && app.has(app.str("settings_notif_turn_off"))
-        }
-        if (app.has(app.str("settings_notif_test"))) fail("A blocked sheet offers the test push")
+        sheetAction("settings_notif_system")
+        sheetAction("settings_notif_turn_off")
+        if (inSheet(app.str("settings_notif_test")) != null) fail("A blocked sheet offers the test push")
         app.device.pressBack()
         val out = app.shell("pm grant $APP $POST_NOTIFICATIONS")
         if (out.isNotBlank()) fail("pm grant failed: $out")
@@ -154,21 +152,23 @@ class PushE2eTest {
 
         tapRow()
         val since = app.deviceTime()
-        tap(app.str("settings_notif_test"))
+        sheetAction("settings_notif_test").performAction(AccessibilityNodeInfo.ACTION_CLICK)
         val firstSend = SystemClock.uptimeMillis()
         app.waitFor("Test sent, waiting", 15_000) { app.has(app.str("settings_notif_test_sent")) }
         val body = pollFor()
         if (body.decodeToString() != """{"kind":"test"}""") fail("The test push body is not the app's own test body")
-        push.deliver(body)
-        app.waitFor("A push arrived", 30_000) { app.has(app.str("settings_notif_test_received")) }
+        // At the delivery boundary: still waiting, nothing arrived yet; then the result follows this delivery.
+        if (!app.has(app.str("settings_notif_test_sent")) || app.has(app.str("settings_notif_test_received"))) {
+            fail("The test result changed before the delivery")
+        }
         // A test push is a delivered push: it starts a wake check, which finds no run and settles nothing.
-        app.waitFor("the wake check of the test push", 60_000) { app.wakeLines(since).isNotEmpty() }
-        if (!noRunChecked(app.wakeLines(since))) fail("The test push's check found runs: ${app.wakeLines(since)}")
+        deliverQuietly(since, body, "the test push")
+        app.waitFor("A push arrived", 30_000) { app.has(app.str("settings_notif_test_received")) }
         assertQuiet(since)
 
         // A second test within 10 s is refused silently: send it after that, and deliver nothing.
         SystemClock.sleep((11_000 - (SystemClock.uptimeMillis() - firstSend)).coerceAtLeast(0))
-        tap(app.str("settings_notif_test"))
+        sheetAction("settings_notif_test").performAction(AccessibilityNodeInfo.ACTION_CLICK)
         app.waitFor("Test sent, waiting (second test)", 15_000) { app.has(app.str("settings_notif_test_sent")) }
         pollFor() // taken from the topic, never delivered
         app.waitFor("No push arrived after the 60 s window", 80_000) { app.has(app.str("settings_notif_test_none")) }
@@ -178,42 +178,81 @@ class PushE2eTest {
     // ---- gate 2: one model run
 
     /**
-     * The app is killed while its run goes on; once the server has the final answer, the real hook (anonymous approval
+     * The app is killed while its run goes on; once the server has finished the run, the real hook (anonymous approval
      * wake, from the fake's synthetic database) wakes it through the fake ntfy; the check settles the run and notifies.
-     * Proof only if the preconditions held before the delivery and the one settling check was caused by the push.
+     * Proved only when, immediately before the delivery, the process is gone and the chat has exactly its stored run,
+     * no queued or steering send and an empty outbox; the hook's one post is the only message; exactly one new
+     * notification of this chat appears within 60 s of the delivery; and the one check that settled anything after
+     * the delivery was caused by the push. Anything less is "not proved", never a second send.
      */
     @Test
     fun pushWakesKilledApp() {
         openSettings()
         enablePush()
+        assertRecord(1, current = true)
         app.device.pressBack()
         val marker = "apofis-e2e-8"
-        val prompt = "Test ${app.nonce}-8. Reply with exactly: $marker"
+        // One turn with a tool call long enough to get the process down before the run ends.
+        val prompt = "Automated app test ${app.nonce}-8. Use the terminal tool to run exactly this command: sleep 45 # $marker . " +
+            "Then reply with one short sentence that includes $marker."
         app.send(session, prompt)
+        var runId = ""
+        app.waitFor("the run stored by the app", 60_000, meanwhile = app::failOnApproval) {
+            app.query(WAKE_PRECONDITION_SQL(session))?.let(::storedRun)?.also { runId = it } != null
+        }
         killInBackground()
-        // Read only: wait until the server stores this turn's final answer.
-        app.waitFor("the final answer with $marker on the server", 300_000) { finals(app.serverMessages(session)).any { marker in it } }
-        if (app.pidof().first != 1) fail("The app process is back before the delivery")
-        val runs = app.query("SELECT count(*) FROM ActiveRunEntity WHERE sessionKey = '$session';").single().toInt()
-        val sends = app.query("SELECT state FROM PendingSendEntity WHERE sessionKey = '$session';")
-        val outbox = app.query("SELECT count(*) FROM NoticeOutboxEntity;").single().toInt()
-        if (!wakePreconditionsHold(runs, sends, outbox)) fail("Not proved: preconditions (runs=$runs sends=$sends outbox=$outbox)")
-        val since = app.deviceTime()
-        push.trigger()
-        push.deliver(pollFor())
+        // Read only: the server finishes the run and stores its final answer.
+        app.waitFor("the run finished on the server", 300_000) { app.runStatus(runId, session) in TERMINAL_RUN }
+        if (app.runStatus(runId, session) != "completed") fail("Not proved: the run ended ${app.runStatus(runId, session)}")
+        app.waitFor("the final answer with $marker on the server", 30_000) { finals(app.serverMessages(session)).any { marker in it } }
+
+        val since = app.deviceTime() // the log cursor, before the precondition read
+        if (app.notificationsTagged(session).isNotEmpty()) fail("Not proved: a notification for the chat was already posted")
+        assertPrecondition(runId)
+        if (push.poll() != null) fail("Not proved: the fake topic held a message before the trigger")
+        push.trigger() // 200 only when this invocation's child posted exactly once to the fake
+        val body = pollFor()
+        if (!body.contentEquals(WAKE_BODY) || push.poll() != null) fail("Not proved: the topic did not hold exactly the hook's one wake")
+        assertPrecondition(runId) // again, immediately before the delivery
+        val before = app.wakeLines(since)
+        if (before.any { (wakeLine(it)?.settled ?: 1) > 0 }) fail("Not proved: a check settled (or logged unreadably) before the delivery: $before")
+        val delivered = SystemClock.uptimeMillis()
+        push.deliver(body)
+        val left = { (60_000 - (SystemClock.uptimeMillis() - delivered)).coerceAtLeast(1) }
+        app.waitFor("one new notification of this chat", left()) { app.notificationsTagged(session).size == 1 }
         val title = app.serverTitle(session)
         app.device.openNotification()
-        app.waitFor("the notification \"${app.str("notif_reply_finished")}\" for the chat", 60_000) {
-            app.has(app.str("notif_reply_finished")) && app.nodes { it.text?.toString()?.contains(title) == true }.isNotEmpty()
+        var row: AccessibilityNodeInfo? = null
+        app.waitFor("that notification in the shade with the chat title and \"${app.str("notif_reply_finished")}\"", left()) {
+            notificationRows(title).singleOrNull()?.also { row = it } != null
         }
+        if (app.notificationsTagged(session).size != 1) fail("Not proved: not exactly one notification of this chat")
+        // The settling check logs its line after the post: wait for it, then read the lines once.
+        app.waitFor("the settling check's line", 30_000) { app.wakeLines(since).drop(before.size).any { (wakeLine(it)?.settled ?: 0) > 0 } }
         val lines = app.wakeLines(since)
-        if (!provedByPush(lines)) fail("Not proved: the settling check was not the push's alone: $lines")
-        app.click(app.str("notif_reply_finished"))
+        if (lines.take(before.size) != before || !provedByPush(before, lines.drop(before.size))) fail("Not proved: the settling check was not the push's alone: $lines")
+        if (row?.performAction(AccessibilityNodeInfo.ACTION_CLICK) != true) fail("Tapping the notification failed")
         app.waitFor("the chat with the marker reply", 30_000) { app.snapshot().replyWith(prompt, marker) != null }
         app.screenshot(name.methodName)
     }
 
     // ---- helpers
+
+    /** The wake precondition, read once and validated, with the process gone; anything else is "not proved". */
+    private fun assertPrecondition(runId: String) {
+        if (app.pidof().first != 1) fail("Not proved: the app process is not gone before the delivery")
+        val out = app.query(WAKE_PRECONDITION_SQL(session)) ?: fail("Not proved: the precondition query failed")
+        if (wakePrecondition(out) != runId) fail("Not proved: the precondition does not hold (stored run, no queued send, empty outbox)")
+    }
+
+    /** The shade's notification rows that show both [title] and "Reply finished" in their own texts. */
+    private fun notificationRows(title: String): List<AccessibilityNodeInfo> {
+        val finished = app.str("notif_reply_finished")
+        fun texts(n: AccessibilityNodeInfo): List<String> =
+            listOfNotNull(n.text?.toString(), n.contentDescription?.toString()) + (0 until n.childCount).mapNotNull(n::getChild).flatMap(::texts)
+        return app.nodes { n -> n.isClickable && texts(n).let { t -> t.any { title in it } && t.any { finished in it } } }
+            .filter { n -> (0 until n.childCount).mapNotNull(n::getChild).none { c -> c.isClickable && texts(c).let { t -> t.any { title in it } && t.any { finished in it } } } }
+    }
 
     private fun killInBackground() {
         app.device.pressHome()
@@ -227,29 +266,44 @@ class PushE2eTest {
         }
     }
 
-    /** No notification of the app and no crash since [since]. */
+    /**
+     * Delivers [body] (and whatever [more] delivers right after) and waits for the new wake check that this delivery
+     * caused: new lines with a push cause, every new line a check that took no run and settled nothing.
+     */
+    private fun deliverQuietly(since: String, body: ByteArray, what: String, more: () -> Unit = {}) {
+        val before = app.wakeLines(since).size
+        push.deliver(body)
+        more()
+        app.waitFor("the push-caused wake check after $what", 60_000) { app.wakeLines(since).drop(before).any { wakeLine(it)?.cause == "push" } }
+        val new = app.wakeLines(since).drop(before)
+        if (!quietPushChecked(new)) fail("The wake checks after $what were not quiet push checks: $new")
+    }
+
+    /** None of the app's notifications is active and no crash was logged since [since] (both reads must succeed). */
     private fun assertQuiet(since: String) {
         val posted = app.notifications()
-        if (posted.isNotEmpty()) fail("The app posted ${posted.size} notification(s)")
+        if (posted.isNotEmpty()) fail("The app has ${posted.size} active notification(s)")
         val crashed = app.crashes(since)
-        if (crashed.isNotEmpty()) fail("The app crashed: ${crashed.take(3)}")
+        if (crashed.isNotEmpty()) fail("The app crashed (${crashed.size} crash log lines)")
     }
 
-    /** Neither the app's prefs nor its databases mention [pkg]: no registration was made with it. */
+    /** Neither the app's prefs nor its databases mention [pkg]: no registration with it was stored. */
     private fun assertNoTrace(pkg: String) {
         val r = app.sh("run-as $APP grep -rlF -- $pkg shared_prefs databases; echo rc=$?").trim()
-        if (r != "rc=1") fail("The app's data mentions $pkg (or could not be searched): $r")
+        if (r != "rc=1") fail("The app's data mentions $pkg (or could not be searched)")
     }
 
-    private fun assertRecord(seq: Int) {
+    /**
+     * Record -[seq] on the server matches the app's own journaled intent for it exactly (id, source, hidden, title); for
+     * the [current] record, the app's stored record and endpoint are that id and the fake's topic. Compared, never logged.
+     */
+    private fun assertRecord(seq: Int, current: Boolean) {
         val id = "apofis-push-${app.pushInstalls.getValue(name.methodName)}-$seq"
-        var last: Pair<Int, Any?> = 0 to null
-        app.waitFor("record -$seq on the server, hidden, with this run's marker", 30_000) {
-            val (code, s) = app.pushRecord(id).also { last = it }
-            code == 200 && s != null && s.optString("source") == "api_server" && s.optBoolean("hidden") &&
-                s.optString("title").let { it.startsWith("$id op-") && it.endsWith(" e2e-${app.nonce}") }
+        app.waitFor("record -$seq on the server as the app's intent says${if (current) ", and the app's current record" else ""}", 30_000) {
+            val (code, s) = app.pushRecord(id)
+            code == 200 && s != null && recordMatches(app.pushPrefsRead(), s, id, push.endpoint, current)
         }
-        app.log("record -$seq present (HTTP ${last.first})")
+        app.log("record -$seq checked")
     }
 
     private fun assertNoRecord(seq: Int) {
@@ -263,50 +317,96 @@ class PushE2eTest {
         return body!!
     }
 
-    private fun onSettings() = app.has(app.str("settings_title")) && rowNode() != null
+    // ---- Settings, found by text and tag, scrolled to
 
+    private fun AccessibilityNodeInfo.texts(): List<String> =
+        listOfNotNull(text?.toString()) + (0 until childCount).mapNotNull(::getChild).flatMap { it.texts() }
+
+    /** Settings is on screen: one of its section headings is visible. */
+    private fun onSettings() = app.nodes { it.isHeading && it.isVisibleToUser && it.text?.toString() in SECTIONS.map(app::str) }.isNotEmpty()
+
+    /** Opens Settings (from the chat's drawer) and scrolls its list until the Notifications group is on screen. */
     private fun openSettings() {
-        if (onSettings()) return
-        app.click(app.str("drawer_open"))
-        app.click(app.str("settings_title"))
-        app.waitFor("Settings with the Notifications row", 15_000) { rowNode() != null }
+        if (!onSettings()) {
+            app.click(app.str("drawer_open"))
+            app.click(app.str("settings_title"))
+            app.waitFor("Settings", 15_000) { onSettings() }
+        }
+        reveal("the Notifications section", ::settingsList) {
+            app.nodes { it.isHeading && it.text?.toString() == app.str("settings_notifications") }.singleOrNull()
+        }
+    }
+
+    /** The Settings screen's own scrolling container: a visible scrollable (not the sheet) holding its section headings. */
+    private fun settingsList(): AccessibilityNodeInfo? {
+        val titles = SECTIONS.map(app::str)
+        fun heading(n: AccessibilityNodeInfo): Boolean =
+            (n.isHeading && n.text?.toString() in titles) || (0 until n.childCount).mapNotNull(n::getChild).any(::heading)
+        return app.nodes { it.isScrollable && it.isVisibleToUser && it.viewIdResourceName != SHEET && heading(it) }.firstOrNull()
     }
 
     /** The Notifications row: the clickable node whose texts start with the row title (not the section heading). */
-    private fun rowNode(): AccessibilityNodeInfo? {
-        val title = app.str("settings_notifications")
-        fun texts(n: AccessibilityNodeInfo): List<String> =
-            listOfNotNull(n.text?.toString()) + (0 until n.childCount).mapNotNull(n::getChild).flatMap(::texts)
-        return app.nodes { it.isClickable && segments(texts(it)).firstOrNull() == title }.singleOrNull()
-    }
+    private fun rowNode(): AccessibilityNodeInfo? =
+        app.nodes { it.isClickable && segments(it.texts()).firstOrNull() == app.str("settings_notifications") }.singleOrNull()
 
-    /** The row's value, by the app's own string names. */
+    /** The row, visible: found by scrolling the Settings list (bounded, both ways, stopping when a scroll moves nothing). */
+    private fun row(): AccessibilityNodeInfo = reveal("the Notifications row", ::settingsList) { rowNode() }
+
+    /** The row's value, by the app's own string names (reading needs no scrolling: the value is its own node text). */
     private fun rowValue(): String? {
-        val n = rowNode() ?: return null
-        fun texts(n: AccessibilityNodeInfo): List<String> =
-            listOfNotNull(n.text?.toString()) + (0 until n.childCount).mapNotNull(n::getChild).flatMap(::texts)
-        val shown = segments(texts(n))
+        val shown = segments(rowNode()?.texts() ?: return null)
         return VALUES.firstOrNull { app.str(it) in shown.drop(1) }
     }
 
-    private fun awaitRow(value: String) = app.waitFor("Notifications showing \"${app.str(value)}\"", 60_000) { rowValue() == value }
+    private fun awaitRow(value: String) = app.waitFor("Notifications showing \"${app.str(value)}\"", 60_000) { rowNode() != null && rowValue() == value }
 
     private fun tapRow() {
         app.waitFor("the Notifications row available", 30_000) { rowNode()?.isEnabled == true }
-        val n = rowNode() ?: fail("No Notifications row")
-        n.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
-        if (!n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping the Notifications row failed")
+        if (!row().performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping the Notifications row failed")
     }
 
-    /** Clicks the enabled element labelled [label] (or its clickable ancestor) through its own action, after scrolling to it. */
-    private fun tap(label: String) {
+    /** The open sheet, by its tag. */
+    private fun sheet(): AccessibilityNodeInfo? = app.nodes { it.viewIdResourceName == SHEET }.singleOrNull()
+
+    private fun inSheet(label: String): AccessibilityNodeInfo? {
         fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? = if (n.isClickable) n else n.parent?.let(::clickableOf)
-        fun find() = app.nodes { (it.text ?: it.contentDescription)?.toString() == label }.firstNotNullOfOrNull { clickableOf(it)?.takeIf { c -> c.isEnabled } }
-        app.waitFor("an enabled \"$label\"", 30_000) { find() != null }
-        val n = find() ?: fail("No enabled \"$label\"")
-        n.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
-        if (!n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping \"$label\" failed")
-        app.log("tapped \"$label\"")
+        val s = sheet() ?: return null
+        fun find(n: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+            if ((n.text ?: n.contentDescription)?.toString() == label) n else (0 until n.childCount).mapNotNull(n::getChild).firstNotNullOfOrNull(::find)
+        return find(s)?.let(::clickableOf)
+    }
+
+    /** A sheet action by its string, scrolled into view inside the sheet and enabled. */
+    private fun sheetAction(stringName: String): AccessibilityNodeInfo {
+        val label = app.str(stringName)
+        app.waitFor("the sheet", 10_000) { sheet() != null }
+        app.waitFor("an enabled \"$label\" in the sheet", 30_000) { inSheet(label)?.isEnabled == true }
+        return reveal("\"$label\" in the sheet", ::sheet) { inSheet(label) }
+    }
+
+    /**
+     * Finds [what] and brings it on screen by scrolling [container] forward, then backward, a bounded number of times,
+     * stopping in a direction as soon as a scroll is refused or moves nothing; logs how many scrolls it took.
+     */
+    private fun reveal(what: String, container: () -> AccessibilityNodeInfo?, find: () -> AccessibilityNodeInfo?): AccessibilityNodeInfo {
+        var scrolls = 0
+        for (action in listOf(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD, AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) {
+            var steps = 0
+            while (steps++ < 15) {
+                find()?.takeIf { it.isVisibleToUser }?.let {
+                    app.log("$what found after $scrolls scroll(s)")
+                    return it
+                }
+                val c = container() ?: fail("No scrolling container for $what")
+                val before = c.texts()
+                if (!c.performAction(action)) break // refused: the end in this direction
+                app.device.waitForIdle()
+                scrolls++
+                if ((container()?.texts() ?: before) == before) break // moved nothing
+            }
+        }
+        find()?.takeIf { it.isVisibleToUser }?.let { return it }
+        fail("Not found on screen after $scrolls scroll(s): $what. Screen: ${app.screen()}")
     }
 
     /** Turns push on from the row (Off: one tap enables) and waits for On. */
@@ -318,6 +418,9 @@ class PushE2eTest {
 
     companion object {
         const val OTHER = "com.example.other"
+        const val SHEET = "notifications.sheet"
+        val TERMINAL_RUN = setOf("completed", "failed", "cancelled", "interrupted") // RunFollower.kt
+        val SECTIONS = listOf("settings_connection", "settings_appearance", "settings_behaviour", "settings_notifications", "settings_about")
         val VALUES = listOf(
             "settings_notif_on", "settings_notif_off", "settings_notif_no_distributor", "settings_notif_blocked",
             "settings_notif_channel_blocked", "settings_notif_registering", "settings_notif_server_error",
@@ -327,8 +430,31 @@ class PushE2eTest {
 
 // ---- the push scenarios' decisions, pure: HarnessSelfTest feeds them canned input
 
+/** The hook's anonymous approval wake (apofis_push.push_body), the only body the fake's trigger accepts as proof. */
+val WAKE_BODY = """{"kind":"needs_input"}""".toByteArray()
+
 /** A journaled create intent: "pushintent <id> <id> op-<16 hex> e2e-<nonce>" (the build host checks the same form). */
 val PUSH_INTENT = Regex("pushintent (apofis-push-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[1-9][0-9]{0,5}) \\1 op-[0-9a-f]{16} e2e-[A-Za-z0-9]{1,20}")
+
+/**
+ * The wake precondition of chat [key] in one read-only statement: its stored runs and their ids, its sends in the app's
+ * queued state or steering ('sending' is the healthy row of the stored run itself), and the outbox rows.
+ */
+fun WAKE_PRECONDITION_SQL(key: String): String {
+    require(Regex("apofis-[0-9a-f-]{36}").matches(key)) { "Not an app session id" }
+    return "SELECT (SELECT count(*) FROM ActiveRunEntity WHERE sessionKey = '$key'), " +
+        "(SELECT group_concat(runId) FROM ActiveRunEntity WHERE sessionKey = '$key'), " +
+        "(SELECT count(*) FROM PendingSendEntity WHERE sessionKey = '$key' AND state IN ('queued', 'steering')), " +
+        "(SELECT count(*) FROM NoticeOutboxEntity);"
+}
+
+/** The stored run when the precondition's one row holds: exactly one run, no queued or steering send, an empty outbox. */
+fun wakePrecondition(rows: List<String>): String? =
+    rows.singleOrNull()?.let { Regex("1\\|(run_[0-9a-f]{32})\\|0\\|0").matchEntire(it) }?.groupValues?.get(1)
+
+/** The run once the app has stored exactly one for the chat (whatever else the row says): to wait for before killing. */
+fun storedRun(rows: List<String>): String? =
+    rows.singleOrNull()?.let { Regex("1\\|(run_[0-9a-f]{32})\\|\\d+\\|\\d+").matchEntire(it) }?.groupValues?.get(1)
 
 /** Accessibility texts as the separate lines and merged parts a person reads. */
 fun segments(texts: List<String>) = texts.flatMap { it.split("\n", ", ") }.map(String::trim).filter(String::isNotEmpty)
@@ -350,6 +476,20 @@ fun pushPrefs(xml: String): Map<String, String>? = runCatching {
 fun injectionConfirmed(read: String, install: String, nonce: String, origin: String): Boolean =
     pushPrefs(read.trim()) == mapOf("install_id" to install, "e2e_nonce" to nonce, "e2e_origin" to origin)
 
+/** What may be logged about an identity read back: a fixed category, never the bytes read. */
+fun identityDiagnostic(read: String): String = if (pushPrefs(read.trim()) == null) "not a whole prefs file" else "values differ"
+
+/** What may be logged about an intent export read: a fixed category, never the bytes read. */
+fun exportDiagnostic(read: String): String {
+    val out = read.trimEnd()
+    return when {
+        out == "@@NONE" -> "no prefs file"
+        !out.endsWith("\n@@READ") -> "unreadable"
+        pushPrefs(out.removeSuffix("@@READ")) == null -> "malformed"
+        else -> "read"
+    }
+}
+
 /**
  * The journal lines for a read of the push prefs ("<file>\n@@READ", or "@@NONE" when there is no file): one
  * "pushintent" per intent; any read failure, malformed file or intent line gives "pushintent-missing" for each of
@@ -365,22 +505,41 @@ fun pushIntentLines(read: String, ifUnreadable: Collection<String>): List<String
     return if (lines.all(PUSH_INTENT::matches)) lines else missing
 }
 
+/**
+ * Server session [server] is record [id] exactly as the app's own intent in [prefsRead] says: same id, source
+ * api_server, hidden, and the intent's exact title; for the [current] record also the app's stored record id and
+ * endpoint equal [id] and [endpoint]. Returns only the verdict: the values are never logged.
+ */
+fun recordMatches(prefsRead: String, server: JSONObject, id: String, endpoint: String, current: Boolean): Boolean {
+    val prefs = pushPrefs(prefsRead.trim()) ?: return false
+    val title = prefs["test_intents"].orEmpty().lines().firstOrNull { it.substringBefore('\t') == id }?.substringAfter('\t') ?: return false
+    if (server.optString("id") != id || server.optString("source") != "api_server" || !server.optBoolean("hidden") ||
+        server.optString("title") != title
+    ) {
+        return false
+    }
+    return !current || (prefs["record"] == id && prefs["endpoint"] == endpoint)
+}
+
 /** One ApofisWake summary: "cause=<c> runs=<n> settled=<n> failed=<n> outcome=<o>"; null for anything else. */
 data class WakeLine(val cause: String, val runs: Int, val settled: Int, val failed: Int)
 
 fun wakeLine(s: String): WakeLine? = Regex("cause=([a-z]+) runs=(\\d+) settled=(\\d+) failed=(\\d+) outcome=[A-Za-z_]+").matchEntire(s.trim())
     ?.groupValues?.let { WakeLine(it[1], it[2].toInt(), it[3].toInt(), it[4].toInt()) }
 
-/** Every line is a well-formed summary of a check that took no run and settled nothing (and there is one). */
-fun noRunChecked(lines: List<String>) = lines.isNotEmpty() && lines.all { wakeLine(it)?.let { w -> w.runs == 0 && w.settled == 0 && w.failed == 0 } == true }
+/** The new lines after a quiet delivery: at least one push-caused check, and every line a check that took no run. */
+fun quietPushChecked(new: List<String>): Boolean {
+    val parsed = new.map { wakeLine(it) ?: return false }
+    return parsed.any { it.cause == "push" } && parsed.all { it.runs == 0 && it.settled == 0 && it.failed == 0 }
+}
 
-/** Before the delivery: the chat has a stored run, no send waiting to go, and the outbox is empty. */
-fun wakePreconditionsHold(runs: Int, sendStates: List<String>, outbox: Int) =
-    runs == 1 && sendStates.none { it == "queued" || it == "sending" } && outbox == 0
-
-/** Exactly one check settled anything, it settled one run, and its cause is one only a pending push mark produces. */
-fun provedByPush(lines: List<String>): Boolean {
-    val parsed = lines.map { wakeLine(it) ?: return false }
-    val settling = parsed.filter { it.settled > 0 }
-    return settling.size == 1 && settling[0].cause == "push" && settling[0].settled == 1
+/**
+ * Before the delivery no check settled anything; after it exactly one check settled anything, it settled one run, and
+ * its cause is one only a pending push mark produces. Any unparsed line fails.
+ */
+fun provedByPush(before: List<String>, after: List<String>): Boolean {
+    val pre = before.map { wakeLine(it) ?: return false }
+    val post = after.map { wakeLine(it) ?: return false }
+    val settling = post.filter { it.settled > 0 }
+    return pre.none { it.settled > 0 } && settling.size == 1 && settling[0].cause == "push" && settling[0].settled == 1
 }
