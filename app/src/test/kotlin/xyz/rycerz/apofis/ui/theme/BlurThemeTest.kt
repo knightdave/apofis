@@ -47,10 +47,7 @@ class BlurThemeTest {
         return seen!!
     }
 
-    /**
-     * The fixed palettes keep blur, and with it the raised glass (never the blur-off fill with blur drawn), except purple
-     * dark, where no translucent glass passes: there exactly the blur-off tokens and no blur.
-     */
+    /** The 12 fixed palettes keep blur, and with it the raised glass (never the blur-off fill with blur drawn). */
     @Test
     fun theFixedPalettesKeepBlurWithTheRaisedGlass() {
         show()
@@ -58,12 +55,6 @@ class BlurThemeTest {
             val s = at(Case(mode, seed, pure))
             val name = "${if (seed == PurpleSeed) "purple" else if (seed == GreenSeed) "green" else "static"} $mode pure=$pure"
             val off = apofisColors(s.scheme, mode == ThemeMode.DARK)
-            if (seed == PurpleSeed && mode == ThemeMode.DARK && !pure) {
-                // No translucent glass keeps selected text at 4.5:1 here (ThemeTokensTest): the blur-off tokens, no blur.
-                assertEquals(name, off, s.colors)
-                assertEquals(name, false, s.blur)
-                continue
-            }
             assertTrue("$name: blur drawn", s.blur)
             assertEquals(name, blurredColors(s.scheme, mode == ThemeMode.DARK), s.colors)
             assertTrue(name, s.colors.glassFill.alpha > off.glassFill.alpha)

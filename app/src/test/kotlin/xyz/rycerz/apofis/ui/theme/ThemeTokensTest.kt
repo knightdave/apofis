@@ -105,55 +105,51 @@ class ThemeTokensTest {
 
     /**
      * With blur on (the Settings switch), the glass shows blurred content of any color: every foreground on it keeps its
-     * floor over black, white, the text color, primary and every grey between, and the glass stays translucent.
+     * floor over black, white, the text color, primary and every grey between, and the glass stays translucent, in all 12
+     * palettes. Selected text is not one of the floors (ruling): its worst case is pinned as a known limit instead.
      */
     @Test
     fun blurredGlassKeepsItsFloorsOverAnyContent() {
         val failures = mutableListOf<String>()
-        val withoutBlur = mutableListOf<String>()
-        val table = StringBuilder("theme | composer alpha | text | selected text | placeholder | expand | primary | button alpha | arrow\n")
+        val table = StringBuilder("theme | composer alpha | text | placeholder | expand | primary | button alpha | arrow | selected text | selected, blur off\n")
+        var worstSelected = Double.MAX_VALUE to ""
+        var worstSelectedOff = Double.MAX_VALUE
         for ((name, scheme, _) in themes) {
             val dark = scheme.surface.luminance() < 0.5f
             val contents = listOf(Color.Black, Color.White, scheme.onSurface, scheme.primary) + (0..255).map { Color(it, it, it) }
             fun worst(fg: Color, glass: Color, over: Color = Color.Transparent) =
                 contents.minOf { content -> contrastRatio(fg, over.compositeOver(glass.compositeOver(content))) }
-            val selection = scheme.primary.copy(alpha = 0.4f) // Material's text selection background
-            val c = blurredColors(scheme, dark)
-            if (c == null) {
-                // No blur for this palette: even the most opaque translucent glass misses a floor.
-                val off = apofisColors(scheme, dark)
-                val g = off.glassFill.copy(alpha = 0.99f)
-                val best = listOf(worst(scheme.onSurface, g, selection) / 4.5, worst(off.muted, g) / 4.5, worst(scheme.primary, g) / 3.0).min()
-                if (best >= 1.0) failures += "$name: blur refused although glass at 0.99 passes"
-                withoutBlur += name
-                table.append("$name | no blur: at 0.99 text %.2f, selected text %.2f, placeholder %.2f; blur off: selected text %.2f\n".format(
-                    worst(scheme.onSurface, g), worst(scheme.onSurface, g, selection), worst(off.muted, g),
-                    contrastRatio(scheme.onSurface, selection.compositeOver(off.glassFill.compositeOver(scheme.surface))),
-                ))
-                continue
-            }
+            val c = blurredColors(scheme, dark) ?: run { failures += "$name: no blur"; null } ?: continue
             val pairs = listOf(
                 Triple("text", scheme.onSurface to c.glassFill, 4.5),
-                Triple("selected text", scheme.onSurface to c.glassFill, 4.5),
                 Triple("placeholder", c.muted to c.glassFill, 4.5),
                 Triple("expand icon", c.expandIcon to c.glassFill, 3.0),
                 Triple("send fill and stop outline", scheme.primary to c.glassFill, 3.0),
                 Triple("scroll arrow", scheme.onSurface to c.glassButtonFill, 3.0),
             )
             val ratios = pairs.map { (what, colors, min) ->
-                val ratio = if (what == "selected text") worst(colors.first, colors.second, selection) else worst(colors.first, colors.second)
+                val ratio = worst(colors.first, colors.second)
                 if (ratio < min) failures += "$name: $what is %.2f:1 over some content, needs $min".format(ratio)
                 ratio
             }
             for ((what, glass) in listOf("composer" to c.glassFill, "scroll button" to c.glassButtonFill)) {
                 if (glass.alpha >= 1f) failures += "$name: the $what glass is opaque"
             }
-            table.append("$name | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f\n".format(c.glassFill.alpha, ratios[0], ratios[1], ratios[2], ratios[3], ratios[4], c.glassButtonFill.alpha, ratios[5]))
+            // Selected text: on Material's selection background (primary at 0.40) over the raised glass; and with blur off,
+            // over the fill-only glass on its page backplate.
+            val selection = scheme.primary.copy(alpha = 0.4f)
+            val selected = worst(scheme.onSurface, c.glassFill, selection)
+            val off = apofisColors(scheme, dark)
+            val selectedOff = contrastRatio(scheme.onSurface, selection.compositeOver(off.glassFill.compositeOver(scheme.surface)))
+            if (selected < worstSelected.first) worstSelected = selected to name
+            worstSelectedOff = minOf(worstSelectedOff, selectedOff)
+            table.append("$name | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f\n".format(c.glassFill.alpha, ratios[0], ratios[1], ratios[2], ratios[3], c.glassButtonFill.alpha, ratios[4], selected, selectedOff))
         }
+        table.append("worst selected text with blur: %.3f in %s; with blur off: %.3f\n".format(worstSelected.first, worstSelected.second, worstSelectedOff))
         println(table)
+        // Known limit (ruling): with blur on, selected text can fall below 4.5:1 over bright content. Pinned, so worse fails.
+        assertTrue("selected text with blur: ${worstSelected.first} in ${worstSelected.second}", worstSelected.first >= SELECTED_WITH_BLUR)
         assertEquals(emptyList<String>(), failures)
-        // Material's selection (primary at 0.40) on purple dark leaves selected text near 4.5:1 even on an opaque glass.
-        assertEquals(listOf("purple dark=true pure=false"), withoutBlur)
         // Without blur nothing changes: the glass keeps the UI map's alpha over its page backplate.
         for ((_, scheme, c) in themes) {
             val dark = scheme.surface.luminance() < 0.5f
@@ -230,5 +226,10 @@ class ThemeTokensTest {
         assertTrue(contrastRatio(shifted, darkCodeFill) >= 4.5)
         assertNotEquals(grey, shifted)
         assertEquals(darkOnSurface, readableOn(darkOnSurface, darkCodeFill, toward = Color.White))
+    }
+
+    private companion object {
+        /** The measured worst case of selected text in the composer with frosted glass on, over any content (known limit). */
+        const val SELECTED_WITH_BLUR = 3.729 // green dark, pure off
     }
 }

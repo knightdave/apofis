@@ -196,41 +196,33 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
     )
 }
 
-/** Material's text selection background (primary at 0.40), drawn over the composer's glass under selected text. */
-internal val ColorScheme.selectionBackground: Color get() = primary.copy(alpha = 0.4f)
-
 /**
  * The tokens with blur on, or null when blur must not be drawn. The glass then shows blurred content of any color instead
  * of a page backplate, so each fill is raised from the UI map's alpha to the smallest translucent one at which every
- * resting foreground on it keeps its floor over any content: the composer's text (also on the selection background),
- * placeholder and primary controls, and the scroll button's arrow. The expand icon takes the placeholder's tone, as in
- * the map. When no translucent fill passes for either surface, null: the theme keeps the blur-off tokens and no blur.
+ * resting foreground on it keeps its floor over any content: the composer's text, placeholder and primary controls, and
+ * the scroll button's arrow. The expand icon takes the placeholder's tone, as in the map. When no translucent fill passes
+ * for either surface, null: the theme keeps the blur-off tokens and no blur.
  */
 internal fun blurredColors(scheme: ColorScheme, dark: Boolean): ApofisColors? {
     val c = apofisColors(scheme, dark)
     val on = scheme.onSurface
-    val card = glassAlpha(c.glassFill, Floor(on, 4.5), Floor(on, 4.5, scheme.selectionBackground), Floor(c.muted, 4.5), Floor(scheme.primary, 3.0)) ?: return null
-    val button = glassAlpha(c.glassButtonFill, Floor(on, 3.0)) ?: return null
+    val card = glassAlpha(c.glassFill, on to 4.5, c.muted to 4.5, scheme.primary to 3.0) ?: return null
+    val button = glassAlpha(c.glassButtonFill, on to 3.0) ?: return null
     return c.copy(expandIcon = c.muted, glassFill = c.glassFill.copy(alpha = card), glassButtonFill = c.glassButtonFill.copy(alpha = button))
 }
 
-/** A foreground that must keep [min] on the glass, seen through a translucent layer [over] drawn on it (none by default). */
-internal class Floor(val foreground: Color, val min: Double, val over: Color = Color.Transparent)
-
-/** The smallest alpha, from [glass]'s own up in 1 % steps and below 1, at which every floor holds over any content; null if none. */
-private fun glassAlpha(glass: Color, vararg floors: Floor): Float? =
+/** The smallest alpha, from [glass]'s own up in 1 % steps and below 1, at which each foreground keeps its floor over any content; null if none. */
+private fun glassAlpha(glass: Color, vararg floors: Pair<Color, Double>): Float? =
     ((glass.alpha * 100).roundToInt()..99).map { it / 100f }
-        .firstOrNull { a -> floors.all { worstContrast(it.foreground, glass.copy(alpha = a), it.over) >= it.min } }
+        .firstOrNull { a -> floors.all { (fg, min) -> worstContrast(fg, glass.copy(alpha = a)) >= min } }
 
 /**
- * The lowest contrast of [foreground] on [glass] (translucent), seen through [over], over content of any color. Each
- * channel of the result is linear in the content's, so content black and white bound the luminance it can show and every
- * luminance between occurs: a foreground inside that range has 1:1.
+ * The lowest contrast of [foreground] on [glass] (translucent) over content of any color: the glass over black and over
+ * white bound the luminance it can show, and every luminance between occurs, so a foreground inside that range has 1:1.
  */
-internal fun worstContrast(foreground: Color, glass: Color, over: Color = Color.Transparent): Double {
-    fun on(content: Color) = over.compositeOver(glass.compositeOver(content))
-    val overBlack = on(Black)
-    val overWhite = on(White)
+internal fun worstContrast(foreground: Color, glass: Color): Double {
+    val overBlack = glass.compositeOver(Black)
+    val overWhite = glass.compositeOver(White)
     if (foreground.luminance() in overBlack.luminance()..overWhite.luminance()) return 1.0
     return min(contrastRatio(foreground, overBlack), contrastRatio(foreground, overWhite))
 }
