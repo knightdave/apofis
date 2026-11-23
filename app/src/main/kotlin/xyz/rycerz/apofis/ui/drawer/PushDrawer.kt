@@ -203,9 +203,10 @@ class PushDrawerState internal constructor(initial: PushDrawerValue) {
  * touch slop and the drag, and never hands over to another finger. A gesture whose down began on an element owning
  * sideways drags ([SidewaysClaims]) never moves the drawer. Before the slop, other fingers are ignored and nothing of
  * theirs is consumed; if the checked finger lifts or another element consumed its move, the gesture ends without moving
- * the drawer. During the drag every event of that finger goes to the velocity tracker (the up included) and is consumed
- * (also without sideways motion, so no list picks the gesture up); its up ends the drag with that velocity, a consumed
- * or missing change ends it as a cancel. Other fingers are drained until all are up. No nested scrolling.
+ * the drawer. During the drag every change of that finger is consumed while the finger is down (also without sideways
+ * motion, so no list picks the gesture up) and goes to the velocity tracker; the up goes to the velocity tracker and is
+ * not consumed, and ends the drag with that velocity. A change someone else already consumed, or a missing one, ends the
+ * drag as a cancel without being sampled. Other fingers are drained until all are up. No nested scrolling.
  */
 private fun Modifier.drawerDrag(state: PushDrawerState, rtl: Boolean, fromScrim: Boolean): Modifier = pointerInput(state, rtl, fromScrim) {
     val sign = if (rtl) -1f else 1f
