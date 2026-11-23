@@ -24,7 +24,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
@@ -167,7 +166,8 @@ class AppContainer(
 
     init {
         // The fallback check runs while any run is stored, push on or off; also reconciled when a connection is published.
-        scope.launch { db.activeRunDao().observeAny().distinctUntilChanged().collect { Wake.post(app, reconcile) } }
+        // Every emission posts: the lane reads the table itself and skips only what it already applied.
+        scope.launch { db.activeRunDao().observeAny().collect { Wake.post(app, reconcile) } }
     }
 
     // Guarded by this.
@@ -336,7 +336,6 @@ class AppContainer(
                 composer.settle() // sends being stored finish (or come back as unsent) before the old graph closes
                 old?.close()
                 WorkManager.getInstance(app).cancelUniqueWork(SendWorker.WORK_NAME)
-                Wake.post(app, WakeRequest.Cancel) // ordered in the wake lane before anything of the new connection
                 // The one place the epoch advances: with the marker, in one commit, inside the notifier's lane (so no
                 // notice, clear or tap of the old one is accepted afterwards, and its notifications and rows go) and
                 // under the push lock (so no wake or registration check falls between). A death here is finished by

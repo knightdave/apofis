@@ -58,6 +58,11 @@ internal fun pendingWake(c: Context): Long? = PushStore.locked {
     wakePrefs(c).let { if (it.contains(WAKE_PENDING)) it.getLong(WAKE_PENDING, 0) else null }
 }
 
+/** Under the push lock: the mark for [epoch] is set again (a retrying job that consumed it), while [epoch] is current. */
+internal fun restorePendingWake(c: Context, epoch: Long): Boolean = PushStore.locked {
+    epoch == connectionEpoch(c) && commitOrRestore(wakePrefs(c)) { putLong(WAKE_PENDING, epoch) }
+}
+
 internal enum class Cleared { REMOVED, NONE, STALE, FAILED }
 
 /** Under the push lock: [epoch] is still current and no wake mark is left (a mark of an older epoch goes with it). */
@@ -80,8 +85,6 @@ internal sealed interface WakeRequest {
     data class FollowUp(val n: Int, val from: UUID) : WakeRequest
     /** The periodic check, from whether runs are stored when the lane gets to it. */
     class Reconcile(val runsStored: suspend () -> Boolean) : WakeRequest
-    /** A switch: the old connection's wake and periodic work go. */
-    data object Cancel : WakeRequest
 }
 
 /**
@@ -95,6 +98,12 @@ internal sealed interface WakeRequest {
  */
 object Wake : PushSink {
     private val lane = Executors.newSingleThreadExecutor { Thread(it, "apofis-wake").apply { isDaemon = true } }
+
+    // The periodic decision (epoch, runs stored) the lane applied last; lane only. Nothing else changes that work.
+    private var periodicApplied: Pair<Long, Boolean>? = null
+
+    /** Test-only: a new process (the lane's memory of what it applied is gone). */
+    internal fun newProcess() = lane.submit { periodicApplied = null }.get(10, TimeUnit.SECONDS)
 
     /** Test-only: runs in the lane at the start of each request's step. */
     internal var laneStep: (WakeRequest) -> Unit = {}
@@ -121,20 +130,10 @@ object Wake : PushSink {
         val wm = WorkManager.getInstance(c)
         val epoch = connectionEpoch(c)
         when (r) {
-            WakeRequest.Cancel -> {
-                install { wm.cancelUniqueWork(WAKE_WORK) }
-                install { wm.cancelUniqueWork(CHECK_WORK) }
-            }
-            is WakeRequest.Reconcile -> if (runBlocking { r.runsStored() }) {
-                val periodic = PeriodicWorkRequestBuilder<WakeWorker>(15, TimeUnit.MINUTES)
-                    .setInitialDelay(15, TimeUnit.MINUTES)
-                    .setConstraints(connected)
-                    .setInputData(workDataOf(EPOCH to epoch, CAUSE to CAUSE_TICK))
-                    .build()
-                // UPDATE: the running schedule is kept and takes this epoch.
-                install { wm.enqueueUniquePeriodicWork(CHECK_WORK, ExistingPeriodicWorkPolicy.UPDATE, periodic) }
-            } else {
-                install { wm.cancelUniqueWork(CHECK_WORK) }
+            is WakeRequest.Reconcile -> {
+                val decision = epoch to runBlocking { r.runsStored() }
+                if (decision == periodicApplied) return
+                if (reconcile(wm, decision)) periodicApplied = decision
             }
             else -> {
                 val job = when {
@@ -152,6 +151,18 @@ object Wake : PushSink {
         }
     }
 
+    /** Installs (UPDATE: the running schedule is kept and takes the epoch) or cancels the periodic check; true when done. */
+    private fun reconcile(wm: WorkManager, decision: Pair<Long, Boolean>): Boolean {
+        val (epoch, runsStored) = decision
+        if (!runsStored) return install { wm.cancelUniqueWork(CHECK_WORK) }
+        val periodic = PeriodicWorkRequestBuilder<WakeWorker>(15, TimeUnit.MINUTES)
+            .setInitialDelay(15, TimeUnit.MINUTES)
+            .setConstraints(connected)
+            .setInputData(workDataOf(EPOCH to epoch, CAUSE to CAUSE_TICK))
+            .build()
+        return install { wm.enqueueUniquePeriodicWork(CHECK_WORK, ExistingPeriodicWorkPolicy.UPDATE, periodic) }
+    }
+
     private fun wakeJob(input: Data, expedited: Boolean = false, delayS: Int = 0): OneTimeWorkRequest =
         OneTimeWorkRequestBuilder<WakeWorker>()
             .apply {
@@ -163,18 +174,19 @@ object Wake : PushSink {
             .build()
 
     /** Waits for WorkManager's answer; one more try on failure, then the mark stays for the next trigger. */
-    private fun install(op: () -> Operation) {
+    private fun install(op: () -> Operation): Boolean {
         repeat(2) {
             try {
                 beforeInstall()
                 op().result.get()
-                return
+                return true
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
-                return
+                return false
             } catch (_: Exception) {
             }
         }
+        return false
     }
 }
 

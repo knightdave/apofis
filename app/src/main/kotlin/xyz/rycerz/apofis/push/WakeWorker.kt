@@ -75,7 +75,11 @@ class WakeWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         } catch (_: Exception) {
             Outcome.RETRY // the database or the notifier's lane (the check's own summary line says so)
         }
-        if (outcome == Outcome.RETRY && runAttemptCount < EXECUTIONS - 1) return Result.retry()
+        if (outcome == Outcome.RETRY && runAttemptCount < EXECUTIONS - 1) {
+            // The fresh budget of a push this job consumed must outlast this execution: its mark goes back.
+            if (cleared == Cleared.REMOVED) restorePendingWake(c, epoch)
+            return Result.retry()
+        }
         val followUp = if (cleared == Cleared.REMOVED) 0 else inputData.getInt(FOLLOW_UP, 0)
         val unfinished = outcome == Outcome.UNFINISHED || (outcome == Outcome.RETRY && runCatching { target.connected.db.activeRunDao().any() }.getOrDefault(false))
         if (unfinished && followUp < RECHECK_DELAYS_S.size) Wake.post(c, WakeRequest.FollowUp(followUp + 1, id))
