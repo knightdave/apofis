@@ -71,6 +71,7 @@ class StringsParityTest {
             val text = file.readText()
             assertFalse("$file has an en dash", text.contains('\u2013'))
             assertFalse("$file has an em dash", text.contains('\u2014'))
+            assertFalse("$file has a typographic ellipsis", text.contains('\u2026'))
         }
     }
 }
