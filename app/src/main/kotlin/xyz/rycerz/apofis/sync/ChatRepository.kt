@@ -13,6 +13,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.ApiError
+import xyz.rycerz.apofis.api.ChatModel
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.MessageDto
 import xyz.rycerz.apofis.api.SessionDto
@@ -298,13 +299,23 @@ class ChatRepository(
     }
 
     /**
-     * Steers the session's running run, else queues [text] and tries to start it at once. The message is stored
-     * before any request; [onStored] runs once it is (before any request). A hidden chat fails locally; an unknown one
-     * throws IllegalArgumentException.
+     * Steers the session's running run, else queues [text] and tries to start it at once; with [images] (digests) it is
+     * always queued. The message is stored before any request; [onStored] runs once it is (before any request). A hidden
+     * chat fails locally; an unknown one throws IllegalArgumentException; see [SendQueue.submit] for the other refusals.
      */
-    suspend fun send(sessionKey: String, text: String, onStored: () -> Unit = {}) {
+    suspend fun send(sessionKey: String, text: String, images: List<String> = emptyList(), onStored: () -> Unit = {}) {
         requireAppKey(sessionKey)
-        queue().submit(sessionKey, text, onStored)
+        queue().submit(sessionKey, text, onStored, images)
+    }
+
+    /** Stores the chat's model choice on this phone only (no server call); sends stored from now on carry it. */
+    suspend fun setChoice(sessionKey: String, choice: ChatModel) {
+        requireAppKey(sessionKey)
+        lock.withLock {
+            ensureOpen()
+            val session = sessionDao.get(sessionKey) ?: return
+            sessionDao.upsert(session.copy(model = choice.model, provider = choice.provider, reasoning = choice.reasoning, fast = choice.fast))
+        }
     }
 
     /** See [SendQueue.cancel]. */

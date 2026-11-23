@@ -5,6 +5,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
@@ -32,7 +33,10 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.HoldingQueue
+import xyz.rycerz.apofis.api.ChatModel
+import xyz.rycerz.apofis.api.MAX_BODY_BYTES
 import xyz.rycerz.apofis.api.buildRunBody
+import xyz.rycerz.apofis.api.expandedSize
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
@@ -40,6 +44,7 @@ import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.db.choice
 
 private const val RUN_ID = "run_ef57074dc1694db39e37045230b1425c"
 
@@ -62,8 +67,19 @@ class SendQueueTest {
             .allowMainThreadQueries()
             .build()
         api = HermesApi(server.url("/").toString(), "secret-key")
-        queue = SendQueue(api, db, { key, run -> started += key to run }, { clock })
+        queue = imageQueue(db)
     }
+
+    // The image store as the queue sees it: bytes by digest, sizes that may differ from the bytes, and a hook in the read.
+    private val files = HashMap<String, ByteArray>()
+    private val sizes = HashMap<String, Long>()
+    @Volatile private var onRead: () -> Unit = {}
+    private var schedules = 0
+
+    private fun imageQueue(db: AppDatabase, active: () -> Boolean = { true }) = SendQueue(
+        api, db, { key, run -> started += key to run }, { clock }, schedule = { schedules++ }, active = active,
+        readImage = { onRead(); files[it] }, imageSize = { sizes[it] ?: files[it]?.size?.toLong() },
+    )
 
     @After
     fun tearDown() {
@@ -1074,5 +1090,313 @@ class SendQueueTest {
         assertEquals(CancelResult.NOW_ATTEMPTED, queue.cancel(key, mayHaveSentShown = false))
         assertEquals(listOf("later"), rows("apofis-a").map { it.text })
         assertEquals(CancelResult.REMOVED_MAY_HAVE_SENT, queue.cancel(key, mayHaveSentShown = true))
+    }
+
+    // Images, the frozen model choice and createStarted (Milestone 4 Task 1a).
+
+    private fun sha(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
+
+    private fun photo(vararg bytes: Byte): String = sha(bytes).also { files[it] = bytes }
+
+    private val oneTwoThree = "data:image/jpeg;base64,AQID" // bytes 1, 2, 3
+
+    @Test
+    fun imagesNeverSteer() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        val d = photo(1, 2, 3)
+        ChatRepository(api, db, { clock }, queue).send("apofis-a", "look", listOf(d))
+        val row = rows("apofis-a").single()
+        assertEquals("queued", row.state) // behind the running reply (decision 5)
+        assertNull(row.runId)
+        assertFalse(row.attempted)
+        assertEquals(d, row.images)
+        assertEquals(buildRunBody("apofis-a", "look", listOf(d)), row.requestBody)
+        assertEquals(0, server.requestCount) // no steer
+    }
+
+    @Test
+    fun storedImageSteerIsNeverDelivered() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        val d = photo(1, 2, 3)
+        val body = buildRunBody("apofis-a", "look", listOf(d))
+        // A steering image row (never written by insert) found by the drain's recovery of stored steers.
+        db.pendingSendDao().upsert(PendingSendEntity("k", "apofis-a", "look", body, clock, "steering", "run_1", null, images = d))
+        assertFalse(queue.drain())
+        assertEquals(0, server.requestCount)
+        assertEquals("queued", pending("k").state)
+        assertNull(pending("k").runId)
+
+        db.activeRunDao().delete("run_1") // the reply ends: the row is the next turn
+        respond(runStart("run_2"), 202)
+        assertTrue(queue.drain())
+        val run = take()
+        assertEquals("/v1/runs", run.target)
+        assertEquals(body.replace("apofis-image:$d", oneTwoThree), run.body!!.utf8())
+    }
+
+    @Test
+    fun bodyAtCapStoredOverCapRefused() = runTest {
+        addSession("apofis-a")
+        running("apofis-a") // a stored row waits behind the reply: nothing is read or sent
+        val d = sha(byteArrayOf(9))
+        sizes[d] = 6_000_000L
+        val bare = expandedSize(buildRunBody("apofis-a", "", listOf(d)), listOf(6_000_000L))
+        val fits = "x".repeat((MAX_BODY_BYTES - bare).toInt())
+        assertEquals(MAX_BODY_BYTES.toLong(), expandedSize(buildRunBody("apofis-a", fits, listOf(d)), listOf(6_000_000L)))
+        try {
+            queue.submit("apofis-a", fits + "x", images = listOf(d))
+            fail("stored a body one byte over the cap")
+        } catch (_: SendTooLarge) {
+        }
+        assertTrue(rows("apofis-a").isEmpty())
+        assertEquals(0, schedules) // nothing armed either
+
+        queue.submit("apofis-a", fits, images = listOf(d))
+        assertEquals(fits, rows("apofis-a").single().text)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun imageWithoutAFileIsNotStored() = runTest {
+        addSession("apofis-a")
+        try {
+            queue.submit("apofis-a", "look", images = listOf(sha(byteArrayOf(1))))
+            fail("stored a send whose image is not on this phone")
+        } catch (_: IllegalArgumentException) {
+        }
+        assertTrue(rows("apofis-a").isEmpty())
+        assertEquals(0, schedules)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun choiceReadAtInsert() = runTest {
+        addSession("apofis-a")
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val choice = ChatModel("m", "p", "high", true)
+        repo.setChoice("apofis-a", choice)
+        respond(runStart("run_1"), 202)
+        repo.send("apofis-a", "hi")
+        val expected = buildRunBody("apofis-a", "hi", choice = choice)
+        assertEquals(expected, rows("apofis-a").single().requestBody)
+        assertEquals(expected, take().body!!.utf8())
+    }
+
+    @Test
+    fun retryResendsFrozenBody() = runTest {
+        addSession("apofis-a")
+        val repo = ChatRepository(api, db, { clock }, queue)
+        repo.setChoice("apofis-a", ChatModel(model = "first"))
+        respond("""{"error":{"code":"invalid_params","message":"route conflict"}}""", 400) // a refused model (H7)
+        repo.send("apofis-a", "hi")
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertFalse(row.attempted)
+        repo.setChoice("apofis-a", ChatModel(model = "second", fast = true))
+        respond(runStart("run_1"), 202)
+        assertEquals(RetryResult.STARTED, repo.retrySend(row.idempotencyKey))
+        val (first, second) = recorded()
+        assertEquals(buildRunBody("apofis-a", "hi", choice = ChatModel(model = "first")), first.body!!.utf8())
+        assertEquals(first.body!!.utf8(), second.body!!.utf8())
+        assertEquals(row.idempotencyKey, second.headers["Idempotency-Key"])
+    }
+
+    @Test
+    fun setChoiceMakesNoRequest() = runTest {
+        addSession("apofis-a") // on the server: a rename here would PATCH it
+        val repo = ChatRepository(api, db, { clock }, queue)
+        val before = db.sessionDao().get("apofis-a")!!
+        repo.setChoice("apofis-a", ChatModel("m", "p", "low", false))
+        assertEquals(ChatModel("m", "p", "low", false), db.sessionDao().get("apofis-a")!!.choice())
+        assertEquals(before, db.sessionDao().get("apofis-a")!!.copy(model = null, provider = null, reasoning = null, fast = null))
+        repo.setChoice("apofis-a", ChatModel())
+        assertEquals(before, db.sessionDao().get("apofis-a"))
+        repo.setChoice("apofis-gone", ChatModel(model = "m")) // no row, nothing written
+        assertNull(db.sessionDao().get("apofis-gone"))
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun attemptExpandsRefs() = runTest {
+        addSession("apofis-a")
+        val d = photo(1, 2, 3)
+        respond(runStart("run_1"), 202)
+        queue.submit("apofis-a", "look", images = listOf(d))
+        val stored = buildRunBody("apofis-a", "look", listOf(d))
+        val run = take()
+        assertEquals(stored.replace("apofis-image:$d", oneTwoThree), run.body!!.utf8())
+        val row = rows("apofis-a").single()
+        assertEquals("sending", row.state)
+        assertEquals(stored, row.requestBody) // the expanded text is never stored
+        assertEquals(d, row.images)
+    }
+
+    @Test
+    fun textOnlyRowIsSentAsStored() = runTest {
+        addSession("apofis-a")
+        val d = photo(1, 2, 3)
+        onRead = { fail("a row without images reads no file") }
+        respond(runStart("run_1"), 202)
+        queue.submit("apofis-a", "apofis-image:$d")
+        assertEquals(buildRunBody("apofis-a", "apofis-image:$d"), take().body!!.utf8())
+    }
+
+    private suspend fun assertImageMissing(attempted: Boolean = false) {
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals(SendError.IMAGE_MISSING, row.error)
+        assertEquals(attempted, row.attempted)
+    }
+
+    @Test
+    fun missingImageOnCreatedChatSendsNothing() = runTest {
+        addSession("apofis-a")
+        val d = sha(byteArrayOf(1, 2, 3))
+        sizes[d] = 3L // stored while the file was there; gone before the attempt
+        queue.submit("apofis-a", "look", images = listOf(d))
+        assertEquals(0, server.requestCount)
+        assertImageMissing()
+    }
+
+    @Test
+    fun missingImageOnLocalChatStartsNoRun() = runTest {
+        addSession("apofis-a", existsOnServer = false)
+        val d = sha(byteArrayOf(1, 2, 3))
+        sizes[d] = 3L
+        respond(created("look"), 201)
+        queue.submit("apofis-a", "look", images = listOf(d))
+        assertTrue(recorded().all { it.target == "/api/sessions" }) // at most the create, never a run
+        assertImageMissing()
+    }
+
+    @Test
+    fun changedFileOfflineNotMarkedAttempted() = runTest {
+        addSession("apofis-a")
+        val d = sha(byteArrayOf(1, 2, 3))
+        files[d] = byteArrayOf(1, 2, 4) // the file under that name no longer has that digest
+        queue.submit("apofis-a", "look", images = listOf(d))
+        assertEquals(0, server.requestCount)
+        assertImageMissing()
+    }
+
+    @Test
+    fun attemptedRowKeepsItsUncertaintyWhenTheFileIsGone() = runTest {
+        addSession("apofis-a")
+        val d = photo(1, 2, 3)
+        dropConnection()
+        queue.submit("apofis-a", "look", images = listOf(d))
+        val key = rows("apofis-a").single().idempotencyKey
+        assertTrue(pending(key).attempted)
+        val sent = server.requestCount
+        files.clear()
+        queue.drain()
+        assertEquals(sent, server.requestCount)
+        assertImageMissing(attempted = true)
+        assertEquals(CancelResult.REMOVED_MAY_HAVE_SENT, queue.cancel(key))
+    }
+
+    @Test
+    fun expiryRecheckedAfterExpansion() = runTest {
+        addSession("apofis-a")
+        val d = photo(1, 2, 3)
+        onRead = { clock += SEND_EXPIRY_MS + 1 } // the deadline passes while the file is read
+        queue.submit("apofis-a", "late", images = listOf(d))
+        assertEquals(0, server.requestCount)
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals(SendError.EXPIRED, row.error)
+        assertFalse(row.attempted)
+    }
+
+    @Test
+    fun expiryRecheckedAfterAttemptMark() = runTest { // control: true on main
+        var mark: () -> Unit = {}
+        val marking = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .setQueryCallback(Dispatchers.Unconfined) { sql, _ -> if (sql.startsWith("UPDATE") && sql.contains("PendingSendEntity")) mark() }
+            .build()
+        try {
+            marking.sessionDao().upsert(SessionEntity("apofis-a", "apofis-a", "", null, false, false, 1.0, null, 0, null, false, true))
+            val q = imageQueue(marking)
+            val key = q.enqueue("apofis-a", "late")
+            mark = { mark = {}; clock += SEND_EXPIRY_MS + 1 } // the first update of the row is the attempt mark
+            q.drain()
+            assertEquals(0, server.requestCount)
+            val row = marking.pendingSendDao().get(key)!!
+            assertEquals(SendError.EXPIRED, row.error)
+            assertFalse(row.attempted)
+        } finally {
+            marking.close()
+        }
+    }
+
+    @Test
+    fun generationChangeDuringExpansionSendsNothing() = runTest {
+        var open = true
+        val q = imageQueue(db, active = { open })
+        addSession("apofis-a")
+        val d = photo(1, 2, 3)
+        onRead = { open = false } // the server switch happens while the file is read
+        q.submit("apofis-a", "look", images = listOf(d))
+        assertEquals(0, server.requestCount)
+        val row = rows("apofis-a").single()
+        assertEquals("queued", row.state)
+        assertFalse(row.attempted)
+    }
+
+    @Test
+    fun identicalWireBytesOnRetry() = runTest {
+        addSession("apofis-a")
+        val d = photo(1, 2, 3)
+        respond("""{"error":{"code":"boom"}}""", 500) // may have been accepted: attempted, same key on Retry
+        respond(runStart("run_1"), 202)
+        queue.submit("apofis-a", "look", images = listOf(d))
+        val row = rows("apofis-a").single()
+        assertEquals(SendError.HTTP_ERROR, row.error)
+        assertTrue(row.attempted)
+        assertEquals(RetryResult.STARTED, queue.retry(row.idempotencyKey))
+        assertTrue(queue.drain())
+        val (first, second) = recorded()
+        assertEquals(buildRunBody("apofis-a", "look", listOf(d)).replace("apofis-image:$d", oneTwoThree), first.body!!.utf8())
+        assertEquals(first.body!!.utf8(), second.body!!.utf8())
+        assertEquals(row.idempotencyKey, first.headers["Idempotency-Key"])
+        assertEquals(row.idempotencyKey, second.headers["Idempotency-Key"])
+    }
+
+    @Test
+    fun createStartedWrittenBeforeCreateRequest() = runTest {
+        addSession("apofis-a", existsOnServer = false)
+        val create = holding.hold(MockResponse.Builder().code(201).body(created("hi")).addHeader("Content-Type", "application/json").build())
+        respond(runStart("run_1"), 202)
+        queue.enqueue("apofis-a", "hi")
+        val job = launch(Dispatchers.Default) { queue.drain() }
+        assertEquals("/api/sessions", take().target)
+        db.sessionDao().get("apofis-a")!!.let {
+            assertTrue(it.createStarted) // a Delete now knows the create may reach the server
+            assertFalse(it.existsOnServer)
+        }
+        create.countDown()
+        job.join()
+        assertEquals("/v1/runs", take().target)
+        db.sessionDao().get("apofis-a")!!.let {
+            assertTrue(it.existsOnServer)
+            assertTrue(it.createStarted) // not written back from the row read before the create
+            assertEquals("hi", it.title)
+        }
+    }
+
+    @Test
+    fun createStartedStaysAfterALostCreateAnswer() = runTest {
+        addSession("apofis-a", existsOnServer = false)
+        dropConnection()
+        queue.enqueue("apofis-a", "hi")
+        assertFalse(queue.drain())
+        assertTrue(recorded().all { it.target == "/api/sessions" })
+        db.sessionDao().get("apofis-a")!!.let {
+            assertTrue(it.createStarted)
+            assertFalse(it.existsOnServer)
+        }
     }
 }

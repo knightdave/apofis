@@ -1,7 +1,9 @@
 package xyz.rycerz.apofis.db
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
+import xyz.rycerz.apofis.api.ChatModel
 
 /** A chat, keyed by a stable local key; [currentId] and [lineageIds] are server session ids. */
 @Entity
@@ -19,7 +21,16 @@ data class SessionEntity(
     val stale: Boolean,
     val existsOnServer: Boolean,
     val hidden: Boolean = false, // hidden on the server: kept only while it holds unsent work, never shown
+    // The model choice of this chat, local to this phone, frozen into each run body when it is stored (see [choice]).
+    val model: String? = null,
+    val provider: String? = null,
+    val reasoning: String? = null,
+    val fast: Boolean? = null,
+    // Written before the create request: the chat may exist on the server even when existsOnServer is still false.
+    @ColumnInfo(defaultValue = "0") val createStarted: Boolean = false,
 )
+
+fun SessionEntity.choice() = ChatModel(model, provider, reasoning, fast)
 
 @Entity(primaryKeys = ["sessionKey", "position"])
 data class MessageEntity(
@@ -35,6 +46,8 @@ data class MessageEntity(
     val toolName: String?,
     val timestamp: Double,
     val finishReason: String?,
+    @ColumnInfo(defaultValue = "0") val droppedToolCalls: Int = 0,
+    @ColumnInfo(defaultValue = "0") val shortened: Boolean = false,
 )
 
 @Entity
@@ -48,6 +61,8 @@ data class PendingSendEntity(
     val runId: String?,
     val error: String?, // one of the fixed codes in SendError, never server text
     val attempted: Boolean = false, // a startRun or steer request for this row may have reached the server
+    @ColumnInfo(defaultValue = "''") val images: String = "", // digests of the body's image references, comma separated, in order
+    @ColumnInfo(defaultValue = "0") val steerOnly: Boolean = false,
 )
 
 @Entity
@@ -99,4 +114,12 @@ data class NoticeStateEntity(
     val notice: String,
     val eventId: String,
     val alerted: String = "[]",
+)
+
+/** The photos of a confirmed own send, by the server message that shows it: [digests] ordered, comma separated, never empty. */
+@Entity(primaryKeys = ["sessionKey", "messageId"])
+data class ImageBindingEntity(
+    val sessionKey: String,
+    val messageId: Long,
+    val digests: String,
 )
