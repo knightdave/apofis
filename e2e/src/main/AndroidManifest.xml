@@ -2,9 +2,20 @@
 <!-- The tests delete the sessions they created through the Hermes API (plain HTTP over adb reverse). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Package visibility: the tests read the app's string resources. -->
+    <!-- Package visibility: the tests read the app's string resources and send it UnifiedPush broadcasts. -->
     <queries>
         <package android:name="xyz.rycerz.apofis" />
     </queries>
-    <application android:usesCleartextTraffic="true" />
+    <application android:usesCleartextTraffic="true">
+        <!-- The e2e UnifiedPush distributor (FakeDistributor.kt); only the app's debug build accepts this package.
+             Exported: the app's connector sends REGISTER and UNREGISTER here. -->
+        <receiver
+            android:name=".FakeDistributor"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.distributor.REGISTER" />
+                <action android:name="org.unifiedpush.android.distributor.UNREGISTER" />
+            </intent-filter>
+        </receiver>
+    </application>
 </manifest>
