@@ -62,7 +62,7 @@ class OpenChatIntentTest {
         SessionEntity(k, k, "", "Title $k", pinned = false, archived = archived, startedAt = 1.0, lastActiveAt = null, messageCount = 0, preview = null, stale = false, existsOnServer = true, hidden = hidden),
     )
 
-    private fun view(uri: Uri) = Intent(Intent.ACTION_VIEW, uri).setClass(app, MainActivity::class.java)
+    private fun view(uri: Uri) = Intent(Intent.ACTION_VIEW, uri).setClassName(app, OPEN_CHAT) // as a notification tap
     private fun view(uri: String) = view(Uri.parse(uri))
 
     private suspend fun post(k: String, run: String = "run_$k", started: Long = 1) {

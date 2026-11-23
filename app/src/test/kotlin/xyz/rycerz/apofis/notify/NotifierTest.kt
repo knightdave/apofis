@@ -6,6 +6,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ComponentName
 import android.content.Context
 import android.service.notification.StatusBarNotification
 import androidx.room.Room
@@ -35,7 +36,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
-import xyz.rycerz.apofis.MainActivity
+import xyz.rycerz.apofis.OPEN_CHAT
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
@@ -490,7 +491,7 @@ class NotifierTest {
             assertTrue(s.isActivity)
             assertTrue(s.flags and PendingIntent.FLAG_IMMUTABLE != 0)
             assertEquals(chatUri(gen, key), s.savedIntent.data)
-            assertEquals(MainActivity::class.java.name, s.savedIntent.component!!.className)
+            assertEquals(ComponentName(app, OPEN_CHAT), s.savedIntent.component) // the non-exported alias
         }
     }
 
