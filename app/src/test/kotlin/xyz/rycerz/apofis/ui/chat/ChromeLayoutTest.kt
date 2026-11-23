@@ -21,7 +21,6 @@ import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -76,9 +75,10 @@ import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.DrawerButton
+import xyz.rycerz.apofis.ui.NewChatButton
+import androidx.compose.ui.test.hasAnyAncestor
 import xyz.rycerz.apofis.ui.FIXED_NOW
 import xyz.rycerz.apofis.ui.FIXED_TODAY
-import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
 /** The chrome's layout against the window: what the overlays cover, insets, large text, the keyboard. */
@@ -149,9 +149,7 @@ class ChromeLayoutTest {
                 stopped += runId
             }
         }
-        val newChat: @Composable RowScope.() -> Unit = {
-            ApofisIconButton(onClick = { newChatTaps++ }, contentDescription = "New chat") { Icon(painterResource(R.drawable.lucide_square_pen), null) }
-        }
+        val newChat: @Composable RowScope.() -> Unit = { NewChatButton { newChatTaps++ } } // the route's own buttons
         rule.setContent {
             val density = LocalDensity.current
             CompositionLocalProvider(
@@ -192,6 +190,17 @@ class ChromeLayoutTest {
     private fun bottomAreaTop() = bounds(hasTestTag("chat.bottom")).top
 
     private fun px(dp: Int) = with(rule.density) { dp.dp.toPx() }
+
+    /** At 320 dp and system scale 2.0, with the route's Drawer and New chat buttons, the longest Polish tappable status keeps its chevron. */
+    @Test
+    @Config(qualifiers = "pl-w320dp-h760dp-xhdpi")
+    fun theStatusChevronKeepsItsWidthInTheNarrowestLargestHeader() {
+        show(chat(emptyList(), StatusLine.LOAD_FAILED, title = "Największe pliki w katalogu domowym"), fontScale = 2f)
+        rule.onNode(hasContentDescription("Nowy czat")).assertExists()
+        val line = bounds(hasTestTag("status.line"))
+        val text = bounds(hasText("Nie udało się otworzyć czatu") and hasAnyAncestor(hasTestTag("status.line")))
+        assertTrue("the chevron got ${line.right - text.right} px", line.right - text.right >= px(12) - 1f)
+    }
 
     // ---- I3: what the overlays cover takes no taps and no accessibility focus ----
 

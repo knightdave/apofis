@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
+import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -129,7 +130,7 @@ internal fun scanLine(s: ScanState, text: CharSequence, out: MutableList<Logical
     // LINE_LOOK characters, from which nothing that depends on the line's end is decided.
     val end = if (finished) nl else minOf(nl, i + LINE_LOOK)
     val whole = end == nl
-    Work.scanSteps += nl - maxOf(i, noBreakBefore) + end - i + 1
+    if (BuildConfig.DEBUG) Work.scanSteps += nl - maxOf(i, noBreakBefore) + end - i + 1
     s.pos = nl + 1
     val first = firstNonSpace(text, i, end)
     val shallow = first - i < 4 && (i until first).all { text[it] == ' ' } // indented under four columns, by spaces only
@@ -456,7 +457,7 @@ private fun mayBecomeListItem(text: CharSequence, start: Int, end: Int): Boolean
     return d > start && (d == end || (d == end - 1 && (text[d] == '.' || text[d] == ')')))
 }
 
-/** Work counters for tests: characters inspected by [chunkRanges], [TextRow]s built and markdown parses. */
+/** Work counters for tests: characters inspected by [chunkRanges], [TextRow]s built and markdown parses; written in debug builds only. */
 internal object Work {
     var chunkSteps = 0L
     var rowsBuilt = 0L
@@ -490,7 +491,7 @@ internal fun chunkRanges(text: CharSequence, start: Int, end: Int, emit: (start:
         while (i <= limit) {
             if (text[i] == '\n') lastBreak = i
             i++
-            Work.chunkSteps++
+            if (BuildConfig.DEBUG) Work.chunkSteps++
         }
         if (lastBreak > s) {
             emit(s, lastBreak, false)
@@ -518,7 +519,7 @@ private fun firstNonSpace(text: CharSequence, from: Int, end: Int): Int {
 
 /** The row for chunk number [c] of [chunks] of block [b] of reply [key]. */
 private fun textRow(key: String, b: LogicalBlock, c: Int, chunk: DisplayChunk, last: Boolean): TextRow {
-    Work.rowsBuilt++
+    if (BuildConfig.DEBUG) Work.rowsBuilt++
     return TextRow("$key/b${b.index}/c$c", chunk, b.kind, b.lang, first = c == 0, joinBelow = !last, fenceClosed = b.fenceClosed && last)
 }
 
@@ -653,8 +654,8 @@ internal class ReplyText {
                 // Only the appended part is made LF. A CR that ended the old text already stands for the line break,
                 // so an LF right after it adds nothing.
                 val from = if (text.endsWith('\r') && raw.getOrNull(text.length) == '\n') text.length + 1 else text.length
-                val builder = norm as? StringBuilder ?: StringBuilder(norm).also { Work.lfChars += norm.length } // first CR in an append
-                Work.lfChars += raw.length - from
+                val builder = norm as? StringBuilder ?: StringBuilder(norm).also { if (BuildConfig.DEBUG) Work.lfChars += norm.length } // first CR in an append
+                if (BuildConfig.DEBUG) Work.lfChars += raw.length - from
                 builder.append(lf(raw.substring(from)))
             }
         }
@@ -678,7 +679,7 @@ internal class ReplyText {
             // How far the last line is only spaces; read on from what is known when the line is the same one.
             val known = if (next.pos == checkpoint.pos) maxOf(blankTo, next.pos) else next.pos
             blankTo = firstNonSpace(new, known, minOf(new.length, next.pos + LINE_LOOK + 1))
-            Work.scanSteps += blankTo - known
+            if (BuildConfig.DEBUG) Work.scanSteps += blankTo - known
             checkpoint = next
             parsed = out.size
         }
@@ -744,7 +745,7 @@ internal class ReplyText {
                 for (r in 0 until k) settled += prev.settled[r]
                 starts.addAll(prev.starts.subList(0, k))
                 decided.addAll(prev.decided.subList(0, k))
-                Work.rowCopies += k
+                if (BuildConfig.DEBUG) Work.rowCopies += k
                 from = if (k == prev.size) prev.looseStart else prev.starts[k]
             }
         }
@@ -781,7 +782,7 @@ internal class ReplyText {
         val f = firstNonSpace(text, from, maxOf(from, minOf(old, lineStart + LINE_LOOK + 1)))
         blankTo = f
         val g = firstNonSpace(text, old, text.length)
-        Work.scanSteps += f - from + g - old
+        if (BuildConfig.DEBUG) Work.scanSteps += f - from + g - old
         val spaces = g == text.length // only spaces were appended
         val b = tail.singleOrNull()?.block
         val longer = if (b != null && !b.stable && b.end == old && b.mode == BlockMode.LITERAL) listOf(b.copy(end = text.length)) else null

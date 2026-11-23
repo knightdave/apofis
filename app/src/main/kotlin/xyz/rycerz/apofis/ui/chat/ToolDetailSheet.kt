@@ -90,8 +90,8 @@ internal fun ToolDetailSheet(step: ToolStep, live: Boolean, onDismiss: () -> Uni
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
             Text(
                 oneLine(step.name),
-                Modifier.semantics { heading() },
-                style = MaterialTheme.typography.titleLarge,
+                Modifier.padding(start = 14.dp).semantics { heading() }, // the other sheets' title inset and style
+                style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
                 maxLines = 3,
                 overflow = TextOverflow.Ellipsis,

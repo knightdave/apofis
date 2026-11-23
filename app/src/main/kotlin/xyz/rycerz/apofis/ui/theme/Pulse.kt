@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.theme
 
+import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
@@ -41,7 +42,7 @@ fun DrawScope.waveDot(color: Color, frame: DotFrame) = drawCircle(color, radius 
 /** From [min] at the start of each [periodMs] to [max] halfway and back. */
 fun pulseAlpha(timeMs: Long, periodMs: Int, min: Float, max: Float): Float = min + (max - min) * wave((timeMs % periodMs).toDouble() / periodMs)
 
-/** Frame loops run by [rememberTimeMs]; for tests. */
+/** Frame loops run by [rememberTimeMs]; for tests, written in debug builds only. */
 internal object PulseProbe {
     var frames = 0L
 }
@@ -68,7 +69,7 @@ fun rememberTimeMs(periodMs: Int, active: Boolean = true): State<Long> {
             while (true) {
                 val now = withFrameMillis { it }
                 time.longValue = (now - start) % periodMs
-                PulseProbe.frames++
+                if (BuildConfig.DEBUG) PulseProbe.frames++
             }
         }
     }

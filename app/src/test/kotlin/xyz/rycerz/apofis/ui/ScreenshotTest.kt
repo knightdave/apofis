@@ -156,14 +156,20 @@ class ScreenshotTest {
     private fun live(text: String = "", steps: List<ToolStep> = emptyList(), status: String = "running", pending: PendingControl? = null) =
         LiveReply("run_1", status, text, steps, pending, Connection.LIVE)
 
-    private fun chatShot(name: String, state: ChatUiState, mode: ThemeMode = ThemeMode.LIGHT, seed: SeedSchemes? = null) =
-        rule.shot(name, mode, seed) { ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY) }
+    /** [routeButtons]: the route's Drawer and New chat buttons in the bar, as the app shows them. */
+    private fun chatShot(name: String, state: ChatUiState, mode: ThemeMode = ThemeMode.LIGHT, seed: SeedSchemes? = null, routeButtons: Boolean = false) =
+        rule.shot(name, mode, seed) {
+            ChatScreen(
+                state, object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY,
+                navigationIcon = { if (routeButtons) DrawerButton {} }, appBarActions = { if (routeButtons) NewChatButton {} },
+            )
+        }
 
     @Test
     fun chat_empty() = chatShot("chat_empty", chat(emptyList(), title = ""))
 
     @Test
-    fun chat_conversation_light() = chatShot("chat_conversation_light", chat(listOf(question, answer)))
+    fun chat_conversation_light() = chatShot("chat_conversation_light", chat(listOf(question, answer)), routeButtons = true)
 
     @Test
     fun chat_conversation_dark() = chatShot("chat_conversation_dark", chat(listOf(question, answer)), ThemeMode.DARK)

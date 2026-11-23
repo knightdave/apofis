@@ -79,6 +79,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import xyz.rycerz.apofis.R
@@ -156,7 +157,10 @@ private fun Block(b: MdBlock, body: TextStyle, color: Color, strike: Boolean, on
                 strike,
                 onLink,
                 Modifier
-                    .drawBehind { drawRoundRect(bar, size = Size(3.dp.toPx(), size.height), cornerRadius = CornerRadius(1.5.dp.toPx())) }
+                    .drawBehind {
+                        val w = 3.dp.toPx()
+                        drawRoundRect(bar, Offset(if (layoutDirection == LayoutDirection.Rtl) size.width - w else 0f, 0f), Size(w, size.height), CornerRadius(1.5.dp.toPx()))
+                    }
                     .padding(start = 12.dp),
             )
         }

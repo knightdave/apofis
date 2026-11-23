@@ -8,8 +8,11 @@ import org.junit.Test
 import xyz.rycerz.apofis.api.ApprovalChoice
 
 /**
- * Every outgoing action of the chat goes through the one covered gate. Enumerated, so a new [ChatActions] method or a
- * new callback parameter of [ChatScreen] fails here until it is gated or listed as harmless with its reason.
+ * The view model's side of the covered gate, by reflection over two surfaces: every [ChatActions] method passes
+ * [CoveredActions] (dropped while covered, passed once uncovered, the exempt ones listed with their reason), and the
+ * number of function parameters of [ChatScreen] is pinned, so a new callback fails here until it is accounted for. It
+ * does not see the screen's own launchers (tool sheet, Select, links, the scroll button, Retry, Connection, a long
+ * command's reader): a missing gate there passes this test. [ChatLaunchersGateTest] taps those on the hosted screen.
  */
 class ChatGateTest {
     /**

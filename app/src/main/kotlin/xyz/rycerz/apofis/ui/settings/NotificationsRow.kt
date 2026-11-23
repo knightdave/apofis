@@ -31,6 +31,7 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import kotlinx.coroutines.CoroutineScope
@@ -183,7 +184,7 @@ fun NotificationsSheet(
     ApofisSheet(onDismiss) {
         // Scrolls, so the last action stays reachable in a short window with a large font.
         Column(Modifier.testTag(SHEET_TAG).verticalScroll(rememberScrollState())) {
-            Text(stringResource(R.string.settings_notifications), Modifier.padding(start = 14.dp), style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.settings_notifications), Modifier.padding(start = 14.dp).semantics { heading() }, style = MaterialTheme.typography.titleMedium)
             Text(
                 lines(stringResource(valueOf(ui)), summaryOf(ui)?.let { stringResource(it) }),
                 Modifier.padding(start = 14.dp, end = 14.dp, bottom = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },

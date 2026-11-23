@@ -12,6 +12,7 @@ import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import org.junit.Assert.assertEquals
@@ -56,6 +57,7 @@ class SessionActionsSheetTest {
     @Test
     fun aBusySheetStaysOpenSoItsErrorIsSeen() {
         host()
+        rule.onNodeWithText("Garden").assert(androidx.compose.ui.test.isHeading()) // the sheet's title, a heading for TalkBack
         rule.onNodeWithText("Pin").performClick()
         val roots = rule.onAllNodes(isRoot())
         roots[roots.fetchSemanticsNodes().size - 1].performTouchInput { click(Offset(centerX, 10f)) } // the scrim

@@ -91,6 +91,7 @@
     <string name="chat_approval_session">Zezwalaj w tym czacie</string>
     <string name="chat_approval_always">Zawsze zezwalaj</string>
     <string name="chat_approval_more">Więcej opcji zgody</string>
+    <string name="chat_approval_full_command">Pokaż całe polecenie</string>
     <string name="chat_answer_changed">Teraz czeka inna prośba.</string>
     <string name="chat_answer_gone">Ta prośba została już rozstrzygnięta lub wygasła.</string>
     <string name="chat_clarify_title">Hermes pyta</string>

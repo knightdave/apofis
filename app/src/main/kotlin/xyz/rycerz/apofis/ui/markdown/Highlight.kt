@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -69,15 +70,15 @@ internal fun highlight(code: String, lang: String, dark: Boolean, codeFill: Colo
  */
 internal fun tokens(code: CharSequence, lang: Lang): AnnotatedString? {
     if (code.length > HIGHLIGHT_MAX_CHARS) return null
-    Work.highlights++
-    Work.largestHighlight = maxOf(Work.largestHighlight, code.length)
+    if (BuildConfig.DEBUG) Work.highlights++
+    if (BuildConfig.DEBUG) Work.largestHighlight = maxOf(Work.largestHighlight, code.length)
     return try {
         scan(code.toString(), SYNTAX.getValue(lang), lang).takeIf { it.text.length == code.length } ?: run {
-            Work.highlightFailures++
+            if (BuildConfig.DEBUG) Work.highlightFailures++
             null
         }
     } catch (_: RuntimeException) {
-        Work.highlightFailures++
+        if (BuildConfig.DEBUG) Work.highlightFailures++
         null
     }
 }
@@ -327,6 +328,6 @@ private fun scan(code: String, syn: Syntax, lang: Lang): AnnotatedString {
         }
         steps += i - start
     }
-    Work.highlightSteps += steps
+    if (BuildConfig.DEBUG) Work.highlightSteps += steps
     return out.toAnnotatedString()
 }

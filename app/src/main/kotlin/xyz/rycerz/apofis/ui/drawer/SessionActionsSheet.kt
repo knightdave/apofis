@@ -5,6 +5,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -62,7 +64,7 @@ private fun SessionActions(prompt: Prompt, actions: PromptActions) {
     val token = prompt.token
     Text(
         prompt.title.ifEmpty { stringResource(R.string.chat_new_title) },
-        Modifier.padding(start = 14.dp, bottom = 8.dp),
+        Modifier.padding(start = 14.dp, bottom = 8.dp).semantics { heading() },
         style = MaterialTheme.typography.titleMedium,
         color = MaterialTheme.colorScheme.onSurface,
         maxLines = 1,

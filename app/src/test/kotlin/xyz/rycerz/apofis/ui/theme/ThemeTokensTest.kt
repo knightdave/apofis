@@ -99,6 +99,8 @@ class ThemeTokensTest {
             floor("handle over the sheet", c.handle.compositeOver(page), page, 3.0)
             floor("error on timelineFill", scheme.error, c.timelineFill, 4.5) // a failed step's title
             floor("onSurfaceVariant on timelineFill", scheme.onSurfaceVariant, c.timelineFill, 4.5) // control card text
+            floor("slider unfilled track (outline) on cardFill", scheme.outline, c.cardFill, 3.0) // the chat text size slider
+            floor("clarify field idle border on timelineFill", c.timelineOutline, c.timelineFill, 3.0)
         }
         assertEquals(emptyList<String>(), failures)
     }

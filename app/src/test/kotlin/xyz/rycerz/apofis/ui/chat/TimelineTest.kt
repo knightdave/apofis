@@ -1,6 +1,21 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Box
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PixelMap
+import androidx.compose.ui.graphics.toPixelMap
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.unit.LayoutDirection
+import xyz.rycerz.apofis.ui.markdown.DisplayChunk
+import xyz.rycerz.apofis.ui.markdown.MarkdownChunk
+import xyz.rycerz.apofis.ui.markdown.parseMarkdown
+import xyz.rycerz.apofis.ui.theme.ApofisColors
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.rememberScrollState
@@ -184,7 +199,9 @@ class TimelineTest {
         more.performClick()
         rule.onNodeWithText("Show fewer steps").assert(hasStateDescription("Expanded"))
         assertEquals(5, nodes("step:r1:").size)
-        rule.onNodeWithTag("step:r1:0:terminal").assertHeightIsAtLeast(48.dp).performClick()
+        rule.onNodeWithTag("step:r1:0:terminal").assertHeightIsAtLeast(48.dp)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button)) // a tool step opens its sheet: a button
+            .performClick()
         assertEquals(listOf(0), tapped) // the original index, also once earlier steps were hidden
         rule.onNodeWithText("Show fewer steps").performClick()
         assertEquals(listOf("step:r1:3:terminal", "step:r1:4:terminal"), nodes("step:r1:").map { it.config[SemanticsProperties.TestTag] })
@@ -630,6 +647,60 @@ class TimelineTest {
             rule.waitForIdle()
             val bound = if (expanded) STEP_PAGE + 2 else 4
             assertTrue("expanded=$expanded, $label: read ${reads[0]} steps", reads[0] <= bound)
+        }
+    }
+
+    // ---- final fix wave: drawn ink follows the layout direction ----
+
+    /** The x of every pixel in [area] that is exactly [color]. */
+    private fun PixelMap.xsOf(color: Color, area: Rect): List<Int> {
+        val xs = ArrayList<Int>()
+        for (y in area.top.toInt() until area.bottom.toInt()) for (x in area.left.toInt() until area.right.toInt()) if (this[x, y] == color) xs += x
+        return xs
+    }
+
+    /** Separate runs of pixels other than [background] in row [y] between [from] and [to]. */
+    private fun PixelMap.inkRuns(y: Int, from: Int, to: Int, background: Color): Int =
+        (from..to).count { x -> this[x, y] != background && (x == from || this[x - 1, y] == background) }
+
+    @Test
+    fun railReasoningChevronAndQuoteBarFollowTheLayoutDirection() {
+        var direction by mutableStateOf(LayoutDirection.Ltr)
+        lateinit var colors: ApofisColors
+        val reply = AssistantReply("r1", listOf(tool(0), ReasoningStep("thinking")), "", 0.0)
+        val quote = DisplayChunk.Blocks(parseMarkdown("> quoted"))
+        rule.setContent {
+            Themed {
+                colors = ApofisTheme.colors
+                CompositionLocalProvider(LocalLayoutDirection provides direction) {
+                    Column {
+                        TimelineCard(reply, "step:r1", onStep = {}, initiallyOpenReasoning = setOf(1))
+                        Box(Modifier.testTag("quote")) { MarkdownChunk(quote, {}) }
+                    }
+                }
+            }
+        }
+        for (d in listOf(LayoutDirection.Ltr, LayoutDirection.Rtl)) {
+            direction = d
+            rule.waitForIdle()
+            val image = rule.onRoot().captureToImage().toPixelMap()
+            val half = image.width / 2
+            val onStart: (List<Int>) -> Boolean = { xs -> xs.isNotEmpty() && xs.all { if (d == LayoutDirection.Rtl) it >= half else it < half } }
+            // The connector between the two steps, where nothing else is drawn: on the start side.
+            val tool = rule.onNodeWithTag("step:r1:0:terminal").fetchSemanticsNode().boundsInRoot
+            val band = Rect(0f, tool.bottom - 4f, image.width.toFloat(), tool.bottom + 4f)
+            assertTrue("$d rail", onStart(image.xsOf(colors.timelineConnector, band)))
+            // The open reasoning chevron, the row's last item at its end edge: pointing down in both directions.
+            val row = rule.onNodeWithTag("step:r1:1").fetchSemanticsNode().boundsInRoot
+            val icon = with(rule.density) { 16.dp.toPx() }.toInt()
+            val from = if (d == LayoutDirection.Rtl) row.left.toInt() else row.right.toInt() - icon
+            val to = from + icon - 1
+            val ink = (row.top.toInt() until row.top.toInt() + 2 * icon + 32).filter { y -> (from..to).any { image[it, y] != colors.timelineFill } }
+            assertTrue("$d: no chevron at the end edge", ink.isNotEmpty())
+            assertEquals("$d chevron: two arm ends on top", 2, image.inkRuns(ink.first(), from, to, colors.timelineFill))
+            assertEquals("$d chevron: one tip below", 1, image.inkRuns(ink.last(), from, to, colors.timelineFill))
+            // The quote's bar, on the start side.
+            assertTrue("$d quote bar", onStart(image.xsOf(colors.quoteBar, rule.onNodeWithTag("quote").fetchSemanticsNode().boundsInRoot)))
         }
     }
 }

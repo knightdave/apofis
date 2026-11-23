@@ -160,7 +160,7 @@ private fun StatusText(@DrawableRes icon: Int?, text: String, color: Color, tapp
             Icon(painterResource(icon), null, Modifier.size(12.dp), tint = color)
             Box(Modifier.width(4.dp))
         }
-        Text(text, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(text, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1, overflow = TextOverflow.Ellipsis) // measured after the chevron, which keeps its width
         if (tappable) Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.size(12.dp), tint = color)
     }
 }

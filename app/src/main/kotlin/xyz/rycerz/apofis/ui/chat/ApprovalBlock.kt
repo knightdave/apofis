@@ -41,6 +41,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -57,6 +58,8 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.PendingControl
@@ -66,24 +69,35 @@ import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.wash
 
 /**
- * The command waiting for approval, in full, with Deny and Allow once; the wider grants sit behind an overflow.
- * Every answer carries this block's own request id and generation. Without command text there is nothing to judge,
- * so only Deny is offered.
+ * The command waiting for approval, with Deny and Allow once; the wider grants sit behind an overflow. A command up to
+ * [ONE_LINE_MAX] characters is shown whole in its row; a longer one shows its head there and a row that opens all of
+ * it in the paged reader ([SelectTextScreen]), so nothing over the bound is laid out in one piece and what Allow grants
+ * can always be read whole. Every answer carries this block's own request id and generation. Without command text
+ * there is nothing to judge, so only Deny is offered.
  */
 @Composable
 internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onChoice: (String, Long, ApprovalChoice) -> Unit) {
-    val command = control.command?.takeIf { it.isNotBlank() }
+    // Once per request (the block is keyed by its id and generation): the blank check walks a whitespace prefix.
+    val command = remember { control.command?.takeIf { it.isNotBlank() } }
+    var reading by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
+    val chatGate = LocalChatGate.current // a control of the chat layout the drawer covers
     val choose = { press: Press, choice: ApprovalChoice -> if (gate.accepts(press)) onChoice(control.requestId, control.executionGeneration, choice) }
     ControlCard(R.string.chat_approval_title, changed, R.drawable.lucide_triangle_exclamation_point, ApofisTheme.colors.warning) {
         if (command != null) {
             CodeSurface {
                 Text(
-                    command,
+                    oneLine(command),
                     Modifier.sidewaysScroll(rememberScrollState(), LocalDensity.current).padding(horizontal = 12.dp, vertical = 8.dp),
                     style = ChatText.code,
                     color = MaterialTheme.colorScheme.onSurface,
                     softWrap = false,
                 )
+            }
+            if (command.length > ONE_LINE_MAX) SmallTextButton(R.string.chat_approval_full_command, { chatGate { reading = true } })
+            if (reading) {
+                Dialog(onDismissRequest = { reading = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+                    SelectTextScreen(command, onBack = { reading = false })
+                }
             }
         } else {
             Text(stringResource(R.string.chat_approval_no_command), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -98,7 +112,6 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                 Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering, gate) { choose(it, ApprovalChoice.ONCE) }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
-                    val chatGate = LocalChatGate.current // a control of the chat layout the drawer covers
                     ApofisIconButton(onClick = { chatGate { menu = true } }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
                         Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
                     }
@@ -137,6 +150,7 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
                 placeholder = { Text(stringResource(R.string.chat_clarify_hint)) },
                 maxLines = 5,
                 enabled = !answering,
+                colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = ApofisTheme.colors.timelineOutline), // 3:1 on the card
             )
             ApofisIconButton(
                 onClick = { if (gate.accepts(sendPress)) onAnswer(control.requestId, control.executionGeneration, answer) },

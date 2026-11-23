@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
+import xyz.rycerz.apofis.BuildConfig
 import android.icu.text.BreakIterator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -129,7 +130,7 @@ internal fun rememberSmoothedText(runId: String, target: String, snap: Boolean):
         snapshotFlow { latest.value to snapNow.value }.collectLatest {
             while (!snapNow.value && smoother.shown < smoother.target.length) {
                 val now = withFrameMillis { it }
-                Work.smoothFrames++
+                if (BuildConfig.DEBUG) Work.smoothFrames++
                 if (now - last >= Motion.SMOOTH_TICK) {
                     last = now
                     smoother.step()

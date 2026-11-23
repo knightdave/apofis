@@ -33,6 +33,7 @@ data class ApofisColors(
     val timelineBody: Color,
     val timelineMuted: Color,
     val timelineConnector: Color,
+    val timelineOutline: Color, // a field's idle border on the timeline fill (the clarify answer)
     val codeFill: Color,
     val codeHeaderFill: Color,
     val codeLabel: Color,
@@ -171,6 +172,7 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
         timelineBody = timelineBody,
         timelineMuted = timelineBody,
         timelineConnector = scheme.secondary.at(0.35f, timelineFill),
+        timelineOutline = readableOn(scheme.outline, timelineFill, on, 3.0), // the page's outline, raised to 3:1 here
         codeFill = scheme.surfaceContainer.at(0.8f, page),
         codeHeaderFill = codeHeaderFill,
         codeLabel = on.at(0.7f, codeHeaderFill),
