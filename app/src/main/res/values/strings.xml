@@ -129,6 +129,7 @@
     <string name="chat_unsent_discard">Discard</string>
     <string name="chat_discard_title">Discard this unsent message?</string>
     <string name="chat_discard_text">Its text will be gone for good.</string>
+    <string name="chat_discard_text_images">Its text and images will be gone for good.</string>
     <string name="chat_note_removed_may_have_sent">Removed from this phone. It may already have reached the server.</string>
     <string name="chat_note_cancel_too_late">Too late to cancel: the message is already being sent.</string>
     <string name="chat_status_server_error">Server error</string>
@@ -242,7 +243,7 @@
     <string name="send_error_image_missing">An attached image is missing on this phone</string>
     <string name="viewer_close">Close image</string>
     <string name="md_image_failed">Image could not be shown</string>
-    <string name="chat_image_unavailable">Image not on this phone</string>
+    <string name="chat_image_unavailable">Image unavailable</string>
     <string name="chat_image">Image %1$d of %2$d</string>
     <string name="model_title">Model for this chat</string>
     <string name="model_default">Server default</string>
@@ -257,10 +258,10 @@
     <string name="reasoning_medium">Medium</string>
     <string name="reasoning_high">High</string>
     <string name="fast_on">Fast mode requested for this chat; the server may ignore it</string>
-    <string name="fast_off">Fast mode is off for this chat</string>
+    <string name="fast_off">Fast mode is no longer requested for this chat</string>
     <string name="chat_image_failed">This image could not be read</string>
     <string name="chat_images_limit">Up to 10 images per message</string>
-    <string name="chat_images_too_large">These images are too large to send together</string>
+    <string name="chat_images_too_large">This message is too large to send</string>
     <string name="chat_attach">Add photos</string>
     <string name="chat_image_remove">Remove image</string>
     <string name="chat_image_processing">Preparing image</string>
@@ -272,11 +273,11 @@
     <string name="cmd_new">Start a new chat</string>
     <string name="cmd_stop">Stop the running reply</string>
     <string name="cmd_steer">Send an instruction to the running reply</string>
-    <string name="cmd_queue">Send after the current reply</string>
+    <string name="cmd_queue">Queue a message</string>
     <string name="cmd_title">Rename this chat</string>
     <string name="cmd_reasoning">Choose the reasoning level</string>
     <string name="cmd_fast">Turn fast mode on or off</string>
-    <string name="cmd_unknown">%1$s is not available in Apofis</string>
+    <string name="cmd_unknown">Command not available: %1$s</string>
     <string name="cmd_no_text">%1$s takes no text after it</string>
     <string name="cmd_nothing_running">No reply is running</string>
     <string name="cmd_needs_text">Type the text after the command</string>
@@ -289,12 +290,12 @@
     <string name="share_images_count">Images: %1$d</string>
     <string name="share_accept">Open as a new chat</string>
     <string name="share_cancel">Cancel</string>
-    <string name="share_deletes_temporary">Opening it deletes the temporary chat you have open.</string>
+    <string name="share_deletes_temporary">Opening this share will try to delete your current temporary chat.</string>
     <string name="share_text_cut">Shared text was shortened to 100000 characters</string>
-    <string name="share_images_failed">Some shared images could not be read</string>
-    <string name="share_too_many">Only the first 10 shared images were added</string>
+    <string name="share_images_failed">Shared images that could not be read were left out</string>
+    <string name="share_too_many">Only the first 10 shared images were considered</string>
     <string name="chat_loading">Loading messages</string>
-    <string name="chat_tool_calls_not_stored">%1$d tool calls are not stored on this phone</string>
+    <string name="chat_tool_calls_not_stored">Tool calls not stored on this phone: %1$d</string>
     <string name="chat_reply_shortened">Shortened on this phone; the full text is on the server</string>
     <string name="licenses_apache">Apache License 2.0</string>
 </resources>
