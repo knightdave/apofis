@@ -15,6 +15,8 @@ import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelChildren
@@ -103,16 +105,29 @@ class RunFollowerTest {
     private fun followers(scope: CoroutineScope) = scope.also { followerScopes += it }
 
     /**
-     * [runTest] that cancels every follower coroutine at the end and waits for it while the test scheduler still runs,
-     * so none is left unfinished to run into the next test (tearDown checks it). runTest alone only cancels them.
+     * [runTest] that ends every follower coroutine after the body, also a body that failed, was cancelled or timed out,
+     * while the test scheduler still runs, so none is left unfinished to run into the next test (tearDown checks it).
+     * runTest alone only cancels them. The body's own failure stays the one reported.
      */
     private fun runFollowerTest(body: suspend TestScope.() -> Unit) = runTest {
-        try {
-            body()
-        } finally {
-            followerScopes.forEach { it.coroutineContext.job.cancelChildren() }
-            followerScopes.flatMap { it.coroutineContext.job.children }.joinAll()
+        val outcome = runCatching { body() }
+        val stuck = endFollowers()
+        outcome.exceptionOrNull()?.let { e ->
+            stuck?.let(e::addSuppressed)
+            throw e
         }
+        stuck?.let { throw it }
+    }
+
+    /**
+     * Cancels every follower coroutine and waits for all of them, at most 10 s in real time. The wait runs off the test
+     * dispatcher and cannot be cancelled, so a cancelled or timed-out caller still waits. Returns the failure, if any.
+     */
+    private suspend fun endFollowers(): AssertionError? {
+        followerScopes.forEach { it.coroutineContext.job.cancelChildren() }
+        val children = followerScopes.flatMap { it.coroutineContext.job.children }
+        val ended = withContext(NonCancellable + Dispatchers.Default) { withTimeoutOrNull(10_000) { children.joinAll() } } != null
+        return if (ended) null else AssertionError("a follower did not end within 10 s after its test")
     }
 
     @Volatile private var beforeQuery: (sql: String, args: List<Any?>) -> Unit = { _, _ -> }
@@ -2220,5 +2235,33 @@ class RunFollowerTest {
         assertTrue(first.await().exceptionOrNull() is ApiError.Http)
         assertTrue(second.await().exceptionOrNull() is ApiError.Http)
         assertTrue(db.activeRunDao().get(RUN)!!.stopRequested)
+    }
+
+    @Test
+    fun followerCleanupOutlastsACancelledCaller() = runFollowerTest {
+        follower() // registers the scope the cleanup ends
+        val holding = CompletableDeferred<Unit>()
+        val release = CountDownLatch(1)
+        lateinit var cleanup: Job
+        var cleanupEndedFirst = true
+        backgroundScope.launch {
+            // A follower in a non-cancellable step under the repository lock that resumes from a real thread.
+            withContext(NonCancellable) {
+                withRepositoryLock {
+                    holding.complete(Unit)
+                    withContext(Dispatchers.IO) { release.await(10, TimeUnit.SECONDS) }
+                }
+                cleanupEndedFirst = cleanup.isCompleted
+            }
+        }
+        holding.await()
+
+        cleanup = launch(start = CoroutineStart.UNDISPATCHED) { endFollowers() }
+        cleanup.cancel() // as runTest cancels a timed-out body during its cleanup
+        release.countDown()
+        cleanup.join()
+
+        assertFalse("the cleanup ended before the follower", cleanupEndedFirst)
+        withRepositoryLock { } // free again before Room closes
     }
 }
