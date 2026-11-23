@@ -4,6 +4,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import xyz.rycerz.apofis.ui.theme.wash
+import xyz.rycerz.apofis.ui.theme.ApofisDialog
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import android.view.WindowManager
 import androidx.activity.compose.LocalActivity
@@ -23,7 +24,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextObfuscationMode
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -204,22 +204,13 @@ fun ConnectScreen(vm: ConnectViewModel, onBack: (() -> Unit)?) {
     }
 
     if (state == ConnectState.ConfirmServerChange) {
-        AlertDialog(
-            onDismissRequest = vm::cancelServerChange,
-            title = { Text(stringResource(R.string.server_change_title)) },
-            text = { Text(stringResource(R.string.server_change_text)) },
-            confirmButton = {
-                val source = remember { MutableInteractionSource() }
-                TextButton(onClick = { vm.confirmServerChange() }, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) {
-                    Text(stringResource(R.string.server_change_confirm))
-                }
-            },
-            dismissButton = {
-                val source = remember { MutableInteractionSource() }
-                TextButton(onClick = vm::cancelServerChange, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
-        )
+        ApofisDialog(
+            title = stringResource(R.string.server_change_title),
+            confirmLabel = stringResource(R.string.server_change_confirm),
+            onConfirm = { vm.confirmServerChange() },
+            dismissLabel = stringResource(R.string.cancel),
+            onDismiss = vm::cancelServerChange,
+            destructive = true,
+        ) { Text(stringResource(R.string.server_change_text)) }
     }
 }

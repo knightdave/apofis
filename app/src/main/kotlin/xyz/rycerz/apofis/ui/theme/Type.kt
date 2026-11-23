@@ -32,7 +32,7 @@ internal val ApofisTypography = Typography(
     labelSmall = style(11.sp), // app bar subtitle (medium), timestamps
 )
 
-/** The chat text size setting; applies to the message list only. */
+/** The chat text size setting; provided around the message list and the Select view only. */
 val LocalChatFontScale = staticCompositionLocalOf { 1f }
 
 /** Message list text styles the Material type table has no slot for. */

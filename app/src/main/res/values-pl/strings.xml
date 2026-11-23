@@ -149,6 +149,16 @@
     <string name="settings_dynamic_color_summary">Kolory dopasowane do tapety</string>
     <string name="settings_pure_black">Czyste tło</string>
     <string name="settings_pure_black_summary">Czarne w ciemnym motywie, białe w jasnym</string>
+    <string name="settings_theme">Motyw</string>
+    <string name="settings_chat_font_size">Rozmiar tekstu czatu</string>
+    <string name="settings_font_preview">Tak będą wyglądać wiadomości.</string>
+    <string name="settings_blur">Matowe szkło</string>
+    <string name="settings_blur_summary">Rozmywa czat za polem wiadomości; może zużywać więcej baterii</string>
+    <string name="settings_behaviour">Zachowanie</string>
+    <string name="settings_enter_to_send">Enter wysyła</string>
+    <string name="settings_enter_to_send_summary">Klawisz Enter wysyła wiadomość zamiast zaczynać nowy wiersz</string>
+    <string name="settings_haptics">Wibracje</string>
+    <string name="settings_haptics_summary">Krótkie wibracje przy dotknięciach i gestach</string>
     <string name="settings_about">O aplikacji</string>
     <string name="settings_version">Wersja</string>
     <string name="settings_license">Licencja</string>

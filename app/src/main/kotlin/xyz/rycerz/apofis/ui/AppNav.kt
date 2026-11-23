@@ -144,12 +144,20 @@ fun AppNav(container: AppContainer) {
                 themeMode = prefs.themeMode.collectAsState().value,
                 dynamicColor = prefs.dynamicColor.collectAsState().value,
                 pureBlack = prefs.pureBlack.collectAsState().value,
+                blur = prefs.blur.collectAsState().value,
+                chatFontScale = prefs.chatFontScale.collectAsState().value,
+                enterToSend = prefs.enterToSend.collectAsState().value,
+                haptics = prefs.haptics.collectAsState().value,
                 versionName = version,
                 notifications = { NotificationsSetting({ container.push }, { container.testPush }, container.notifyPrefs, container.pushCommands, conn?.generation ?: 0) },
                 onConnection = { chosen = Screen.RECONNECT },
                 onThemeMode = { scope.launch { prefs.setThemeMode(it) } },
                 onDynamicColor = { scope.launch { prefs.setDynamicColor(it) } },
                 onPureBlack = { scope.launch { prefs.setPureBlack(it) } },
+                onBlur = { scope.launch { prefs.setBlur(it) } },
+                onChatFontScale = { scope.launch { prefs.setChatFontScale(it) } },
+                onEnterToSend = { scope.launch { prefs.setEnterToSend(it) } },
+                onHaptics = { scope.launch { prefs.setHaptics(it) } },
                 onLicenses = { chosen = Screen.LICENSES },
                 onBack = { chosen = Screen.CHAT },
             )
@@ -247,7 +255,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                         container.chatShown(conn.generation, sessionKey, true)
                         onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
                     }
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, enterToSend = prefs.enterToSend.collectAsState().value, dragArea = dragArea, covered = drawerState.covered, coveredNow = { drawerState.covered })
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, enterToSend = prefs.enterToSend.collectAsState().value, chatFontScale = prefs.chatFontScale.collectAsState().value, dragArea = dragArea, covered = drawerState.covered, coveredNow = { drawerState.covered })
                 }
             }
         }

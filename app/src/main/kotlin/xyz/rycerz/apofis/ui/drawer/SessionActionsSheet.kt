@@ -1,31 +1,25 @@
 package xyz.rycerz.apofis.ui.drawer
 
-import androidx.compose.runtime.remember
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import xyz.rycerz.apofis.ui.theme.wash
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.ui.theme.ApofisDialog
 import xyz.rycerz.apofis.ui.theme.ApofisSheet
 import xyz.rycerz.apofis.ui.theme.SheetRow
 
@@ -93,56 +87,42 @@ private fun SessionActions(prompt: Prompt, actions: PromptActions) {
 @Composable
 private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
     var title by rememberSaveable(prompt.token) { mutableStateOf(prompt.title) }
-    AlertDialog(
-        onDismissRequest = { actions.dismiss(prompt.token) },
-        title = { Text(stringResource(R.string.drawer_rename_title)) },
-        text = {
-            Column {
-                OutlinedTextField(
-                    title,
-                    { title = it.take(TITLE_MAX) },
-                    Modifier.fillMaxWidth(),
-                    label = { Text(stringResource(R.string.drawer_rename_hint)) },
-                    singleLine = true,
-                )
-                ErrorLine(prompt.error, Modifier.padding(top = 8.dp))
-            }
-        },
-        confirmButton = {
-            DialogButton({ actions.confirmRename(prompt.token, title) }, enabled = title.isNotBlank() && !prompt.busy && !prompt.gone) {
-                Text(stringResource(R.string.drawer_save))
-            }
-        },
-        dismissButton = { DialogButton({ actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
-    )
+    ApofisDialog(
+        title = stringResource(R.string.drawer_rename_title),
+        confirmLabel = stringResource(R.string.drawer_save),
+        onConfirm = { actions.confirmRename(prompt.token, title) },
+        dismissLabel = stringResource(R.string.cancel),
+        onDismiss = { actions.dismiss(prompt.token) },
+        confirmEnabled = title.isNotBlank() && !prompt.busy && !prompt.gone,
+    ) {
+        Column {
+            OutlinedTextField(
+                title,
+                { title = it.take(TITLE_MAX) },
+                Modifier.fillMaxWidth(),
+                label = { Text(stringResource(R.string.drawer_rename_hint)) },
+                singleLine = true,
+            )
+            ErrorLine(prompt.error, Modifier.padding(top = 8.dp))
+        }
+    }
 }
 
 @Composable
-private fun DeleteDialog(prompt: Prompt, actions: PromptActions) {
-    val scheme = MaterialTheme.colorScheme
-    AlertDialog(
-        onDismissRequest = { actions.dismiss(prompt.token) },
-        title = { Text(stringResource(R.string.drawer_delete_title)) },
-        text = {
-            Column {
-                Text(stringResource(R.string.drawer_delete_text))
-                if (prompt.running) Text(stringResource(R.string.drawer_delete_running), Modifier.padding(top = 8.dp))
-                ErrorLine(prompt.error, Modifier.padding(top = 8.dp))
-            }
-        },
-        confirmButton = {
-            DialogButton({ actions.confirmDelete(prompt.token) }, enabled = !prompt.busy && !prompt.gone) {
-                Text(stringResource(R.string.drawer_delete), color = if (prompt.busy) Color.Unspecified else scheme.error)
-            }
-        },
-        dismissButton = { DialogButton({ actions.dismiss(prompt.token) }) { Text(stringResource(R.string.cancel)) } },
-    )
-}
-
-@Composable
-private fun DialogButton(onClick: () -> Unit, enabled: Boolean = true, content: @Composable () -> Unit) {
-    val source = remember { MutableInteractionSource() }
-    TextButton(onClick = onClick, Modifier.wash(source, ButtonDefaults.textShape), enabled = enabled, interactionSource = source) { content() }
+private fun DeleteDialog(prompt: Prompt, actions: PromptActions) = ApofisDialog(
+    title = stringResource(R.string.drawer_delete_title),
+    confirmLabel = stringResource(R.string.drawer_delete),
+    onConfirm = { actions.confirmDelete(prompt.token) },
+    dismissLabel = stringResource(R.string.cancel),
+    onDismiss = { actions.dismiss(prompt.token) },
+    destructive = true,
+    confirmEnabled = !prompt.busy && !prompt.gone,
+) {
+    Column {
+        Text(stringResource(R.string.drawer_delete_text))
+        if (prompt.running) Text(stringResource(R.string.drawer_delete_running), Modifier.padding(top = 8.dp))
+        ErrorLine(prompt.error, Modifier.padding(top = 8.dp))
+    }
 }
 
 @Composable

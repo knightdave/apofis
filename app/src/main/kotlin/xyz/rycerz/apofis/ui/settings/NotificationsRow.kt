@@ -4,19 +4,14 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.provider.Settings
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -54,10 +49,10 @@ import xyz.rycerz.apofis.push.PushUi
 import xyz.rycerz.apofis.push.TestOutcome
 import xyz.rycerz.apofis.push.TestPush
 import xyz.rycerz.apofis.push.TestPushResult
+import xyz.rycerz.apofis.ui.theme.ApofisDialog
 import xyz.rycerz.apofis.ui.theme.ApofisSheet
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.SheetRow
-import xyz.rycerz.apofis.ui.theme.wash
 
 /** What Settings shows about notifications: system access, the push state as the registrar reports it, the last test. */
 data class NotificationsUi(val access: NotificationAccess, val push: PushUi, val test: TestPushResult?)
@@ -224,34 +219,19 @@ fun NotificationsSheet(
         }
     }
     if (confirmOff) {
-        // shortcut: Material's AlertDialog with washed text buttons, as the drawer uses; Milestone 2 Task 10 replaces it with ApofisDialog.
-        AlertDialog(
-            onDismissRequest = { confirmOff = false },
-            title = { Text(stringResource(R.string.settings_notif_turn_off_title)) },
-            text = { Text(stringResource(R.string.settings_notif_turn_off_text), Modifier.verticalScroll(rememberScrollState())) },
-            confirmButton = {
-                DialogButton({ confirmOff = false; onTurnOff() }, enabled = !busy) {
-                    Text(stringResource(R.string.settings_notif_turn_off), color = MaterialTheme.colorScheme.error.copy(alpha = if (busy) 0.38f else 1f))
-                }
-            },
-            dismissButton = { DialogButton({ confirmOff = false }) { Text(stringResource(R.string.cancel)) } },
-        )
+        ApofisDialog(
+            title = stringResource(R.string.settings_notif_turn_off_title),
+            confirmLabel = stringResource(R.string.settings_notif_turn_off),
+            onConfirm = { confirmOff = false; onTurnOff() },
+            dismissLabel = stringResource(R.string.cancel),
+            onDismiss = { confirmOff = false },
+            destructive = true,
+            confirmEnabled = !busy,
+        ) { Text(stringResource(R.string.settings_notif_turn_off_text)) }
     }
 }
 
 internal const val SHEET_TAG = "notifications.sheet"
-
-@Composable
-private fun DialogButton(onClick: () -> Unit, enabled: Boolean = true, content: @Composable () -> Unit) {
-    val haptics = ApofisTheme.haptics
-    val source = remember { MutableInteractionSource() }
-    TextButton(
-        { haptics.selection(); onClick() },
-        Modifier.heightIn(min = 48.dp).wash(source, ButtonDefaults.textShape),
-        enabled = enabled,
-        interactionSource = source,
-    ) { content() }
-}
 
 /**
  * The Notifications row and its sheet, wired to the registrar and the test push. The lazily built [push] and [testPush]

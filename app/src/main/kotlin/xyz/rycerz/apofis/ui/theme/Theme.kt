@@ -108,8 +108,9 @@ fun ApofisTheme(
         else -> remember(dark, configuration, context) { if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context) }
     }
     val scheme = remember(base, dark, pureBlack) { deriveScheme(base, dark, pageFor(base, dark, pureBlack)) }
-    val colors = remember(scheme, dark) { apofisColors(scheme, dark) }
     val view = LocalView.current
+    val glassBlurs = blur && view.isHardwareAccelerated
+    val colors = remember(scheme, dark, glassBlurs) { apofisColors(scheme, dark, glassBlurs) }
     val enabled by rememberUpdatedState(hapticsEnabled)
     val haptics = remember(view) { ViewHaptics(view::performHapticFeedback) { enabled() } }
     MaterialTheme(colorScheme = scheme, typography = ApofisTypography, shapes = ApofisShapes) {
@@ -120,7 +121,7 @@ fun ApofisTheme(
             LocalIndication provides WashIndication,
             LocalHaptics provides haptics,
             LocalReduceMotion provides reduceMotion,
-            LocalBlur provides (blur && view.isHardwareAccelerated),
+            LocalBlur provides glassBlurs,
             content = content,
         )
     }

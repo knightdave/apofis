@@ -2,6 +2,7 @@ package xyz.rycerz.apofis.ui.theme
 
 import androidx.compose.material3.ColorScheme
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.compositeOver
 import kotlin.math.abs
 import org.junit.Assert.assertEquals
@@ -98,6 +99,62 @@ class ThemeTokensTest {
             floor("handle over the sheet", c.handle.compositeOver(page), page, 3.0)
             floor("error on timelineFill", scheme.error, c.timelineFill, 4.5) // a failed step's title
             floor("onSurfaceVariant on timelineFill", scheme.onSurfaceVariant, c.timelineFill, 4.5) // control card text
+        }
+        assertEquals(emptyList<String>(), failures)
+    }
+
+    /**
+     * With blur on (the Settings switch), the glass shows blurred content of any color: every foreground on it keeps its
+     * floor over black, white, the text color, primary and every grey between, and the glass stays translucent.
+     */
+    @Test
+    fun blurredGlassKeepsItsFloorsOverAnyContent() {
+        val failures = mutableListOf<String>()
+        val table = StringBuilder("theme | composer alpha | text | placeholder | expand | primary | button alpha | arrow\n")
+        for ((name, scheme, _) in themes) {
+            val dark = scheme.surface.luminance() < 0.5f
+            val c = apofisColors(scheme, dark, blur = true)
+            val contents = listOf(Color.Black, Color.White, scheme.onSurface, scheme.primary) + (0..255).map { Color(it, it, it) }
+            fun worst(fg: Color, glass: Color) = contents.minOf { contrastRatio(fg, glass.compositeOver(it)) }
+            val pairs = listOf(
+                Triple("text", scheme.onSurface to c.glassFill, 4.5),
+                Triple("placeholder", c.muted to c.glassFill, 4.5),
+                Triple("expand icon", c.expandIcon to c.glassFill, 3.0),
+                Triple("send fill and stop outline", scheme.primary to c.glassFill, 3.0),
+                Triple("scroll arrow", scheme.onSurface to c.glassButtonFill, 3.0),
+            )
+            val ratios = pairs.map { (what, colors, min) ->
+                val ratio = worst(colors.first, colors.second)
+                if (ratio < min) failures += "$name: $what is %.2f:1 over some content, needs $min".format(ratio)
+                ratio
+            }
+            for ((what, glass) in listOf("composer" to c.glassFill, "scroll button" to c.glassButtonFill)) {
+                if (glass.alpha >= 1f) failures += "$name: the $what glass is opaque"
+            }
+            table.append("$name | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f\n".format(c.glassFill.alpha, ratios[0], ratios[1], ratios[2], ratios[3], c.glassButtonFill.alpha, ratios[4]))
+        }
+        println(table)
+        assertEquals(emptyList<String>(), failures)
+        // Without blur nothing changes: the glass keeps the UI map's alpha over its page backplate.
+        for ((_, scheme, c) in themes) {
+            val dark = scheme.surface.luminance() < 0.5f
+            assertEquals(if (dark) 0.74f else 0.82f, c.glassFill.alpha, 0.002f)
+            assertEquals(if (dark) 0.40f else 0.85f, c.glassButtonFill.alpha, 0.002f)
+        }
+    }
+
+    /** The switch: its outline when off and its fill when on reach 3:1 on the card; the thumb when on reaches 3:1 on its track. */
+    @Test
+    fun switchReaches3to1OnTheCard() {
+        val failures = mutableListOf<String>()
+        for ((name, scheme, c) in themes) {
+            fun floor(what: String, fg: Color, bg: Color) {
+                val ratio = contrastRatio(fg, bg)
+                if (ratio < 3.0) failures += "$name: $what is %.2f:1".format(ratio)
+            }
+            floor("off outline on the card", scheme.outline, c.cardFill)
+            floor("on track on the card", scheme.primary, c.cardFill)
+            floor("on thumb on its track", scheme.onPrimary, scheme.primary)
         }
         assertEquals(emptyList<String>(), failures)
     }
