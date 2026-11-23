@@ -44,6 +44,8 @@
     <string name="chat_send">Wyślij</string>
     <string name="chat_steer">Wyślij do trwającej odpowiedzi</string>
     <string name="chat_stop">Zatrzymaj</string>
+    <string name="composer_expand">Rozwiń edytor</string>
+    <string name="composer_collapse">Zwiń edytor</string>
     <string name="chat_scroll_to_bottom">Przewiń do najnowszej wiadomości</string>
     <string name="chat_today">Dzisiaj</string>
     <string name="chat_yesterday">Wczoraj</string>
