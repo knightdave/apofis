@@ -186,7 +186,7 @@ fun ChatScreen(
     val barHidden = remember { BarHidden() }
     val barSlot = remember {
         @Composable {
-            SideEffect { ChromeProbe.barCompositions++ }
+            if (BuildConfig.DEBUG) SideEffect { ChromeProbe.barCompositions++ }
             val c = barCallbacks.value
             val input = barInput.value // read here, so this slot (and its probe) recomposes when the bar's inputs change
             ChatTopBar(
@@ -213,7 +213,7 @@ fun ChatScreen(
     val bottomFor = { barHeight: Int, statusTop: Int ->
         bottoms.get(barHeight, statusTop) {
         @Composable {
-            SideEffect { ChromeProbe.bottomCompositions++ }
+            if (BuildConfig.DEBUG) SideEffect { ChromeProbe.bottomCompositions++ }
             val input = bottomInput.value
             val actions = callbacks.value.actions
             Column(
@@ -291,8 +291,8 @@ fun ChatScreen(
                 val follow = o.follow
                 val backdrop = o.backdrop
                 val dragArea = drag.value
-                SideEffect {
-                    if (BuildConfig.DEBUG) ChromeProbe.bodyCompositions++
+                if (BuildConfig.DEBUG) SideEffect {
+                    ChromeProbe.bodyCompositions++
                     ChromeProbe.bodyBackdropId = System.identityHashCode(backdrop)
                     ChromeProbe.bodyBackdropHasLayer = backdrop.layer != null
                 }
@@ -385,7 +385,7 @@ fun ChatScreen(
     // remembered and reads no per-token state, so streaming never measures the root again.
     val policy = remember {
         val measure: SubcomposeMeasureScope.(Constraints) -> MeasureResult = { constraints ->
-            ChromeProbe.rootMeasures++
+            if (BuildConfig.DEBUG) ChromeProbe.rootMeasures++
             val loose = constraints.copy(minWidth = 0, minHeight = 0)
             // The status inset is the system's: reserved at the top whether the bar is shown or not.
             val status = statusInsets.value.getTop(this)
@@ -666,7 +666,7 @@ private class BodyCache {
     }
 }
 
-/** Counters the tests read to prove that streamed tokens leave the chrome alone; a few increments, no other cost. */
+/** Counters the tests read to prove that streamed tokens leave the chrome alone; written in debug builds only (each call site). */
 internal object ChromeProbe {
     var barCompositions = 0
     var bottomCompositions = 0
@@ -675,8 +675,8 @@ internal object ChromeProbe {
     // Which backdrop the transcript was last composed with, as scalars: no reference keeps it alive after the screen.
     var bodyBackdropId = 0
     var bodyBackdropHasLayer = false
-    var composerBackdropId = 0 // the backdrop the composer was last composed with (debug builds only)
-    var bodyCompositions = 0 // debug builds only
+    var composerBackdropId = 0 // the backdrop the composer was last composed with
+    var bodyCompositions = 0
 }
 
 /**

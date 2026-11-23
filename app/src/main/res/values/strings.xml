@@ -92,6 +92,7 @@
     <string name="chat_approval_session">Allow for this chat</string>
     <string name="chat_approval_always">Always allow</string>
     <string name="chat_approval_more">More approval options</string>
+    <string name="chat_approval_full_command">Show full command</string>
     <string name="chat_answer_changed">A different request is waiting now.</string>
     <string name="chat_answer_gone">This request was already settled or has expired.</string>
     <string name="chat_clarify_title">Hermes asks</string>

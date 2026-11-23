@@ -32,6 +32,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.click
@@ -159,6 +160,18 @@ class SettingsUiTest {
         assertEquals("the sheet row's one selection, no light impact", listOf(selection, selection), calls)
         assertTrue("the sheet closed", rule.onAllNodes(hasText("Light")).fetchSemanticsNodes().isEmpty())
         rule.onNodeWithText("Dark", substring = true).assertExists() // the row shows the stored mode
+    }
+
+    /** In a short, narrow window at double size the theme choices scroll: the last one can be reached and picked. */
+    @Test
+    @Config(qualifiers = "w320dp-h200dp-xhdpi", fontScale = 2f)
+    fun theLastThemeChoiceIsReachableInAShortWindow() {
+        show()
+        row("Theme").performClick()
+        rule.waitForIdle()
+        sheetRow("Dark").performScrollTo().assertIsDisplayed().performClick()
+        rule.waitForIdle()
+        assertEquals(listOf<Any>(ThemeMode.DARK), events)
     }
 
     /** Rotation or process death keeps the sheet open, and it always marks the stored mode. */

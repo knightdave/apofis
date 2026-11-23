@@ -66,6 +66,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.semantics.Role
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
@@ -138,7 +139,7 @@ fun DrawerContent(
                         }
                         .padding(start = 16.dp, top = 10.dp, end = 16.dp, bottom = 12.dp),
                 ) {
-                    IconRow(R.drawable.lucide_settings, stringResource(R.string.settings_title), onSettings)
+                    IconRow(R.drawable.lucide_settings, stringResource(R.string.settings_title), onSettings, navigation = true)
                 }
             },
             modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -193,7 +194,7 @@ private fun ChatList(rows: List<DrawerRow>, query: String, hasArchived: Boolean,
         )
     }
     val archived: @Composable () -> Unit = {
-        Box(Modifier.padding(top = 8.dp)) { IconRow(R.drawable.lucide_archive, stringResource(R.string.drawer_archived), onArchived, chevron = true) }
+        Box(Modifier.padding(top = 8.dp)) { IconRow(R.drawable.lucide_archive, stringResource(R.string.drawer_archived), onArchived, chevron = true, navigation = true) }
     }
     val showNoMatch = query.isNotEmpty() && rows.isEmpty()
     if (lazy) {
@@ -313,16 +314,20 @@ internal fun ChatRow(row: DrawerRow.Chat, onClick: () -> Unit, onLongPress: () -
     }
 }
 
-/** A plain drawer entry with a leading icon: new chat, Archived, Settings. */
+/** A plain drawer entry with a leading icon: new chat, Archived, Settings; [navigation] (another page) gives one selection. */
 @Composable
-private fun IconRow(@DrawableRes icon: Int, label: String, onClick: () -> Unit, chevron: Boolean = false) {
+private fun IconRow(@DrawableRes icon: Int, label: String, onClick: () -> Unit, chevron: Boolean = false, navigation: Boolean = false) {
     val scheme = MaterialTheme.colorScheme
+    val haptics = ApofisTheme.haptics
     Row(
         Modifier
             .fillMaxWidth()
             .heightIn(min = 48.dp)
             .clip(RoundedCornerShape(16.dp))
-            .clickable(onClick = onClick)
+            .clickable(role = Role.Button) {
+                if (navigation) haptics.selection()
+                onClick()
+            }
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

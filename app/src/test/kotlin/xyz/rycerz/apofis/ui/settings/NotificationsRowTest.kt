@@ -553,6 +553,7 @@ class NotificationsRowTest {
         turnedOn()
         setting()
         rule.onNodeWithText(text(R.string.settings_notifications)).performClick()
+        rule.onNode(hasText(text(R.string.settings_notifications)) and hasAnyAncestor(hasTestTag(SHEET_TAG)) and androidx.compose.ui.test.isHeading()).assertExists() // the title
         rule.onNodeWithText(text(R.string.settings_notif_test)).performClick()
         joinCommands()
         waitFor(text(R.string.settings_notif_test_sent))

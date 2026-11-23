@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.ui.text.AnnotatedString
 import java.text.BreakIterator
 import java.text.StringCharacterIterator
@@ -85,14 +86,14 @@ fun displayChunks(source: CharSequence, block: LogicalBlock): List<DisplayChunk>
         rawPieces(source, block, block.start) { s, e, _, last -> out += rawChunk(source, block, s, e, last, whole) }
         return out
     }
-    Work.markdownParses++
-    Work.largestParse = maxOf(Work.largestParse, block.end - block.start)
+    if (BuildConfig.DEBUG) Work.markdownParses++
+    if (BuildConfig.DEBUG) Work.largestParse = maxOf(Work.largestParse, block.end - block.start)
     val chunks = try {
         val blocks = parseMarkdown(source.substring(block.start, block.end), tables = block.kind == BlockKind.TABLE)
         // A scanned table parses to exactly one table; anything else (the scanner and the parser disagree) is literal.
         if (block.kind == BlockKind.TABLE && blocks.singleOrNull() !is MdBlock.Table) null else sliceBlocks(blocks)
     } catch (_: RuntimeException) {
-        Work.parseFailures++
+        if (BuildConfig.DEBUG) Work.parseFailures++
         null
     }
     // A block that cannot be cut small enough (one huge list item, say) shows as literal text instead.
@@ -144,7 +145,7 @@ internal fun codeRanges(text: CharSequence, start: Int, end: Int, emit: (start: 
         while (i <= limit) {
             if (text[i] == '\n') lastBreak = i
             i++
-            Work.chunkSteps++
+            if (BuildConfig.DEBUG) Work.chunkSteps++
         }
         if (lastBreak > s) {
             emit(s, lastBreak, limit, false)
@@ -154,7 +155,7 @@ internal fun codeRanges(text: CharSequence, start: Int, end: Int, emit: (start: 
         val far = minOf(end, s + TABLE_MAX_CHARS + 1) // a break right at the limit still ends the line
         while (i < far && text[i] != '\n') {
             i++
-            Work.chunkSteps++
+            if (BuildConfig.DEBUG) Work.chunkSteps++
         }
         if (i < far) { // the long line ends here
             emit(s, i, i, false)

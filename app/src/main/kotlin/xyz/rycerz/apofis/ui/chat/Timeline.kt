@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
+import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -48,6 +49,8 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.sp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.AssistantReply
@@ -66,7 +69,7 @@ private const val MIN_SHOWN_DURATION_S = 0.1
 
 // The one-line title and preview are cut before layout: a 1 MB name would otherwise be measured whole on every pass.
 // The sheet shows the whole value; the end-to-end suite only reads short previews, which pass unchanged.
-private const val ONE_LINE_MAX = 1000
+internal const val ONE_LINE_MAX = 1000
 
 /** An expanded card shows at most this many steps at a time, with Earlier and Later rows to move through the rest. */
 internal const val STEP_PAGE = 40
@@ -226,7 +229,7 @@ private fun ToolRow(step: ToolStep, rail: Rail, modifier: Modifier, live: Boolea
     val duration = step.durationSeconds?.takeIf { it >= MIN_SHOWN_DURATION_S && it.isFinite() }?.let { stringResource(R.string.chat_tool_duration, it) }
     StepRow(
         rail,
-        modifier.clickable(onClick = onClick).semantics(mergeDescendants = true) { if (state != null) stateDescription = state },
+        modifier.clickable(role = Role.Button, onClick = onClick).semantics(mergeDescendants = true) { if (state != null) stateDescription = state },
         icon = {
             when {
                 step.running -> MiniDots(animate = live) // only a step of the live run is the active one
@@ -263,12 +266,13 @@ private fun ReasoningRow(step: ReasoningStep, rail: Rail, index: Int, open: Bool
     val colors = ApofisTheme.colors
     val state = stringResource(if (open) R.string.state_expanded else R.string.state_collapsed)
     val rotation by animateFloatAsState(if (open) 90f else 0f, tween(Motion.CHEVRON, easing = EaseOutCubic), label = "reasoning")
+    val turn = if (LocalLayoutDirection.current == LayoutDirection.Rtl) -rotation else rotation // the mirrored chevron turns the other way to point down
     StepRow(
         rail,
         modifier.clickable(role = Role.Button, onClick = onToggle).semantics(mergeDescendants = true) { stateDescription = state },
         icon = { Icon(painterResource(R.drawable.lucide_lightbulb), null, Modifier.size(18.dp), tint = colors.timelineStrong) },
         trailing = {
-            Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.padding(start = 4.dp).size(16.dp).rotate(rotation), tint = colors.timelineMuted)
+            Icon(painterResource(R.drawable.lucide_chevron_right), null, Modifier.padding(start = 4.dp).size(16.dp).rotate(turn), tint = colors.timelineMuted)
         },
         body = if (open && step.text.isNotEmpty()) {
             {
@@ -297,14 +301,14 @@ private fun StepRow(
     body: (@Composable () -> Unit)? = null,
     texts: @Composable () -> Unit,
 ) {
-    Work.timelineRows++
+    if (BuildConfig.DEBUG) Work.timelineRows++
     val connector = ApofisTheme.colors.timelineConnector
     var header by remember { mutableIntStateOf(0) }
     Column(
         modifier
             .fillMaxWidth()
             .drawBehind {
-                val x = 12.dp.toPx()
+                val x = if (layoutDirection == LayoutDirection.Rtl) size.width - 12.dp.toPx() else 12.dp.toPx()
                 val y = header / 2f
                 val gap = 12.dp.toPx() // icon half height plus air
                 val width = 1.dp.toPx()
@@ -420,7 +424,7 @@ private class TextPages {
  * [cutAt]. Reads at most the page and one code point past it.
  */
 internal fun pageEnd(text: CharSequence, start: Int): Int {
-    Work.pageEnds++
+    if (BuildConfig.DEBUG) Work.pageEnds++
     val cap = start + TEXT_PAGE_CHARS
     val limit = minOf(text.length, cap)
     var i = start

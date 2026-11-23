@@ -58,6 +58,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.performScrollTo
@@ -1205,6 +1206,29 @@ class DrawerUiTest {
         runCode { state.open() } // already open: not another opening
         settled()
         assertEquals(2, openings)
+    }
+
+    /** Settings and Archived (another page) give one selection each, through the app's haptics; New chat gives none. All are buttons. */
+    @Test
+    fun navigationRowsGiveOneSelectionAndAreButtons() {
+        val opened = ArrayList<String>()
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                CompositionLocalProvider(LocalHaptics provides haptics) {
+                    DrawerContent(rows, "", false, hasArchived = true, actions = object : DrawerActions {}, onQuery = {}, onNewChat = { opened += "new" }, onArchived = { opened += "archived" }, onSettings = { opened += "settings" })
+                }
+            }
+        }
+        for ((i, label) in listOf("Settings", "Archived").withIndex()) {
+            rule.onNode(androidx.compose.ui.test.hasText(label) and androidx.compose.ui.test.hasClickAction())
+                .assert(androidx.compose.ui.test.SemanticsMatcher.expectValue(SemanticsProperties.Role, androidx.compose.ui.semantics.Role.Button))
+                .performClick()
+            assertEquals(i + 1, haptics.selections)
+        }
+        rule.onNodeWithText("New chat").performClick()
+        assertEquals(listOf("settings", "archived", "new"), opened)
+        assertEquals("New chat gives no selection", 2, haptics.selections)
+        assertEquals(0, haptics.lights)
     }
 
     @Test
