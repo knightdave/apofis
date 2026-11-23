@@ -116,7 +116,7 @@ class NotifierTest {
         row(A, "run_a", started = 1) // run A's finish committed; the post never happened
         ask(A, "run_b", started = 2, request = "r1") // run B started later and needs an answer
 
-        notifier.replayOutbox() // A's finish comes back afterwards
+        notifier.replayOutbox(gen) // A's finish comes back afterwards
 
         assertEquals(str(R.string.notif_needs_answer), text(A))
         assertTrue(rows().isEmpty())
@@ -175,12 +175,12 @@ class NotifierTest {
         assertTrue(!silent(shown(A)!!))
         assertEquals(1, rows().size) // the post happened; its row and order were not written
 
-        notifier.replayOutbox()
+        notifier.replayOutbox(gen)
         assertTrue(silent(shown(A)!!))
         assertTrue(rows().isEmpty())
 
         nm.cancelAll()
-        notifier.replayOutbox()
+        notifier.replayOutbox(gen)
         finish(A, "run_a", 1)
         assertTrue(active().isEmpty())
     }
@@ -190,7 +190,7 @@ class NotifierTest {
         start()
         row(A, "run_a", 1, notice = Notice.FAILED)
 
-        notifier.replayOutbox()
+        notifier.replayOutbox(gen)
 
         assertEquals(str(R.string.notif_reply_failed), text(A))
         assertTrue(silent(shown(A)!!))
@@ -203,7 +203,7 @@ class NotifierTest {
         row(A, "run_a", 1, generation = 4)
         row(B, "run_b", 1, generation = 5)
 
-        notifier.replayOutbox()
+        notifier.replayOutbox(gen)
 
         assertNull(shown(A))
         assertEquals(str(R.string.notif_reply_finished), text(B))
@@ -221,7 +221,7 @@ class NotifierTest {
 
         assertEquals(1, rows(6).size)
         assertTrue(active().isEmpty())
-        notifier.replayOutbox() // the new row needs no live callback
+        notifier.replayOutbox(gen) // the new row needs no live callback
         assertEquals(str(R.string.notif_reply_finished), text(A))
     }
 
@@ -230,7 +230,7 @@ class NotifierTest {
         start()
         row(A, "run_a", 1, generation = 6) // committed by a newer connection than this reader knows
 
-        notifier.replayOutbox()
+        notifier.replayOutbox(gen)
 
         assertEquals(1, rows(6).size)
     }
@@ -270,6 +270,23 @@ class NotifierTest {
     }
 
     @Test
+    fun anOldReplayOrderedAfterTheBumpTouchesNothing() = runTest {
+        start()
+        val old = gen
+        notifier.switchEpoch { gen = 6 } // the old check's replay reaches the lane only after this
+        finish(A, "run_a", 1) // the new connection's tray
+        row(B, "run_b", 1) // and its pending finish
+        notifier.replayOutbox(old)
+        notifier.idle()
+        assertEquals("the new connection's outbox is left", 1, rows().size)
+        assertNotNull(shown(A))
+        assertNull(shown(B))
+        notifier.replayOutbox(gen) // its own replay still works
+        assertTrue(rows().isEmpty())
+        assertNotNull(shown(B))
+    }
+
+    @Test
     fun staleApprovalAfterFinishDropped() = runTest {
         start()
         ask(A, "run_a", 1, "r1")
@@ -301,7 +318,7 @@ class NotifierTest {
         ask(B, "run_b", 1, "r1")
         db.activeRunDao().delete("run_a") // ended while the process was dead
 
-        start().replayOutbox()
+        start().replayOutbox(gen)
 
         assertNull(shown(A))
         assertNotNull(shown(B))
@@ -316,7 +333,7 @@ class NotifierTest {
         assertEquals(1, rows().size)
 
         notifier.beforeAck = {}
-        notifier.replayOutbox()
+        notifier.replayOutbox(gen)
         assertTrue(rows().isEmpty())
         assertTrue(silent(shown(A)!!))
     }
@@ -581,7 +598,7 @@ class NotifierTest {
 
         visible = null
         notifier.beforeAck = {}
-        start().replayOutbox() // the next process, chat no longer on screen
+        start().replayOutbox(gen) // the next process, chat no longer on screen
 
         assertTrue(active().isEmpty())
         assertTrue(rows().isEmpty())
@@ -593,7 +610,7 @@ class NotifierTest {
         finish(A, "run_a", 1)
         db.noticeStateDao().upsert(xyz.rycerz.apofis.db.NoticeStateEntity(A, gen, 2, "run_b", "FINISHED", "run:run_b")) // decided later, cancel lost
 
-        start().replayOutbox()
+        start().replayOutbox(gen)
 
         assertNull(shown(A))
     }
@@ -796,7 +813,7 @@ class NotifierTest {
             xyz.rycerz.apofis.db.NoticeStateEntity(A, gen, 1, "run_a", "NEEDS_ANSWER", "req:run_a:pB:$gen", """["req:run_a:pA:$gen","!req:run_a:pB:$gen"]"""),
         )
 
-        start().replayOutbox()
+        start().replayOutbox(gen)
 
         assertNull(shown(A))
     }
