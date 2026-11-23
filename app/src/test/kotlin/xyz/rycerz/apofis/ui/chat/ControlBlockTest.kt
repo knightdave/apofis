@@ -29,6 +29,7 @@ import androidx.compose.ui.test.isHeading
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
@@ -273,6 +274,11 @@ class ControlBlockTest {
     private fun readWhole(): List<String> {
         rule.onNodeWithText("Show full command").performClick()
         rule.waitForIdle()
+        return readOpen()
+    }
+
+    /** Reads the open reader's pieces in order to the last one, and goes back. */
+    private fun readOpen(): List<String> {
         val list = rule.onNode(hasScrollToIndexAction())
         val pieces = ArrayList<String>()
         while (true) {
@@ -323,5 +329,63 @@ class ControlBlockTest {
         val pieces = readWhole()
         assertTrue(pieces.last().endsWith("x"))
         assertEquals(command.length, pieces.sumOf { it.length })
+    }
+
+    // ---- closing commit: the block follows the current command of its request ----
+
+    private fun footer(pending: () -> PendingControl) = rule.setContent { Themed { ReplyFooter(reply, live(pending()), emptyMap(), answering = false, actions) } }
+
+    @Test
+    fun aShortCommandReplacedByALongOneUnderTheSameRequestShowsTheNewOne() {
+        val long = "echo " + "z".repeat(20_000) + " > /tmp/new"
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "ls", null))
+        footer { pending }
+        rule.onNodeWithText("ls").assertExists()
+        assertEquals(0, rule.onAllNodesWithTextCount("Show full command"))
+        pending = pending.copy(command = long) // the same id and generation
+        rule.waitForIdle()
+        rule.onNodeWithText(long.take(ONE_LINE_MAX)).assertExists()
+        assertTrue("laid out whole", layoutInputs().all { it <= ONE_LINE_MAX })
+        val pieces = readWhole()
+        assertTrue("the reader shows the new tail", pieces.last().endsWith("/tmp/new"))
+        assertEquals(long, pieces.joinToString(""))
+    }
+
+    @Test
+    fun aLongCommandReplacedWhileTheReaderIsOpenShowsTheNewText() {
+        val a = "echo " + "a".repeat(20_000) + " > /tmp/a"
+        val b = "echo " + "b".repeat(20_000) + " > /tmp/b"
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, a, null))
+        footer { pending }
+        rule.onNodeWithText("Show full command").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithTag("select.piece:0").assertExists()
+        pending = pending.copy(command = b) // the reader stays open
+        rule.waitForIdle()
+        assertEquals(b, readOpen().joinToString(""))
+    }
+
+    @Test
+    fun aCommandThatBecomesBlankLeavesDenyOnly() {
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "ls", null))
+        footer { pending }
+        rule.onNodeWithText("Allow once").assertExists()
+        pending = pending.copy(command = "  ")
+        rule.waitForIdle()
+        rule.onNodeWithText("Deny").assertExists()
+        assertEquals(0, rule.onAllNodesWithTextCount("Allow once"))
+        assertEquals(0, rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.ContentDescription) and hasClickAction()).fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun aBlankCommandThatGetsTextOffersAllow() {
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "  ", null))
+        footer { pending }
+        assertEquals(0, rule.onAllNodesWithTextCount("Allow once"))
+        pending = pending.copy(command = "ls")
+        rule.waitForIdle()
+        rule.onNodeWithText("ls").assertExists()
+        rule.onNodeWithText("Allow once").assertExists()
+        rule.onNodeWithContentDescription("More approval options").assertExists()
     }
 }

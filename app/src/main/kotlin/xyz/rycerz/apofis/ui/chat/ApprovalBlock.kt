@@ -77,8 +77,8 @@ import xyz.rycerz.apofis.ui.theme.wash
  */
 @Composable
 internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onChoice: (String, Long, ApprovalChoice) -> Unit) {
-    // Once per request (the block is keyed by its id and generation): the blank check walks a whitespace prefix.
-    val command = remember { control.command?.takeIf { it.isNotBlank() } }
+    // The request's current command, checked once per distinct command (the blank check walks a whitespace prefix).
+    val command = remember(control.command) { control.command?.takeIf { it.isNotBlank() } }
     var reading by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
     val chatGate = LocalChatGate.current // a control of the chat layout the drawer covers
     val choose = { press: Press, choice: ApprovalChoice -> if (gate.accepts(press)) onChoice(control.requestId, control.executionGeneration, choice) }
