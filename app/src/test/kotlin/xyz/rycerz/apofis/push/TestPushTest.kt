@@ -25,6 +25,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 
+private const val O = "1:g1" // the registration a test belongs to
+
 @RunWith(RobolectricTestRunner::class)
 class TestPushTest {
     private val app = ApplicationProvider.getApplicationContext<Application>()
@@ -52,7 +54,7 @@ class TestPushTest {
     fun postsOnlyTheTestKind() = runTest {
         server.enqueue(MockResponse.Builder().code(200).build())
         val t = push()
-        assertTrue(t.send(endpoint))
+        assertTrue(t.send(endpoint, O))
         val req = server.takeRequest()
         assertEquals("POST", req.method)
         assertEquals("/upWIRECHECK012?up=1", req.target)
@@ -61,21 +63,21 @@ class TestPushTest {
         assertEquals("1", req.headers["X-UnifiedPush"])
         assertNull(req.headers["Authorization"])
         assertNull(req.headers["Cookie"])
-        assertEquals(TestPushResult.SENT, t.lastResult.value)
+        assertEquals(TestPushResult.SENT, t.lastResult.value?.result)
     }
 
     @Test
     fun redirectAndInterruptedFail() = runTest {
         server.enqueue(MockResponse.Builder().code(302).addHeader("Location", "$origin/upWIRECHECK013?up=1").build())
         val t = push()
-        assertFalse(t.send(endpoint))
-        assertEquals(TestPushResult.SEND_FAILED, t.lastResult.value)
+        assertFalse(t.send(endpoint, O))
+        assertEquals(TestPushResult.SEND_FAILED, t.lastResult.value?.result)
         assertEquals(1, server.requestCount) // never followed
 
         val broken = OkHttpClient.Builder().addInterceptor { throw InterruptedIOException("timeout") }.build()
         val t2 = push(broken)
-        assertFalse(t2.send(endpoint))
-        assertEquals(TestPushResult.SEND_FAILED, t2.lastResult.value)
+        assertFalse(t2.send(endpoint, O))
+        assertEquals(TestPushResult.SEND_FAILED, t2.lastResult.value?.result)
 
     }
 
@@ -91,8 +93,8 @@ class TestPushTest {
     fun rejectedEndpointsMakeNoCall() = runTest {
         for (bad in listOf("https://evil.example/upAbC123xyz_-9?up=1", "http://127.0.0.1:1/upWIRECHECK012?up=1", "file:///upAbC123xyz_-9")) {
             val t = push(answering())
-            assertFalse(t.send(bad))
-            assertEquals(TestPushResult.SEND_FAILED, t.lastResult.value)
+            assertFalse(t.send(bad, O))
+            assertEquals(TestPushResult.SEND_FAILED, t.lastResult.value?.result)
         }
         assertEquals("no request attempted", 0, calls)
     }
@@ -100,28 +102,28 @@ class TestPushTest {
     @Test
     fun wakeBeforeTheAnswerIsNotCounted() = runTest {
         lateinit var t: TestPush
-        t = push(answering { t.onWake() })
-        assertTrue(t.send(endpoint))
-        assertEquals("known limit: the user sends again", TestPushResult.SENT, t.lastResult.value)
+        t = push(answering { t.onWake(O) })
+        assertTrue(t.send(endpoint, O))
+        assertEquals("known limit: the user sends again", TestPushResult.SENT, t.lastResult.value?.result)
     }
 
     @Test
     fun windowStartsAtTheAnswer() = runTest {
         val t = push(answering { now += 9_000 }) // a slow POST
-        t.send(endpoint)
+        t.send(endpoint, O)
         now += TEST_WINDOW_MS - 1
         t.tick()
-        assertEquals(TestPushResult.SENT, t.lastResult.value)
-        t.onWake()
-        assertEquals(TestPushResult.WAKE_ARRIVED, t.lastResult.value)
+        assertEquals(TestPushResult.SENT, t.lastResult.value?.result)
+        t.onWake(O)
+        assertEquals(TestPushResult.WAKE_ARRIVED, t.lastResult.value?.result)
     }
 
     @Test
     fun oneSendAtATime() = runTest {
         lateinit var t: TestPush
         var second: Boolean? = null
-        t = push(answering { if (calls == 1) { now += 10_000; second = runBlocking { t.send(endpoint) } } }) // past the 10 s throttle, still in flight
-        assertTrue(t.send(endpoint))
+        t = push(answering { if (calls == 1) { now += 10_000; second = runBlocking { t.send(endpoint, O) } } }) // past the 10 s throttle, still in flight
+        assertTrue(t.send(endpoint, O))
         assertEquals(false, second)
         assertEquals(1, calls)
     }
@@ -130,52 +132,52 @@ class TestPushTest {
     fun wakeInsideTheWindowArrives() = runTest {
         server.enqueue(MockResponse.Builder().code(200).build())
         val t = push()
-        t.send(endpoint)
+        t.send(endpoint, O)
         now += TEST_WINDOW_MS - 1
         t.tick()
-        assertEquals(TestPushResult.SENT, t.lastResult.value)
-        t.onWake()
-        assertEquals(TestPushResult.WAKE_ARRIVED, t.lastResult.value)
+        assertEquals(TestPushResult.SENT, t.lastResult.value?.result)
+        t.onWake(O)
+        assertEquals(TestPushResult.WAKE_ARRIVED, t.lastResult.value?.result)
         now += TEST_WINDOW_MS
         t.tick()
-        assertEquals(TestPushResult.WAKE_ARRIVED, t.lastResult.value)
+        assertEquals(TestPushResult.WAKE_ARRIVED, t.lastResult.value?.result)
     }
 
     @Test
     fun noWakeUntilTheWindowEnds() = runTest {
         server.enqueue(MockResponse.Builder().code(204).build())
         val t = push()
-        t.send(endpoint)
+        t.send(endpoint, O)
         now += TEST_WINDOW_MS
         t.tick()
-        assertEquals(TestPushResult.NO_WAKE, t.lastResult.value)
-        t.onWake()
-        assertEquals(TestPushResult.NO_WAKE, t.lastResult.value)
+        assertEquals(TestPushResult.NO_WAKE, t.lastResult.value?.result)
+        t.onWake(O)
+        assertEquals(TestPushResult.NO_WAKE, t.lastResult.value?.result)
     }
 
     @Test
     fun wakeWithoutWindowChangesNothing() = runTest {
         val t = push()
-        t.onWake()
+        t.onWake(O)
         t.tick()
-        assertNull(t.lastResult.value)
+        assertNull(t.lastResult.value?.result)
         // A failed send opens no window either.
         server.enqueue(MockResponse.Builder().code(500).build())
-        t.send(endpoint)
-        t.onWake()
-        assertEquals(TestPushResult.SEND_FAILED, t.lastResult.value)
+        t.send(endpoint, O)
+        t.onWake(O)
+        assertEquals(TestPushResult.SEND_FAILED, t.lastResult.value?.result)
     }
 
     @Test
     fun atMostOneSendPerTenSeconds() = runTest {
         repeat(2) { server.enqueue(MockResponse.Builder().code(200).build()) }
         val t = push()
-        assertTrue(t.send(endpoint))
+        assertTrue(t.send(endpoint, O))
         now += 9_999
-        assertFalse(t.send(endpoint))
+        assertFalse(t.send(endpoint, O))
         assertEquals(1, server.requestCount)
         now += 1
-        assertTrue(t.send(endpoint))
+        assertTrue(t.send(endpoint, O))
         assertEquals(2, server.requestCount)
     }
 
@@ -185,13 +187,43 @@ class TestPushTest {
         val release = java.util.concurrent.CountDownLatch(1)
         lateinit var t: TestPush
         t = push(answering { if (calls == 1) { inFlight.countDown(); release.await(10, java.util.concurrent.TimeUnit.SECONDS) } })
-        val job = backgroundScope.launch(kotlinx.coroutines.Dispatchers.Default) { t.send(endpoint) }
+        val job = backgroundScope.launch(kotlinx.coroutines.Dispatchers.Default) { t.send(endpoint, O) }
         assertTrue(inFlight.await(10, java.util.concurrent.TimeUnit.SECONDS))
         job.cancel() // the Settings sheet closed while the POST was out
         release.countDown()
         job.join()
         now += 10_000
-        assertTrue("the same instance sends again", t.send(endpoint))
-        assertEquals(TestPushResult.SENT, t.lastResult.value)
+        assertTrue("the same instance sends again", t.send(endpoint, O))
+        assertEquals(TestPushResult.SENT, t.lastResult.value?.result)
+    }
+
+    // Fix round 1 (Task 5): a test belongs to the registration it was sent for.
+
+    @Test
+    fun aTestCountsOnlyForItsRegistration() = runTest {
+        val a = "1:g1"
+        val b = "2:g2"
+        val t = push(answering())
+        assertTrue(t.send(endpoint, a))
+        assertEquals(TestOutcome(a, TestPushResult.SENT), t.lastResult.value)
+        t.onWake(b) // another registration's wake: it completes nothing
+        assertEquals(TestOutcome(a, TestPushResult.SENT), t.lastResult.value)
+        t.onWake(a)
+        assertEquals(TestOutcome(a, TestPushResult.WAKE_ARRIVED), t.lastResult.value)
+    }
+
+    @Test
+    fun aLateCompletionStaysWithItsRegistration() = runTest {
+        val a = "1:g1"
+        val b = "2:g2"
+        lateinit var t: TestPush
+        t = push(answering { t.onWake(b) }) // the registration changed while A's POST was answered; B's wake arrives
+        assertTrue(t.send(endpoint, a))
+        assertEquals("the late completion is A's, not B's", TestOutcome(a, TestPushResult.SENT), t.lastResult.value)
+        t.onWake(b)
+        assertEquals(TestOutcome(a, TestPushResult.SENT), t.lastResult.value)
+        now += TEST_WINDOW_MS
+        t.tick()
+        assertEquals(TestOutcome(a, TestPushResult.NO_WAKE), t.lastResult.value)
     }
 }

@@ -45,6 +45,7 @@ import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.RealUnifiedPush
 import xyz.rycerz.apofis.push.UnifiedPushPort
 import xyz.rycerz.apofis.push.TestPush
+import xyz.rycerz.apofis.ui.settings.PushCommands
 import xyz.rycerz.apofis.push.pushPolicy
 import xyz.rycerz.apofis.push.pushPrefs
 import xyz.rycerz.apofis.push.validateEndpoint
@@ -179,6 +180,7 @@ class AppContainer(
             scheduleWork = { PublishWorker.recover(app, pushStore) }, epoch = { connectionEpoch(app) })
     }
     val testPush by lazy { TestPush(SystemClock::elapsedRealtime, OkHttpClient()) { validateEndpoint(it, pushPolicy.origins(app), pushPolicy.loopbackOrigin(app)) } }
+    val pushCommands = PushCommands(scope) // Settings' one push command at a time, for the life of the running job
 
     /** The current connection's generation: persisted, so a restart keeps it; every switch moves it on. */
     fun epoch(): Long = connectionEpoch(app)
