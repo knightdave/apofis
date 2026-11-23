@@ -18,21 +18,25 @@ From the moment a candidate is recorded, nothing merges to `main` except a commi
 Only one procedure makes a tag, for the controller and for the owner alike. It runs `scripts/tag-release.sh` taken from the tested commit itself, never from a working tree, from the main checkout:
 
 ```sh
-git fetch origin && git show <SHA>:scripts/tag-release.sh | bash -s -- <version> <SHA> SHA256:PtPAxwgKEbi47CtvfmAp8yRCRrzf+3lyQBtfrIWH7NM <ledger file>
+GIT_NO_REPLACE_OBJECTS=1 git fetch --no-tags --no-prune --no-prune-tags --refmap= origin refs/heads/main &&
+  GIT_NO_REPLACE_OBJECTS=1 git show <SHA>:scripts/tag-release.sh | bash -s -- <version> <SHA> SHA256:PtPAxwgKEbi47CtvfmAp8yRCRrzf+3lyQBtfrIWH7NM <ledger file>
 ```
+
+The fetch names `main` only and never prunes or fetches tags, so no local tag is removed or added; `GIT_NO_REPLACE_OBJECTS=1` makes git read the real objects, never local replacements.
 
 It stops with a message and pushes nothing unless, in order:
 
 1. the last line of the ledger file that starts with `Candidate passed: ` is exactly `Candidate passed: <SHA>`;
-2. `git fetch origin` succeeds and `main` on origin, as `git ls-remote` reads it now, is exactly `<SHA>`;
-3. the newest push run of `ci.yml` on `main` for `<SHA>` in origin's repository succeeded (`gh run list --repo <origin URL> --branch main --event push`, so a pull request run, the tag's own run or a fork's run never counts);
-4. the allowed signers are read from `<SHA>:release/allowed-signers`, not from the working tree;
-5. if `v<version>` already exists on `origin`, the object origin holds must pass the check below, and the script stops there; if it exists only here, that object must pass the check and is pushed. It never retags or deletes;
-6. otherwise it creates the signed annotated tag `v<version>` on `<SHA>` (`git tag -s`, message `Apofis <version>`), which then passes the same check.
+2. the same named fetch of `main` succeeds and `main` on origin, as `git ls-remote` reads it now, is exactly `<SHA>`;
+3. origin has exactly one push URL and it equals its fetch URL, so the repository checked is the one that receives the tag;
+4. the newest push run of `ci.yml` on `main` for `<SHA>` in origin's repository succeeded (`gh run list --repo <origin URL> --branch main --event push`, so a pull request run, the tag's own run or a fork's run never counts);
+5. the allowed signers are read from `<SHA>:release/allowed-signers`, not from the working tree;
+6. if `v<version>` already exists on `origin`: a local `v<version>` with a different id stops the run (the owner removes it); otherwise the object origin advertised is fetched by name into `FETCH_HEAD` only, must be the object received, must pass the check below, and the script stops there without writing a ref. If it exists only here, that object must pass the check and is pushed. It never retags or deletes;
+7. otherwise it creates the signed annotated tag `v<version>` on `<SHA>` (`git tag -s`, message `Apofis <version>`), which then passes the same check.
 
-The check works on the tag object's id, read once: an annotated tag whose own name is `v<version>`, on `<SHA>`, verified against the allowed signers with the expected fingerprint. Exactly that object is pushed, with `--no-follow-tags` and without force, so no other tag goes along.
+The check works on the tag object's id, read once: an annotated tag whose own name is `v<version>`, on `<SHA>`, verified against the allowed signers with the expected fingerprint. Exactly that object is pushed, as the typed source `<id>^{tag}` (a ref named like the id cannot be taken instead), with `--no-follow-tags` and without force, so no other tag goes along. Success is printed only when origin, read back after the push, holds that id.
 
-Every run of the procedure ends with a line that starts with `tag-release:`. No such line means the script did not run: a failed `git show` feeds bash an empty script, which succeeds. After a failed or unconfirmed push, run the same command again; it checks the tag on origin and never retags. A local tag that was never pushed and fails the check stays; it is the owner's to remove with `git tag -d v<version>`, since the script never deletes.
+A run that finishes ends with a line that starts with `tag-release:`. No final `tag-release:` line means the outcome is unknown, not that the script did not run; rerun the procedure and confirm the remote tag before recording the outcome. After a failed or unconfirmed push, run the same command again; it checks the tag on origin and never retags. A local tag that was never pushed and fails the check stays; it is the owner's to remove with `git tag -d v<version>`, since the script never deletes.
 
 If signing fails, nothing is pushed: put "tag not pushed: signing failed" and the filled-in command in the handoff, to be run from the main checkout once signing works.
 

@@ -165,6 +165,10 @@ fresh; printf 'Candidate passed: %s\nCandidate passed: %s\n' "$main_sha" "$side"
 refused "tag-release refuses when the last Candidate passed line names another SHA"
 fresh; printf 'Candidate passed: %s \n' "$main_sha" > "$tmp/ledger"
 refused "tag-release refuses a Candidate passed line with trailing space"
+fresh; printf 'Candidate passed: %s\r\n' "$main_sha" > "$tmp/ledger"
+refused "tag-release refuses a Candidate passed line ending in CRLF"
+fresh; printf 'Candidate passed: %s\000\n' "$main_sha" > "$tmp/ledger"
+refused "tag-release refuses a Candidate passed line with a NUL after the SHA"
 fresh; printf 'Candidate passed: %s\n' "$c1" > "$tmp/ledger"; runs "$(run "$c1" main push success)"; printf '%s\n' "$c1" > "$tmp/commit"
 refused "tag-release refuses when main on origin is not the SHA" "$c1"
 # main moved on origin while this clone's fetch refspec no longer updates its stale origin/main.
@@ -177,6 +181,9 @@ runs "$(run "$c1" main push success),$(run "$main_sha" main pull_request success
 refused "tag-release refuses without a green push run on main for the SHA"
 fresh; touch "$tmp/gh_fail"
 refused "tag-release refuses when gh fails"
+fresh; git init -q --bare "$tmp/elsewhere$n.git"; git -C "$w" config remote.origin.pushurl "$tmp/elsewhere$n.git"
+refused "tag-release refuses when origin's push URL is another repository"
+check "  and that repository gains no tag" "$(git -C "$tmp/elsewhere$n.git" for-each-ref refs/tags)" ""
 
 fresh; git -C "$w" tag -s v0.1.0 "$c1" -m t
 check "tag-release refuses an existing tag on another commit" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 1
@@ -207,9 +214,35 @@ fresh; git -C "$w" tag -s v0.1.0 "$main_sha" -m t; git -C "$w" push -q origin v0
 check "tag-release accepts a right tag that exists only on origin" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 0
 check "  and creates nothing new" "$(origin_tag) $(local_tag)" "$good none"
 
-fresh; git -C "$w" tag -s v0.1.0 "$main_sha" -m t; before=$(local_tag)
-check "tag-release accepts an existing tag at the SHA with the right signer" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 0
+fresh; git -C "$w" tag -s v0.1.0 "$main_sha" -m t; git -C "$w" push -q origin v0.1.0; git -C "$w" tag -d v0.1.0 > /dev/null; good=$(origin_tag)
+git -C "$w" tag -s v0.1.0 "$main_sha" -m "another object"; mine=$(local_tag)
+check "tag-release refuses a different local tag when origin holds the right one" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 1
+check "  and leaves both unchanged" "$(origin_tag) $(local_tag)" "$good $mine"
+
+fresh; git -C "$w" tag -s v0.1.0 "$main_sha" -m t; before=$(local_tag); printf 'Candidate passed: %s' "$main_sha" > "$tmp/ledger"
+check "tag-release accepts an existing tag at the SHA (ledger without a final newline)" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 0
 check "  and pushes that tag, not a new one" "$(origin_tag)" "$before"
+
+fresh; git -C "$w" tag -s v0.1.0 "$main_sha" -m t; before=$(local_tag); git -C "$w" update-ref "refs/heads/$before" "$c1"
+check "tag-release pushes the verified object despite a ref named like its id" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 0
+check "  origin holds that object" "$(origin_tag)" "$before"
+
+fresh; git -C "$w" config fetch.prune true; git -C "$w" config fetch.pruneTags true
+git -C "$w" tag -s v0.1.0 "$main_sha" -m t; before=$(local_tag); git -C "$w" tag -a other "$c1" -m o; other=$(local_tag other)
+check "tag-release with fetch pruning on reuses the local-only tag" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 0
+check "  origin holds that object" "$(origin_tag)" "$before"
+check "  and the unrelated local tag is still there" "$(local_tag other)" "$other"
+
+# An unsigned v0.1.0 replaced, for local reads only, by a signed object of the same name.
+fresh; git -C "$w" tag -s v0.1.0 "$main_sha" -m good; signed=$(local_tag); git -C "$w" tag -d v0.1.0 > /dev/null
+git -C "$w" tag -a v0.1.0 "$main_sha" -m unsigned; git -C "$w" replace "$(local_tag)" "$signed"
+check "tag-release checks the object itself, not its replacement" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 1
+check "  and pushes nothing" "$(origin_tag)" none
+
+# origin accepts the push, then drops the tag: the read-back must not confirm it.
+fresh; printf '#!/bin/sh\ngit update-ref -d refs/tags/v0.1.0\n' > "$o/hooks/post-receive"; chmod +x "$o/hooks/post-receive"
+check "tag-release does not confirm a push origin does not hold" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp/ledger")" 1
+check "  and says so" "$(said 'failed or was not confirmed')" 1
 
 # With push.followTags on and an unrelated annotated tag on a main ancestor.
 fresh; git -C "$w" config push.followTags true; git -C "$w" tag -a other "$c1" -m o
