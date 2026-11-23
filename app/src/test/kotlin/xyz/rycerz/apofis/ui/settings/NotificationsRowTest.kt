@@ -1113,20 +1113,24 @@ class NotificationsRowTest {
     fun theEnableRowLooksUnavailableWhileACommandRuns() {
         setting()
         val row = rule.onNode(hasText(text(R.string.settings_notifications)) and SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
+        row.assert(hasText(text(R.string.settings_notif_off), substring = true))
         val normal = row.captureToImage().asAndroidBitmap()
-        val registering = Gate().also { registerGate = it }
-        row.performClick() // enable: the command is held at REGISTER, push still shows Off
-        await(registering.entered)
+        // A command on the shared holder that leaves push Off throughout, as one from another screen would.
+        val release = CompletableDeferred<Unit>()
+        assertTrue(uiCommands.run { release.await() })
         rule.waitForIdle()
         row.assertIsNotEnabled()
             .assert(hasText(text(R.string.settings_notifications), substring = true)) // still labelled
             .assert(hasText(text(R.string.settings_notif_off), substring = true)) // its value and fallback still readable
             .assert(hasText(text(R.string.settings_notif_fallback), substring = true))
         assertFalse("drawn unavailable", normal.sameAs(row.captureToImage().asAndroidBitmap()))
-        registering.open.complete(Unit)
+        release.complete(Unit)
         joinCommands()
-        waitFor(text(R.string.settings_notif_registering))
-        row.assertIsEnabled().assert(hasClickAction())
+        rule.waitUntil(WATCHDOG_MS) { !uiCommands.busy }
+        rule.waitForIdle() // recomposed with the command ended
+        assertEquals(PushState.Off, registrar.ui.value.state)
+        row.assert(hasText(text(R.string.settings_notif_off), substring = true)).assertIsEnabled().assert(hasClickAction())
+        assertTrue("the normal look is back", normal.sameAs(row.captureToImage().asAndroidBitmap()))
     }
 
     @Test
