@@ -24,6 +24,7 @@ private const val TAG = "ApofisE2e"
 private val SESSION_ID = Regex("apofis-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 private val RUN_ID = Regex("run_[0-9a-f]{32}")
 private val SCENARIO = Regex("[A-Za-z]{1,40}")
+private val UUID = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 fun fail(message: String): Nothing = throw AssertionError(message)
 
@@ -46,6 +47,15 @@ class AppDriver {
     val nonce get() = arg("apofisNonce").also { require(Regex("[0-9a-f]{8}").matches(it)) { "Bad apofisNonce" } }
     private val key get() = arg("apofisKey")
 
+    /** The push install the harness minted for each push scenario; empty when the run has no push provisioning. */
+    val pushInstalls: Map<String, String> by lazy {
+        val raw = args.getString("apofisPushInstalls") ?: return@lazy emptyMap()
+        raw.split(',').associate { it.substringBefore('=') to it.substringAfter('=') }
+            .also { m -> require(m.all { (k, v) -> SCENARIO.matches(k) && UUID.matches(v) }) { "Bad apofisPushInstalls" } }
+    }
+    val pushPort get() = arg("apofisPushPort").toInt().also { require(it in 1024..65535) { "Bad apofisPushPort" } }
+    val pushTopic get() = arg("apofisPushTopic").also { require(Regex("up[A-Za-z0-9]{12}").matches(it)) { "Bad apofisPushTopic" } }
+
     /** The scenario now running, written into each journal line. */
     var scenario = "none"
 
@@ -67,8 +77,13 @@ class AppDriver {
 
     // ---- app lifecycle
 
-    /** Clears the app's data (checked), grants local network access and (API 33+) notifications, launches. */
+    /**
+     * Clears the app's data (checked), grants local network access and (API 33+) notifications, launches. With push
+     * provisioning, the push record intents in the app's data are journaled before the clear (an interrupted scenario's
+     * too), and a push scenario's identity is written into the cleared data and read back before the launch.
+     */
     fun freshStart(grantLocalNetwork: Boolean = true) {
+        if (pushInstalls.isNotEmpty()) exportPushIntents(pushInstalls.keys) // whose they are is unknown if unreadable: all
         val cleared = shell("pm clear $APP").trim()
         if (cleared != "Success") fail("pm clear did not confirm: $cleared")
         if (grantLocalNetwork) grantLocalNetwork()
@@ -77,7 +92,106 @@ class AppDriver {
             val out = shell("pm grant $APP $POST_NOTIFICATIONS")
             if (out.isNotBlank()) fail("pm grant $POST_NOTIFICATIONS failed: $out")
         }
+        pushInstalls[scenario]?.let(::injectPushIdentity)
         launch()
+    }
+
+    /**
+     * Writes this scenario's push identity (its install id, the run nonce, the fake ntfy's loopback origin) into the
+     * cleared app's push prefs and reads them back: anything but exactly those values fails the scenario before push
+     * can be turned on. With them the debug app titles every record "<id> op-<marker> e2e-<nonce>" and keeps an intent.
+     */
+    private fun injectPushIdentity(install: String) {
+        val origin = "http://127.0.0.1:$pushPort"
+        val xml = "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n" +
+            "    <string name=\"install_id\">$install</string>\n    <string name=\"e2e_nonce\">$nonce</string>\n" +
+            "    <string name=\"e2e_origin\">$origin</string>\n</map>"
+        shell("run-as $APP mkdir -p shared_prefs")
+        shell("run-as $APP tee shared_prefs/push.xml", "$xml\n") // stdin passes through run-as, as for sqlite3
+        val read = shell("run-as $APP cat shared_prefs/push.xml")
+        if (!injectionConfirmed(read, install, nonce, origin)) {
+            log("push identity: ${identityDiagnostic(read)}") // a fixed category: never the bytes read
+            fail("The push identity was not read back as written; push stays off")
+        }
+        log("push identity written and read back")
+    }
+
+    /**
+     * Journals "pushintent <id> <title>" for every create intent in the app's push prefs, or "pushintent-missing
+     * <scenario>" for each of [ifUnreadable] when they cannot be read: the build host then deletes nothing of those.
+     */
+    fun exportPushIntents(ifUnreadable: Collection<String>) {
+        val read = sh("run-as $APP sh -c 'if [ -e shared_prefs/push.xml ]; then cat shared_prefs/push.xml && echo && echo @@READ; else echo @@NONE; fi'")
+        log("push intents: ${exportDiagnostic(read)}") // a fixed category: never the bytes read
+        pushIntentLines(read, ifUnreadable).forEach(::journal)
+    }
+
+    /** The device clock in seconds, for `logcat -T`. */
+    fun deviceTime(): String = sh("date +%s").trim().also { if (!Regex("\\d+").matches(it)) fail("Bad device time: $it") } + ".000"
+
+    /**
+     * Every line the app's wake tag (debug builds, ApofisWake) logged since [since], in order, malformed ones included
+     * (the callers' parsers refuse them); fails when logcat itself failed.
+     */
+    fun wakeLines(since: String): List<String> {
+        val out = sh("logcat -d -v raw -T $since -s ApofisWake:I; echo rc=$?").trimEnd().lines()
+        if (out.lastOrNull() != "rc=0") fail("Not proved: the wake log could not be read")
+        return out.dropLast(1).filter { it.isNotBlank() && !it.startsWith("--------- beginning of") }
+    }
+
+    /** Crash lines of the app since [since]; fails when the crash log could not be read (never taken as "no crash"). */
+    fun crashes(since: String): List<String> {
+        val out = sh("logcat -d -b crash -v raw -T $since; echo rc=$?").trimEnd().lines()
+        if (out.lastOrNull() != "rc=0") fail("The crash log could not be read")
+        return out.dropLast(1).filter { APP in it }
+    }
+
+    /** The app's active notifications as `cmd notification list` keys; fails when the list cannot be read. */
+    fun notifications(): List<String> {
+        val out = sh("cmd notification list; echo rc=$?").trim().lines()
+        if (out.lastOrNull() != "rc=0") fail("cmd notification list failed: $out")
+        return out.dropLast(1).filter { "|$APP|" in it }
+    }
+
+    /**
+     * The rows of [sql] on the app's database, one line each (read through run-as, never the key); null when sqlite
+     * stopped on an error or the output ended early (-bail, then an end mark the output must end with).
+     */
+    fun query(sql: String): List<String>? {
+        val out = shell("run-as $APP sqlite3 -bail databases/apofis.db", "$sql\nSELECT '@@end';\n").lines().filter(String::isNotBlank)
+        return if (out.lastOrNull() == "@@end") out.dropLast(1) else null
+    }
+
+    /** The app's active notification keys whose tag is [tag] (the app tags a chat's notification with its session key). */
+    fun notificationsTagged(tag: String): List<String> = notifications().filter { it.split('|').getOrNull(3) == tag }
+
+    /** The push prefs file as read through run-as, for comparisons only: never logged (it holds the endpoint and token). */
+    fun pushPrefsRead(): String = shell("run-as $APP cat shared_prefs/push.xml")
+
+    /** The server's status of run [runId], after checking it belongs to session [session]. */
+    fun runStatus(runId: String, session: String): String {
+        if (!RUN_ID.matches(runId) || !SESSION_ID.matches(session)) fail("Not a run or session id")
+        val (code, body) = http("GET", "v1/runs/$runId")
+        val r = if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null
+        if (r?.optString("run_id") != runId || r.optString("session_id") != session) fail("GET run $runId answered $code without its session")
+        return r.optString("status")
+    }
+
+    /** The server title of session [id], after proving it is this run's (as [serverMessages] does). */
+    fun serverTitle(id: String): String {
+        if (!SESSION_ID.matches(id)) fail("Not an app session id")
+        val (code, body) = http("GET", "api/sessions/$id")
+        val s = if (code == 200) runCatching { JSONObject(body).getJSONObject("session") }.getOrNull() else null
+        if (s?.optString("id") != id || !s.optString("title").contains(nonce)) fail("GET $id returned $code without this run's identity")
+        return s.optString("title")
+    }
+
+    /** Push record [id] of this scenario's install on the server, read with the tests' key: its HTTP code and session. */
+    fun pushRecord(id: String): Pair<Int, JSONObject?> {
+        val install = pushInstalls[scenario] ?: fail("No push install for $scenario")
+        if (!Regex("apofis-push-$install-[1-9][0-9]{0,5}").matches(id)) fail("Not a record of this scenario's install")
+        val (code, body) = http("GET", "api/sessions/$id")
+        return code to (if (code == 200) runCatching { JSONObject(body).getJSONObject("session") }.getOrNull() else null)
     }
 
     fun grantLocalNetwork() {
@@ -131,6 +245,9 @@ class AppDriver {
         roots().forEach(::walk)
         return found
     }
+
+    /** The root of each of the app's own windows (a bottom sheet or dialog is a window of its own). */
+    fun appRoots(): List<AccessibilityNodeInfo> = roots().filter { it.packageName == APP }
 
     private fun roots(): List<AccessibilityNodeInfo> {
         val ua = instrumentation.uiAutomation
@@ -324,13 +441,15 @@ class AppDriver {
      * this process dies, and the build host reads or deletes on the server only what it names, after checking each
      * session's own record.
      */
-    private fun journal(line: String) {
+    fun journal(line: String) {
         val p = line.split(' ')
         val ok = when (p[0]) {
             "send" -> p.size == 3 && SESSION_ID.matches(p[1]) && SCENARIO.matches(p[2])
             "chat" -> p.size == 4 && SCENARIO.matches(p[1]) && SESSION_ID.matches(p[2]) &&
                 (p[3] == "none" || p[3].split(',').let { ids -> ids.size in 1..8 && ids.all(SESSION_ID::matches) })
             "run" -> p.size == 3 && RUN_ID.matches(p[1]) && SESSION_ID.matches(p[2])
+            "pushintent" -> PUSH_INTENT.matches(line)
+            "pushintent-missing" -> p.size == 2 && SCENARIO.matches(p[1])
             else -> false
         }
         if (!ok) fail("Not a journal line")

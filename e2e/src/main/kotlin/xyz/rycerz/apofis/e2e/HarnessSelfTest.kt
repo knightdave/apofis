@@ -187,4 +187,221 @@ class HarnessSelfTest {
         assertTrue(SurvivalE2eTest.BANANA.containsMatchIn("Done apofis-e2e-6. BANANA."))
         assertFalse(SurvivalE2eTest.BANANA.containsMatchIn("Done apofis-e2e-6. NOBANANA"))
     }
+    // ---- the push scenarios' decisions (PushE2eTest.kt)
+
+    private val install = "0f8fad5b-d9cb-469f-a165-70867728950e"
+    private val origin = "http://127.0.0.1:18650"
+
+    private fun prefsXml(vararg kv: Pair<String, String>) = "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n" +
+        kv.joinToString("") { (k, v) -> "    <string name=\"$k\">$v</string>\n" } + "</map>\n"
+
+    @Test
+    fun pushIdentityCountsOnlyWhenReadBackWhole() {
+        val whole = prefsXml("install_id" to install, "e2e_nonce" to "0a1b2c3d", "e2e_origin" to origin)
+        assertTrue(injectionConfirmed(whole, install, "0a1b2c3d", origin))
+        assertFalse("an interrupted write, cut off", injectionConfirmed(whole.dropLast(8), install, "0a1b2c3d", origin))
+        assertFalse("nothing written", injectionConfirmed("", install, "0a1b2c3d", origin))
+        assertFalse("run-as refused", injectionConfirmed("run-as: package not debuggable", install, "0a1b2c3d", origin))
+        assertFalse("another install", injectionConfirmed(whole, "1f8fad5b-d9cb-469f-a165-70867728950e", "0a1b2c3d", origin))
+        assertFalse("a value missing", injectionConfirmed(prefsXml("install_id" to install, "e2e_nonce" to "0a1b2c3d"), install, "0a1b2c3d", origin))
+    }
+
+    @Test
+    fun pushIntentsAreJournaledOrMissingForEveryInstall() {
+        val id1 = "apofis-push-$install-1"
+        val id2 = "apofis-push-$install-2"
+        val intents = "$id1\t$id1 op-0123456789abcdef e2e-0a1b2c3d&#10;$id2\t$id2 op-fedcba9876543210 e2e-0a1b2c3d"
+        val read = prefsXml("install_id" to install, "test_intents" to intents) + "\n@@READ\n"
+        val both = listOf("a", "b")
+        assertEquals(listOf("pushintent $id1 $id1 op-0123456789abcdef e2e-0a1b2c3d", "pushintent $id2 $id2 op-fedcba9876543210 e2e-0a1b2c3d"), pushIntentLines(read, both))
+        assertTrue(pushIntentLines(read, both).all(PUSH_INTENT::matches))
+        assertEquals("no file: nothing to export", emptyList<String>(), pushIntentLines("@@NONE\n", both))
+        assertEquals("no intent yet", emptyList<String>(), pushIntentLines(prefsXml("install_id" to install) + "@@READ", both))
+        val missing = listOf("pushintent-missing a", "pushintent-missing b")
+        assertEquals("run-as failed", missing, pushIntentLines("run-as: unknown package\n", both))
+        assertEquals("cut off before its end mark", missing, pushIntentLines(read.substringBefore("@@READ").dropLast(10), both))
+        assertEquals("a malformed file", missing, pushIntentLines("<map><string name=\"test_intents\">x\n@@READ", both))
+        val forged = prefsXml("test_intents" to "$id1\tapofis-push-$install-9 op-0123456789abcdef e2e-0a1b2c3d") + "@@READ"
+        assertEquals("an intent whose title names another id", missing, pushIntentLines(forged, both))
+    }
+
+    @Test
+    fun pushDiagnosticsNeverCarryTheBytesRead() {
+        val secret = "SENTINELendpoint0123"
+        val token = "SENTINELtoken4567"
+        val prefs = prefsXml("install_id" to install, "endpoint" to "http://127.0.0.1:18650/$secret?up=1", "registration" to "g1\t$token")
+        val reads = listOf(prefs, prefs.dropLast(20), prefs.replace("<map>", "<map><string name=\"x\">$secret"), "$secret\n$token", "")
+        for (r in reads) {
+            // Only a fixed category, whatever was read: no byte of it can reach the log.
+            assertTrue(identityDiagnostic(r), identityDiagnostic(r) in setOf("not a whole prefs file", "values differ"))
+            for (d in listOf(exportDiagnostic(r), exportDiagnostic("$r\n@@READ"))) {
+                assertTrue(d, d in setOf("no prefs file", "unreadable", "malformed", "read"))
+                assertFalse(d, secret in d || token in d || install in d)
+            }
+        }
+        assertEquals("malformed", exportDiagnostic(prefs.dropLast(20) + "\n@@READ"))
+    }
+
+    @Test
+    fun distributorLogsOnlyKnownActionsFromTheApp() {
+        val secret = "SENTINELaction0123"
+        assertEquals("distributor: REGISTER from the app", distributorLog("org.unifiedpush.android.distributor.REGISTER", "xyz.rycerz.apofis"))
+        assertNull("an action from another app", distributorLog("org.unifiedpush.android.distributor.REGISTER", "com.example.$secret"))
+        assertNull("no sender identity", distributorLog("org.unifiedpush.android.distributor.REGISTER", null))
+        assertNull("an unknown action", distributorLog("org.unifiedpush.android.distributor.$secret", "xyz.rycerz.apofis"))
+    }
+
+    @Test
+    fun quietDeliveriesNeedANewPushCheckThatTookNoRun() {
+        assertTrue(quietPushChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=0 settled=0 failed=0 outcome=DONE")))
+        assertFalse("no line at all", quietPushChecked(emptyList()))
+        assertFalse("only a periodic check: the push was not seen", quietPushChecked(listOf("cause=periodic runs=0 settled=0 failed=0 outcome=DONE")))
+        assertFalse("a run taken", quietPushChecked(listOf("cause=push runs=0 settled=0 failed=0 outcome=none", "cause=push runs=1 settled=0 failed=0 outcome=DONE")))
+        assertFalse("a line of another form", quietPushChecked(listOf("cause=push runs=0 settled=0 failed=0")))
+        assertEquals(WakeLine("periodic", 3, 1, 2), wakeLine("cause=periodic runs=3 settled=1 failed=2 outcome=RETRY"))
+    }
+
+    /** The precondition's SQL against the app's real states, on an in-memory SQLite database, through its validator. */
+    @Test
+    fun wakePreconditionPassesTheStoredRunsSendingRowOnly() {
+        val key = "apofis-0a1b2c3d-0000-4000-8000-000000000001"
+        val run = "run_0123456789abcdef0123456789abcdef"
+        fun verdict(runs: List<String>, sends: List<String>, outbox: Int): String? {
+            val db = android.database.sqlite.SQLiteDatabase.create(null)
+            try {
+                db.execSQL("CREATE TABLE ActiveRunEntity (runId TEXT PRIMARY KEY, sessionKey TEXT NOT NULL)")
+                db.execSQL("CREATE TABLE PendingSendEntity (idempotencyKey TEXT PRIMARY KEY, sessionKey TEXT NOT NULL, state TEXT NOT NULL, runId TEXT)")
+                db.execSQL("CREATE TABLE NoticeOutboxEntity (eventId TEXT PRIMARY KEY)")
+                runs.forEach { db.execSQL("INSERT INTO ActiveRunEntity VALUES ('$it', '$key')") }
+                sends.forEachIndexed { i, st -> db.execSQL("INSERT INTO PendingSendEntity VALUES ('s$i', '$key', '$st', ${if (st == "sending") "'$run'" else "NULL"})") }
+                repeat(outbox) { db.execSQL("INSERT INTO NoticeOutboxEntity VALUES ('e$it')") }
+                db.execSQL("INSERT INTO PendingSendEntity VALUES ('other', 'apofis-0a1b2c3d-0000-4000-8000-000000000009', 'queued', NULL)")
+                return db.rawQuery(WAKE_PRECONDITION_SQL(key), null).use { c ->
+                    c.moveToFirst()
+                    listOf((0 until c.columnCount).joinToString("|") { c.getString(it) ?: "" })
+                }.let(::wakePrecondition)
+            } finally {
+                db.close()
+            }
+        }
+        assertEquals("the stored run with its own sending row: the healthy state passes", run, verdict(listOf(run), listOf("sending"), 0))
+        assertEquals(run, verdict(listOf(run), listOf("failed"), 0))
+        assertNull("a queued send", verdict(listOf(run), listOf("sending", "queued"), 0))
+        assertNull("a steering send", verdict(listOf(run), listOf("steering"), 0))
+        assertNull("no stored run", verdict(emptyList(), emptyList(), 0))
+        assertNull("two stored runs", verdict(listOf(run, "run_fedcba9876543210fedcba9876543210"), emptyList(), 0))
+        assertNull("an outbox row", verdict(listOf(run), emptyList(), 1))
+        assertNull("a failed query (no row)", wakePrecondition(emptyList()))
+        assertNull("unexpected output", wakePrecondition(listOf("1|$run|0|0", "extra")))
+        assertEquals(run, storedRun(listOf("1|$run|1|0")))
+    }
+
+    @Test
+    fun pushProofNeedsOnePushSettlementAfterTheDelivery() {
+        val settled = "cause=push runs=1 settled=1 failed=0 outcome=DONE"
+        val quiet = "cause=push runs=1 settled=0 failed=0 outcome=DONE"
+        assertTrue(provedByPush(emptyList(), listOf(settled)))
+        assertTrue("a check that settled nothing does not count", provedByPush(listOf(quiet), listOf(quiet, settled)))
+        assertFalse("settled by the periodic check", provedByPush(emptyList(), listOf("cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("settled by a recheck", provedByPush(emptyList(), listOf("cause=recheck runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("settled before the delivery", provedByPush(listOf(settled), listOf(settled)))
+        assertFalse("two settling checks", provedByPush(emptyList(), listOf(settled, "cause=periodic runs=1 settled=1 failed=0 outcome=DONE")))
+        assertFalse("no settling check", provedByPush(emptyList(), listOf(quiet)))
+        assertFalse("an unparsed line", provedByPush(emptyList(), listOf(settled, "something else")))
+    }
+
+    @Test
+    fun recordMatchesTheAppsOwnIntentExactly() {
+        val id = "apofis-push-$install-1"
+        val title = "$id op-0123456789abcdef e2e-0a1b2c3d"
+        val endpoint = "http://127.0.0.1:18650/upAbC123xyz09q?up=1"
+        val prefs = prefsXml("test_intents" to "$id\t$title", "record" to id, "endpoint" to endpoint)
+        fun server(i: String = id, src: String = "api_server", hidden: Boolean = true, t: String = title) =
+            JSONObject().put("id", i).put("source", src).put("hidden", hidden).put("title", t)
+        assertTrue(recordMatches(prefs, server(), id, endpoint, current = true))
+        assertFalse("another stored endpoint", recordMatches(prefs, server(), id, "http://127.0.0.1:18650/upOTHER0000000?up=1", current = true))
+        assertTrue("an earlier record: its endpoint is not compared", recordMatches(prefs, server(), id, "x", current = false))
+        assertFalse("another id answered", recordMatches(prefs, server(i = "apofis-push-$install-2"), id, endpoint, current = true))
+        assertFalse("another source", recordMatches(prefs, server(src = "cli"), id, endpoint, current = true))
+        assertFalse("visible", recordMatches(prefs, server(hidden = false), id, endpoint, current = true))
+        assertFalse("another operation marker", recordMatches(prefs, server(t = "$id op-ffffffffffffffff e2e-0a1b2c3d"), id, endpoint, current = true))
+        assertFalse("no intent for the id", recordMatches(prefsXml("record" to id, "endpoint" to endpoint), server(), id, endpoint, current = true))
+        assertFalse("not the current record", recordMatches(prefsXml("test_intents" to "$id\t$title", "record" to "apofis-push-$install-2", "endpoint" to endpoint), server(), id, endpoint, current = true))
+    }
+
+    /** A list of [size] rows shown [window] at a time; [appearsAt]: the target row exists only from that scroll on. */
+    private class FakeList(val target: Int, val appearsAt: Int, val size: Int = 10, val window: Int = 3, val boundsOnly: Boolean = false) : ScrollList<Int> {
+        var offset = 0
+        var scrolls = 0
+        override fun find() = target.takeIf { scrolls >= appearsAt }
+        override fun visible(n: Int) = n in offset until offset + window
+        override fun scroll(forward: Boolean): Boolean {
+            val next = if (forward) offset + 1 else offset - 1
+            if (next < 0 || next + window > size) return false
+            offset = next
+            scrolls++
+            return true
+        }
+        // What is shown: the rows' texts and bounds; with boundsOnly every row reads the same and only the bounds move.
+        override fun shown(): Any = (offset until offset + window).map { (if (boundsOnly) "row" else "row $it") to it * 100 }
+    }
+
+    @Test
+    fun revealScrollsFirstAndJudgesProgressByWhatIsShown() {
+        // The section heading (row 2) is visible at once, but the row (5) does not exist until the second scroll.
+        val settings = FakeList(target = 5, appearsAt = 2)
+        assertEquals(5 to 3, revealIn(settings))
+        // The same for a sheet action that exists only once the sheet has scrolled twice.
+        assertEquals(4 to 2, revealIn(FakeList(target = 4, appearsAt = 2, size = 6)))
+        // Only bounds move (every row reads the same): still progress.
+        assertEquals(7 to 5, revealIn(FakeList(target = 7, appearsAt = 0, boundsOnly = true)))
+        // Nothing shown changes although the scroll was accepted: that direction stops at once.
+        val stuck = object : ScrollList<Int> {
+            var asked = 0
+            override fun find(): Int? = null
+            override fun visible(n: Int) = false
+            override fun scroll(forward: Boolean) = true.also { asked++ }
+            override fun shown(): Any = "same"
+        }
+        assertEquals(null to 2, revealIn(stuck))
+        assertEquals(2, stuck.asked)
+        // Not found anywhere: bounded both ways.
+        assertNull(revealIn(FakeList(target = 99, appearsAt = 99)).first)
+    }
+
+    @Test
+    fun anObservationFinishingAfterTheDeadlineDoesNotCount() {
+        var clock = 0L
+        assertTrue("seen in time", observedBy(1_000, { clock }, { clock += 100 }) { clock >= 500 })
+        clock = 0L
+        assertFalse("seen, but the probe ended after the deadline", observedBy(1_000, { clock }, { clock += 100 }) { (clock >= 900).also { if (it) clock += 300 } })
+        clock = 0L
+        assertFalse("never seen", observedBy(1_000, { clock }, { clock += 100 }) { false })
+        clock = 2_000L
+        assertFalse("past the deadline before the first probe", observedBy(1_000, { clock }, { clock += 100 }) { true })
+        clock = 0L
+        assertTrue("a stale node is only not yet", observedBy(1_000, { clock }, { clock += 100 }) { if (clock < 300) throw IllegalStateException("stale") else true })
+    }
+
+    @Test
+    fun anEvidenceFailureInsideTheDeadlineWaitEscapes() {
+        var probes = 0
+        val escaped = runCatching {
+            observedBy(1_000, { 0L }, {}) {
+                probes++
+                if (probes == 1) fail("The notification list could not be read") else true
+            }
+        }.exceptionOrNull()
+        assertTrue("the evidence assertion escapes", escaped is AssertionError)
+        assertEquals("the second probe never runs", 1, probes)
+    }
+
+    @Test
+    fun settingsRowValueIsAWholeSegment() {
+        val off = segments(listOf("Notifications, Off\nWithout push, the app checks about every 15 minutes while a reply is running"))
+        assertEquals(listOf("Notifications", "Off"), off.take(2))
+        val missing = segments(listOf("Notifications", "ntfy is not installed"))
+        assertFalse("ntfy" in missing.drop(1))
+        assertTrue("ntfy" in segments(listOf("Notifications, ntfy")).drop(1))
+    }
 }
