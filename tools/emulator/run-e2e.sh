@@ -4,7 +4,9 @@
 #   tools/emulator/run-e2e.sh --smoke             connect tests and the harness self-tests, no model run
 #   tools/emulator/run-e2e.sh --full              every e2e test: smoke, self-tests and the seven survival scenarios
 #   tools/emulator/run-e2e.sh --scenario <name>   one survival scenario, e.g. stopDuringRun
-#   tools/emulator/run-e2e.sh --test <Class[#method]>   any test in the e2e module
+#   tools/emulator/run-e2e.sh --test <Class[#method]>   any test in the e2e module (a push or model method: its row)
+#   tools/emulator/run-e2e.sh --push              the push scenarios with a local fake ntfy, no model run
+#   tools/emulator/run-e2e.sh --push-model        the three model scenarios of Milestone 3 (at most 3 model starts)
 #
 # Runs on the build host; it calls itself on the emulator host with --remote and --in-shell (internal).
 # tools/emulator/run-e2e-selftest.sh sources it (APOFIS_E2E_LIB=1) to test its safeguards without any host.
@@ -47,8 +49,28 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   replyOfAnotherTurnOrWithoutTheMarkerDoesNotCount replyTextJoinsOnlyThatReplysRows
   stepMustBeOfThatReplyRunningAndShowExactlyTheCommand chatKeyIsReadFromTheChatScreensTagOnly
   steerReplyIsTheFinalReplyOfThisTurnOnly steeredTurnOnTheServerMustBeInOrderAndAlone
-  terminalCommandsComeFromToolCallArguments interruptedResultMustBelongToTheCommandsOwnCall steerRowsAreUnwrapped)
+  terminalCommandsComeFromToolCallArguments interruptedResultMustBelongToTheCommandsOwnCall steerRowsAreUnwrapped
+  pushIdentityCountsOnlyWhenReadBackWhole pushIntentsAreJournaledOrMissingForEveryInstall pushDiagnosticsNeverCarryTheBytesRead
+  distributorLogsOnlyKnownActionsFromTheApp
+  quietDeliveriesNeedANewPushCheckThatTookNoRun wakePreconditionPassesTheStoredRunsSendingRowOnly
+  pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly revealScrollsFirstAndJudgesProgressByWhatIsShown
+  anObservationFinishingAfterTheDeadlineDoesNotCount anEvidenceFailureInsideTheDeadlineWaitEscapes settingsRowValueIsAWholeSegment)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
+# Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
+# tunnel. Gate 1's start no model run.
+PUSH_TESTS=(connectorLifecycle hostilePushes permissionAndTestPush)
+PUSH_ALL=("${PUSH_TESTS[@]}" pushWakesKilledApp)
+# The methods that start model runs selectable here, each with its proved upper bound of model starts: each sends exactly
+# one message and no steer. A method without a proved bound is not listed (steerDuringRun: a refused steer can become a
+# fresh run). Their selections reserve the bound in the shared ledger before instrumentation.
+PUSH_MODEL=(PushE2eTest#pushWakesKilledApp SurvivalE2eTest#connectAndChat SurvivalE2eTest#replySurvivesProcessDeath)
+declare -A MODEL_BOUND=([PushE2eTest#pushWakesKilledApp]=1 [SurvivalE2eTest#connectAndChat]=1 [SurvivalE2eTest#replySurvivesProcessDeath]=1)
+LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m3 # shared by every worktree, outside any checkout
+LEDGER_LIMIT=8
+LIVE_DB=/home/hermes/.hermes/state.db # opened only by the per-install listing (push_listing), read-only
+PUSH_SCRIPT=server/apofis-push/apofis_push.py
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+PUSHID_RE="apofis-push-$UUID_RE-[1-9][0-9]{0,5}"
 
 # The emulator host never prints anything to the build host's terminal. It reports progress and failures as codes;
 # the build host prints its own text for each known code and a fixed notice for anything else.
@@ -104,17 +126,20 @@ declare -A REMOTE_MSG=(
 allowlist() {
   local t
   printf '%s\n' instrument.txt results.txt logcat.txt
-  for t in "${SMOKE[@]}" "${SCENARIOS[@]}"; do printf '%s.png\nfailed-%s.png\n' "$t" "$t"; done
+  for t in "${SMOKE[@]}" "${SCENARIOS[@]}" "${PUSH_ALL[@]}"; do printf '%s.png\nfailed-%s.png\n' "$t" "$t"; done
   for t in "${EVIDENCE[@]}"; do printf '%s.png\n' "$t"; done
 }
 allowed() { allowlist | grep -qxF -- "$1"; }
 
 # The session journal's line forms: "send <key> <scenario>" (written before each send in chat <key>), one
 # "chat <scenario> <key> <ids>|none" per scenario that sent (written at its end: the chat's server ids, current first,
-# or none when the app never had one), and "run <run id> <key>" (the run the app followed in chat <key>).
+# or none when the app never had one), and "run <run id> <key>" (the run the app followed in chat <key>). Push
+# scenarios add "pushintent <record id> <title>" (a create intent the app committed before its request; the title is
+# "<record id> op-<marker> e2e-<nonce>") and "pushintent-missing <scenario>" (the intents could not be read).
 journal_line_ok() {
   [[ $1 =~ ^send\ $SESSION_RE\ [A-Za-z]{1,40}$ || $1 =~ ^chat\ [A-Za-z]{1,40}\ $SESSION_RE\ (none|$SESSION_RE(,$SESSION_RE){0,7})$ ||
-    $1 =~ ^run\ $RUN_RE\ $SESSION_RE$ ]]
+    $1 =~ ^run\ $RUN_RE\ $SESSION_RE$ || $1 =~ ^pushintent-missing\ [A-Za-z]{1,40}$ ]] && return 0
+  [[ $1 =~ ^pushintent\ ($PUSHID_RE)\ ($PUSHID_RE)\ op-[0-9a-f]{16}\ e2e-[A-Za-z0-9]{1,20}$ ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]
 }
 
 log() { printf '[e2e %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -264,11 +289,30 @@ bg() { "$@" </dev/null {proto}<&- & child=$!; local rc=0; wait "$child" || rc=$?
 adb() { bounded "${ADB_TIMEOUT:-60}" "$ADB_BIN" "$@" </dev/null; }
 free_port() { local o; o=$(ss -Hltn "sport = :$1") || rdie ss; [ -z "$o" ]; }
 
+# The am instrument filter of a selection. --full (all) never runs the push scenarios: they need push provisioning.
+instrument_filter() {
+  local f
+  case $1 in
+    all) echo "-e package $PKG -e notClass $PKG.PushE2eTest" ;;
+    smoke) echo "-e class $PKG.SmokeE2eTest,$PKG.HarnessSelfTest" ;;
+    push) f=$(printf "$PKG.PushE2eTest#%s," "${PUSH_TESTS[@]}"); echo "-e class ${f%,}" ;;
+    push-model) f=$(printf "$PKG.%s," "${PUSH_MODEL[@]}"); echo "-e class ${f%,}" ;;
+    *) echo "-e class $PKG.$1" ;;
+  esac
+}
+
+# The push values are "-" when the selection has no push scenario.
+push_args_ok() {
+  [[ $1 == - && $2 == - && $3 == - ]] ||
+    [[ $1 =~ ^18[0-9]{3}$ && $2 =~ ^up[A-Za-z0-9]{12}$ && $3 =~ ^[A-Za-z]{1,40}=$UUID_RE(,[A-Za-z]{1,40}=$UUID_RE){0,3}$ ]]
+}
+
 remote() {
-  local tests=$1 tunnel_port=$2 run_id=$3 nonce=$4 d
+  local tests=$1 tunnel_port=$2 run_id=$3 nonce=$4 push_port=$5 push_topic=$6 push_installs=$7 d
   no_core_dumps || rdie core
-  [[ $tests =~ ^(all|smoke|[A-Za-z0-9_#]+)$ && $tunnel_port =~ ^[0-9]+$ && $run_id =~ ^$RUNID_RE$ && $nonce =~ ^[0-9a-f]{8}$ ]] ||
+  [[ $tests =~ ^(all|smoke|push|push-model|[A-Za-z0-9_#]+)$ && $tunnel_port =~ ^[0-9]+$ && $run_id =~ ^$RUNID_RE$ && $nonce =~ ^[0-9a-f]{8}$ ]] ||
     rdie args
+  push_args_ok "$push_port" "$push_topic" "$push_installs" || rdie args
   root=$HOME/$REMOTE_DIR
   state=$root/.state
   lock_owned "$state" "$run_id" || rdie not-locked
@@ -288,7 +332,7 @@ remote() {
   cd "$root"
   exec nix develop .#emulator -c env HOME="$state/home" XDG_CONFIG_HOME="$state/xdg/config" XDG_CACHE_HOME="$state/xdg/cache" \
     XDG_DATA_HOME="$state/xdg/data" XDG_STATE_HOME="$state/xdg/state" XDG_RUNTIME_DIR="$state/xdg/runtime" \
-    "$root/tools/emulator/run-e2e.sh" --in-shell "$tests" "$tunnel_port" "$out" "$nonce"
+    "$root/tools/emulator/run-e2e.sh" --in-shell "$tests" "$tunnel_port" "$out" "$nonce" "$push_port" "$push_topic" "$push_installs"
 }
 
 # Writes a heartbeat to the build host every 5 s; when the connection is gone the write fails and the run is stopped.
@@ -299,13 +343,15 @@ heartbeat() {
 }
 
 in_shell() {
-  local tests=$1 tunnel_port=$2 nonce=$4 p filter start
+  local tests=$1 tunnel_port=$2 nonce=$4 push_port=$5 push_topic=$6 push_installs=$7 p filter start push_e=''
+
   out=$3
   state=${out%/runs/*}
   root=${state%/.state}
   rid=${out##*/}
   no_core_dumps || rdie core
   [[ $rid =~ ^$RUNID_RE$ ]] || rdie args
+  push_args_ok "$push_port" "$push_topic" "$push_installs" || rdie args
   exec {proto}<&0 </dev/null
   ADB_BIN=$(command -v adb)
   trap finish EXIT
@@ -316,11 +362,7 @@ in_shell() {
   ask "PID $$"
   heartbeat $$ </dev/null {proto}<&- &
   hb_pid=$!
-  case $tests in
-    all) filter="-e package $PKG" ;;
-    smoke) filter="-e class $PKG.SmokeE2eTest,$PKG.HarnessSelfTest" ;;
-    *) filter="-e class $PKG.$tests" ;;
-  esac
+  filter=$(instrument_filter "$tests")
 
   rmsg build
   bg bounded "$BUILD_TIMEOUT" ./gradlew --no-daemon --no-configuration-cache --console=plain \
@@ -386,6 +428,11 @@ in_shell() {
   done
   [[ $health == *" 200 "* ]] || rdie hermes-failed
   rmsg hermes-ok
+  if [ "$push_port" != - ]; then
+    # The fake ntfy on the build host, through its own tunnel: the app's endpoint and the tests' poll use the loopback.
+    adb reverse "tcp:$push_port" "tcp:$push_port" >/dev/null 2>&1 || rdie reverse-failed
+    push_e="-e apofisPushInstalls $push_installs -e apofisPushTopic $push_topic -e apofisPushPort $push_port"
+  fi
   ADB_TIMEOUT=180 adb install -r -t app/build/outputs/apk/debug/app-debug.apk >"$out/install.log" 2>&1 || rdie install-failed
   ADB_TIMEOUT=180 adb install -r -t e2e/build/outputs/apk/debug/e2e-debug.apk >>"$out/install.log" 2>&1 || rdie install-failed
 
@@ -397,7 +444,7 @@ in_shell() {
   # an environment, in a file, or in this shell's own variables.
   { IFS= read -r -t 120 -u "$proto" k && [ -n "$k" ] && printf '%s\n' "$k"; } |
     bounded "$TEST_TIMEOUT" "$ADB_BIN" shell "IFS= read -r k && [ -n \"\$k\" ] && exec am instrument -w -r -e apofisKey \"\$k\" \
--e apofisUrl $hermes_url -e apofisDirectUrl $direct_url -e apofisNonce $nonce $filter $RUNNER || echo 'no key: instrumentation not started'" \
+-e apofisUrl $hermes_url -e apofisDirectUrl $direct_url -e apofisNonce $nonce $push_e $filter $RUNNER || echo 'no key: instrumentation not started'" \
     >"$out/instrument.txt" 2>&1 {proto}<&- &
   child=$!
   local irc=0
@@ -419,7 +466,7 @@ finish() {
   if [ -n "$booted" ]; then
     ADB_TIMEOUT=90 adb pull "$DEVICE_OUT" "$out/device" >/dev/null 2>&1
     pull_rc=$?
-    if ADB_TIMEOUT=60 adb logcat -d -v threadtime ApofisE2e:V TestRunner:V AndroidRuntime:E '*:S' >"$out/logcat.txt" 2>/dev/null &&
+    if ADB_TIMEOUT=60 adb logcat -d -v threadtime ApofisE2e:V ApofisWake:I TestRunner:V AndroidRuntime:E '*:S' >"$out/logcat.txt" 2>/dev/null &&
       [ -s "$out/logcat.txt" ]; then logcat_ok=1; else rmsg logcat-failed; rc=$CLEANUP_EXIT; fi
   fi
   report_sessions "$pull_rc"
@@ -501,7 +548,8 @@ stage() {
   copy "$out/instrument.txt" instrument.txt || return 1
   [ -z "$logcat_ok" ] || copy "$out/logcat.txt" logcat.txt || return 1
   if [ -d "$out/device" ]; then
-    for t in "${SMOKE[@]}" "${SCENARIOS[@]}" "${EVIDENCE[@]}" "${SMOKE[@]/#/failed-}" "${SCENARIOS[@]/#/failed-}"; do
+    for t in "${SMOKE[@]}" "${SCENARIOS[@]}" "${PUSH_ALL[@]}" "${EVIDENCE[@]}" "${SMOKE[@]/#/failed-}" "${SCENARIOS[@]/#/failed-}" \
+      "${PUSH_ALL[@]/#/failed-}"; do
       copy "$out/device/$t.png" "$t.png" || return 1
     done
     # One result file from the tests' own: "<Class>.<test> PASS|FAIL" for each well-formed one.
@@ -559,6 +607,8 @@ key='' nonce='' run_id='' tmp='' interrupted='' key_sent_local='' mode='' arg=''
 tun_fd='' tunnel_pid='' tunnel_port='' rin='' rout='' remote_pid='' remote_shell_pid='' last_line=''
 sessions_state='' journal=() published='' export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
 incoming='' wd_pid='' orig_out='' orig_err=''
+push=() models=() owned=() model_capable='' keep_push='' push_port='' push_topic='' push_installs='' push_dir='' fake_pid=''
+declare -A install_of=()
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
 rsh() { bounded "${RSH_TIMEOUT:-60}" ssh -o BatchMode=yes "$HOST" "$@"; }
@@ -631,7 +681,7 @@ check_sessions() {
   local rf=$E2E_OUT/$run_id/results.txt passed=''
   if [ -n "$published" ] && [ -f "$rf" ] && [ -r "$rf" ] && [ -s "$rf" ] &&
     { grep -qvE '^[A-Za-z0-9]+\.[A-Za-z0-9]+ (PASS|FAIL)$' "$rf"; [ "$?" = 1 ]; }; then # 1: no malformed row; 2: grep failed
-    passed=$(sed -n 's/^SurvivalE2eTest\.\([A-Za-z]*\) PASS$/\1/p' "$rf") || { passed=''; bad=1; }
+    passed=$(sed -nE 's/^(SurvivalE2eTest\.([A-Za-z]*)|PushE2eTest\.(pushWakesKilledApp)) PASS$/\2\3/p' "$rf") || { passed=''; bad=1; }
     # The list must be exactly what the instrumentation itself reported, from the same verified copy: a list that
     # disagrees proves nothing about which scenarios sent. No server id is ever inferred from a test name.
     if ! reported_rows "$E2E_OUT/$run_id/instrument.txt" | cmp -s - <(sort -u "$rf"); then
@@ -726,6 +776,279 @@ check_sessions() {
   return "$ok"
 }
 
+# ---------------------------------------------------------------- Milestone 3: selections, ledger, push records
+
+# A test class of the e2e module, or one of its test methods: "<Class>" or "<Class>#<method>", by its source file.
+known_test() {
+  local src c=${1%%#*} m=${1#*#} f
+  src=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/e2e/src/main/kotlin/xyz/rycerz/apofis/e2e || return 1
+  [[ $1 =~ ^[A-Z][A-Za-z0-9]*(#[a-z][A-Za-z0-9]*)?$ ]] && f=$src/$c.kt && [ -f "$f" ] && grep -q '^ *@Test' "$f" || return 1
+  [[ $1 != *'#'* ]] || grep -A1 '^ *@Test' "$f" | grep -qE "^ *fun $m\("
+}
+
+# The selection matrix. Sets tests (what the emulator host runs: a suite name, or a class or method shown to exist),
+# push (the PushE2eTest methods: they get push provisioning), models (the model-starting methods, whose bounds the
+# ledger reserves) and model_capable (anything that can start a model run, ledgered or not, prints the hook warning).
+# --smoke, --full, --scenario and --test of the other tests keep their behaviour; --full never selects a push test; a
+# suite name is never a --test argument. Fails for anything else, before any side effect.
+select_tests() {
+  local m=$1 a=${2:-} t
+  push=() models=() model_capable=1 tests=
+  case $m in
+    smoke) tests=smoke model_capable='' ;;
+    full) tests=all ;;
+    scenario)
+      for t in "${SCENARIOS[@]}"; do [ "$a" != "$t" ] || tests=SurvivalE2eTest#$a; done # literal equality only
+      [ -n "$tests" ] || return 1 ;;
+    push) tests=push push=("${PUSH_TESTS[@]}") model_capable='' ;;
+    push-model) tests=push-model push=(pushWakesKilledApp) models=("${PUSH_MODEL[@]}") ;;
+    test)
+      known_test "$a" || return 1
+      tests=$a
+      case $a in
+        PushE2eTest#*) push=("${a#PushE2eTest#}") ;;
+        PushE2eTest) return 1 ;; # the class would run the model method without its reservation
+      esac
+      [ -z "${MODEL_BOUND[$a]+x}" ] || models=("$a")
+      case $a in SmokeE2eTest | SmokeE2eTest#* | HarnessSelfTest | HarnessSelfTest#* | PushE2eTest#connectorLifecycle | \
+        PushE2eTest#hostilePushes | PushE2eTest#permissionAndTestPush) model_capable='' ;; esac ;;
+    *) return 1 ;;
+  esac
+  [[ $tests =~ ^[A-Za-z0-9_#-]+$ ]] # the strict token check, before any remote command is built from it
+}
+
+# <n> random letters and digits.
+rand_alnum() {
+  local c=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 s='' b
+  for b in $(od -An -N"$1" -tu1 /dev/urandom); do s+=${c:b%62:1}; done
+  [ "${#s}" = "$1" ] && printf '%s' "$s"
+}
+
+# The model-start ledger, one per milestone (path and limit are arguments; Milestone 4 has its own). Lines:
+# "reserve <run id> <method> <bound>" before a run's instrumentation, and "observed <run id> <method> 0" only to release
+# a reservation of an invocation that never handed the key to the device. A reservation counts its bound until
+# released.
+# ledger_check <ledger> [<run id> <method>...]: the one parser of the ledger. Every line must be exactly one of the two
+# forms (single spaces, a line break at the end of the file), no run and method reserved twice, no observation without
+# its reservation or twice; with a proposal, none of its run and methods may repeat or already be reserved. Prints the
+# starts the ledger counts; fails on anything else.
+ledger_check() {
+  local f=$1
+  shift
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    [ -f "$f" ] && [ -r "$f" ] || return 1
+    [ ! -s "$f" ] || [ "$(tail -c1 "$f" | od -An -tx1 | tr -d ' ')" = 0a ] || return 1 # a torn last line
+  else
+    f=/dev/null
+  fi
+  awk -v line="^(reserve|observed) ${RUNID_RE} [A-Za-z0-9]+#[A-Za-z0-9]+ [0-9]{1,3}\$" -v proposal="$*" '
+    $0 !~ line { bad = 1; exit }
+    $1 == "reserve" { k = $2 " " $3; if (k in r) { bad = 1; exit } r[k] = $4; next }
+    { k = $2 " " $3; if (!(k in r) || (k in o)) { bad = 1; exit } o[k] = $4 }
+    END {
+      if (bad) exit 1
+      n = split(proposal, p, " ")
+      for (i = 2; i <= n; i++) { k = p[1] " " p[i]; if ((k in r) || (k in seen)) exit 1; seen[k] = 1 }
+      for (k in r) t += (k in o) ? o[k] : r[k]
+      print t + 0
+    }' "$f"
+}
+
+ledger_total() { ledger_check "$1"; }
+
+# ledger_reserve <ledger> <limit> <run id> <method>=<bound>...: under flock, appends one reservation per method only when
+# the ledger reads and its count plus these bounds stays within <limit>; fails (appending nothing) otherwise.
+ledger_reserve() {
+  local f=$1 limit=$2 run=$3 p add=0
+  shift 3
+  for p; do [[ $p =~ ^[A-Za-z0-9]+#[A-Za-z0-9]+=[0-9]{1,3}$ ]] || return 1; add=$((add + ${p#*=})); done
+  mkdir -p -- "${f%/*}" || return 1
+  (
+    flock -w 30 9 || exit 1
+    t=$(ledger_check "$f" "$run" "${@%=*}") && [ $((t + add)) -le "$limit" ] || exit 1
+    for p; do printf 'reserve %s %s %s\n' "$run" "${p%=*}" "${p#*=}"; done >>"$f"
+  ) 9>>"$f.lock"
+}
+
+# ledger_release <ledger> <run id> <method>: under flock, releases that reservation ("observed ... 0"); only while it
+# is reserved and not yet released, by the same parser.
+ledger_release() {
+  local f=$1
+  (
+    flock -w 30 9 || exit 1
+    ledger_check "$f" >/dev/null && ! ledger_check "$f" "$2" "$3" >/dev/null || exit 1 # valid, and that one is reserved
+    ! grep -qxF "observed $2 $3 0" "$f" || exit 1
+    printf 'observed %s %s 0\n' "$2" "$3" >>"$f"
+  ) 9>>"$f.lock"
+}
+
+# The hook-installation warning of every model-capable run: whether the real hook may be installed (count only).
+hook_warning() {
+  local f n out=''
+  for f in ~/.hermes/config.yaml ~/.hermes/shell-hooks-allowlist.json; do
+    n=unknown
+    if [ ! -e "$f" ]; then n=0; elif n=$(grep -c -F apofis_push.py -- "$f" 2>/dev/null) || [ "$?" = 1 ]; then :; else n=unknown; fi
+    [[ $n =~ ^[0-9]+$ ]] || n=unknown
+    out+=" ${f##*/}=$n"
+  done
+  log "WARNING: hook installation check (counts of apofis_push.py):$out. With the hook installed, each model run here can send one contentless wake naming a test chat to the owner's ntfy endpoint."
+}
+
+# push_listing <install>: the ids of every server record under that install, from the live database, read-only, with a
+# run-private HERMES_HOME (the one other thing allowed to open it is the named Step 0 check). Fails when the listing
+# failed, was incomplete or did not parse: never an empty answer then.
+push_listing() {
+  local out rc=0 l rows
+  out=$(bounded 30 env -i PATH="$PATH" HERMES_HOME="$push_dir/check-home" python3 -I "$PUSH_SCRIPT" check \
+    --state-db "$LIVE_DB" --only-install "$1" --ids --log - 2>/dev/null) || rc=$?
+  [ "$rc" = 0 ] && [ "$(sed -n 3,4p <<<"$out")" = "$(printf 'origins none\ndb opened read-only')" ] || return 1
+  rows=$(sed -n '5,$p' <<<"$out") || return 1
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    [[ ${l%%$'\t'*} =~ ^apofis-push-$1-[[:graph:]]*$ ]] || return 1
+    printf '%s\n' "${l%%$'\t'*}"
+  done <<<"$rows"
+}
+
+# Host-minted push identities: one install per push scenario (so no scenario's ids depend on another's), the topic,
+# and the run-private directory. Every install's namespace on the server must be empty, or the run stops here.
+provision_push() {
+  local m r
+  push_dir=$tmp/push
+  mkdir -m 700 "$push_dir" "$push_dir/fake" "$push_dir/check-home" || die "could not create $push_dir"
+  push_installs=''
+  for m in "${push[@]}"; do
+    install_of[$m]=$(cat /proc/sys/kernel/random/uuid) && [[ ${install_of[$m]} =~ ^$UUID_RE$ ]] || die "could not mint an install id"
+    push_installs+="${push_installs:+,}$m=${install_of[$m]}"
+    r=$(push_listing "${install_of[$m]}") || die "push: the listing of $m's new install failed; nothing started"
+    [ -z "$r" ] || die "push: $m's new install already has records on the server; nothing started"
+  done
+  push_topic=up$(rand_alnum 12) && [[ $push_topic =~ ^up[A-Za-z0-9]{12}$ ]] || die "could not mint the push topic"
+  log "push: ${#push[@]} install(s) minted, each with an empty namespace on the server"
+}
+
+# Starts the fake ntfy on this host (run-private directory, minimal environment, its own session so a terminal signal
+# does not reach it before the cleanup) and waits for it to listen.
+start_fake() {
+  local wake='' i owner
+  [[ " ${push[*]} " == *" pushWakesKilledApp "* ]] && wake=${install_of[pushWakesKilledApp]}
+  # Started directly by this shell (setsid does not fork here: a background job of a non-interactive shell leads no
+  # group), which names itself as the owner: the fake starts only as this shell's child, and stops when reparented.
+  # The pid is read here: the arguments of a background command are expanded after the fork, in the child.
+  owner=$BASHPID
+  setsid env -i PATH="$PATH" python3 -I tools/emulator/fake_ntfy.py --run-dir "$push_dir/fake" --port "$push_port" \
+    --topic "$push_topic" --script "$PUSH_SCRIPT" ${wake:+--wake-install "$wake"} --owner-pid "$owner" \
+    </dev/null >"$push_dir/fake.log" 2>&1 7>&- &
+  fake_pid=$!
+  for i in $(seq 40); do
+    [ "$(head -n1 "$push_dir/fake.log" 2>/dev/null)" = READY ] && return 0
+    alive "$fake_pid" || return 1
+    sleep 0.25
+  done
+  return 1
+}
+
+# Stops the fake (it accounts for any hook child) and checks that it said so and that its port is closed here.
+stop_fake() {
+  local rc=0 o
+  [ -n "$fake_pid" ] || return 0
+  kill -TERM "$fake_pid" 2>/dev/null
+  wait_gone 40 alive "$fake_pid" || { kill -KILL "$fake_pid" 2>/dev/null; rc=1; }
+  wait "$fake_pid" 2>/dev/null || rc=1
+  alive "$fake_pid" || fake_pid=''
+  grep -qxE 'stopped: child (released|killed)' "$push_dir/fake.log" 2>/dev/null || rc=1
+  o=$(ss -Hltn "sport = :$push_port") && [ -z "$o" ] || rc=1
+  if [ "$rc" = 0 ]; then log "fake ntfy stopped, every hook child accounted for, its port $push_port closed"
+  else
+    keep_push=1 # the evidence stays: the fake's log, its run directory and any child's files
+    log "FAILED: the fake ntfy did not stop cleanly (a hook child unaccounted for, or its port $push_port still open); kept for inspection: $push_dir"
+  fi
+  return "$rc"
+}
+
+# Push records, rule C3. A record is deleted only when a journaled create intent of this run names it, its id is of
+# that intent's install (this run's), its title ends with this run's nonce, and the server's row is api_server with
+# exactly that title; then it must be gone. A missing intent never licenses a delete; an install whose intents could
+# not be read is not cleaned at all. Then every install is listed again: any record left fails the run, unremoved.
+check_push() {
+  local ok=0 l id title inst m code gone body refused=' ' left
+  # Nothing minted: nothing of this run can exist on the server, and no path is touched.
+  [ "${#push[@]}" -gt 0 ] && [ "${#install_of[@]}" -gt 0 ] || return 0
+  # Every file of this check lives in the run's own private directory, created by this run.
+  if [ -z "$push_dir" ] || [ ! -d "$push_dir" ] || [ -L "$push_dir" ] || [ ! -O "$push_dir" ] ||
+    ! body=$(mktemp "$push_dir/body.XXXXXX"); then
+    log "FAILED: push: no private directory to work in; push records may remain under the installs ${install_of[*]}"
+    return 1
+  fi
+  if [ -n "$key_sent_local" ] && [ "$sessions_state" != ok ]; then
+    log "FAILED: push: the journal is missing or unreadable, so no create intent is known; no push record is deleted"
+    ok=1
+  fi
+  [ "$sessions_state" = ok ] || journal=()
+  for l in "${journal[@]}"; do
+    [[ $l == pushintent-missing\ * ]] || continue
+    m=${l#pushintent-missing }
+    log "FAILED: push: the create intents of $m could not be read; its install is not cleaned"
+    refused+="${install_of[$m]:-?} "
+    ok=1
+  done
+  for l in "${journal[@]}"; do
+    [[ $l == pushintent\ * ]] || continue
+    read -r _ id title <<<"$l"
+    inst=${id#apofis-push-} inst=${inst%-*}
+    if ! printf '%s\n' "${install_of[@]}" | grep -qxF -- "$inst" || ! [[ $id =~ ^apofis-push-$inst-[1-9][0-9]{0,5}$ ]] ||
+      [[ $title != *" e2e-$nonce" ]]; then
+      log "FAILED: push: a journaled intent is not of this run's installs or nonce; no request for it"
+      ok=1
+      continue
+    fi
+    if [[ $refused == *" $inst "* ]]; then continue; fi
+    code=$(hermes GET "api/sessions/$id" "$body") || code=error
+    if [ "$code" = 404 ]; then log "push: $id not on the server (never created)"; continue; fi
+    if [ "$code" != 200 ] || ! jq -e --arg id "$id" --arg t "$title" \
+      '.session | .id == $id and .source == "api_server" and .title == $t' "$body" >/dev/null 2>&1; then
+      log "FAILED: push: $id answered $code without its journaled title and source; left alone"
+      ok=1
+      continue
+    fi
+    code=$(hermes DELETE "api/sessions/$id" "$body") || code=error
+    if [ "$code" = 200 ] && jq -e --arg id "$id" '.id == $id and .deleted == true' "$body" >/dev/null 2>&1 &&
+      gone=$(hermes GET "api/sessions/$id" "$body") && [ "$gone" = 404 ]; then # the transfer's own exit counts too
+      log "push: $id (title with nonce $nonce) deleted and verified gone"
+    else
+      log "FAILED: push: deleting $id answered $code; it may remain"
+      ok=1
+    fi
+  done
+  rm -f -- "$body" # the file mktemp made above, nothing else
+  for m in "${push[@]}"; do
+    [ -n "${install_of[$m]:-}" ] || continue # never minted (the run stopped before): nothing of it can exist
+    if ! left=$(push_listing "${install_of[$m]}"); then
+      log "FAILED: push records may remain: the listing of $m's install failed"
+      ok=1
+    elif [ -n "$left" ]; then
+      log "FAILED: push records may remain (not deleted): $(paste -sd' ' <<<"$left")"
+      ok=1
+    else
+      log "push: no record left under $m's install"
+    fi
+  done
+  return "$ok"
+}
+
+# After the run: a reservation belongs to the invocation that made it (owned, filled only after a successful
+# reservation) and only it may change one. Released only when the key was never handed to the device; once it was,
+# the reservation stays at its bound whatever was observed.
+observe_starts() {
+  local m
+  for m in "${owned[@]}"; do
+    if [ -n "$key_sent_local" ]; then log "ledger: $m stays at its reserved ${MODEL_BOUND[$m]} (the key was handed to the device)"
+    elif ledger_release "$LEDGER" "$run_id" "$m"; then log "ledger: $m released (the key never left this host)"
+    else log "FAILED: ledger: could not release the reservation of $m"; return 1; fi
+  done
+  [ "${#owned[@]}" = 0 ] || log "ledger: $(ledger_total "$LEDGER" || echo unknown) of $LEDGER_LIMIT model starts counted for Milestone 3"
+}
+
 # Lists the user's home and config entries and /tmp entries owned by the user on the emulator host (never printed).
 listing() {
   # shellcheck disable=SC2016
@@ -815,12 +1138,15 @@ end_local() {
     wait "$wd_pid" 2>/dev/null
     wd_pid=''
   fi
+  # The push directory (the fake's run directory, its log, the run-private homes) goes once the fake is gone.
+  if [ -n "$push_dir" ] && [ -z "$fake_pid" ] && [ -z "$keep_push" ]; then remove_tree "$push_dir" || { log "FAILED: could not remove $push_dir"; r=1; }; push_dir=''; fi
   if [ -n "$tmp" ]; then rm -f "$tmp/in" "$tmp/out" "$tmp/wd" "$tmp/before.txt" "$tmp/after.txt" "$tmp/files"; rmdir "$tmp"; tmp=''; fi
   return "$r"
 }
 
 cleanup_overrun() {
   log "FAILED: the cleanup did not finish within ${TRAP_LIMIT}s and stopped there; sessions or emulator host checks may be incomplete"
+  [ "${#install_of[@]}" = 0 ] || log "FAILED: push records may remain under the installs ${install_of[*]}"
   [ -z "$lock_tried" ] || [ -n "$released" ] || lock_help "may still be held by this run ($run_id)"
   end_local
   key=''
@@ -856,6 +1182,7 @@ local_cleanup() {
   [ -z "$rin" ] || exec {rin}>&-
   [ -z "$rout" ] || exec {rout}<&-
   if [ -n "$tun_fd" ]; then exec {tun_fd}>&-; wait_gone 10 alive "$tunnel_pid" || stop_pid "$tunnel_pid"; fi
+  stop_fake || bad=1
   if [ -n "$locked" ]; then
     postcheck || bad=1
   elif [ -n "$lock_tried" ]; then
@@ -868,6 +1195,9 @@ local_cleanup() {
     esac
   fi
   [ -z "$key" ] || check_sessions || bad=1
+  [ -z "$key" ] || check_push || bad=1
+  observe_starts || bad=1
+  [ -z "$model_capable" ] || hook_warning
   if [ -n "$locked" ]; then
     if listing >"$tmp/after.txt"; then
       new=$(comm -13 <(sort "$tmp/before.txt") <(sort "$tmp/after.txt") | grep -c .)
@@ -877,7 +1207,7 @@ local_cleanup() {
       log "FAILED: could not list the emulator host's home after the run"; bad=1
     fi
   fi
-  for r in "$tunnel_pid" "$remote_pid"; do
+  for r in "$tunnel_pid" "$remote_pid" "$fake_pid"; do
     [ -z "$r" ] || ! alive "$r" || { log "FAILED: local process $r is still running"; bad=1; }
   done
   end_local || bad=1
@@ -913,7 +1243,7 @@ run_remote() {
   mkfifo -m 600 "$tmp/in" "$tmp/out"
   # shellcheck disable=SC2029 # the arguments are meant to expand here
   bounded "$REMOTE_TIMEOUT" ssh -o BatchMode=yes -o ServerAliveInterval=15 \
-    -o ServerAliveCountMax=4 "$HOST" "cd ~/$REMOTE_DIR && exec tools/emulator/run-e2e.sh --remote $tests $tunnel_port $run_id $nonce" \
+    -o ServerAliveCountMax=4 "$HOST" "cd ~/$REMOTE_DIR && exec tools/emulator/run-e2e.sh --remote $tests $tunnel_port $run_id $nonce ${push_port:--} ${push_topic:--} ${push_installs:--}" \
     <"$tmp/in" >"$tmp/out" 2>/dev/null &
   remote_pid=$!
   exec {rin}>"$tmp/in" {rout}<"$tmp/out"
@@ -1097,6 +1427,8 @@ evaluate() {
           for t in "${SCENARIOS[@]}"; do expected+=("SurvivalE2eTest#$t"); done ;;
     scenario) expected=("SurvivalE2eTest#$arg") ;;
     test) [[ $arg != *'#'* ]] || expected=("$arg") ;;
+    push) for t in "${PUSH_TESTS[@]}"; do expected+=("PushE2eTest#$t"); done ;;
+    push-model) expected=("${PUSH_MODEL[@]}") ;;
   esac
   if [[ $mode == smoke || $mode == full ]]; then for t in "${SELFTESTS[@]}"; do expected+=("HarnessSelfTest#$t"); done; fi
   log "results:"
@@ -1109,7 +1441,7 @@ evaluate() {
   for t in "${expected[@]}"; do
     m=${t#*#}
     grep -qx "$t 0" <<<"$res" || { log "  MISSING or not passed: $t"; bad=1; }
-    [[ $t == SmokeE2eTest#* || $t == SurvivalE2eTest#* ]] || continue # only these save evidence
+    [[ $t == SmokeE2eTest#* || $t == SurvivalE2eTest#* || $t == PushE2eTest#* ]] || continue # only these save evidence
     [ -s "$dir/$m.png" ] || { log "  missing screenshot $m.png"; bad=1; }
     grep -qx "${t/\#/.} PASS" "$dir/results.txt" 2>/dev/null || { log "  missing PASS in results.txt for $t"; bad=1; }
     case $m in
@@ -1126,17 +1458,21 @@ evaluate() {
 }
 
 main() {
-  local tests='' r
+  local tests='' r m free p bounds=()
   case ${1:-} in
-    --smoke) tests=smoke mode=smoke ;;
-    --full) tests=all mode=full ;;
-    --scenario) arg=${2:?scenario name} tests=SurvivalE2eTest#$arg mode=scenario ;;
-    --test) arg=${2:?test class} tests=$arg mode=test ;;
+    --smoke) mode=smoke ;;
+    --full) mode=full ;;
+    --scenario) arg=${2:?scenario name} mode=scenario ;;
+    --test) arg=${2:?test class} mode=test ;;
+    --push) mode=push ;;
+    --push-model) mode='push-model' ;;
     --remote) shift; remote "$@"; return ;;
     --in-shell) shift; in_shell "$@"; return ;;
-    *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]>" >&2; exit 2 ;;
+    *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]> | --push | --push-model" >&2; exit 2 ;;
   esac
-  [[ $tests =~ ^[A-Za-z0-9_#]+$ ]] || die "bad test name: $tests"
+  # The whole command line is checked before anything happens: one option, and its one argument where it takes one.
+  [ "$#" = "$([ -n "$arg" ] && echo 2 || echo 1)" ] || die "bad arguments: one selection, with its one argument"
+  select_tests "$mode" "$arg" || die "not a selection of this harness: ${1} ${arg}"
   no_core_dumps || die "could not disable core dumps"
   # The first action: this host's lock, before anything else is touched here or on the emulator host.
   exec 7>"${XDG_RUNTIME_DIR:-/tmp}/apofis-e2e.lock"
@@ -1154,6 +1490,15 @@ main() {
   key=$(grep -E '^API_SERVER_KEY=' ~/.hermes/.env | cut -d= -f2- | tr -d "\"'")
   [ "${#key}" -ge 16 ] || die "API_SERVER_KEY not found in ~/.hermes/.env"
   log "run $run_id, nonce $nonce"
+  [ -z "$model_capable" ] || hook_warning
+  if [ "${#models[@]}" -gt 0 ]; then
+    for m in "${models[@]}"; do bounds+=("$m=${MODEL_BOUND[$m]}"); done
+    ledger_reserve "$LEDGER" "$LEDGER_LIMIT" "$run_id" "${bounds[@]}" ||
+      die "ledger: reserving ${bounds[*]} would pass $LEDGER_LIMIT model starts, or $LEDGER is unreadable or ambiguous; nothing started"
+    owned=("${models[@]}") # only now: the cleanup may change only what this invocation reserved
+    log "ledger: reserved ${bounds[*]} ($(ledger_total "$LEDGER") of $LEDGER_LIMIT counted)"
+  fi
+  [ "${#push[@]}" = 0 ] || provision_push
 
   log "stage 0: the emulator host's lock"
   take_lock
@@ -1173,24 +1518,39 @@ main() {
 
   log "stage 2: reverse tunnel to Hermes"
   # shellcheck disable=SC2016
-  tunnel_port=$(rsh 'for p in $(seq 18642 18662); do o=$(ss -Hltn "sport = :$p") || exit 1; [ -n "$o" ] || { echo "$p"; exit 0; }; done; exit 1' 2>/dev/null) ||
-    tunnel_port=''
+  free=$(rsh 'for p in $(seq 18642 18662); do o=$(ss -Hltn "sport = :$p") || exit 1; [ -n "$o" ] || echo "$p"; done' 2>/dev/null) ||
+    free=''
+  tunnel_port=$(head -n1 <<<"$free")
   [[ $tunnel_port =~ ^18[0-9]{3}$ ]] || die "no free tunnel port on $HOST"
+  local fwd=(-R "127.0.0.1:$tunnel_port:127.0.0.1:$HERMES_PORT") ports=("$tunnel_port")
+  if [ "${#push[@]}" -gt 0 ]; then
+    # The fake ntfy's port: free on both hosts, inside the postcheck's port range on the emulator host.
+    for p in $(tail -n +2 <<<"$free"); do
+      [[ $p =~ ^18[0-9]{3}$ ]] && r=$(ss -Hltn "sport = :$p") && [ -z "$r" ] && { push_port=$p; break; }
+    done
+    [ -n "$push_port" ] || die "no port free on both hosts for the fake ntfy"
+    start_fake || die "the fake ntfy did not start"
+    log "fake ntfy listening on 127.0.0.1:$push_port here (run-private, synthetic database only)"
+    fwd+=(-R "127.0.0.1:$push_port:127.0.0.1:$push_port") ports+=("$push_port")
+  fi
   # Its stdin is held by this script: when this script dies for any reason, the remote cat ends and the tunnel closes.
   exec {tun_fd}> >(exec ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
-    -R "127.0.0.1:$tunnel_port:127.0.0.1:$HERMES_PORT" "$HOST" 'exec cat >/dev/null' >/dev/null 2>&1)
+    "${fwd[@]}" "$HOST" 'exec cat >/dev/null' >/dev/null 2>&1)
   tunnel_pid=$!
   local listen=''
-  for _ in $(seq 20); do
-    # shellcheck disable=SC2029
-    listen=$(RSH_TIMEOUT=20 rsh "ss -Hltn 'sport = :$tunnel_port'" 2>/dev/null | awk '{print $4}' | sort -u) || listen=''
-    [ -z "$listen" ] || break
-    alive "$tunnel_pid" || die "the tunnel exited"
-    sleep 1
+  for p in "${ports[@]}"; do
+    listen=''
+    for _ in $(seq 20); do
+      # shellcheck disable=SC2029
+      listen=$(RSH_TIMEOUT=20 rsh "ss -Hltn 'sport = :$p'" 2>/dev/null | awk '{print $4}' | sort -u) || listen=''
+      [ -z "$listen" ] || break
+      alive "$tunnel_pid" || die "the tunnel exited"
+      sleep 1
+    done
+    # The requested bind is not enough: the server's SSH policy could widen it, so the actual listener is checked.
+    [ "$listen" = "127.0.0.1:$p" ] || die "the tunnel does not listen on 127.0.0.1:$p only"
   done
-  # The requested bind is not enough: the server's SSH policy could widen it, so the actual listener is checked.
-  [ "$listen" = "127.0.0.1:$tunnel_port" ] || die "the tunnel does not listen on 127.0.0.1:$tunnel_port only"
-  log "tunnel up: $HOST 127.0.0.1:$tunnel_port -> 127.0.0.1:$HERMES_PORT (verified loopback only)"
+  log "tunnel up: $HOST 127.0.0.1:$tunnel_port -> 127.0.0.1:$HERMES_PORT${push_port:+, 127.0.0.1:$push_port -> the fake ntfy} (verified loopback only)"
 
   local rc=0
   run_remote "$tests" || rc=$?
