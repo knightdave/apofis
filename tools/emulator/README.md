@@ -179,8 +179,11 @@ contacts ntfy.sh or any other push host.
   30 s), and 200 only with proof that this invocation's child posted exactly once to this fake (one new hook log line
   `matched regs=1 <this origin>=200`, exactly one message received meanwhile, the fixed `{"kind":"needs_input"}`). On
   stop it admits no further trigger, waits for a hook parent still starting, and kills any child still holding a slot.
-  Its stdin is a pipe the harness holds: if the harness dies without its cleanup, the fake stops by itself and removes
-  its files. The cleanup stops it, requires "stopped: child released|killed" and its port closed here (otherwise it
+  The harness starts it as its own child and passes its own pid (`--owner-pid`): the fake starts only if that process
+  is its parent, and checks about twice a second that it still is. If the harness dies without its cleanup, the fake
+  is reparented, stops (bounded teardown, killing any hook child still holding a slot) and, when every child is
+  accounted for, removes the files it created in its run directory; the harness's own temporary directory on the
+  build host stays (as on main). The cleanup stops it, requires "stopped: child released|killed" and its port closed here (otherwise it
   fails and keeps the private directory for inspection); the postcheck covers the tunnel's port there.
 - **The distributor** is the e2e APK (`FakeDistributor`, accepted only by debug builds): it answers the app's REGISTER
   with `NEW_ENDPOINT http://127.0.0.1:<port>/<topic>?up=1` and sends MESSAGE, UNREGISTERED and TEMP_UNAVAILABLE for the
@@ -204,12 +207,12 @@ contacts ntfy.sh or any other push host.
   record left fails the run with "push records may remain", naming it, without deleting it.
 - **The ledger.** `--push-model` and its `--test` selections first reserve their proved upper bounds (1 per method) in
   `~/.local/state/apofis-e2e/model-budget-m3`, shared by every worktree and appended under `flock`
-  (`reserve <run id> <method> <bound>`), and refuse when the reserved and observed starts would pass 8 or the ledger is
-  unreadable, ambiguous or torn, or a proposal repeats a run and method. After the run an observed count
-  (`observed <run id> <method> <n>`) replaces a reservation's bound only on positive proof: 0 when the key never left
-  the build host; otherwise only with a journal found complete, either the user turns in the server's whole record of
-  the method's journaled chat (a complete page for that session with at least its one turn) or 0 when that journal has
-  no send for it. Anything uncertain leaves the bound. Every model-capable run, ledgered or not (`--full`, `--scenario`,
+  (`reserve <run id> <method> <bound>`), and refuse when the counted starts plus the new bounds would pass 8, the ledger
+  is unreadable, not exactly in its two line forms or torn, or a proposal repeats a run and method or one already
+  reserved (one parser reads existing and proposed entries). A reservation belongs to the invocation that made it:
+  only it may change it. Once the key was handed to the device the reservation stays at its bound whatever was
+  observed; it is released (`observed <run id> <method> 0`) only when the key never left the build host. Every
+  model-capable run, ledgered or not (`--full`, `--scenario`,
   model-capable `--test`), prints how often `apofis_push.py` appears in `~/.hermes/config.yaml` and the allowlist (count
   only, "unknown" when a file cannot be read): with the hook installed, each model run can send one contentless wake
   naming a test chat to the owner's ntfy endpoint.

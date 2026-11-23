@@ -469,7 +469,7 @@ class RealTrigger(Base):
             # A dummy owner like the harness: it starts the fake, then a long-lived child that inherits every descriptor
             # it has (as the tunnel's ssh does), then waits; it dies abruptly, the other child stays alive.
             owner = subprocess.Popen(["bash", "-c", 'exec 5>"$1.held"; "$2" -I "$3" --run-dir "$4" --port "$5" --topic "$6" '
-                                      '--script "$7" --wake-install "$8" --stop-with-parent >"$1" 2>&1 </dev/null & '
+                                      '--script "$7" --wake-install "$8" --owner-pid $$ >"$1" 2>&1 </dev/null & '
                                       'echo $! >"$1.pid"; sleep 300 & echo $! >"$1.sibling"; wait',
                                       "_", out, sys.executable, os.path.join(HERE, "fake_ntfy.py"), run, str(port), TOPIC,
                                       SCRIPT, INSTALL])
@@ -565,7 +565,7 @@ class RealTrigger(Base):
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
             p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "fake_ntfy.py"), "--run-dir", root, "--port",
-                                  str(port), "--topic", TOPIC, "--script", SCRIPT, "--stop-with-parent"],
+                                  str(port), "--topic", TOPIC, "--script", SCRIPT, "--owner-pid", str(os.getpid())],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 self.assertEqual(b"READY\n", p.stdout.readline())
@@ -578,6 +578,23 @@ class RealTrigger(Base):
                     p.kill()
                 for f in (p.stdin, p.stdout, p.stderr):
                     f.close()
+
+
+    def test_an_owner_that_is_not_its_parent_starts_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = os.path.join(root, "run")
+            os.mkdir(run)
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            p = subprocess.run([sys.executable, "-I", os.path.join(HERE, "fake_ntfy.py"), "--run-dir", run, "--port",
+                                str(port), "--topic", TOPIC, "--script", SCRIPT, "--wake-install", INSTALL, "--owner-pid", "1"],
+                               capture_output=True, timeout=WATCHDOG)  # its parent is this test, not pid 1
+            self.assertEqual(3, p.returncode)
+            self.assertEqual(b"", p.stdout)
+            self.assertEqual([], os.listdir(run))  # no home, no fixture
+            with socket.socket() as s:
+                self.assertNotEqual(0, s.connect_ex(("127.0.0.1", port)))
 
 
 class Cli(unittest.TestCase):

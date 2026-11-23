@@ -511,11 +511,17 @@ fun <N> revealIn(list: ScrollList<N>, cap: Int = 15): Pair<N?, Int> {
 
 /**
  * Polls [condition] until the absolute [deadline] of [now]: true only for an observation that completed by it (the
- * time is read after the probe too, so one that finished late does not count).
+ * time is read after the probe too, so one that finished late does not count). Only a not-yet observation is retried:
+ * a false result or an ordinary exception (a stale UI node, as [AppDriver.waitFor] retries). An evidence failure
+ * (an AssertionError from fail()) or any other Error escapes at once.
  */
 fun observedBy(deadline: Long, now: () -> Long, pause: () -> Unit, condition: () -> Boolean): Boolean {
     while (now() <= deadline) {
-        val seen = runCatching(condition).getOrDefault(false)
+        val seen = try {
+            condition()
+        } catch (e: Exception) {
+            false
+        }
         if (seen) return now() <= deadline
         pause()
     }

@@ -379,6 +379,21 @@ class HarnessSelfTest {
         assertFalse("never seen", observedBy(1_000, { clock }, { clock += 100 }) { false })
         clock = 2_000L
         assertFalse("past the deadline before the first probe", observedBy(1_000, { clock }, { clock += 100 }) { true })
+        clock = 0L
+        assertTrue("a stale node is only not yet", observedBy(1_000, { clock }, { clock += 100 }) { if (clock < 300) throw IllegalStateException("stale") else true })
+    }
+
+    @Test
+    fun anEvidenceFailureInsideTheDeadlineWaitEscapes() {
+        var probes = 0
+        val escaped = runCatching {
+            observedBy(1_000, { 0L }, {}) {
+                probes++
+                if (probes == 1) fail("The notification list could not be read") else true
+            }
+        }.exceptionOrNull()
+        assertTrue("the evidence assertion escapes", escaped is AssertionError)
+        assertEquals("the second probe never runs", 1, probes)
     }
 
     @Test

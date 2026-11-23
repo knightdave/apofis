@@ -834,8 +834,18 @@ LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m3 models=() owned=() key_sent
 # shellcheck disable=SC2329,SC2032 # the recorders replace the real commands inside the subshells below
 seam_case() { # <push_dir> <installs: "" or one>
   (
-    mktemp() { echo "mktemp $*" >>"$t/fileops"; command mktemp "$@"; }
-    rm() { echo "rm $*" >>"$t/fileops"; command rm "$@"; }
+    # Record every call and refuse it without executing anything, except the one fixture: a file made from the exact
+    # template inside this test's own owned directory, and the removal of exactly the file so made.
+    mktemp() {
+      echo "mktemp $*" >>"$t/fileops"
+      [ "$*" = "$t/owned-push/body.XXXXXX" ] || return 1
+      command mktemp "$@" | tee "$t/made"
+    }
+    rm() {
+      echo "rm $*" >>"$t/fileops"
+      [ -s "$t/made" ] && [ "$*" = "-f -- $(cat "$t/made")" ] || return 1
+      command rm -f -- "$(cat "$t/made")"
+    }
     push_listing() { :; }
     push=(connectorLifecycle) push_dir=$1 key_sent_local='' sessions_state=ok journal=()
     if [ -n "$2" ]; then install_of=([connectorLifecycle]=$2); else install_of=(); fi
@@ -847,7 +857,7 @@ seam_case '' ''
 check "push check: nothing minted and no private directory (a refused reservation): passes, no file operation at all" '[ ! -s "$t/fileops" ] && [ "$(cat "$t/seam-rc")" = 0 ]'
 : >"$t/fileops"
 seam_case '' "$IA"
-check "push check: installs but no private directory: refused, still no file operation" '[ ! -s "$t/fileops" ]'
+check "push check: installs but no private directory: refused (exit 1), still no file operation" '[ ! -s "$t/fileops" ] && [ "$(cat "$t/seam-rc")" = 1 ]'
 mkdir -p "$t/owned-push"
 : >"$t/fileops"
 seam_case "$t/owned-push" "$IA"

@@ -54,7 +54,7 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   distributorLogsOnlyKnownActionsFromTheApp
   quietDeliveriesNeedANewPushCheckThatTookNoRun wakePreconditionPassesTheStoredRunsSendingRowOnly
   pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly revealScrollsFirstAndJudgesProgressByWhatIsShown
-  anObservationFinishingAfterTheDeadlineDoesNotCount settingsRowValueIsAWholeSegment)
+  anObservationFinishingAfterTheDeadlineDoesNotCount anEvidenceFailureInsideTheDeadlineWaitEscapes settingsRowValueIsAWholeSegment)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
 # Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
 # tunnel. Gate 1's start no model run.
@@ -930,12 +930,14 @@ provision_push() {
 # Starts the fake ntfy on this host (run-private directory, minimal environment, its own session so a terminal signal
 # does not reach it before the cleanup) and waits for it to listen.
 start_fake() {
-  local wake='' i
+  local wake='' i owner
   [[ " ${push[*]} " == *" pushWakesKilledApp "* ]] && wake=${install_of[pushWakesKilledApp]}
-  # Started directly by this script (setsid does not fork here: a background job of a non-interactive shell leads no
-  # group), so this script is its parent: when this script dies for any reason, the fake is reparented and stops.
+  # Started directly by this shell (setsid does not fork here: a background job of a non-interactive shell leads no
+  # group), which names itself as the owner: the fake starts only as this shell's child, and stops when reparented.
+  # The pid is read here: the arguments of a background command are expanded after the fork, in the child.
+  owner=$BASHPID
   setsid env -i PATH="$PATH" python3 -I tools/emulator/fake_ntfy.py --run-dir "$push_dir/fake" --port "$push_port" \
-    --topic "$push_topic" --script "$PUSH_SCRIPT" ${wake:+--wake-install "$wake"} --stop-with-parent \
+    --topic "$push_topic" --script "$PUSH_SCRIPT" ${wake:+--wake-install "$wake"} --owner-pid "$owner" \
     </dev/null >"$push_dir/fake.log" 2>&1 7>&- &
   fake_pid=$!
   for i in $(seq 40); do

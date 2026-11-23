@@ -13,7 +13,8 @@ runs in D/home with HERMES_HOME=D/home, so its slot locks and log stay in D, wit
 answers once the detached child the script starts has released its slot (past CHILD_WAIT it kills the child's process
 group), and answers 200 only with proof that this invocation's child posted exactly once to this fake: one new hook
 log line "matched regs=1 <this origin>=200", exactly one message received meanwhile, and that message the fixed
-anonymous body. On SIGTERM, SIGINT, SIGHUP, or (with --stop-with-parent) when its parent process is gone, the fake admits
+anonymous body. With --owner-pid it starts only when that process is its parent. On SIGTERM, SIGINT, SIGHUP, or (with
+--owner-pid) when its parent is no longer that owner, the fake admits
 no further trigger, waits for a hook still starting, stops serving, kills any child still holding a slot, checks it
 is gone and exits 0 (1 if one could not be accounted for); after an owner's death it also removes the files it
 created when every child is accounted for. Python 3.9+ standard library.
@@ -381,15 +382,19 @@ def main(argv: list) -> int:
     for a in ("--run-dir", "--port", "--topic", "--script"):
         p.add_argument(a, required=True)
     p.add_argument("--wake-install")
-    p.add_argument("--stop-with-parent", action="store_true")  # the owner started us: a changed parent pid means it died
+    p.add_argument("--owner-pid")  # the harness's own pid: it must be our parent, and its going away stops us
     try:
         o = p.parse_args(argv)
     except SystemExit:
         return 2
     if (not os.path.isdir(o.run_dir) or not o.port.isdigit() or not 1024 <= int(o.port) <= 65535
             or not TOPIC_RE.fullmatch(o.topic) or not os.path.isfile(o.script)
-            or (o.wake_install is not None and not UUID_RE.fullmatch(o.wake_install))):
+            or (o.wake_install is not None and not UUID_RE.fullmatch(o.wake_install))
+            or (o.owner_pid is not None and not o.owner_pid.isdigit())):
         return 2
+    owner = int(o.owner_pid) if o.owner_pid is not None else None
+    if owner is not None and os.getppid() != owner:  # not started by that owner (or it is already gone): nothing at all
+        return 3
     for fd in [int(f) for f in os.listdir("/proc/self/fd")]:  # nothing inherited beyond stdio (a lock, a tunnel)
         if fd > 2:
             try:
@@ -401,11 +406,10 @@ def main(argv: list) -> int:
         signal.signal(s, lambda *_: stop.set())
     fake = Fake(o.run_dir, int(o.port), o.topic, o.script, o.wake_install)
     orphaned = threading.Event()
-    parent = os.getppid()  # read before anything else could let the owner die unnoticed
     fake.start()
     say("READY")
     while not stop.wait(0.5):
-        if o.stop_with_parent and os.getppid() != parent:  # reparented: the owner is gone, whoever holds its descriptors
+        if owner is not None and os.getppid() != owner:  # reparented: the owner is gone, whoever holds its descriptors
             orphaned.set()
             break
     child = fake.stop()
