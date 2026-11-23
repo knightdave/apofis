@@ -1,5 +1,8 @@
 package xyz.rycerz.apofis.ui.chat
 
+import androidx.compose.ui.platform.LocalDensity
+import xyz.rycerz.apofis.ui.theme.claimSideways
+import xyz.rycerz.apofis.ui.theme.sidewaysScroll
 import androidx.annotation.StringRes
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -21,7 +24,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -77,7 +79,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             CodeSurface {
                 Text(
                     command,
-                    Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+                    Modifier.sidewaysScroll(rememberScrollState(), LocalDensity.current).padding(horizontal = 12.dp, vertical = 8.dp),
                     style = ChatText.code,
                     color = MaterialTheme.colorScheme.onSurface,
                     softWrap = false,
@@ -96,7 +98,8 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                 Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering, gate) { choose(it, ApprovalChoice.ONCE) }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
-                    ApofisIconButton(onClick = { menu = true }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
+                    val chatGate = LocalChatGate.current // a control of the chat layout the drawer covers
+                    ApofisIconButton(onClick = { chatGate { menu = true } }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
                         Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
                     }
                     DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
@@ -130,7 +133,7 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
             OutlinedTextField(
                 answer,
                 { answer = it },
-                Modifier.weight(1f),
+                Modifier.weight(1f).claimSideways(),
                 placeholder = { Text(stringResource(R.string.chat_clarify_hint)) },
                 maxLines = 5,
                 enabled = !answering,

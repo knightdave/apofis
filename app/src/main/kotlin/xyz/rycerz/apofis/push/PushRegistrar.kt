@@ -179,14 +179,28 @@ class PushRegistrar(
         afterUserOp()
     }
 
-    /** Off is committed (with the registration to revoke) before anything else happens. */
-    suspend fun disable() {
-        withContext(NonCancellable) { // the user confirmed Off: a cancelled caller does not undo it
-            op { _ ->
-                if (enabled()) rotate(off = true) else finishRevocations()
+    /**
+     * Off is committed (with the registration to revoke) before anything else happens. True when it was applied: Off is
+     * on disk (its unregistering may still fail and be retried); false when it was dropped because the connection it was
+     * admitted under is gone, or the commit failed.
+     */
+    suspend fun disable(): Boolean {
+        var applied = false
+        try {
+            withContext(NonCancellable) { // the user confirmed Off: a cancelled caller does not undo it
+                op { _ ->
+                    if (enabled()) commitLive { beginRevocation(off = true) }
+                    applied = true
+                    finishRevocations()
+                }
             }
+            afterUserOp()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logFailure(e) // finalising or scheduling failed: the outcome already decided stands
         }
-        afterUserOp()
+        return applied
     }
 
     /** Finishes persisted intents and publishes. True when nothing is left for this connection to retry. */
@@ -255,6 +269,16 @@ class PushRegistrar(
         !prefs.contains(Keys.REVOKE)
     } ?: false
 
+    /** Recomputes the shown state in turn with the operations: under the registrar's lock, off the main thread, no network. */
+    suspend fun refreshNow() = withContext(Dispatchers.IO) { mutex.withLock { state.value = compute() } }
+
+    /**
+     * The record's endpoint for a test push of [owner], in one read: only while [owner] is the current registration and its
+     * journaled registration (that epoch and instance) owns the published endpoint; otherwise null.
+     */
+    fun testEndpoint(owner: String): String? =
+        PushStore.locked { endpoint?.takeIf { testOwner(epoch(), currentInstance()) == owner && it == confirmed() } }
+
     /** Recomputes the shown state, e.g. after the receiver failed to store an endpoint. */
     fun refresh() {
         state.value = compute()
@@ -289,7 +313,7 @@ class PushRegistrar(
                 } finally {
                     live = { true }
                     if (server && !stale && recordThis) runCatching { recordOutcome(a != null, error) }.onFailure(::logFailure)
-                    state.value = compute()
+                    runCatching { state.value = compute() }.onFailure(::logFailure) // never replaces the operation's own outcome or cancellation
                 }
             }
         }
@@ -518,7 +542,7 @@ class PushRegistrar(
             matching -> PushState.ServerError(distributor) // the running policy refuses the stored endpoint
             else -> PushState.Registering
         }
-        return PushUi(s)
+        return PushUi(s, testOwner(epoch(), currentInstance()))
     }
 
 

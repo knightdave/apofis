@@ -3,13 +3,6 @@ package xyz.rycerz.apofis.ui
 import android.os.Looper
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.rememberDrawerState
-import androidx.compose.ui.Modifier
 import java.time.ZoneOffset
 import org.robolectric.Shadows.shadowOf
 import xyz.rycerz.apofis.db.SessionEntity
@@ -22,6 +15,9 @@ import xyz.rycerz.apofis.ui.drawer.Prompt
 import xyz.rycerz.apofis.ui.drawer.PromptActions
 import xyz.rycerz.apofis.ui.drawer.PromptHost
 import xyz.rycerz.apofis.ui.drawer.PromptKind
+import xyz.rycerz.apofis.ui.drawer.PushDrawer
+import xyz.rycerz.apofis.ui.drawer.PushDrawerValue
+import xyz.rycerz.apofis.ui.drawer.rememberPushDrawerState
 import xyz.rycerz.apofis.ui.drawer.groupSessions
 import androidx.compose.runtime.Composable
 import kotlinx.coroutines.test.runTest
@@ -55,6 +51,12 @@ import xyz.rycerz.apofis.ui.connect.ConnectScreen
 import xyz.rycerz.apofis.ui.connect.ConnectState
 import xyz.rycerz.apofis.ui.connect.ConnectViewModel
 import xyz.rycerz.apofis.ui.settings.SettingsScreen
+import xyz.rycerz.apofis.notify.NotificationAccess
+import xyz.rycerz.apofis.notify.Runtime
+import xyz.rycerz.apofis.push.PushState
+import xyz.rycerz.apofis.push.PushUi
+import xyz.rycerz.apofis.ui.settings.NotificationsRow
+import xyz.rycerz.apofis.ui.settings.NotificationsUi
 import xyz.rycerz.apofis.ui.theme.SeedSchemes
 
 @RunWith(RobolectricTestRunner::class)
@@ -105,6 +107,7 @@ class ScreenshotTest {
         dynamicColor = true,
         pureBlack = false,
         versionName = "0.1.0",
+        notifications = { NotificationsRow(NotificationsUi(NotificationAccess(Runtime.GRANTED, true, true, true), PushUi(PushState.NoDistributor), null)) {} },
         onConnection = {},
         onThemeMode = {},
         onDynamicColor = {},
@@ -292,15 +295,11 @@ class ScreenshotTest {
 
     @Composable
     private fun DrawerOpen(rows: List<DrawerRow>, query: String = "", hasArchived: Boolean = true, refreshFailed: Boolean = false) {
-        ModalNavigationDrawer(
-            drawerContent = {
-                ModalDrawerSheet(Modifier.fillMaxWidth(0.75f), drawerContainerColor = MaterialTheme.colorScheme.surface) {
-                    DrawerContent(rows, query, refreshFailed, hasArchived, object : DrawerActions {}, {}, {}, {}, {})
-                }
-            },
-            drawerState = rememberDrawerState(DrawerValue.Open),
-        ) {
-            ChatScreen(chat(listOf(question, answer)), object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY)
+        PushDrawer(
+            rememberPushDrawerState(PushDrawerValue.Open),
+            drawerContent = { DrawerContent(rows, query, refreshFailed, hasArchived, object : DrawerActions {}, {}, {}, {}, {}) },
+        ) { dragArea ->
+            ChatScreen(chat(listOf(question, answer)), object : ChatActions {}, onOpenConnection = {}, zone = utc, today = FIXED_TODAY, dragArea = dragArea)
         }
     }
 

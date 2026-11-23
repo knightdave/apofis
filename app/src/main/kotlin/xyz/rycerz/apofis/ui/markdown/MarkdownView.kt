@@ -1,12 +1,12 @@
 package xyz.rycerz.apofis.ui.markdown
 
+import xyz.rycerz.apofis.ui.theme.sidewaysScroll
 import android.content.ClipData
 import androidx.annotation.StringRes
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -109,7 +109,7 @@ fun MarkdownChunk(
         is DisplayChunk.Literal -> Text(chunk.text, modifier.fillMaxWidth(), style = body, color = MaterialTheme.colorScheme.onSurface)
         is DisplayChunk.Code -> Text(
             chunk.text,
-            modifier.horizontalScroll(rememberScrollState()),
+            modifier.sidewaysScroll(rememberScrollState(), LocalDensity.current),
             style = scaled(ChatText.code),
             color = MaterialTheme.colorScheme.onSurface,
             softWrap = false,
@@ -358,7 +358,7 @@ private fun Table(
                     CopyButton(R.string.md_table_copy, source)
                 }
             }
-            Column(Modifier.horizontalScroll(scroll)) {
+            Column(Modifier.sidewaysScroll(scroll, density)) {
                 if (first) TableRow(table.header, table.align, fitted, headerStyle, MaterialTheme.colorScheme.onSurface, colors.tableHeaderFill, colors.tableDivider, onLink)
                 for (r in from until to) TableRow(table.rows[r], table.align, fitted, bodyStyle, colors.tableBody, Color.Unspecified, colors.tableDivider, onLink)
             }

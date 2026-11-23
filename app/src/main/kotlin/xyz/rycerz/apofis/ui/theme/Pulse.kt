@@ -75,11 +75,14 @@ fun rememberTimeMs(periodMs: Int, active: Boolean = true): State<Long> {
     return time
 }
 
-/** A 9 dp dot whose alpha pulses 0.4 to 1 over [Motion.PULSE_PERIOD]; under reduced motion a 9 dp ring, 1.5 dp stroke. */
+/**
+ * A 9 dp dot whose alpha pulses 0.4 to 1 over [Motion.PULSE_PERIOD]; under reduced motion a 9 dp ring, 1.5 dp stroke.
+ * While not [active] (composed but not on screen) it schedules no frames and draws its first frame.
+ */
 @Composable
-fun PulsingDot(color: Color, modifier: Modifier = Modifier) {
+fun PulsingDot(color: Color, modifier: Modifier = Modifier, active: Boolean = true) {
     val reduce = ApofisTheme.reduceMotion
-    val time = rememberTimeMs(Motion.PULSE_PERIOD)
+    val time = rememberTimeMs(Motion.PULSE_PERIOD, active)
     Box(
         modifier.size(9.dp).drawBehind {
             if (reduce) {

@@ -220,7 +220,7 @@ class PushReceiver : MessagingReceiver() {
             if (!trusted(context) || instance != instanceOf(pushPrefs(context))) return@locked
             if (handoff?.claim() == false) throw Abandoned() // the sink's commit is the event's own first write
             try {
-                testPush?.onWake()
+                testPush?.onWake(testOwner(connectionEpoch(context), instance))
                 if (sink == null) return@locked
                 val handedOff = try {
                     sink.onPush(context, connectionEpoch(context))

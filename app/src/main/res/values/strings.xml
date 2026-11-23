@@ -156,6 +156,28 @@
     <string name="settings_source">Source code</string>
     <string name="settings_source_url" translatable="false">https://github.com/knightdave/apofis</string>
     <string name="settings_licenses">Open-source licenses</string>
+    <string name="settings_notifications">Notifications</string>
+    <string name="settings_notif_off">Off</string>
+    <string name="settings_notif_on">ntfy</string>
+    <string name="settings_notif_no_distributor">ntfy is not installed</string>
+    <string name="settings_notif_blocked">Blocked in system settings</string>
+    <string name="settings_notif_channel_blocked">Some notifications are blocked</string>
+    <string name="settings_notif_registering">Setting up</string>
+    <string name="settings_notif_server_error">Not saved on the server</string>
+    <string name="settings_notif_fallback">Without push, the app checks about every 15 minutes while a reply is running</string>
+    <string name="settings_notif_retry">Try again now</string>
+    <string name="settings_notif_system">Open system settings</string>
+    <string name="settings_notif_test">Send test push</string>
+    <string name="settings_notif_test_sent">Test sent, waiting</string>
+    <string name="settings_notif_test_failed">Test not sent</string>
+    <string name="settings_notif_test_received">A push arrived</string>
+    <string name="settings_notif_test_none">No push arrived</string>
+    <string name="settings_notif_turn_off">Turn off push</string>
+    <string name="settings_notif_turn_off_text">Replies will still be checked about every 15 minutes while one is running.</string>
+    <string name="settings_notif_turn_off_title">Turn off push?</string>
+    <string name="settings_notif_turn_off_failed">Could not turn off push. Try again.</string>
+    <string name="settings_notif_system_unavailable">System settings could not be opened</string>
+    <string name="settings_ntfy_url" translatable="false">https://f-droid.org/packages/io.heckel.ntfy</string>
     <string name="licenses_lucide">Lucide icons</string>
     <string name="licenses_commonmark">commonmark-java (BSD 2-Clause)</string>
     <string name="licenses_unifiedpush">UnifiedPush Android connector (Apache License 2.0)</string>
@@ -174,6 +196,8 @@
     <string name="chat_show_full">Show full message</string>
     <string name="settings_link_no_app">No app on this phone can open links</string>
     <string name="drawer_open">Open chat list</string>
+    <string name="drawer_close">Close the chat list</string>
+    <string name="drawer_title">Chat list</string>
     <string name="drawer_new_chat">New chat</string>
     <string name="drawer_search_hint">Search chats</string>
     <string name="drawer_no_match">No chats match</string>

@@ -28,6 +28,8 @@ import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.layout.SubcomposeMeasureScope
 import androidx.compose.ui.layout.MeasureResult
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.foundation.layout.asPaddingValues
@@ -91,6 +93,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.key
 import androidx.compose.runtime.SideEffect
 import xyz.rycerz.apofis.chat.SendState
+import xyz.rycerz.apofis.api.ApprovalChoice
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -124,7 +127,9 @@ fun ChatScreen(
     listState: LazyListState = rememberLazyListState(),
     currentState: (() -> ChatUiState)? = null, // the owner's state now, for Copy and Select at action time
     enterToSend: Boolean = false, // Return sends (the setting); off, it starts a new line
-    covered: Boolean = false, // another surface (the drawer) is over the chat and owns Back
+    dragArea: Modifier = Modifier, // where a horizontal drag may start (the push drawer): the top bar and the transcript, never the composer
+    covered: Boolean = false, // the drawer covers the chat and owns Back (for composition)
+    coveredNow: () -> Boolean = { covered }, // the same, read live when an action fires: every action is dropped while true
 ) {
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<StepSubject?>(null) } // the tool step shown in the sheet, fixed when opened
@@ -157,22 +162,33 @@ fun ChatScreen(
             state.status == StatusLine.LOAD_FAILED,
         ),
     )
+    // One gate for everything the chat can do: while the drawer covers it, a press that was already down (another
+    // finger dragged the drawer) or any late activation does nothing. Read at call time, so it recomposes nothing.
+    val coveredRead = rememberUpdatedState(coveredNow)
+    val actionsNow = rememberUpdatedState(actions)
+    val gate = remember { Gate { coveredRead.value() } }
+    val passGate: (() -> Unit) -> Unit = remember { gate::pass } // one instance: a new one would recompose the bar
+    val gated = remember { CoveredActions({ actionsNow.value }, gate) }
     val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
-    val callbacks = rememberUpdatedState(Callbacks(actions, onRetryLoad, zone, today))
+    val openConnection = remember { { gate.pass { barCallbacks.value.onOpenConnection() } } }
+    val retryLoad = remember { { gate.pass { barCallbacks.value.onRetryLoad() } } }
+    val callbacks = rememberUpdatedState(Callbacks(gated, retryLoad, zone, today))
     // The objects the slots use, read through a holder too: replacing the list state (and with it the follower), the
     // backdrop (the blur setting) or the link handler reaches the screen; equal identities notify nothing.
     val objects = rememberUpdatedState(Objects(listState, follow, backdrop, uriHandler))
     // Read by the transcript slot only: the app passes a new lambda with every state, which must not reach the composer.
     val current = rememberUpdatedState(currentState)
+    val drag = rememberUpdatedState(dragArea)
 
     val barHidden = remember { BarHidden() }
     val barSlot = remember {
         @Composable {
             SideEffect { ChromeProbe.barCompositions++ }
             val c = barCallbacks.value
+            val input = barInput.value // read here, so this slot (and its probe) recomposes when the bar's inputs change
             ChatTopBar(
-                barInput.value, c.onOpenConnection, c.onRetryLoad, c.navigationIcon, c.appBarActions,
-                Modifier
+                input, openConnection, retryLoad, c.navigationIcon, c.appBarActions,
+                drag.value
                     .blockTouchesBelow()
                     .coverForAccessibility(order = -1f)
                     .onFocusChanged { barHidden.focused = it.hasFocus }
@@ -239,7 +255,7 @@ fun ChatScreen(
                         busy = input.sending,
                         enterToSend = input.enterToSend,
                         expanded = input.expanded,
-                        onExpandedChange = { expandedIn.value = if (it) input.sessionKey else null },
+                        onExpandedChange = { grow -> gate.pass { expandedIn.value = if (grow) input.sessionKey else null } }, // a user action of the covered layout
                         backdrop = objects.value.backdrop,
                         subject = if (input.mode == ComposerMode.STOP || input.mode == ComposerMode.STEER) input.runId else input.sessionKey,
                     )
@@ -271,6 +287,7 @@ fun ChatScreen(
                 val listState = o.list
                 val follow = o.follow
                 val backdrop = o.backdrop
+                val dragArea = drag.value
                 SideEffect {
                     if (BuildConfig.DEBUG) ChromeProbe.bodyCompositions++
                     ChromeProbe.bodyBackdropId = System.identityHashCode(backdrop)
@@ -278,7 +295,7 @@ fun ChatScreen(
                 }
                 val surface = MaterialTheme.colorScheme.surface
                 if (state.status == StatusLine.LOAD_FAILED) {
-                    Uncovered(barHeight, bottomArea, fullScreen = false) {
+                    Uncovered(barHeight, bottomArea, fullScreen = false, dragArea) {
                         BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             // With room, the text and Retry. With less, the title's own retry stays while the bar is shown;
                             // with the bar hidden, a compact Retry alone wherever its 48 dp target fits. Below that nothing:
@@ -305,7 +322,7 @@ fun ChatScreen(
                             bottom = bottomArea.toDp() + 8.dp,
                         )
                     }
-                    Uncovered(barHeight, bottomArea, fullScreen = true) {
+                    Uncovered(barHeight, bottomArea, fullScreen = true, dragArea) {
                         MessageList(
                             state.items,
                             state.live,
@@ -313,7 +330,7 @@ fun ChatScreen(
                             state.answering,
                             c.actions,
                             onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
-                            onStep = { detail = it },
+                            onStep = { step -> gate.pass { detail = step } },
                             listState = listState,
                             contentPadding = padding,
                             zone = c.zone,
@@ -333,8 +350,8 @@ fun ChatScreen(
                                     }
                                     drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
                                 },
-                            onLink = { url -> linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure },
-                            onSelect = { selectKey = it },
+                            onLink = { url -> gate.pass { linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure } },
+                            onSelect = { key -> gate.pass { selectKey = key } },
                             current = current.value?.let { now -> { now().items } },
                             onRevealGrew = follow::onGrew, // the follower read through the objects holder above
                         )
@@ -345,8 +362,10 @@ fun ChatScreen(
                         visible = follow.buttonVisible,
                         backdrop = backdrop,
                         onClick = {
-                            follow.onButton()
-                            scope.launch { listState.animateScrollToItem(0) }
+                            gate.pass {
+                                follow.onButton()
+                                scope.launch { listState.animateScrollToItem(0) }
+                            }
                         },
                         // The 28 dp circle sits 12 dp from the end and 12 dp above the bottom area; its 48 dp target extends 10 dp around it.
                         Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)).padding(end = 2.dp, bottom = 2.dp),
@@ -392,10 +411,13 @@ fun ChatScreen(
         }
         measure
     }
-    SubcomposeLayout(
-        modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
-        policy,
-    )
+    // Controls inside the layout (the bar slots' buttons, the approval's More) reach the same gate.
+    CompositionLocalProvider(LocalChatGate provides passGate) {
+        SubcomposeLayout(
+            modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
+            policy,
+        )
+    }
 
     state.confirmCancel?.let { id ->
         // The dialog follows its own row: it rewords once a request may have gone out, and closes once the row is
@@ -542,8 +564,8 @@ private fun WashTextButton(label: Int, onClick: () -> Unit) {
  * parent; touches are stopped by the bars themselves); otherwise the content is laid out inside it.
  */
 @Composable
-private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, content: @Composable () -> Unit) {
-    Layout(content) { measurables, constraints ->
+private fun Uncovered(top: Int, bottom: Int, fullScreen: Boolean, modifier: Modifier, content: @Composable () -> Unit) {
+    Layout(content, modifier) { measurables, constraints ->
         val height = (constraints.maxHeight - top - bottom).coerceAtLeast(0)
         val full = Constraints.fixed(constraints.maxWidth, constraints.maxHeight)
         val placeable = measurables.single().measure(if (fullScreen) full else Constraints.fixed(constraints.maxWidth, height))
@@ -590,6 +612,44 @@ private data class BarCallbacks(
 private data class Objects(val list: LazyListState, val follow: Follower, val backdrop: BackdropState, val uri: UriHandler)
 
 private data class Callbacks(val actions: ChatActions, val onRetryLoad: () -> Unit, val zone: ZoneId, val today: LocalDate)
+
+/**
+ * The chat's one action gate for controls a caller puts in [ChatScreen]'s top bar slots: `LocalChatGate.current { action() }`
+ * runs the action only while the drawer does not cover the chat.
+ */
+val LocalChatGate = staticCompositionLocalOf<(() -> Unit) -> Unit> { { it() } }
+
+/** Runs an action only while the chat is not covered by the drawer, asking [covered] at that moment. */
+internal class Gate(private val covered: () -> Boolean) {
+    fun pass(action: () -> Unit) {
+        if (!covered()) action()
+    }
+
+    fun <T> passOr(covering: T, action: () -> T): T = if (covered()) covering else action()
+}
+
+/**
+ * [actions] through [gate]. Exempt, and passed straight on: typing ([onDraftChange]), which dropping could lose, and
+ * the six confirm and dismiss callbacks of the confirmation dialogs, which are their own windows above the drawer.
+ */
+internal class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
+    override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
+    override fun onSendClick(): Boolean = gate.passOr(false) { actions().onSendClick() } // covered: not accepted, nothing called
+    override fun onStopClick(runId: String) = gate.pass { actions().onStopClick(runId) }
+    override fun onRetry(idempotencyKey: String) = gate.pass { actions().onRetry(idempotencyKey) }
+    override fun onConfirmRetry(idempotencyKey: String) = actions().onConfirmRetry(idempotencyKey)
+    override fun onDismissRetry(idempotencyKey: String) = actions().onDismissRetry(idempotencyKey)
+    override fun onCancel(idempotencyKey: String) = gate.pass { actions().onCancel(idempotencyKey) }
+    override fun onConfirmCancel(idempotencyKey: String, mayHaveSentShown: Boolean) = actions().onConfirmCancel(idempotencyKey, mayHaveSentShown)
+    override fun onDismissCancel(idempotencyKey: String) = actions().onDismissCancel(idempotencyKey)
+    override fun onPutBack() = gate.pass { actions().onPutBack() }
+    override fun onDiscardUnsent() = gate.pass { actions().onDiscardUnsent() }
+    override fun onConfirmDiscard(id: Long) = actions().onConfirmDiscard(id)
+    override fun onDismissDiscard() = actions().onDismissDiscard()
+    override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) = gate.pass { actions().onApproval(requestId, executionGeneration, choice) }
+    override fun onClarify(requestId: String, executionGeneration: Long, answer: String) = gate.pass { actions().onClarify(requestId, executionGeneration, answer) }
+    override fun onResolveUnknown() = gate.pass { actions().onResolveUnknown() }
+}
 
 /** The body lambda for the last pair of bar heights. */
 private class BodyCache {

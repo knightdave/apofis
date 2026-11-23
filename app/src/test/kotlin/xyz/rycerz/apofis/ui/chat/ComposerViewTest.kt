@@ -6,15 +6,12 @@ import android.view.inputmethod.EditorInfo
 import androidx.activity.ComponentActivity
 import android.view.View
 import android.view.inputmethod.InputConnection
-import androidx.activity.compose.BackHandler
+import xyz.rycerz.apofis.ui.drawer.PushDrawer
+import xyz.rycerz.apofis.ui.drawer.PushDrawerState
+import xyz.rycerz.apofis.ui.drawer.rememberPushDrawerState
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.material3.DrawerState
-import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
@@ -1010,21 +1007,22 @@ class ComposerViewTest {
         assertTrue("collapsed, Back leaves", rule.activity.isFinishing)
     }
 
-    /** With the drawer over the chat, Back closes the drawer first; the editor stays expanded with its draft, the next Back collapses it. */
-    @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+    /**
+     * With the push drawer over the chat, Back closes the drawer first; the editor stays expanded with its draft, the next
+     * Back collapses it. The same while a finger holds the drawer part way out.
+     */
     @Test
     fun backClosesTheDrawerBeforeCollapsing() {
         ui = ui.copy(draft = "one\ntwo\nthree")
-        lateinit var drawer: DrawerState
+        lateinit var drawer: PushDrawerState
         lateinit var drawerScope: CoroutineScope
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
-                drawer = rememberDrawerState(DrawerValue.Closed)
+                drawer = rememberPushDrawerState()
                 drawerScope = rememberCoroutineScope()
-                // As AppNav does: the drawer's Back first in composition, the chat told when it is covered.
-                BackHandler(drawer.isOpen) { drawerScope.launch { drawer.close() } }
-                ModalNavigationDrawer(drawerContent = { ModalDrawerSheet { Text("Chats") } }, drawerState = drawer) {
-                    ChatScreen(ui, chatActions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, covered = drawer.isOpen)
+                // As AppNav does: the drawer owns its Back; the chat is told when it is covered.
+                PushDrawer(drawer, drawerContent = { Text("Chats") }) { drag ->
+                    ChatScreen(ui, chatActions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, dragArea = drag, covered = drawer.covered, coveredNow = { drawer.covered })
                 }
             }
         }
@@ -1036,7 +1034,21 @@ class ComposerViewTest {
         assertTrue(drawer.isOpen)
         rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }
         rule.waitForIdle()
-        assertTrue("Back did not close the drawer", drawer.isClosed)
+        assertTrue("Back did not close the drawer", !drawer.isOpen && drawer.fraction == 0f)
+        rule.onNodeWithContentDescription("Collapse the editor").assertExists()
+        assertEquals("one\ntwo\nthree", shownText())
+        // A finger holds the drawer part way out (from closed): Back closes the drawer, not the editor.
+        rule.onNodeWithTag("chat.topbar").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(androidx.compose.ui.geometry.Offset(12f, 0f)) }
+        }
+        rule.waitForIdle()
+        assertTrue("the drag did not move the drawer", drawer.fraction > 0f)
+        rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }
+        rule.waitForIdle()
+        assertTrue("Back did not close the drawer", !drawer.isOpen && drawer.fraction == 0f)
+        rule.onRoot().performTouchInput { up() }
+        rule.waitForIdle()
         rule.onNodeWithContentDescription("Collapse the editor").assertExists()
         assertEquals("one\ntwo\nthree", shownText())
         rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }

@@ -19,6 +19,11 @@ import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.click
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.test.swipeDown
 import java.time.ZoneOffset
 import kotlinx.coroutines.runBlocking
@@ -65,6 +70,8 @@ class ChromeInputsTest {
         override fun openUri(uri: String) = Unit
     })
     private var currentState by mutableStateOf<(() -> ChatUiState)?>(null)
+    private var dragArea by mutableStateOf<Modifier>(Modifier)
+    private var covered by mutableStateOf(false)
     private var enterToSend by mutableStateOf(false)
     private var fontScale by mutableStateOf(1f)
 
@@ -84,7 +91,7 @@ class ChromeInputsTest {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                 val density = androidx.compose.ui.platform.LocalDensity.current
                 CompositionLocalProvider(LocalBlur provides blur, LocalUriHandler provides uri, LocalClipboard provides clipboard, androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(density.density, fontScale)) {
-                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState, enterToSend = enterToSend)
+                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState, enterToSend = enterToSend, dragArea = dragArea, covered = covered)
                 }
             }
         }
@@ -194,6 +201,72 @@ class ChromeInputsTest {
         rule.onNodeWithContentDescription("Copy").performClick()
         rule.waitForIdle()
         assertEquals("Copy did not read the replacement reader", listOf<String?>("Hello"), clipboard.writes)
+    }
+
+    /** The push drawer's drag area is an input too: the top bar and the transcript carry the replacement, the composer neither. */
+    @Test
+    fun replacedDragAreaReceivesTheDrags() {
+        val hits = IntArray(2)
+        fun counting(i: Int) = Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { awaitPointerEvent(); hits[i]++ } } }
+        dragArea = counting(0)
+        show()
+        dragArea = counting(1)
+        rule.waitForIdle()
+        val before = hits[0]
+        rule.onNodeWithTag("chat.topbar").performTouchInput { click(Offset(width / 2f, height / 2f)) }
+        val onBar = hits[1]
+        assertTrue("the top bar does not carry the new drag area", onBar > 0)
+        rule.onNode(hasScrollToIndexAction()).performTouchInput { click(center) }
+        assertTrue("the transcript does not carry the new drag area", hits[1] > onBar)
+        val onList = hits[1]
+        rule.onNodeWithTag("composer.field").performTouchInput { click(center) }
+        assertEquals("the composer carries the drag area", onList, hits[1])
+        assertEquals("the old drag area is still used", before, hits[0])
+    }
+
+    /** `covered` is read when an action fires: covered drops the tap, uncovered lets the next one through. */
+    @Test
+    fun replacedCoveredReachesTheGate() {
+        ui = chat(listOf(UserMessage("u1", "Failed one", false, FIXED_NOW, SendState.FAILED, "k1", error = "unconfirmed", attempted = true)))
+        val got = ArrayList<String>()
+        actions = object : ChatActions {
+            override fun onRetry(idempotencyKey: String) {
+                got += idempotencyKey
+            }
+        }
+        covered = true
+        show()
+        rule.onNodeWithText("Retry").performClick()
+        rule.waitForIdle()
+        assertEquals(emptyList<String>(), got)
+        covered = false
+        rule.waitForIdle()
+        rule.onNodeWithText("Retry").performClick()
+        rule.waitForIdle()
+        assertEquals(listOf("k1"), got)
+    }
+
+    /** A link tapped while covered opens nothing; uncovered it opens. */
+    @Test
+    fun aCoveredLinkOpensNothing() {
+        ui = chat(listOf(AssistantReply("r1", emptyList(), "[docs](https://example.com/docs)", FIXED_NOW)))
+        val opened = ArrayList<String>()
+        uri = object : UriHandler {
+            override fun openUri(uri: String) {
+                opened += uri
+            }
+        }
+        covered = true
+        show()
+        val link = rule.onNode(androidx.compose.ui.test.hasClickAction() and androidx.compose.ui.test.hasAnyAncestor(androidx.compose.ui.test.hasTestTag("reply:r1/b0/c0")), useUnmergedTree = true)
+        link.performClick()
+        rule.waitForIdle()
+        assertEquals(emptyList<String>(), opened)
+        covered = false
+        rule.waitForIdle()
+        link.performClick()
+        rule.waitForIdle()
+        assertEquals(listOf("https://example.com/docs"), opened)
     }
 
     /** The Enter to send setting reaches the composer after first composition: the IME action becomes Send and sends. */
