@@ -4,11 +4,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.DrawerState
-import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.geometry.Offset
+import xyz.rycerz.apofis.ui.drawer.PushDrawer
+import xyz.rycerz.apofis.ui.drawer.PushDrawerState
+import xyz.rycerz.apofis.ui.drawer.rememberPushDrawerState
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.test.ExperimentalTestApi
@@ -236,20 +237,42 @@ class AnswerGuardTest {
 
     @Test
     fun rightAfterTheDrawerClosesAnApprovalGoesThrough() {
-        val drawer = DrawerState(DrawerValue.Closed)
+        lateinit var drawer: PushDrawerState
         lateinit var scope: CoroutineScope
         rule.setContent {
             Themed {
+                drawer = rememberPushDrawerState()
                 scope = rememberCoroutineScope()
-                ModalNavigationDrawer(drawerContent = { ModalDrawerSheet { Text("Drawer") } }, drawerState = drawer) { Footer(approval) }
+                PushDrawer(drawer, drawerContent = { Text("Drawer") }) { drag -> Box(drag) { Footer(approval) } }
             }
         }
         tick(1_000)
         rule.runOnIdle { scope.launch { drawer.open() } }
-        settle()
+        tick(48) // reduced motion: open in a frame
         rule.runOnIdle { scope.launch { drawer.close() } }
-        settle()
+        tick(48) // closed; well inside the 300 ms answer interval, which counts from when the request showed, not from the close
         rule.onNodeWithText("Allow once").performClick() // at once
+        assertEquals(1, approvals.size)
+    }
+
+    /** A drawer drag that starts on an answer control answers nothing; a fresh tap afterwards answers once. */
+    @Test
+    fun aDrawerDragOnAnAnswerControlAnswersNothing() {
+        rule.setContent {
+            Themed {
+                PushDrawer(rememberPushDrawerState(), drawerContent = { Text("Drawer") }) { drag -> Box(drag) { Footer(approval) } }
+            }
+        }
+        tick(1_000)
+        rule.onNodeWithText("Allow once").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(8f, 0f)) }
+            repeat(10) { moveBy(Offset(-8f, 0f)) }
+            up()
+        }
+        tick(400)
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
         assertEquals(1, approvals.size)
     }
 

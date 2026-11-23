@@ -44,6 +44,35 @@ class ChatLookupE2eTest {
         app.waitFor("composer.send disabled again", 10_000) { sendButtons().singleOrNull()?.isEnabled == false }
     }
 
+    /** The drawer's Settings row (not "New chat": a new chat's own title reads the same). The chat screen has no such text. */
+    private fun drawerRow() = app.nodes { it.text?.toString() == app.str("settings_title") }.isNotEmpty()
+
+    private fun chatShown() = app.snapshot().tagged("chat.title").size == 1 && app.composerField() != null
+
+    // With the chat hidden, a "New chat" text can only be the drawer's new-chat row.
+    private fun drawerShown() = drawerRow() && app.nodes { it.text?.toString() == app.str("drawer_new_chat") }.isNotEmpty() && app.snapshot().tagged("chat.title").isEmpty() && app.composerField() == null
+
+    /** The push drawer: opened by its button and by a swipe on the chat, closed by Back and by a tap on the pushed chat. */
+    @Test
+    fun pushDrawer() {
+        app.freshStart()
+        app.connect(app.url)
+        if (drawerRow()) fail("The closed drawer's rows are in the accessibility tree")
+
+        app.click(app.str("drawer_open"))
+        app.waitFor("the open drawer, the chat hidden", 10_000) { drawerShown() }
+        app.screenshot(name.methodName + "-open")
+        app.device.pressBack()
+        app.waitFor("the chat back after Back", 10_000) { chatShown() && !drawerRow() }
+
+        val w = app.device.displayWidth
+        val y = app.device.displayHeight / 2
+        app.device.swipe(w * 2 / 10, y, w * 8 / 10, y, 20) // from the middle of the empty list
+        app.waitFor("the drawer opened by a swipe", 10_000) { drawerShown() }
+        if (!app.device.click(w * 9 / 10, y)) fail("Tapping the pushed chat failed") // the scrim over the pushed chat
+        app.waitFor("the chat back after a tap on the scrim", 10_000) { chatShown() && !drawerRow() }
+    }
+
     /** Three typed lines show the expand button; expanding and collapsing keep the text. Nothing is sent. */
     @Test
     fun composerExpandAndCollapse() {
