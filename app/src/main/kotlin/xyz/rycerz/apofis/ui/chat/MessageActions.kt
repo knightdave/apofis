@@ -86,7 +86,7 @@ internal fun pieceEnd(text: CharSequence, start: Int, cap: Int = PAGE_CHARS): In
 // ---- what an action may act on
 
 /** Reply text worth an action; a body over [PAGE_CHARS] counts as text unread, so the check never scans a huge body. */
-private fun hasText(text: String) = text.length > PAGE_CHARS || text.isNotBlank()
+internal fun hasText(text: String) = text.length > PAGE_CHARS || text.isNotBlank()
 
 /**
  * The one eligibility rule, at draw time and at action time, from the transcript as it is now: the raw text of item

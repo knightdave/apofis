@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
+import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.Composable
@@ -81,7 +82,7 @@ internal class Follower(private val list: LazyListState, internal var lastRun: S
      */
     fun onGrew() {
         if (measured && free() && shouldPin(state, contentGrew = true, atBottom = atBottom(), nowMs = frameMs)) {
-            ChromeProbe.pins++
+            if (BuildConfig.DEBUG) ChromeProbe.pins++
             list.requestScrollToItem(0)
         }
     }
@@ -141,7 +142,7 @@ internal fun rememberFollow(list: LazyListState, ui: ChatUiState): Follower {
         while (now < follower.state.holdUntilMs) {
             follower.frameMs = now
             if (follower.free() && shouldPin(follower.state, contentGrew = false, atBottom = follower.atBottom(), nowMs = now)) {
-                ChromeProbe.pins++
+                if (BuildConfig.DEBUG) ChromeProbe.pins++
                 list.scrollToItem(0)
             }
             now = withFrameMillis { it }

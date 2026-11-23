@@ -13,6 +13,12 @@ import androidx.compose.ui.input.InputMode
 import androidx.compose.ui.input.InputModeManager
 import androidx.compose.ui.platform.LocalInputModeManager
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsNode
+import androidx.compose.ui.test.hasScrollToIndexAction
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
@@ -23,6 +29,7 @@ import androidx.compose.ui.test.isHeading
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
@@ -108,9 +115,14 @@ class ControlBlockTest {
     fun withoutCommandOnlyDenyAndUnknownKindsNoButtons() {
         var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "  ", null))
         rule.setContent { Themed { ReplyFooter(reply, live(pending), emptyMap(), answering = false, actions) } }
-        rule.onNodeWithText("Deny").assertExists()
-        assertEquals(0, rule.onAllNodesWithTextCount("Allow once"))
-        assertEquals(0, rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.ContentDescription) and hasClickAction()).fetchSemanticsNodes().size)
+        for (absent in listOf("  ", null)) {
+            pending = PendingControl("approval", "ctl_1", 1, absent, null)
+            rule.waitForIdle()
+            rule.onNodeWithText("Deny").assertExists()
+            assertEquals(0, rule.onAllNodesWithTextCount("Allow once"))
+            assertEquals(0, rule.onAllNodesWithTextCount("Show full command"))
+            assertEquals(0, rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.ContentDescription) and hasClickAction()).fetchSemanticsNodes().size)
+        }
         pending = PendingControl("payment", "ctl_9", 1, "pay 100", "?")
         rule.waitForIdle()
         rule.onNodeWithText("Hermes is waiting for an answer").assert(isHeading())
@@ -244,5 +256,136 @@ class ControlBlockTest {
         for (label in listOf("Deny", "Allow once")) rule.onNodeWithText(label).assertIsNotEnabled().performClick()
         rule.onNodeWithContentDescription("More approval options").assertIsNotEnabled()
         assertTrue(choices.isEmpty())
+    }
+
+    // ---- final fix wave: a long command is never laid out whole, and can always be read whole
+
+    /** The length of every text layout input composed now (all windows). */
+    private fun layoutInputs(): List<Int> =
+        rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.GetTextLayoutResult), useUnmergedTree = true).fetchSemanticsNodes().map { node ->
+            val results = ArrayList<TextLayoutResult>()
+            node.config[SemanticsActions.GetTextLayoutResult].action!!(results)
+            results.single().layoutInput.text.length
+        }
+
+    private fun textOf(node: SemanticsNode) = node.config[SemanticsProperties.Text].joinToString("") { it.text }
+
+    /** Opens the full command, reads the reader's pieces in order to the last one, and goes back. */
+    private fun readWhole(): List<String> {
+        rule.onNodeWithText("Show full command").performClick()
+        rule.waitForIdle()
+        return readOpen()
+    }
+
+    /** Reads the open reader's pieces in order to the last one, and goes back. */
+    private fun readOpen(): List<String> {
+        val list = rule.onNode(hasScrollToIndexAction())
+        val pieces = ArrayList<String>()
+        while (true) {
+            if (runCatching { list.performScrollToIndex(pieces.size) }.isFailure) break // past the last piece
+            rule.waitForIdle()
+            pieces += textOf(rule.onAllNodes(hasTestTag("select.piece:${pieces.size}")).fetchSemanticsNodes().singleOrNull() ?: break)
+        }
+        rule.onNodeWithContentDescription("Back").performClick()
+        rule.waitForIdle()
+        return pieces
+    }
+
+    @Test
+    fun anOrdinaryCommandIsShownWholeInItsRow() {
+        val command = "x".repeat(ONE_LINE_MAX)
+        rule.setContent { Themed { ReplyFooter(reply, live(PendingControl("approval", "ctl_1", 1, command, null)), emptyMap(), answering = false, actions) } }
+        rule.onNodeWithText(command).assertExists()
+        assertEquals(0, rule.onAllNodesWithTextCount("Show full command"))
+    }
+
+    @Test
+    fun aLongCommandShowsItsHeadAndTheReaderShowsAllOfIt() {
+        val a = "printf '%s' " + "y".repeat(20_000) + " > /tmp/a"
+        val b = a.dropLast(1) + "b" // the same command but for its last character
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, a, null))
+        rule.setContent { Themed { ReplyFooter(reply, live(pending), emptyMap(), answering = false, actions) } }
+        for ((i, command) in listOf(a, b).withIndex()) {
+            pending = PendingControl("approval", "ctl_1", i + 1L, command, null)
+            rule.waitForIdle()
+            assertTrue("a text laid out over the bound: ${layoutInputs().max()}", layoutInputs().all { it <= ONE_LINE_MAX })
+            rule.onNodeWithText(command.take(ONE_LINE_MAX)).assertExists() // the head, in the command's row
+            val pieces = readWhole()
+            assertTrue(pieces.size > 1)
+            assertTrue("the last piece shows the difference", pieces.last().endsWith(if (i == 0) "/tmp/a" else "/tmp/b"))
+            assertEquals(command, pieces.joinToString(""))
+            seen()
+            rule.onNodeWithText("Allow once").performClick() // Allow stays where it was
+            assertEquals(Triple("ctl_1", i + 1L, ApprovalChoice.ONCE), choices.last())
+        }
+    }
+
+    @Test
+    fun aMillionSpacesThenOneCharacterIsACommandReadableToItsEnd() {
+        val command = " ".repeat(1_000_000) + "x"
+        rule.setContent { Themed { ReplyFooter(reply, live(PendingControl("approval", "ctl_1", 1, command, null)), emptyMap(), answering = false, actions) } }
+        assertTrue(layoutInputs().all { it <= ONE_LINE_MAX })
+        rule.onNodeWithText("Allow once").assertExists()
+        val pieces = readWhole()
+        assertTrue(pieces.last().endsWith("x"))
+        assertEquals(command.length, pieces.sumOf { it.length })
+    }
+
+    // ---- closing commit: the block follows the current command of its request ----
+
+    private fun footer(pending: () -> PendingControl) = rule.setContent { Themed { ReplyFooter(reply, live(pending()), emptyMap(), answering = false, actions) } }
+
+    @Test
+    fun aShortCommandReplacedByALongOneUnderTheSameRequestShowsTheNewOne() {
+        val long = "echo " + "z".repeat(20_000) + " > /tmp/new"
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "ls", null))
+        footer { pending }
+        rule.onNodeWithText("ls").assertExists()
+        assertEquals(0, rule.onAllNodesWithTextCount("Show full command"))
+        pending = pending.copy(command = long) // the same id and generation
+        rule.waitForIdle()
+        rule.onNodeWithText(long.take(ONE_LINE_MAX)).assertExists()
+        assertTrue("laid out whole", layoutInputs().all { it <= ONE_LINE_MAX })
+        val pieces = readWhole()
+        assertTrue("the reader shows the new tail", pieces.last().endsWith("/tmp/new"))
+        assertEquals(long, pieces.joinToString(""))
+    }
+
+    @Test
+    fun aLongCommandReplacedWhileTheReaderIsOpenShowsTheNewText() {
+        val a = "echo " + "a".repeat(20_000) + " > /tmp/a"
+        val b = "echo " + "b".repeat(20_000) + " > /tmp/b"
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, a, null))
+        footer { pending }
+        rule.onNodeWithText("Show full command").performClick()
+        rule.waitForIdle()
+        rule.onNodeWithTag("select.piece:0").assertExists()
+        pending = pending.copy(command = b) // the reader stays open
+        rule.waitForIdle()
+        assertEquals(b, readOpen().joinToString(""))
+    }
+
+    @Test
+    fun aCommandThatBecomesBlankLeavesDenyOnly() {
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "ls", null))
+        footer { pending }
+        rule.onNodeWithText("Allow once").assertExists()
+        pending = pending.copy(command = "  ")
+        rule.waitForIdle()
+        rule.onNodeWithText("Deny").assertExists()
+        assertEquals(0, rule.onAllNodesWithTextCount("Allow once"))
+        assertEquals(0, rule.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsProperties.ContentDescription) and hasClickAction()).fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun aBlankCommandThatGetsTextOffersAllow() {
+        var pending by mutableStateOf(PendingControl("approval", "ctl_1", 1, "  ", null))
+        footer { pending }
+        assertEquals(0, rule.onAllNodesWithTextCount("Allow once"))
+        pending = pending.copy(command = "ls")
+        rule.waitForIdle()
+        rule.onNodeWithText("ls").assertExists()
+        rule.onNodeWithText("Allow once").assertExists()
+        rule.onNodeWithContentDescription("More approval options").assertExists()
     }
 }

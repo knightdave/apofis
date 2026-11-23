@@ -187,7 +187,7 @@ internal fun ReplyFooter(
             null -> Unit
         }
         // The first icon lines up with the 20 dp text inset (a 16 dp icon centred in its 48 dp target).
-        if (rowActions != null && !reply.live && !active && reply.text.isNotBlank()) {
+        if (rowActions != null && !reply.live && !active && hasText(reply.text)) { // the tap check's own bounded rule
             MessageActionRow(reply, rowActions, Modifier.padding(start = 4.dp))
         }
     }

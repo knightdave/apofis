@@ -810,4 +810,20 @@ class MessagesUiTest {
         rule.waitForIdle()
         assertEquals(0, rule.onAllNodes(hasText("Show more")).fetchSemanticsNodes().size)
     }
+
+    /**
+     * The footer draws Copy and Select by the tap check's own bounded rule: a long whitespace prefix with a text tail has
+     * the row (without walking the prefix), and a body over the page cap counts as text unread, exactly as [actionable].
+     */
+    @Test
+    fun theFooterDrawsActionsByTheTapChecksBoundedRule() {
+        var reply by mutableStateOf(AssistantReply("r1", emptyList(), " ".repeat(1_000_000) + "x", 0.0))
+        rule.setContent { Themed { ReplyFooter(reply, null, emptyMap(), answering = false, object : ChatActions {}, RowActions({ listOf(reply) }, {})) } }
+        for (text in listOf(" ".repeat(1_000_000) + "x", " ".repeat(PAGE_CHARS + 1), "  ", "ok")) {
+            reply = reply.copy(text = text)
+            rule.waitForIdle()
+            val drawn = rule.onAllNodes(hasContentDescription("Copy")).fetchSemanticsNodes().isNotEmpty()
+            assertEquals("${text.length} characters", actionable(listOf(reply), "r1") != null, drawn)
+        }
+    }
 }

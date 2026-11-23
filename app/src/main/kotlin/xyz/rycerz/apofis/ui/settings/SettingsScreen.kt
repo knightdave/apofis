@@ -168,6 +168,7 @@ fun SettingsScreen(
     }
     if (themeSheet) {
         ApofisSheet(onDismiss = { themeSheet = false }) {
+            Column(Modifier.verticalScroll(rememberScrollState())) { // a short window still reaches every choice
             for (mode in ThemeMode.entries) {
                 SheetRow(
                     themeIcon(mode),
@@ -182,6 +183,7 @@ fun SettingsScreen(
                         Icon(painterResource(R.drawable.lucide_check), null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
                     }
                 }
+            }
             }
         }
     }
@@ -249,7 +251,7 @@ private fun FontScaleRows(stored: Float, onChange: (Float) -> Unit) {
     val source = remember { MutableInteractionSource() }
     val primary = MaterialTheme.colorScheme.primary
     val onPrimary = MaterialTheme.colorScheme.onPrimary
-    val colors = SliderDefaults.colors(thumbColor = primary, activeTrackColor = primary, inactiveTrackColor = ApofisTheme.colors.switchOffTrack)
+    val colors = SliderDefaults.colors(thumbColor = primary, activeTrackColor = primary, inactiveTrackColor = MaterialTheme.colorScheme.outline) // 3:1 on the card, as the switch's off outline
     val state = remember {
         SliderState(shown, ((CHAT_FONT_SCALE_MAX - CHAT_FONT_SCALE_MIN) / 0.05f).roundToInt() - 1, CHAT_FONT_SCALE_MIN..CHAT_FONT_SCALE_MAX)
     }
