@@ -90,7 +90,7 @@ internal fun ToolDetailSheet(step: ToolStep, live: Boolean, onDismiss: () -> Uni
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
             Text(
                 oneLine(step.name),
-                Modifier.padding(start = 14.dp).semantics { heading() }, // the other sheets' title inset and style
+                Modifier.semantics { heading() }, // the other sheets' title style; no inset, so it lines up with the section labels
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
                 maxLines = 3,
