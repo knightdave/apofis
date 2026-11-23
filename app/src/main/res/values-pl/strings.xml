@@ -288,7 +288,7 @@
     <string name="share_cancel">Anuluj</string>
     <string name="share_deletes_temporary">Po otwarciu aplikacja spróbuje usunąć bieżący czat tymczasowy.</string>
     <string name="share_text_cut">Udostępniony tekst skrócono do 100000 znaków</string>
-    <string name="share_images_failed">Pominięto udostępnione obrazy, których nie udało się odczytać</string>
+    <string name="share_images_failed">Pominięto co najmniej jeden udostępniony obraz</string>
     <string name="share_too_many">Uwzględniono tylko pierwsze 10 udostępnionych obrazów</string>
     <string name="chat_loading">Wczytywanie wiadomości</string>
     <string name="chat_tool_calls_not_stored">Wywołania narzędzi niezapisane na tym telefonie: %1$d</string>

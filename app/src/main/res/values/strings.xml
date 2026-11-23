@@ -292,7 +292,7 @@
     <string name="share_cancel">Cancel</string>
     <string name="share_deletes_temporary">Opening this share will try to delete your current temporary chat.</string>
     <string name="share_text_cut">Shared text was shortened to 100000 characters</string>
-    <string name="share_images_failed">Shared images that could not be read were left out</string>
+    <string name="share_images_failed">One or more shared images were left out</string>
     <string name="share_too_many">Only the first 10 shared images were considered</string>
     <string name="chat_loading">Loading messages</string>
     <string name="chat_tool_calls_not_stored">Tool calls not stored on this phone: %1$d</string>
