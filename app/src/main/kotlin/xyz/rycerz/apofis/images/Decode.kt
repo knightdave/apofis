@@ -19,15 +19,15 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 object ImageLimits {
@@ -56,6 +56,10 @@ sealed interface Encoded {
     data class Failed(val reason: ImageFailure) : Encoded
 }
 
+/**
+ * A `Bytes` array must not change until the call returns. A `Stored` file is a file of the app's private
+ * directories, trusted to be a regular file that does not change while it is read.
+ */
 sealed interface ImageInput {
     data class Content(val uri: Uri) : ImageInput
     data class Bytes(val bytes: ByteArray, val label: String? = null) : ImageInput
@@ -74,31 +78,64 @@ data class DecodeLimits(
     val sourceDeadlineMs: Long = 20_000,
 )
 
+private typealias Decoder = (ImageDecoder.Source, ImageDecoder.OnHeaderDecodedListener) -> Bitmap
+
 private const val ALLOCATION_LIMIT = 64L * 1024 * 1024
 private const val SNIFF_BYTES = 64
 
-/** Process-wide: one decode at a time, at most [ImageLimits.MAX_COPIES] source copies (each with its temp file). */
+/** Process-wide: one decode (with an upload's encode) at a time, at most [ImageLimits.MAX_COPIES] source copies. */
 private val gate = Mutex()
 private val copySlots = Semaphore(ImageLimits.MAX_COPIES)
 
-/** Blocking work that may outlive its caller (a stuck provider read, a decode whose caller was cancelled). */
+/** Every request's worker runs here. Internal for the tests' observation only; never cancelled. */
 internal val decodeWork = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
 private class Fail(val reason: ImageFailure) : Exception(null, null, false, false)
 
-/** A copy slot and, once created, its temp file: given back together exactly once. */
-private class Copy {
-    @Volatile var file: File? = null
-    private val done = AtomicBoolean()
+/**
+ * What one request shares between its waiting caller and its worker. The worker owns everything the request
+ * takes (copy slot, temp file, descriptor, gate, bitmap) and gives it all back before it reports. An abandoning
+ * caller sets [abandoned] first; the worker checks it between stages and reads.
+ */
+private class Request<T : Any>(private val dispose: (T) -> Unit) {
+    val abandoned = AtomicBoolean()
+    val copied = CompletableDeferred<Unit>()
+    val admitted = CompletableDeferred<Unit>()
+    val done = CompletableDeferred<Unit>()
+    val signal = CancellationSignal()
+    val descriptor = AtomicReference<AssetFileDescriptor?>()
+    @Volatile var value: T? = null
+    @Volatile var failure: ImageFailure? = null
+    private val claimed = AtomicBoolean()
 
-    fun release() {
-        if (done.compareAndSet(false, true)) {
-            file?.delete()
-            copySlots.release()
+    fun checkWanted() {
+        if (abandoned.get()) throw Fail(ImageFailure.UNREADABLE)
+    }
+
+    /** The value, for the caller that waited for it; at most one of [take] and [disposeUnclaimed] gets it. */
+    fun take(): T? = value?.takeIf { claimed.compareAndSet(false, true) }
+
+    fun disposeUnclaimed() {
+        val v = value ?: return
+        if (claimed.compareAndSet(false, true)) dispose(v)
+    }
+
+    /** Never on the caller's thread: signal, close and dispose run on [decodeWork]. */
+    fun abandon(worker: Job?) {
+        abandoned.set(true)
+        worker?.cancel() // wakes a worker waiting for the gate; no effect on blocking code
+        decodeWork.launch {
+            signal.cancel()
+            runCatching { descriptor.getAndSet(null)?.close() }
+            disposeUnclaimed()
         }
     }
 }
 
+/**
+ * Decodes [input] within [limits], the longest side at most [longestSide]. Only cancellation of the calling job
+ * propagates; an independently cancelled codec operation is an unreadable image.
+ */
 suspend fun decodeBounded(
     context: Context,
     input: ImageInput,
@@ -113,41 +150,136 @@ internal suspend fun decodeBounded(
     longestSide: Int,
     software: Boolean,
     limits: DecodeLimits,
-    decode: (ImageDecoder.Source, ImageDecoder.OnHeaderDecodedListener) -> Bitmap,
-): Decoded = try {
-    var copy: Copy? = null
-    val source: ImageInput = when (input) {
-        is ImageInput.Bytes -> if (input.bytes.size > limits.maxSourceBytes) throw Fail(ImageFailure.TOO_LARGE) else input
-        is ImageInput.Stored -> input
-        is ImageInput.Content -> {
-            if (!copySlots.tryAcquire()) throw Fail(ImageFailure.BUSY)
-            copy = copyIn(context, input.uri, limits)
-            ImageInput.Stored(copy.file!!)
+    decode: Decoder,
+): Decoded = mapFailures(Decoded::Failed) {
+    Decoded.Ok(admit(context, input, longestSide, software, limits, decode, use = { it }, dispose = Bitmap::recycle))
+}
+
+/** Software decode at [ImageLimits.UPLOAD_SIDE], flattened on white, JPEG at quality 85; pixels only, no EXIF. */
+suspend fun toUploadJpeg(context: Context, input: ImageInput, limits: DecodeLimits = DecodeLimits()): Encoded =
+    toUploadJpeg(context, input, limits, ImageDecoder::decodeBitmap, ::flatJpeg)
+
+/** The encode runs inside the gate, so at most one decoded bitmap and one white copy exist at a time. */
+internal suspend fun toUploadJpeg(
+    context: Context,
+    input: ImageInput,
+    limits: DecodeLimits,
+    decode: Decoder,
+    encode: (Bitmap) -> ByteArray,
+): Encoded = mapFailures(Encoded::Failed) {
+    Encoded.Ok(admit(context, input, ImageLimits.UPLOAD_SIDE, software = true, limits, decode, use = encode, dispose = {}))
+}
+
+private inline fun <R> mapFailures(failed: (ImageFailure) -> R, block: () -> R): R = try {
+    block()
+} catch (e: Fail) {
+    failed(e.reason)
+} catch (e: CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    failed(ImageFailure.UNREADABLE)
+}
+
+/**
+ * Starts one worker for the request and waits for it: the source deadline until the copy is done, then
+ * [ImageLimits.GATE_WAIT_MS] until the worker is in the gate, then no limit. On expiry or cancellation the
+ * caller abandons and leaves at once.
+ */
+private suspend fun <T : Any> admit(
+    context: Context,
+    input: ImageInput,
+    longestSide: Int,
+    software: Boolean,
+    limits: DecodeLimits,
+    decode: Decoder,
+    use: (Bitmap) -> T,
+    dispose: (T) -> Unit,
+): T {
+    if (longestSide <= 0) throw Fail(ImageFailure.UNREADABLE)
+    if (input is ImageInput.Bytes && input.bytes.size > limits.maxSourceBytes) throw Fail(ImageFailure.TOO_LARGE)
+    val content = input is ImageInput.Content
+    if (content && !copySlots.tryAcquire()) throw Fail(ImageFailure.BUSY)
+    var slotHeld = content // by this caller until the worker starts
+    val request = Request(dispose)
+    var worker: Job? = null
+    fun start() {
+        slotHeld = false
+        worker = try {
+            // ATOMIC: the body starts even when cancelled first, so its finally always gives the slot back.
+            @OptIn(DelicateCoroutinesApi::class)
+            decodeWork.launch(start = CoroutineStart.ATOMIC) {
+                request.work(context, input, longestSide, software, limits, decode, use)
+            }
+        } catch (e: Throwable) {
+            if (content) copySlots.release()
+            throw e
         }
     }
-    var handedOver = false
     try {
-        if (withTimeoutOrNull(ImageLimits.GATE_WAIT_MS) { gate.lock() } == null) throw Fail(ImageFailure.UNREADABLE)
-        handedOver = true
-        // The decode cannot be interrupted: a cancelled caller leaves at once, the gate and the copy wait for it.
-        decodeWork.async {
-            try {
-                Decoded.Ok(decodeGated(source, longestSide, software, limits, decode))
-            } finally {
-                gate.unlock()
-                copy?.release()
-            }
-        }.await()
+        val copied = if (content) withTimeoutOrNull(limits.sourceDeadlineMs) { start(); request.copied.await() } else start()
+        if (copied == null || withTimeoutOrNull(ImageLimits.GATE_WAIT_MS) { request.admitted.await() } == null) {
+            request.abandon(worker)
+            throw Fail(ImageFailure.UNREADABLE)
+        }
+        request.done.await()
+    } catch (e: CancellationException) {
+        request.abandon(worker)
+        throw e
     } finally {
-        if (!handedOver) copy?.release()
+        if (slotHeld) copySlots.release()
     }
-} catch (e: Fail) {
-    Decoded.Failed(e.reason)
-} catch (e: CancellationException) {
-    currentCoroutineContext().ensureActive()
-    Decoded.Failed(ImageFailure.UNREADABLE)
-} catch (e: Throwable) {
-    Decoded.Failed(ImageFailure.UNREADABLE)
+    request.failure?.let { throw Fail(it) }
+    return request.take() ?: throw Fail(ImageFailure.UNREADABLE)
+}
+
+/** The worker: copy, gate, decode, use; then everything given back, then the result reported. */
+private suspend fun <T : Any> Request<T>.work(
+    context: Context,
+    input: ImageInput,
+    longestSide: Int,
+    software: Boolean,
+    limits: DecodeLimits,
+    decode: Decoder,
+    use: (Bitmap) -> T,
+) {
+    var temp: File? = null
+    var produced: T? = null
+    var failed: ImageFailure? = null
+    try {
+        val source = if (input is ImageInput.Content) {
+            if (!contentAllowed(context, input.uri)) throw Fail(ImageFailure.NOT_AN_IMAGE)
+            checkWanted()
+            val file = File.createTempFile("decode-", ".tmp", context.cacheDir).also { temp = it }
+            checkWanted()
+            val afd = context.contentResolver.openAssetFileDescriptor(input.uri, "r", signal) ?: throw Fail(ImageFailure.UNREADABLE)
+            descriptor.set(afd)
+            checkWanted() // published first, then checked: an abandoning caller closes it, or the finally does
+            afd.createInputStream().use { copyCapped(it, file, limits.maxSourceBytes, abandoned) }
+            ImageInput.Stored(file)
+        } else {
+            input
+        }
+        copied.complete(Unit)
+        produced = gate.withLock {
+            checkWanted() // an abandoned request starts no decode
+            admitted.complete(Unit)
+            use(decodeGated(source, longestSide, software, limits, decode))
+        }
+    } catch (e: Fail) {
+        failed = e.reason
+    } catch (e: Throwable) {
+        failed = ImageFailure.UNREADABLE
+    } finally {
+        runCatching { descriptor.getAndSet(null)?.close() }
+        temp?.delete() // shortcut: a failed delete still returns the slot; clearDecodeTemps removes the file at the next start
+        if (input is ImageInput.Content) copySlots.release()
+    }
+    value = produced
+    failure = failed
+    done.complete(Unit)
+    copied.complete(Unit)
+    admitted.complete(Unit)
+    if (abandoned.get()) disposeUnclaimed() // value published first, then checked: see Request.abandon
 }
 
 /** Scheme content only, a provider of another package, no user info in the authority. */
@@ -160,60 +292,16 @@ private fun contentAllowed(context: Context, uri: Uri): Boolean {
     return provider.packageName != context.packageName
 }
 
-/**
- * Copies [uri] into a new temp file; the caller has taken a copy slot, which this call owns from here. A watchdog
- * in the caller's context, armed before the copy starts, bounds the check, the open and the read; on expiry or
- * cancellation it cancels the signal and closes the descriptor, and a blocked call keeps the slot until it returns.
- */
-private suspend fun copyIn(context: Context, uri: Uri, limits: DecodeLimits): Copy {
-    val copy = Copy()
-    val signal = CancellationSignal()
-    val descriptor = AtomicReference<AssetFileDescriptor?>()
-    val copied = CompletableDeferred<Copy>()
-    var started = false
-    fun giveUp() {
-        signal.cancel()
-        runCatching { descriptor.get()?.close() }
-        // Not started, or already finished (the copy job has returned): release now; otherwise the job does it.
-        if (!started || !copied.completeExceptionally(CancellationException("gave up"))) copy.release()
-    }
-    return try {
-        withTimeoutOrNull(limits.sourceDeadlineMs) {
-            started = true
-            decodeWork.launch {
-                val handed = try {
-                    if (!contentAllowed(context, uri)) throw Fail(ImageFailure.NOT_AN_IMAGE)
-                    val file = File.createTempFile("decode-", ".tmp", context.cacheDir).also { copy.file = it }
-                    val afd = context.contentResolver.openAssetFileDescriptor(uri, "r", signal) ?: throw Fail(ImageFailure.UNREADABLE)
-                    descriptor.set(afd)
-                    afd.use { copyCapped(it.createInputStream(), file, limits.maxSourceBytes) }
-                    copied.complete(copy)
-                } catch (e: Throwable) {
-                    copied.completeExceptionally(e)
-                    false
-                }
-                // Failed, or the caller gave up first: nobody else will release it.
-                if (!handed) copy.release()
-            }
-            copied.await()
-        } ?: run {
-            giveUp()
-            throw Fail(ImageFailure.UNREADABLE)
-        }
-    } catch (e: CancellationException) {
-        giveUp()
-        throw e
-    }
-}
-
-/** Bytes read are counted; past [max] the copy stops with TOO_LARGE. */
-private fun copyCapped(input: InputStream, file: File, max: Long) {
+/** Bytes read are counted; past [max] the copy stops with TOO_LARGE. Only -1 ends the stream. */
+private fun copyCapped(input: InputStream, file: File, max: Long, abandoned: AtomicBoolean) {
     file.outputStream().use { out ->
         val buffer = ByteArray(64 * 1024)
         var total = 0L
         while (true) {
+            if (abandoned.get()) throw Fail(ImageFailure.UNREADABLE)
             val n = input.read(buffer)
-            if (n < 0) break
+            if (n == -1) break
+            if (n <= 0) throw Fail(ImageFailure.UNREADABLE)
             total += n
             if (total > max) throw Fail(ImageFailure.TOO_LARGE)
             out.write(buffer, 0, n)
@@ -221,13 +309,13 @@ private fun copyCapped(input: InputStream, file: File, max: Long) {
     }
 }
 
-/** Runs on a worker thread while this call holds the gate. */
+/** Runs on the worker while it holds the gate. The bitmap is checked against the target the header set. */
 private fun decodeGated(
     input: ImageInput,
     longestSide: Int,
     software: Boolean,
     limits: DecodeLimits,
-    decode: (ImageDecoder.Source, ImageDecoder.OnHeaderDecodedListener) -> Bitmap,
+    decode: Decoder,
 ): Bitmap {
     val head = when (input) {
         is ImageInput.Bytes -> input.bytes.copyOf(minOf(SNIFF_BYTES, input.bytes.size))
@@ -241,29 +329,64 @@ private fun decodeGated(
     val format = sniff(head)
     if (format == null || format !in limits.formats) throw Fail(ImageFailure.NOT_AN_IMAGE)
     val label = (input as? ImageInput.Bytes)?.label
-    if (label != null && LABELS[label.lowercase()] != format) throw Fail(ImageFailure.NOT_AN_IMAGE)
+    if (label != null && LABELS.entries.none { it.value == format && it.key.equals(label, ignoreCase = true) }) {
+        throw Fail(ImageFailure.NOT_AN_IMAGE)
+    }
     val source = when (input) {
         is ImageInput.Bytes -> ImageDecoder.createSource(input.bytes)
         else -> ImageDecoder.createSource((input as ImageInput.Stored).file)
     }
-    return decode(source) { decoder, info, _ ->
+    var target: Pair<Int, Int>? = null
+    val bitmap = decode(source) { decoder, info, _ ->
         val width = info.size.width.toLong()
         val height = info.size.height.toLong()
+        if (width <= 0 || height <= 0) throw Fail(ImageFailure.UNREADABLE)
         if (width * height > limits.maxPixels) throw Fail(ImageFailure.TOO_LARGE)
-        val (targetWidth, targetHeight) = targetSize(width, height, longestSide)
-        decoder.setTargetSize(targetWidth, targetHeight)
+        val size = targetSize(width, height, longestSide) ?: throw Fail(ImageFailure.UNREADABLE)
+        decoder.setTargetSize(size.first, size.second)
         if (software) decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
         if (Build.VERSION.SDK_INT >= 36 && Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.CINNAMON_BUN_2) {
             decoder.setAllocationLimit(ALLOCATION_LIMIT)
         }
+        target = size
     }
+    val size = target
+    if (size == null || bitmap.width > size.first || bitmap.height > size.second ||
+        (software && bitmap.config == Bitmap.Config.HARDWARE)
+    ) {
+        bitmap.recycle()
+        throw Fail(ImageFailure.UNREADABLE)
+    }
+    return bitmap
 }
 
-/** Longest side min(source, [side]), aspect kept, each side at least 1; Long arithmetic throughout. */
-internal fun targetSize(width: Long, height: Long, side: Int): Pair<Int, Int> {
+/**
+ * Longest side min(source, [side]), aspect kept, each side at least 1; Long arithmetic throughout. Null when a
+ * side or [side] is 0 or less.
+ */
+internal fun targetSize(width: Long, height: Long, side: Int): Pair<Int, Int>? {
+    if (width <= 0 || height <= 0 || side <= 0) return null
     val longest = maxOf(width, height)
     if (longest <= side) return width.toInt() to height.toInt()
     return maxOf(1L, width * side / longest).toInt() to maxOf(1L, height * side / longest).toInt()
+}
+
+/** White canvas, JPEG at quality 85; both bitmaps recycled. */
+internal fun flatJpeg(bitmap: Bitmap): ByteArray = try {
+    val flat = createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+    try {
+        Canvas(flat).apply {
+            drawColor(Color.WHITE)
+            drawBitmap(bitmap, 0f, 0f, null)
+        }
+        val out = ByteArrayOutputStream()
+        if (!flat.compress(Bitmap.CompressFormat.JPEG, ImageLimits.JPEG_QUALITY, out)) throw Fail(ImageFailure.UNREADABLE)
+        out.toByteArray()
+    } finally {
+        flat.recycle()
+    }
+} finally {
+    bitmap.recycle()
 }
 
 private val LABELS = mapOf(
@@ -278,7 +401,10 @@ private val LABELS = mapOf(
 
 private val HEIF_BRANDS = setOf("heic", "heix", "heim", "heis", "hevc", "hevx", "hevm", "hevs", "mif1", "msf1")
 
-/** The format named by the first bytes, or null. */
+/**
+ * The format named by the first bytes, or null. An `ftyp` box is read only when its 32-bit size is at least 16
+ * and at least 16 bytes are present; its brands only within min(box size, the bytes given).
+ */
 internal fun sniff(head: ByteArray): ImageFormat? {
     fun at(offset: Int, vararg bytes: Int) =
         head.size >= offset + bytes.size && bytes.indices.all { head[offset + it] == bytes[it].toByte() }
@@ -288,13 +414,12 @@ internal fun sniff(head: ByteArray): ImageFormat? {
         at(0, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A) -> ImageFormat.PNG
         text(0, "GIF87a") || text(0, "GIF89a") -> ImageFormat.GIF
         text(0, "RIFF") && text(8, "WEBP") -> ImageFormat.WEBP
-        text(4, "ftyp") -> {
-            val box = ((head[0].toInt() and 0xFF) shl 24) or ((head[1].toInt() and 0xFF) shl 16) or
-                ((head[2].toInt() and 0xFF) shl 8) or (head[3].toInt() and 0xFF)
-            val end = minOf(head.size, if (box in 16..SNIFF_BYTES) box else head.size)
+        head.size >= 16 && text(4, "ftyp") -> {
+            val box = (0..3).fold(0L) { acc, i -> (acc shl 8) or (head[i].toLong() and 0xFF) }
+            if (box < 16) return null
+            val end = minOf(box, head.size.toLong()).toInt()
             // The major brand at 8, the compatible brands from 16; the minor version at 12 is skipped.
-            val brands = (listOf(8) + (16..end - 4 step 4)).filter { it + 4 <= end }
-                .map { String(head, it, 4, Charsets.US_ASCII) }
+            val brands = (listOf(8) + (16..end - 4 step 4)).map { String(head, it, 4, Charsets.US_ASCII) }
             when {
                 brands.any { it == "avif" || it == "avis" } -> ImageFormat.AVIF
                 brands.any { it in HEIF_BRANDS } -> ImageFormat.HEIF
@@ -302,35 +427,6 @@ internal fun sniff(head: ByteArray): ImageFormat? {
             }
         }
         else -> null
-    }
-}
-
-/** Software decode at [ImageLimits.UPLOAD_SIDE], flattened on white, JPEG at quality 85; pixels only, no EXIF. */
-suspend fun toUploadJpeg(context: Context, input: ImageInput, limits: DecodeLimits = DecodeLimits()): Encoded {
-    val decoded = decodeBounded(context, input, ImageLimits.UPLOAD_SIDE, software = true, limits)
-    if (decoded is Decoded.Failed) return Encoded.Failed(decoded.reason)
-    val bitmap = (decoded as Decoded.Ok).bitmap
-    return try {
-        withContext(Dispatchers.IO) {
-            val flat = createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
-            try {
-                Canvas(flat).apply {
-                    drawColor(Color.WHITE)
-                    drawBitmap(bitmap, 0f, 0f, null)
-                }
-                val out = ByteArrayOutputStream()
-                if (!flat.compress(Bitmap.CompressFormat.JPEG, ImageLimits.JPEG_QUALITY, out)) throw Fail(ImageFailure.UNREADABLE)
-                Encoded.Ok(out.toByteArray())
-            } finally {
-                flat.recycle()
-            }
-        }
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Throwable) {
-        Encoded.Failed(ImageFailure.UNREADABLE)
-    } finally {
-        bitmap.recycle()
     }
 }
 

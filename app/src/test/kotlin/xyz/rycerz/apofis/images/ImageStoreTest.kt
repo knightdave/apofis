@@ -11,6 +11,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.After
 import org.junit.Test
 
 /** Plain JVM: the store uses only java.io, java.security and coroutines. */
@@ -24,6 +25,14 @@ class ImageStoreTest {
     private val abcSha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
     private fun names() = dir.list()!!.sorted()
+
+    /** Fixture bytes with their measured size checked once, here. */
+    private fun bytes(text: String) = text.toByteArray().also { assertEquals(text.length, it.size) }
+
+    @After
+    fun tearDown() {
+        dir.deleteRecursively()
+    }
 
     @Test
     fun putIsIdempotent() = runBlocking {
@@ -60,7 +69,7 @@ class ImageStoreTest {
     @Test
     fun readRejectsTamperedFile() = runBlocking {
         store.put(abc)
-        File(dir, "$abcSha.jpg").writeBytes("abd".toByteArray())
+        File(dir, "$abcSha.jpg").writeBytes(bytes("abd"))
         assertNull(store.read(abcSha))
         assertNotNull(store.file(abcSha))
     }
@@ -80,10 +89,10 @@ class ImageStoreTest {
 
     @Test
     fun collectKeepsReferencedAndYoung() = runBlocking {
-        val old = store.put("old".toByteArray())!!
-        val kept = store.put("kept".toByteArray())!!
+        val old = store.put(bytes("old"))!!
+        val kept = store.put(bytes("kept"))!!
         now += 600_000
-        val young = store.put("young".toByteArray())!!
+        val young = store.put(bytes("young"))!!
         store.collect({ setOf(kept) })
         assertEquals(listOf("$kept.jpg", "$young.jpg").sorted(), names())
         assertNull(store.file(old))
@@ -102,10 +111,10 @@ class ImageStoreTest {
 
     @Test
     fun ageBoundaryExact() = runBlocking {
-        val a = store.put("a".toByteArray())!!
-        val b = store.put("b".toByteArray())!! // same mtime as a
+        val a = store.put(bytes("a"))!!
+        val b = store.put(bytes("b"))!! // same mtime as a
         now += 1
-        val c = store.put("c".toByteArray())!!
+        val c = store.put(bytes("c"))!!
         assertEquals(File(dir, "$a.jpg").lastModified(), File(dir, "$b.jpg").lastModified())
         now += 599_999 // a and b exactly 600,000 ms old, c 599,999 ms
         store.collect({ emptySet() })
@@ -147,5 +156,54 @@ class ImageStoreTest {
         // The referenced name protects only its own file; the look-alikes go by age alone.
         store.collect({ setOf(sha, sha.take(32), "put-123.tmp", "notes.txt") })
         assertEquals(listOf("$sha.jpg", "put-456.tmp").sorted(), names())
+    }
+
+    @Test
+    fun putAfterTamperRepairs() = runBlocking {
+        store.put(abc)
+        File(dir, "$abcSha.jpg").writeBytes(bytes("abd"))
+        assertNull(store.read(abcSha))
+        assertEquals(abcSha, store.put(abc))
+        assertArrayEquals(abc, store.read(abcSha))
+        assertEquals(listOf("$abcSha.jpg"), names())
+    }
+
+    @Test
+    fun failedAgeSetThrows() = runBlocking {
+        // The temp file becomes a dangling link: setting its age fails, while a rename would still succeed.
+        val dangling = ImageStore(dir, clock = { now }, beforeRename = {
+            val temp = dir.listFiles()!!.single()
+            assertTrue(temp.delete())
+            Files.createSymbolicLink(temp.toPath(), File(dir, "missing/target").toPath())
+        })
+        try {
+            dangling.put(abc)
+            fail("put must fail when the age cannot be set")
+        } catch (e: IOException) {
+            assertEquals("age not set", e.message)
+        }
+        assertTrue(names().isEmpty())
+    }
+
+    @Test
+    fun overCapPutThrows() = runBlocking {
+        val big = ByteArray((ImageLimits.MAX_SOURCE_BYTES + 1).toInt())
+        assertEquals(ImageLimits.MAX_SOURCE_BYTES + 1, big.size.toLong())
+        try {
+            store.put(big)
+            fail("put must refuse bytes larger than a stored image may be")
+        } catch (e: IOException) {
+            assertEquals("larger than a stored image may be", e.message)
+        }
+        assertTrue(!dir.exists() || names().isEmpty())
+    }
+
+    @Test
+    fun sizeOfMissingIsNull() = runBlocking {
+        store.put(abc)
+        assertEquals(3L, store.size(abcSha))
+        assertTrue(File(dir, "$abcSha.jpg").delete())
+        assertNull(store.size(abcSha))
+        assertNull(store.size("0".repeat(64)))
     }
 }
