@@ -379,4 +379,24 @@ class PublishWorkerTest {
         current = null
         assertEquals(ListenableWorker.Result.success(), run(local = false))
     }
+
+    /** On a proven, confirmed On, [change] leaves one term of work (or none); then a run without a connection. */
+    private suspend fun TestScope.onlyThisTerm(change: android.content.SharedPreferences.Editor.() -> Unit, work: Boolean) {
+        registrar().on()
+        assertTrue(prefs.edit().apply(change).commit())
+        assertEquals(work, needsWork(prefs, setOf(NTFY_PACKAGE), 0L))
+        val sent = api.calls.size
+        current = null
+        assertEquals(if (work) ListenableWorker.Result.retry() else ListenableWorker.Result.success(), run(local = false))
+        assertEquals("nothing sent", sent, api.calls.size)
+    }
+
+    @Test
+    fun flagAloneMeansWork() = runTest { onlyThisTerm({ putBoolean(Keys.SERVER_UNDONE, true) }, work = true) }
+
+    @Test
+    fun recordWithoutProofAloneMeansWork() = runTest { onlyThisTerm({ remove(Keys.VERIFIED_AT) }, work = true) }
+
+    @Test
+    fun neitherTermNoWork() = runTest { onlyThisTerm({}, work = false) } // control
 }
