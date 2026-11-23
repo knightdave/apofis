@@ -1010,6 +1010,58 @@ class WakeWorkerTest {
         assertEquals("the timer is back, with no push", Input(epoch(), CAUSE_TICK, 0), input(live(CHECK_WORK).single().id))
     }
 
+    @Test
+    fun anOlderMarkClearedByANewConnectionsJobIsNoConsumedPush() = runTest {
+        stored("run_a")
+        on("run_a", A, "running")
+        awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
+        PushStore.locked { Wake.onPush(app, epoch()) } // a mark of connection A, never served
+        container.connect(Credentials(url(), "key-2")) // same server: run_a is kept; no push under B
+        Wake.idle()
+        val periodic = live(CHECK_WORK).single()
+        driver.setInitialDelayMet(periodic.id)
+        driver.setAllConstraintsMet(periodic.id)
+        driver.setPeriodDelayMet(periodic.id)
+        awaitWork { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
+        val job = live().single()
+        assertEquals(Input(epoch(), CAUSE_PERIODIC, 0), input(job.id))
+        routes["/v1/runs/run_a"] = { MockResponse.Builder().code(503).build() }
+        assertEquals("a 503: retried", WorkInfo.State.ENQUEUED, runJob().state)
+        assertNull("A's old mark is gone and not written back as B's", pendingWake(app))
+        Wake.recover(app)
+        Wake.idle()
+        val after = live().single()
+        assertEquals("no push job for B: still the periodic job's retry", job.id, after.id)
+        assertEquals(Input(epoch(), CAUSE_PERIODIC, 0), input(after.id))
+        assertFalse(expedited(after.id))
+    }
+
+    @Test
+    fun aFailedPeriodicInstallIsNotRememberedAsApplied() = runTest {
+        stored("run_a")
+        awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
+        // The timer is removed (through the lane, so its memory says "removed"; a removal behind the lane's back would
+        // leave it remembering "installed" and skip the install this test is about).
+        Wake.post(app, WakeRequest.Reconcile { false })
+        Wake.idle()
+        assertTrue(live(CHECK_WORK).isEmpty())
+        // Its install fails twice: only this request installs while the hook throws.
+        var failures = 2
+        Wake.beforeInstall = { if (failures-- > 0) throw IllegalStateException("database full") }
+        Wake.post(app, WakeRequest.Reconcile { true })
+        Wake.idle()
+        Wake.beforeInstall = {}
+        assertTrue("not installed", live(CHECK_WORK).isEmpty())
+        // An emission with the same decision arrives: the lane must not treat the failed install as applied.
+        db.activeRunDao().upsert(ActiveRunEntity("run_a", A, 3L, "running", 1L))
+        awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
+        assertEquals(Input(epoch(), CAUSE_TICK, 0), input(live(CHECK_WORK).single().id))
+    }
+
     /** Holds the lane at each request [hold] selects, one at a time, with a receipt when it arrives there. */
     private inner class LaneGate(private val hold: (WakeRequest) -> Boolean) {
         val arrived = Channel<WakeRequest>(Channel.UNLIMITED)

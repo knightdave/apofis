@@ -65,14 +65,19 @@ internal fun restorePendingWake(c: Context, epoch: Long): Boolean = PushStore.lo
 
 internal enum class Cleared { REMOVED, NONE, STALE, FAILED }
 
-/** Under the push lock: [epoch] is still current and no wake mark is left (a mark of an older epoch goes with it). */
+/**
+ * Under the push lock: [epoch] is still current and no wake mark is left. Only a mark of [epoch] is a consumed push
+ * (REMOVED); an older value goes in the same checked commit and counts as no mark (NONE).
+ */
 internal fun clearPendingWake(c: Context, epoch: Long): Cleared = PushStore.locked {
     val p = wakePrefs(c)
+    if (epoch != connectionEpoch(c)) return@locked Cleared.STALE
+    if (!p.contains(WAKE_PENDING)) return@locked Cleared.NONE
+    val consumed = p.getLong(WAKE_PENDING, 0) == epoch
     when {
-        epoch != connectionEpoch(c) -> Cleared.STALE
-        !p.contains(WAKE_PENDING) -> Cleared.NONE
-        commitOrRestore(p) { remove(WAKE_PENDING) } -> Cleared.REMOVED
-        else -> Cleared.FAILED
+        !commitOrRestore(p) { remove(WAKE_PENDING) } -> Cleared.FAILED
+        consumed -> Cleared.REMOVED
+        else -> Cleared.NONE
     }
 }
 
