@@ -19,7 +19,8 @@ main() {
     case $fpr in SHA256:*) ;; *) die "expected fingerprint $fpr is not SHA256:..." ;; esac
 
     # One reader decides: the last line starting "Candidate passed: " is exactly the wanted one.
-    awk -v want="Candidate passed: $sha" '/^Candidate passed: / { l = $0 } END { exit !(l == want) }' "$ledger" ||
+    # The shell opens the ledger: an awk operand like "want=" would be an assignment, not a file.
+    awk -v want="Candidate passed: $sha" '/^Candidate passed: / { l = $0 } END { exit !(l == want) }' < "$ledger" ||
         die "the last 'Candidate passed: ' line of $ledger is not exactly 'Candidate passed: $sha'"
     # fetch <ref>: that one ref into FETCH_HEAD only: no tags, no pruning, no configured refspecs.
     fetch() { git fetch --no-tags --no-prune --no-prune-tags --refmap= origin "$1"; }
