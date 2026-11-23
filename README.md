@@ -16,7 +16,35 @@ Install and update with [Obtainium](https://github.com/ImranR98/Obtainium):
 - Open on the phone: `obtainium://add/https://github.com/knightdave/apofis`
 - Or add the repository URL in Obtainium by hand: https://github.com/knightdave/apofis
 
-APKs are published on the [Releases](https://github.com/knightdave/apofis/releases) page. Every push to `main` produces a pre-release; tags `v*` produce normal releases.
+APKs are published on the [Releases](https://github.com/knightdave/apofis/releases) page. Every push to `main` triggers a pre-release build (`0.1.0-pre.N`, tag `pre-N`); normal releases are signed tags `v*`.
+
+Once 0.1.0 is published, and before checking for the update, open the app's settings in Obtainium, turn off "Include prereleases" and turn on "Verify the 'latest' tag", so Obtainium follows normal releases only. A phone that runs a pre-release with a higher versionCode than 0.1.0 cannot install 0.1.0 over it; it gets the next normal release instead.
+
+## Verify a release
+
+Every APK, pre-releases included, is signed with one key. Its certificate's SHA-256 digest is recorded in [release/signing-cert.sha256](release/signing-cert.sha256):
+
+```
+b13d0d93e9f095a9c74a42647d03df2b25c6a703e86981aeb90a7f864c2c0c73
+```
+
+Check a downloaded APK with the Android SDK's build tools:
+
+```sh
+apksigner verify --print-certs apofis-0.1.0.apk
+```
+
+It must show exactly one signer with that `certificate SHA-256 digest`. Release tags are annotated and signed with an SSH key whose public half is in [release/allowed-signers](release/allowed-signers) (fingerprint `SHA256:PtPAxwgKEbi47CtvfmAp8yRCRrzf+3lyQBtfrIWH7NM`). In a clone:
+
+```sh
+git -c gpg.ssh.allowedSignersFile=release/allowed-signers tag -v v0.1.0
+```
+
+It must print `Good "git" signature` with that fingerprint.
+
+## How releases are made
+
+A normal release is made only from a commit of `main` that passed CI and the emulator scenario set: `scripts/tag-release.sh` creates and pushes the signed tag after checking the commit, the CI run and the signature. For a tag, CI refuses to build, before any APK signing secret is used, unless the tag is a signed `vX.Y.Z` on a commit of `main`, and it refuses to publish an APK whose signing certificate is not the recorded one. The procedure, the checks and the rollback rules are in [RELEASING.md](RELEASING.md).
 
 ## Build
 

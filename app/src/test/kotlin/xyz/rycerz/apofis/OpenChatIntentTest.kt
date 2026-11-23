@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.job
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -62,8 +63,18 @@ class OpenChatIntentTest {
         SessionEntity(k, k, "", "Title $k", pinned = false, archived = archived, startedAt = 1.0, lastActiveAt = null, messageCount = 0, preview = null, stale = false, existsOnServer = true, hidden = hidden),
     )
 
-    private fun view(uri: Uri) = Intent(Intent.ACTION_VIEW, uri).setClass(app, MainActivity::class.java)
+    private fun view(uri: Uri) = Intent(Intent.ACTION_VIEW, uri).setClassName(app, OPEN_CHAT) // as a notification tap
     private fun view(uri: String) = view(Uri.parse(uri))
+
+    /**
+     * [c]'s start and the work it launches without awaiting (the notifier's cleanup), joined: lane idles raced that
+     * launch on Dispatchers.Default and lost when its threads were busy.
+     */
+    private suspend fun started(c: AppContainer): Connected? {
+        c.notifier // its lane and observers run for the container's life: not the start's work
+        val before = c.scope.coroutineContext.job.children.toSet()
+        return c.load().also { (c.scope.coroutineContext.job.children.toSet() - before).forEach { it.join() } }
+    }
 
     private suspend fun post(k: String, run: String = "run_$k", started: Long = 1) {
         container.notifier.notice(k, run, started, Notice.FINISHED, "run:$run", container.epoch(), replay = false)
@@ -184,9 +195,7 @@ class OpenChatIntentTest {
     fun disconnectedStartPostsNothing() = runTest {
         db.noticeOutboxDao().upsert(NoticeOutboxEntity("run:r", "apofis-a", "r", 1, "FINISHED", container.epoch(), 0))
 
-        assertNull(container.load()) // no usable credentials
-        container.notifier.idle()
-        container.notifier.idle() // after the start's cleanup
+        assertNull(started(container)) // no usable credentials
 
         assertTrue(nm.activeNotifications.isEmpty())
     }
@@ -198,9 +207,7 @@ class OpenChatIntentTest {
             .putLong("connection_epoch", container.epoch() + 1).commit() // a switch moved on, then the process died
 
         val next = AppContainer(app, CredentialStore(app) { key }) { db } // no usable credentials
-        assertNull(next.load())
-        next.notifier.idle()
-        next.notifier.idle()
+        assertNull(started(next))
 
         assertTrue(nm.activeNotifications.isEmpty())
     }

@@ -33,13 +33,19 @@ const val LUCIDE_LICENSE_ASSET = "LUCIDE-LICENSE"
 const val COMMONMARK_LICENSE_ASSET = "COMMONMARK-LICENSE"
 const val COMMONMARK_NOTICE_ASSET = "COMMONMARK-NOTICE"
 const val UNIFIEDPUSH_LICENSE_ASSET = "UNIFIEDPUSH-CONNECTOR-LICENSE"
+const val APACHE_LICENSE_ASSET = "APACHE-LICENSE-2.0"
 
-/** Every shipped license: its heading and its asset. */
+/** The Apache 2.0 libraries in the APK besides the UnifiedPush connector; names are not translated. */
+private const val APACHE_LIBRARIES =
+    "Kotlin standard library, AndroidX, Jetpack Compose, Room, WorkManager, OkHttp, Okio, kotlinx.serialization, kotlinx.coroutines"
+
+/** Every shipped license: its heading, a line before its text (or none) and its assets. */
 private val LICENSES = listOf(
-    R.string.licenses_lucide to listOf(LUCIDE_LICENSE_ASSET),
+    Triple(R.string.licenses_lucide, "", listOf(LUCIDE_LICENSE_ASSET)),
     // The repository's license at the pinned tag, then the notice the four jars carry (another copyright line).
-    R.string.licenses_commonmark to listOf(COMMONMARK_LICENSE_ASSET, COMMONMARK_NOTICE_ASSET),
-    R.string.licenses_unifiedpush to listOf(UNIFIEDPUSH_LICENSE_ASSET),
+    Triple(R.string.licenses_commonmark, "", listOf(COMMONMARK_LICENSE_ASSET, COMMONMARK_NOTICE_ASSET)),
+    Triple(R.string.licenses_unifiedpush, "", listOf(UNIFIEDPUSH_LICENSE_ASSET)),
+    Triple(R.string.licenses_apache, APACHE_LIBRARIES, listOf(APACHE_LICENSE_ASSET)),
 )
 
 /** The third-party license texts shipped in the app, verbatim. */
@@ -48,7 +54,11 @@ private val LICENSES = listOf(
 fun LicensesScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val texts by produceState(emptyList<String>()) {
-        value = withContext(Dispatchers.IO) { LICENSES.map { (_, assets) -> assets.joinToString("\n\n") { a -> context.assets.open(a).bufferedReader().use { it.readText() } } } }
+        value = withContext(Dispatchers.IO) {
+            LICENSES.map { (_, intro, assets) ->
+                (listOf(intro).filter { it.isNotEmpty() } + assets.map { a -> context.assets.open(a).bufferedReader().use { it.readText() } }).joinToString("\n\n")
+            }
+        }
     }
     Scaffold(
         topBar = {
@@ -70,7 +80,7 @@ fun LicensesScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 8.dp),
         ) {
-            LICENSES.forEachIndexed { i, (title, _) ->
+            LICENSES.forEachIndexed { i, (title, _, _) ->
                 Text(
                     stringResource(title),
                     style = MaterialTheme.typography.titleMedium,
