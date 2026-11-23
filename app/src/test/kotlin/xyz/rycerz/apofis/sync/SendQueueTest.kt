@@ -1413,12 +1413,12 @@ class SendQueueTest {
         return text
     }
 
-    /** A file size and a caption whose expanded body is exactly 9,000,000 bytes. */
-    private fun atWireCap(d: String): Pair<Long, String> {
+    /** A file size and a caption whose expanded body, measured as admission does, is exactly [cap] bytes. */
+    private fun atWireCap(d: String, cap: Long = 9_000_000): Pair<Long, String> {
         val base = expandedSize(buildRunBody("", "", listOf(d)), listOf(0L))
-        val size = 3L * ((9_000_000 - base) / 4)
-        val text = "x".repeat((9_000_000 - expandedSize(buildRunBody("", "", listOf(d)), listOf(size))).toInt())
-        assertEquals(9_000_000L, expandedSize(buildRunBody("", text, listOf(d)), listOf(size)))
+        val size = 3L * ((cap - base) / 4)
+        val text = "x".repeat((cap - expandedSize(buildRunBody("", "", listOf(d)), listOf(size))).toInt())
+        assertEquals(cap, expandedSize(buildRunBody("", text, listOf(d)), listOf(size)))
         return size to text
     }
 
@@ -1440,6 +1440,11 @@ class SendQueueTest {
         running("apofis-a")
         val photos = (1..11).map { photo(it.toByte()) }
         assertRefused(photos, expected = IllegalArgumentException::class.java)
+        val huge = object : AbstractList<String>() { // refused on its size alone: no element is ever read or copied
+            override val size = 1_000_000
+            override fun get(index: Int): String = throw AssertionError("element $index visited")
+        }
+        assertRefused(huge, expected = IllegalArgumentException::class.java)
         assertTrue(sizeAsked.isEmpty())
         queue.submit("apofis-a", "ten", images = photos.take(10))
         assertEquals(photos.take(10).joinToString(","), rows("apofis-a").single().images)
@@ -1482,7 +1487,7 @@ class SendQueueTest {
         addSession("apofis-a")
         running("apofis-a")
         val d = sha(byteArrayOf(9))
-        val (size, fits) = atWireCap(d)
+        val (size, fits) = atWireCap(d, 9_000_000L - "apofis-a".length) // room for the session id: only the choice differs
         sizes[d] = size
         val repo = ChatRepository(api, db, { clock }, queue)
         repo.send("apofis-a", fits, listOf(d))
@@ -1512,7 +1517,7 @@ class SendQueueTest {
     @Test
     fun fileLargerThanItsReportedSizeSendsNothing() = runTest {
         addSession("apofis-a")
-        val big = ByteArray(6_800_000) { (it % 251).toByte() } // hashes to its digest, but expands past 9,000,000
+        val big = ByteArray(7_100_000) { (it % 251).toByte() } // hashes to its digest, but expands past 9,400,000 characters
         val d = sha(big)
         files[d] = big
         sizes[d] = 1L // measured while a truncated copy stood under that name
@@ -1545,5 +1550,48 @@ class SendQueueTest {
         respond(runStart("run_1"), 202)
         assertTrue(queue.drain())
         assertEquals(legacy, take().body!!.utf8())
+    }
+
+    @Test
+    fun admittedAtTheWireCapIsPostedWithItsIdAndChoice() = runTest {
+        addSession("apofis-a") // exists on the server, session id "apofis-a"
+        val choice = ChatModel("m".repeat(256), "p".repeat(256), "r".repeat(256), true)
+        ChatRepository(api, db, { clock }, queue).setChoice("apofis-a", choice)
+        val (size, caption) = atWireCap("0".repeat(64)) // only the digest's length matters to the sizes
+        val photo = ByteArray(size.toInt()) { (it % 253).toByte() }
+        val d = sha(photo)
+        files[d] = photo
+        respond(runStart("run_1"), 202)
+        queue.submit("apofis-a", caption, images = listOf(d))
+        val run = take()
+        assertEquals("/v1/runs", run.target)
+        val dataUrl = "data:image/jpeg;base64," + java.util.Base64.getEncoder().encodeToString(photo)
+        assertEquals(buildRunBody("apofis-a", caption, listOf(d), choice).replace("apofis-image:$d", dataUrl), run.body!!.utf8())
+        assertEquals("sending", rows("apofis-a").single().state)
+    }
+
+    @Test
+    fun grownRepeatedFileStopsReadingAtTheCeiling() = runTest {
+        addSession("apofis-a")
+        val grown = ByteArray(4_000_000) { (it % 241).toByte() } // two expansions pass 9,400,000 characters
+        val d = sha(grown)
+        files[d] = grown
+        sizes[d] = 1L // measured as a truncated copy
+        var reads = 0
+        onRead = { reads++ }
+        queue.submit("apofis-a", "look", images = listOf(d, d, d))
+        assertEquals(2, reads) // the third occurrence is never read
+        assertEquals(0, server.requestCount)
+        assertImageMissing()
+    }
+
+    @Test
+    fun sizeNearLongMaxIsRefusedWithoutOverflow() = runTest {
+        addSession("apofis-a")
+        val d = sha(byteArrayOf(1))
+        for (size in listOf(Long.MAX_VALUE - 1, 3L shl 61)) { // the second makes 4 * ceil(n / 3) wrap to Long.MIN_VALUE
+            sizes[d] = size
+            assertRefused(listOf(d), expected = SendTooLarge::class.java)
+        }
     }
 }

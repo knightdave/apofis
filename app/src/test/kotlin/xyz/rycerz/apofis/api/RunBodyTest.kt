@@ -147,6 +147,20 @@ class RunBodyTest {
     }
 
     @Test
+    fun expandStopsAtTheMaximumLength() {
+        val body = buildRunBody("s", "x", listOf(d1, d2))
+        val expected = body.replace("apofis-image:$d1", "data:image/jpeg;base64,AQID").replace("apofis-image:$d2", "data:image/jpeg;base64,BAUGBw==")
+        assertEquals(expected, expandImageRefs(body, listOf(d1, d2), expected.length) { files[it] })
+        var reads = 0
+        assertNull(expandImageRefs(body, listOf(d1, d2), expected.length - 1) { reads++; files[it] })
+        assertEquals(2, reads) // the total passes only with the last file
+        val afterFirst = expected.length - "BAUGBw==".length // everything but the second file's base64
+        reads = 0
+        assertNull(expandImageRefs(body, listOf(d1, d2), afterFirst - 1) { reads++; files[it] })
+        assertEquals(1, reads) // stopped before the second file is read
+    }
+
+    @Test
     fun textThatLooksLikeARefIsNotExpanded() {
         for (text in listOf("apofis-image:$d1", """{"url":"apofis-image:$d1"}""", """"},{"type":"image_url","image_url":{"url":"apofis-image:$d1"}}""")) {
             val body = buildRunBody("s", text, listOf(d2))

@@ -10,6 +10,7 @@ import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.MAX_BODY_BYTES
+import xyz.rycerz.apofis.api.MAX_EXPANDED_LENGTH
 import xyz.rycerz.apofis.api.MAX_IMAGES
 import xyz.rycerz.apofis.api.SessionDto
 import xyz.rycerz.apofis.api.buildRunBody
@@ -159,6 +160,7 @@ class SendQueue(
      * running run gets a steer of that run, stored as such before any request (not yet attempted).
      */
     private suspend fun store(sessionKey: String, text: String, steer: Boolean, images: List<String> = emptyList()): PendingSendEntity {
+        require(images.size <= MAX_IMAGES) { "too many images" } // before the copy: a huge list is never walked
         val digests = images.toList() // the caller's list may change while this suspends
         withContext(Dispatchers.IO) { admit(text, digests) }
         return handoff.withLock {
@@ -171,15 +173,16 @@ class SendQueue(
     }
 
     /**
-     * Decides once, before anything is armed, on the caller's inputs only: at most [MAX_IMAGES] well-formed digests, each
-     * file's size known (IllegalArgumentException), the row within [MAX_ROW_BYTES] and the expanded body within
-     * MAX_BODY_BYTES ([SendTooLarge]). Measured without the session id and choice, which ride in the margins of both.
+     * Decides once, before anything is armed, on the caller's inputs only: well-formed digests, each file's size known
+     * (IllegalArgumentException), no file, the row and the expanded body over their bounds ([MAX_ROW_BYTES],
+     * MAX_BODY_BYTES; [SendTooLarge]). Measured without the session id and choice, which ride in the margins of both.
      */
     private fun admit(text: String, images: List<String>) {
-        require(images.size <= MAX_IMAGES) { "too many images" }
         require(images.all { d -> d.length == 64 && d.all { it in '0'..'9' || it in 'a'..'f' } }) { "bad digest" }
         if (text.length > MAX_ROW_BYTES) throw SendTooLarge() // each character is at least one byte
-        val sizes = images.map { d -> requireNotNull(imageSize(d)?.takeIf { it >= 0 }) { "image missing" } }
+        val sizes = images.map { d ->
+            requireNotNull(imageSize(d)?.takeIf { it >= 0 }) { "image missing" }.also { if (it > MAX_BODY_BYTES) throw SendTooLarge() }
+        }
         val body = buildRunBody("", text, images)
         if (text.encodeToByteArray().size + body.encodeToByteArray().size > MAX_ROW_BYTES) throw SendTooLarge()
         if (expandedSize(body, sizes) > MAX_BODY_BYTES) throw SendTooLarge()
@@ -472,8 +475,8 @@ class SendQueue(
 
     /**
      * What [attempt] posts: the stored body, or for a row with images that body with each reference replaced by its file,
-     * re-hashed while read; null when one is missing, unreadable or changed, or has grown past MAX_BODY_BYTES since it
-     * was measured. Never stored; built once per attempt.
+     * re-hashed while read; null when one is missing, unreadable or changed, or the files have grown past
+     * MAX_EXPANDED_LENGTH since they were measured. Never stored; built once per attempt.
      */
     private fun wireBody(send: PendingSendEntity): String? {
         if (send.images.isEmpty()) return send.requestBody
@@ -486,9 +489,7 @@ class SendQueue(
                 null
             }
         }
-        val body = expandImageRefs(send.requestBody, send.images.split(','), read) ?: return null
-        // The expansion added only ASCII, so this is the exact UTF-8 size of what would be posted.
-        return body.takeIf { send.requestBody.encodeToByteArray().size + (it.length - send.requestBody.length) <= MAX_BODY_BYTES }
+        return expandImageRefs(send.requestBody, send.images.split(','), MAX_EXPANDED_LENGTH, read)
     }
 
     private fun expired(send: PendingSendEntity) = now() - send.createdAt > SEND_EXPIRY_MS

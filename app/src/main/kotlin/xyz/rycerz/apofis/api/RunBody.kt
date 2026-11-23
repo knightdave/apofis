@@ -16,6 +16,11 @@ const val IMAGE_REF = "apofis-image:"
 const val MAX_BODY_BYTES = 9_000_000 // H3 allows 10,000,000
 const val MAX_IMAGES = 10 // H1: the server commits at most 10 images per message
 
+// The longest expanded body an attempt builds, in characters. Above every admitted body once its session id and choice
+// are added (at most about 9,006,000), and low enough that the posted bytes stay under the server's 10,000,000 when the
+// caption's characters take several bytes each (at most about 500,000 more, given the row budget).
+const val MAX_EXPANDED_LENGTH = 9_400_000
+
 private const val DATA_URL = "data:image/jpeg;base64,"
 
 /**
@@ -74,10 +79,11 @@ fun expandedSize(body: String, imageBytes: List<Long>): Long =
 
 /**
  * [body] with each image part's reference replaced by the data URL of its file; null unless the image parts are exactly
- * the builder's parts for [digests] in order, every file is there and its bytes hash to its digest. A caption that looks
- * like a part is escaped JSON and never matches. Without digests [body] itself is returned, uncopied.
+ * the builder's parts for [digests] in order, every file is there, its bytes hash to its digest and the result stays
+ * within [maxLength] characters (checked as each file is read, before the next is read or anything is built). A caption
+ * that looks like a part is escaped JSON and never matches. Without digests [body] itself is returned, uncopied.
  */
-fun expandImageRefs(body: String, digests: List<String>, bytes: (sha256: String) -> ByteArray?): String? {
+fun expandImageRefs(body: String, digests: List<String>, maxLength: Int = MAX_EXPANDED_LENGTH, bytes: (sha256: String) -> ByteArray?): String? {
     if (digests.isEmpty()) return body
     val urls = IntArray(digests.size) // where each reference starts
     var from = 0
@@ -89,9 +95,16 @@ fun expandImageRefs(body: String, digests: List<String>, bytes: (sha256: String)
         from = at + token.length
     }
     if (body.indexOf(PART, from) >= 0) return null
-    val files = digests.map { d -> bytes(d)?.takeIf { sha256(it) == d } ?: return null }
-    val size = body.length + files.sumOf { DATA_URL.length + 4L * ((it.size + 2) / 3) - REF_LENGTH }
-    val out = StringBuilder(size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+    // Fixed text first, then each file's base64: the total only grows, so the first total over the maximum is final.
+    var length = body.length + digests.size.toLong() * (DATA_URL.length - REF_LENGTH)
+    val files = ArrayList<ByteArray>(digests.size)
+    for (d in digests) {
+        val b = bytes(d)?.takeIf { sha256(it) == d } ?: return null
+        length += 4L * ((b.size + 2) / 3)
+        if (length > maxLength) return null
+        files += b
+    }
+    val out = StringBuilder(length.toInt())
     var copied = 0
     for ((i, b) in files.withIndex()) {
         out.append(body, copied, urls[i]).append(DATA_URL).append(Base64.getEncoder().encodeToString(b))
