@@ -10,18 +10,29 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
@@ -54,6 +65,7 @@ import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.SendQueue
+import xyz.rycerz.apofis.sync.withRepositoryLock
 
 private const val KEY = "apofis-a"
 private const val RUN = "run_1"
@@ -88,6 +100,41 @@ class RunFollowerTest {
         if (!await(10, TimeUnit.SECONDS)) gateTimeouts.incrementAndGet()
     }
 
+    /** The scope of every follower a test builds; tearDown fails the test if one of their coroutines is still unfinished. */
+    private val followerScopes = CopyOnWriteArrayList<CoroutineScope>()
+
+    private fun followers(scope: CoroutineScope) = scope.also { followerScopes += it }
+
+    /**
+     * [runTest] that ends every follower coroutine after the body, also a body that failed, was cancelled or timed out,
+     * while the test scheduler still runs, so none is left unfinished to run into the next test (tearDown checks it).
+     * runTest alone only cancels them. The body's own failure stays the one reported.
+     */
+    private fun runFollowerTest(body: suspend TestScope.() -> Unit) = runTest {
+        val outcome = runCatching { body() }
+        val stuck = endFollowers()
+        outcome.exceptionOrNull()?.let { e ->
+            stuck?.let(e::addSuppressed)
+            throw e
+        }
+        stuck?.let { throw it }
+    }
+
+    /**
+     * Cancels every follower coroutine and waits for all of them, at most 10 s in real time. The wait runs off the test
+     * dispatcher and cannot be cancelled, so a cancelled or timed-out caller still waits; its result comes back into
+     * the protected context without a dispatcher change, so a cancelled caller still receives it. Returns the failure,
+     * if any.
+     */
+    private suspend fun endFollowers(): AssertionError? {
+        followerScopes.forEach { it.coroutineContext.job.cancelChildren() }
+        val children = followerScopes.flatMap { it.coroutineContext.job.children }
+        val ended = withContext(NonCancellable) {
+            withContext(Dispatchers.Default) { withTimeoutOrNull(10_000) { children.joinAll() } }
+        } != null
+        return if (ended) null else AssertionError("a follower did not end within 10 s after its test")
+    }
+
     @Volatile private var beforeQuery: (sql: String, args: List<Any?>) -> Unit = { _, _ -> }
 
     @Before
@@ -113,8 +160,14 @@ class RunFollowerTest {
     fun tearDown() {
         val unopened = gates.count { it.count > 0 }
         gates.forEach { it.countDown() } // no server thread stays blocked
+        // A follower coroutine that outlived its test can never end (its test scheduler no longer runs); one that holds
+        // the process-wide repository lock would block every later test, so the lock is probed too (FLAKY cause 6).
+        val followersEnded = runBlocking { withTimeoutOrNull(2_000) { followerScopes.flatMap { it.coroutineContext.job.children }.joinAll() } } != null
+        val lockFree = runBlocking { withTimeoutOrNull(2_000) { withRepositoryLock { } } } != null
         db.close()
         server.close()
+        assertTrue("a follower outlived its test", followersEnded)
+        assertTrue("the repository lock is still held", lockFree)
         assertEquals("gates never opened", 0, unopened)
         assertEquals("gate waits that timed out", 0, gateTimeouts.get())
     }
@@ -126,7 +179,7 @@ class RunFollowerTest {
     ): RunFollower {
         lateinit var f: RunFollower
         f = RunFollower(
-            api, db, repo, backgroundScope,
+            api, db, repo, followers(backgroundScope),
             delayMs = {
                 delays += it
                 seenAtDelay += f.live(KEY).value
@@ -222,7 +275,7 @@ class RunFollowerTest {
     // ---- tests ----
 
     @Test
-    fun finishAfterConfirmedDeleteRecreatesNothing() = runTest {
+    fun finishAfterConfirmedDeleteRecreatesNothing() = runFollowerTest {
         val f = follower()
         val gate = gate()
         messages()
@@ -244,7 +297,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun stopDrawnForAFinishedRunNeverStopsItsSuccessor() = runTest {
+    fun stopDrawnForAFinishedRunNeverStopsItsSuccessor() = runFollowerTest {
         val f = follower()
         f.resumeAll()
         addSession()
@@ -258,7 +311,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun earlierTranscriptFetchDoesNotClearALaterRejection() = runTest {
+    fun earlierTranscriptFetchDoesNotClearALaterRejection() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, json("{}", 500)) // the follower's next read fails without saying anything about the key
@@ -279,9 +332,9 @@ class RunFollowerTest {
     }
 
     @Test
-    fun finishOfAClosedConnectionLeavesTheRunToTheNewOne() = runTest {
+    fun finishOfAClosedConnectionLeavesTheRunToTheNewOne() = runFollowerTest {
         val open = AtomicBoolean(true)
-        val f = RunFollower(api, db, repo, backgroundScope, delayMs = {}, onRunFinished = { finished += it }, active = open::get)
+        val f = RunFollower(api, db, repo, followers(backgroundScope), delayMs = {}, onRunFinished = { finished += it }, active = open::get)
         val wrote = CompletableDeferred<Unit>()
         f.beforeFinishWrite = {
             open.set(false) // a switch to a new key at the same server closes this connection; its rows stay
@@ -300,7 +353,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun backgroundWorkerFinishesAnEndedRunThenSendsTheNextMessage() = runTest {
+    fun backgroundWorkerFinishesAnEndedRunThenSendsTheNextMessage() = runFollowerTest {
         val f = follower() // never resumed: the app is in the background, so no follower runs
         messages()
         on(STATUS, status("completed")) // the run finished on the server meanwhile
@@ -323,7 +376,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun backgroundWorkerLeavesARunningRunAlone() = runTest {
+    fun backgroundWorkerLeavesARunningRunAlone() = runFollowerTest {
         val f = follower()
         on(STATUS, status("running"))
         addSession()
@@ -341,7 +394,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun streamsThenReplacesWithServerRows() = runTest {
+    fun streamsThenReplacesWithServerRows() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val gate = gate()
@@ -384,7 +437,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun firstAttachSendsNoLastEventId() = runTest {
+    fun firstAttachSendsNoLastEventId() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -396,7 +449,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun resumesFromStoredSeq() = runTest {
+    fun resumesFromStoredSeq() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done) // a fresh process: the row survived, the live text did not
         messages()
@@ -416,7 +469,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun silentCloseReconnects() = runTest {
+    fun silentCloseReconnects() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val gate = gate()
@@ -439,7 +492,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun truncatedFallsBackToPolling() = runTest {
+    fun truncatedFallsBackToPolling() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -458,7 +511,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun eventsNotFoundFallsBackToPolling() = runTest {
+    fun eventsNotFoundFallsBackToPolling() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -473,7 +526,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun statusNotFoundFinishesQuietly() = runTest {
+    fun statusNotFoundFinishesQuietly() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -488,7 +541,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun queuedThenRunning() = runTest {
+    fun queuedThenRunning() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -505,7 +558,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun unknownWaitsForResolve() = runTest {
+    fun unknownWaitsForResolve() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -531,7 +584,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun stopRecordsStoppedOutcome() = runTest {
+    fun stopRecordsStoppedOutcome() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -554,7 +607,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun cancelledWithoutStopIsInterrupted() = runTest {
+    fun cancelledWithoutStopIsInterrupted() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -566,7 +619,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun failedRunRecordsFailed() = runTest {
+    fun failedRunRecordsFailed() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -583,7 +636,7 @@ class RunFollowerTest {
         """{"event":"approval.request","kind":"approval","prompt_id":"evt_prompt","execution_generation":9,"seq":1}"""
 
     @Test
-    fun approvalUsesPendingControlIds() = runTest {
+    fun approvalUsesPendingControlIds() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -619,7 +672,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun approvalConflictClearsPending() = runTest {
+    fun approvalConflictClearsPending() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -652,7 +705,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun resumeAllFollowsEveryStoredRun() = runTest {
+    fun resumeAllFollowsEveryStoredRun() = runFollowerTest {
         val f = follower()
         addSession("apofis-a")
         addSession("apofis-b")
@@ -675,7 +728,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun pauseAllKeepsRows() = runTest {
+    fun pauseAllKeepsRows() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -705,7 +758,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun unknownEventTypesIgnored() = runTest {
+    fun unknownEventTypesIgnored() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val gate = gate()
@@ -731,7 +784,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun toolStepsCarryDuration() = runTest {
+    fun toolStepsCarryDuration() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val gate = gate()
@@ -757,7 +810,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun unauthorizedStopsWithoutDeletingRow() = runTest {
+    fun unauthorizedStopsWithoutDeletingRow() = runFollowerTest {
         val f = follower()
         on(EVENTS, json("""{"error":{"code":"invalid_api_key"}}""", 401))
         started(f)
@@ -769,7 +822,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun finishRetriesWhenSyncFails() = runTest {
+    fun finishRetriesWhenSyncFails() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val rowsDuringRetry = CopyOnWriteArrayList<Boolean>()
@@ -808,7 +861,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun approvalReplacedReturnsChanged() = runTest {
+    fun approvalReplacedReturnsChanged() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", otherControl))
@@ -825,7 +878,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun approvalGoneReturnsGone() = runTest {
+    fun approvalGoneReturnsGone() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("running"))
@@ -838,7 +891,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun clarifyUsesSameRule() = runTest {
+    fun clarifyUsesSameRule() = runFollowerTest {
         val f = follower()
         val release = gate()
         val clarify = """{"kind":"clarify","prompt_id":"cl_1","execution_generation":2,"command":null,"question":"Which?"}"""
@@ -854,7 +907,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun finishTailSurvivesCancellation() = runTest {
+    fun finishTailSurvivesCancellation() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         // Leaving the foreground while onRunFinished runs cancels the follower job; the handoff must still complete.
         val f = follower(done, beforeFinished = {
@@ -872,7 +925,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun onRunStartedWhilePausedWaitsForResume() = runTest {
+    fun onRunStartedWhilePausedWaitsForResume() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -896,7 +949,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun approvalRefreshFailureIsRetried() = runTest {
+    fun approvalRefreshFailureIsRetried() = runFollowerTest {
         val f = follower()
         messages()
         val release = gate()
@@ -921,7 +974,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun unauthorizedStopCancelsFollower() = runTest {
+    fun unauthorizedStopCancelsFollower() = runFollowerTest {
         val f = follower()
         val release = gate()
         on("/v1/runs/$RUN/stop", json("""{"error":{"code":"invalid_api_key"}}""", 401))
@@ -948,7 +1001,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun unknownSettledEventKeepsApproval() = runTest {
+    fun unknownSettledEventKeepsApproval() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -961,7 +1014,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun approvalRespondedClearsOnlyWhenStatusAgrees() = runTest {
+    fun approvalRespondedClearsOnlyWhenStatusAgrees() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("waiting_for_approval", pendingControl), status("waiting_for_approval", pendingControl), status("running"))
@@ -985,7 +1038,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun pollingSurvivesPauseResumeAndRestart() = runTest {
+    fun pollingSurvivesPauseResumeAndRestart() = runFollowerTest {
         val f = follower()
         messages()
         val statusCalls = AtomicInteger()
@@ -1014,7 +1067,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun permanentSyncFailureUnblocksSession() = runTest {
+    fun permanentSyncFailureUnblocksSession() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         on(MESSAGES, json("not json"))
@@ -1034,7 +1087,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun finishKeepsRetryingInTheForegroundUntilTheSyncSucceeds() = runTest {
+    fun finishKeepsRetryingInTheForegroundUntilTheSyncSucceeds() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val calls = AtomicInteger()
@@ -1050,7 +1103,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun malformedRunIdEndsAsFailure() = runTest {
+    fun malformedRunIdEndsAsFailure() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         f.resumeAll()
@@ -1075,7 +1128,7 @@ class RunFollowerTest {
         json("""{"session_id":"$KEY","data":[${rows.joinToString(",")}]}""")
 
     @Test
-    fun hiddenUserRowDoesNotConfirm() = runTest {
+    fun hiddenUserRowDoesNotConfirm() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         on(MESSAGES, messagesWith("""{"id":10,"role":"user","display_kind":"hidden","content":"text p1","timestamp":1.0}"""))
@@ -1087,7 +1140,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun mergedSteersAreAllConfirmed() = runTest {
+    fun mergedSteersAreAllConfirmed() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         on(
@@ -1111,7 +1164,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun transcriptNeverLosesUserTextDuringFinish() = runTest {
+    fun transcriptNeverLosesUserTextDuringFinish() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val gate = gate()
@@ -1135,7 +1188,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun cancellationDuringFinishWriteStillCompletes() = runTest {
+    fun cancellationDuringFinishWriteStillCompletes() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         f.beforeFinishWrite = {
@@ -1154,7 +1207,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun newerApprovalDuringPostIsShown() = runTest {
+    fun newerApprovalDuringPostIsShown() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1170,7 +1223,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun alreadyResolvedReportsGone() = runTest {
+    fun alreadyResolvedReportsGone() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1186,7 +1239,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun conflictWithReplacementReportsChanged() = runTest {
+    fun conflictWithReplacementReportsChanged() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1202,7 +1255,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun pauseAfterTruncationNeverReattaches() = runTest {
+    fun pauseAfterTruncationNeverReattaches() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("running"))
@@ -1227,7 +1280,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun serverStoppingWithoutLocalIntentIsInterrupted() = runTest {
+    fun serverStoppingWithoutLocalIntentIsInterrupted() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -1240,7 +1293,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun stopAllStopsEveryRunOfTheChat() = runTest {
+    fun stopAllStopsEveryRunOfTheChat() = runFollowerTest {
         val f = follower()
         addSession()
         addRun(RUN)
@@ -1257,7 +1310,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun stopAllThrowsWhenAStopFails() = runTest {
+    fun stopAllThrowsWhenAStopFails() = runFollowerTest {
         val f = follower()
         addSession()
         addRun(RUN)
@@ -1270,7 +1323,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun stopIntentIsStoredApartFromStatus() = runTest {
+    fun stopIntentIsStoredApartFromStatus() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("running"))
@@ -1285,7 +1338,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun recoveryFromStoppingIsStoredAsRunning() = runTest {
+    fun recoveryFromStoppingIsStoredAsRunning() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("running"))
@@ -1300,7 +1353,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun unrecognizedStatusIsStoredAsRunning() = runTest {
+    fun unrecognizedStatusIsStoredAsRunning() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("brand_new_state"))
@@ -1316,7 +1369,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun terminalStatusIsStoredBeforeFinish() = runTest {
+    fun terminalStatusIsStoredBeforeFinish() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val gate = gate()
@@ -1331,9 +1384,9 @@ class RunFollowerTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
-    fun pauseAllSurvivesInlineCompletion() = runTest {
+    fun pauseAllSurvivesInlineCompletion() = runFollowerTest {
         // Unconfined: a cancelled job completes inside cancel(), so its completion handler runs during pauseAll.
-        val f = RunFollower(api, db, repo, CoroutineScope(UnconfinedTestDispatcher(testScheduler)), delayMs = { awaitCancellation() })
+        val f = RunFollower(api, db, repo, followers(CoroutineScope(UnconfinedTestDispatcher(testScheduler))), delayMs = { awaitCancellation() })
         addSession("apofis-a")
         addSession("apofis-b")
         db.activeRunDao().upsert(ActiveRunEntity("run_a", "apofis-a", null, "running", 1L, polling = true))
@@ -1346,7 +1399,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun syncWithoutRequestKeepsCredentialsRejected() = runTest {
+    fun syncWithoutRequestKeepsCredentialsRejected() = runFollowerTest {
         val rejectedAtDelay = CopyOnWriteArrayList<Boolean>()
         val f = follower(onDelay = {
             rejectedAtDelay += credentialsRejected.value
@@ -1370,7 +1423,7 @@ class RunFollowerTest {
     // ---- fix round 3 ----
 
     @Test
-    fun failedReadAfterPostKeepsApprovalAndRetries() = runTest {
+    fun failedReadAfterPostKeepsApprovalAndRetries() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("waiting_for_approval", otherControl))
@@ -1385,7 +1438,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun malformedAnswerWithRequestStillPendingIsAnError() = runTest {
+    fun malformedAnswerWithRequestStillPendingIsAnError() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1402,7 +1455,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun malformedAnswerWithRequestGoneIsGone() = runTest {
+    fun malformedAnswerWithRequestGoneIsGone() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1417,7 +1470,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun resumeRightAfterPauseWaitsForTheOldJob() = runTest {
+    fun resumeRightAfterPauseWaitsForTheOldJob() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -1439,7 +1492,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun pauseDuringTerminalStatusWriteStillStoresIt() = runTest {
+    fun pauseDuringTerminalStatusWriteStillStoresIt() = runFollowerTest {
         val f = follower()
         messages()
         on(EVENTS, sse(delta(0, "a"), terminal(1)))
@@ -1459,7 +1512,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun failedFinishTransactionLeavesLiveAndQueue() = runTest {
+    fun failedFinishTransactionLeavesLiveAndQueue() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val atRetry = CopyOnWriteArrayList<String>()
         val f = follower(done, onDelay = {
@@ -1479,7 +1532,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun successfulTranscriptFetchClearsCredentialsRejected() = runTest {
+    fun successfulTranscriptFetchClearsCredentialsRejected() = runFollowerTest {
         val rejectedAtDelay = CopyOnWriteArrayList<Boolean>()
         val f = follower(onDelay = {
             rejectedAtDelay += credentialsRejected.value
@@ -1508,7 +1561,7 @@ class RunFollowerTest {
     private val unauthorized = json("""{"error":{"code":"invalid_api_key"}}""", 401)
 
     @Test
-    fun acceptedAnswerStaysSentWhenTheReadIsRejected() = runTest {
+    fun acceptedAnswerStaysSentWhenTheReadIsRejected() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
@@ -1522,7 +1575,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun alreadyResolvedWithFailedReadRethrowsAndRetries() = runTest {
+    fun alreadyResolvedWithFailedReadRethrowsAndRetries() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), json("{}", 500), status("running"))
@@ -1542,7 +1595,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun olderReadNeverOverwritesANewerApproval() = runTest {
+    fun olderReadNeverOverwritesANewerApproval() = runFollowerTest {
         val f = follower()
         messages()
         val slow = gate()
@@ -1577,7 +1630,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun truncatedAnswerResponseIsReconciled() = runTest {
+    fun truncatedAnswerResponseIsReconciled() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1594,7 +1647,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun restartAfterPollingFallbackNeverRequestsEvents() = runTest {
+    fun restartAfterPollingFallbackNeverRequestsEvents() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val g = follower(done) // a second follower whose gate is open before the run exists
         g.resumeAll()
@@ -1614,7 +1667,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun rejectionDuringFinishDrainStaysShown() = runTest {
+    fun rejectionDuringFinishDrainStaysShown() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done, beforeFinished = {
             try {
@@ -1640,7 +1693,7 @@ class RunFollowerTest {
     private val resolvedBody = json("""{"run_id":"$RUN","status":"resolved","prompt_id":"ctl_prompt"}""")
 
     @Test
-    fun refreshKeepsRetryingUntilAReadSucceeds() = runTest {
+    fun refreshKeepsRetryingUntilAReadSucceeds() = runFollowerTest {
         val f = follower()
         val release = gate()
         val failed = json("{}", 500)
@@ -1655,7 +1708,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun refreshPendingAtPauseResumesAfterResumeAll() = runTest {
+    fun refreshPendingAtPauseResumesAfterResumeAll() = runFollowerTest {
         val paused = AtomicBoolean(false)
         val resumed = AtomicBoolean(false)
         val readsWhilePaused = AtomicInteger()
@@ -1683,7 +1736,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun rejectionBetweenStatusReadAndItsApplyStaysShown() = runTest {
+    fun rejectionBetweenStatusReadAndItsApplyStaysShown() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1709,7 +1762,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun rejectedRefreshAfterAnswerStopsTheStream() = runTest {
+    fun rejectedRefreshAfterAnswerStopsTheStream() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), unauthorized)
@@ -1727,7 +1780,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun pauseWhileApplyingTerminalStatusStillStoresIt() = runTest {
+    fun pauseWhileApplyingTerminalStatusStillStoresIt() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("completed"))
@@ -1749,7 +1802,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun cancelledRefreshStaysRequestedUntilApplied() = runTest {
+    fun cancelledRefreshStaysRequestedUntilApplied() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("waiting_for_approval", pendingControl), status("waiting_for_approval", otherControl))
@@ -1796,7 +1849,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun sendRightAfterRunningIsShownIsSteered() = runTest {
+    fun sendRightAfterRunningIsShownIsSteered() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("queued"), status("running"))
@@ -1814,7 +1867,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun sendRightAfterApprovalIsShownIsNotSteered() = runTest {
+    fun sendRightAfterApprovalIsShownIsNotSteered() = runFollowerTest {
         val f = follower()
         messages()
         on(STATUS, status("waiting_for_approval", pendingControl))
@@ -1832,7 +1885,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun sendRightAfterTerminalStatusIsShownIsNotSteered() = runTest {
+    fun sendRightAfterTerminalStatusIsShownIsNotSteered() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         messages()
@@ -1851,7 +1904,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun sendRightAfterStopIsShownIsNotSteered() = runTest {
+    fun sendRightAfterStopIsShownIsNotSteered() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("running"))
@@ -1870,7 +1923,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun failedStopKeepsTheStatusAndTheNextSendSteers() = runTest {
+    fun failedStopKeepsTheStatusAndTheNextSendSteers() = runFollowerTest {
         val f = follower()
         val release = gate()
         on(STATUS, status("running"))
@@ -1893,7 +1946,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun statusReadReturningAfterTheTerminalEventNeverUndoesIt() = runTest {
+    fun statusReadReturningAfterTheTerminalEventNeverUndoesIt() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val finish = gate()
@@ -1925,7 +1978,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun statusReadBeforeTheTerminalEventEndsTerminal() = runTest {
+    fun statusReadBeforeTheTerminalEventEndsTerminal() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val finish = gate()
@@ -1949,7 +2002,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun lateRunningReadAfterRestartShowsTheStoredTerminalStatus() = runTest {
+    fun lateRunningReadAfterRestartShowsTheStoredTerminalStatus() = runFollowerTest {
         val f = follower() // a new process over a database that already stored the terminal status
         on(STATUS, status("running"))
         on(EVENTS, heldStream())
@@ -1966,7 +2019,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun failedTerminalStoreIsRetriedByTheNextObservation() = runTest {
+    fun failedTerminalStoreIsRetriedByTheNextObservation() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val atRetry = CopyOnWriteArrayList<String>()
         val f = follower(done, onDelay = {
@@ -2012,7 +2065,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun overlappingStopsKeepTheIntentOfTheOneAccepted() = runTest {
+    fun overlappingStopsKeepTheIntentOfTheOneAccepted() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val release = gate()
@@ -2045,7 +2098,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun overlappingStopsThatBothFailLeaveNoIntent() = runTest {
+    fun overlappingStopsThatBothFailLeaveNoIntent() = runFollowerTest {
         val f = follower()
         val release = gate()
         val firstAnswer = gate()
@@ -2068,7 +2121,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun stopWhoseIntentCannotBeStoredSendsNothingAndALaterStopCounts() = runTest {
+    fun stopWhoseIntentCannotBeStoredSendsNothingAndALaterStopCounts() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val release = gate()
@@ -2096,7 +2149,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun acceptedStopSurvivesItsCallerBeingCancelled() = runTest {
+    fun acceptedStopSurvivesItsCallerBeingCancelled() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val release = gate()
@@ -2132,7 +2185,7 @@ class RunFollowerTest {
     }
 
     @Test
-    fun stopIntentFromBeforeARestartSurvivesTwoOverlappingFailedStops() = runTest {
+    fun stopIntentFromBeforeARestartSurvivesTwoOverlappingFailedStops() = runFollowerTest {
         val done = CompletableDeferred<Unit>()
         val f = follower(done)
         val release = gate()
@@ -2158,5 +2211,105 @@ class RunFollowerTest {
         release.countDown()
         done.await()
         assertEquals(listOf("STOPPED"), outcomes().map { it.outcome })
+    }
+
+    @Test
+    fun stopIntentLoadAndRegisterInterleave() = runFollowerTest {
+        val f = follower()
+        addSession()
+        addRun()
+        db.activeRunDao().setStopRequested(RUN) // accepted by the server before the process restarted
+        // Refresher.stop is called directly with its lock held here, so both stops queue on that lock before either
+        // registers and get it in turn. A stop that counts itself and loads the stored intent in two lock steps lets
+        // the other count itself in between: both then skip the load and the last failure erases the intent.
+        val refresher = RunFollower::class.java.getDeclaredMethod("refresher", ActiveRunEntity::class.java)
+            .apply { isAccessible = true }.invoke(f, db.activeRunDao().get(RUN))!!
+        val lock = refresher.javaClass.getDeclaredField("stopping").apply { isAccessible = true }.get(refresher) as Mutex
+        val stop = refresher.javaClass.getDeclaredMethod("stop", Function1::class.java, Continuation::class.java)
+            .apply { isAccessible = true }
+        val failingPost: suspend () -> Unit = { throw ApiError.Http(500, null) }
+        fun failingStop() = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { suspendCoroutineUninterceptedOrReturn<Unit> { stop.invoke(refresher, failingPost, it) } }
+        }
+
+        lock.lock()
+        val first = failingStop() // each runs up to the held lock before the next line
+        val second = failingStop()
+        lock.unlock()
+
+        assertTrue(first.await().exceptionOrNull() is ApiError.Http)
+        assertTrue(second.await().exceptionOrNull() is ApiError.Http)
+        assertTrue(db.activeRunDao().get(RUN)!!.stopRequested)
+    }
+
+    @Test
+    fun followerCleanupOutlastsACancelledCaller() = runFollowerTest {
+        follower() // registers the scope the cleanup ends
+        val holding = CompletableDeferred<Unit>()
+        val release = CountDownLatch(1)
+        var opened = false
+        backgroundScope.launch {
+            // A follower in a non-cancellable step under the repository lock that resumes from a real thread.
+            withContext(NonCancellable) {
+                withRepositoryLock {
+                    holding.complete(Unit)
+                    opened = withContext(Dispatchers.IO) { release.await(10, TimeUnit.SECONDS) }
+                }
+            }
+        }
+        holding.await()
+
+        val cleanup = launch(start = CoroutineStart.UNDISPATCHED) { endFollowers() }
+        try {
+            cleanup.cancel() // as runTest cancels a timed-out body during its cleanup
+            testScheduler.runCurrent() // a cancellable wait would end here, with the follower still held
+            assertFalse("the cleanup ended before the follower", cleanup.isCompleted)
+        } finally {
+            release.countDown()
+        }
+        cleanup.join()
+
+        assertTrue("the follower's latch expired instead of being opened", opened)
+        withRepositoryLock { } // free again before Room closes
+    }
+
+    @Test
+    fun bodyFailureSurvivesItsOwnCancellation() {
+        val release = CountDownLatch(1)
+        var opened = false
+        var followerEnded = false
+        val failure = runCatching {
+            runFollowerTest {
+                follower() // registers the scope the cleanup ends
+                // The follower's latch opens only once the test job's cancellation has reached this child, so the
+                // follower is suspended through that cancellation.
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        release.countDown()
+                    }
+                }
+                val holding = CompletableDeferred<Unit>()
+                backgroundScope.launch {
+                    withContext(NonCancellable) {
+                        holding.complete(Unit)
+                        opened = withContext(Dispatchers.IO) { release.await(10, TimeUnit.SECONDS) }
+                        followerEnded = true
+                    }
+                }
+                holding.await()
+                cancel() // as runTest's timeout cancels the body
+                throw AssertionError("body sentinel") // without suspending
+            }
+        }.exceptionOrNull()
+
+        assertTrue("the follower's latch expired instead of being opened", opened)
+        assertTrue("the cleanup did not wait for the follower", followerEnded)
+        assertTrue("got $failure", failure is AssertionError && failure.message == "body sentinel")
+        assertTrue(
+            "the cleanup timed out instead of waiting",
+            failure!!.suppressed.none { it is AssertionError && it.message == "a follower did not end within 10 s after its test" },
+        )
     }
 }
