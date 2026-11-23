@@ -321,10 +321,12 @@ class PushRegistrar(
 
     /**
      * The one place [Keys.SERVER_UNDONE] is written: set when a server-facing operation failed, except when the server was
-     * only unreachable while the proof stands (that proves nothing); removed when it had an API and did not fail.
+     * only unreachable while the proof stands (that proves nothing); removed when it had an API and did not fail. A 502 or
+     * 504 is a proxy that could not reach the server, so it counts as unreachable too.
      */
     private fun recordOutcome(hadApi: Boolean, error: Exception?) {
-        val unreachable = error is ApiError.Network || error is ApiError.Unavailable || error is IOException
+        val unreachable = error is ApiError.Network || error is ApiError.Unavailable || error is IOException ||
+            (error is ApiError.Http && error.status in setOf(502, 504))
         when {
             failed && unreachable && prefs.contains(Keys.VERIFIED_AT) -> Unit
             failed -> if (!prefs.contains(Keys.SERVER_UNDONE)) PushStore.commit(prefs) { putBoolean(Keys.SERVER_UNDONE, true) }

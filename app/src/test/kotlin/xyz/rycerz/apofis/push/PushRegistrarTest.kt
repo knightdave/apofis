@@ -709,6 +709,40 @@ class PushRegistrarTest {
     }
 
     @Test
+    fun proxyAnswersKeepProvenOn() = runTest {
+        // What HermesApi maps a proxy's 502, 503 and 504 to (503 is already Unavailable).
+        for (error in listOf(ApiError.Http(502, null), ApiError.Unavailable(null), ApiError.Http(504, null))) {
+            with(World()) {
+                val r = registrar()
+                turnedOn(r)
+                val proof = prefs.getLong(Keys.VERIFIED_AT, -1)
+                now += VERIFY_EVERY_MS
+                apiA.failWith = error
+                assertFalse("$error: the work reports retry", r.verifyNow(force = false))
+                assertTrue("$error: a read was attempted", apiA.calls.last().startsWith("read "))
+                assertEquals("$error", PushState.On(NTFY_PACKAGE), r.ui.value.state)
+                assertFalse("$error: no flag", prefs.contains(Keys.SERVER_UNDONE))
+                assertEquals("$error: the proof is unchanged", proof, prefs.getLong(Keys.VERIFIED_AT, -1))
+                restart()
+                assertEquals("$error: rebuilt from the same prefs", PushState.On(NTFY_PACKAGE), registrar().ui.value.state)
+            }
+        }
+    }
+
+    @Test
+    fun definiteHttpErrorStillFlags() = runTest { // control
+        with(World()) {
+            val r = registrar()
+            turnedOn(r)
+            now += VERIFY_EVERY_MS
+            apiA.failWith = ApiError.Http(500, null)
+            assertFalse(r.verifyNow(force = false))
+            assertTrue(prefs.getBoolean(Keys.SERVER_UNDONE, false))
+            assertEquals(PushState.ServerError(NTFY_PACKAGE), r.ui.value.state)
+        }
+    }
+
+    @Test
     fun registrationOfAnotherPolicyIsReplaced() = runTest {
         with(World()) {
             port.installed += "xyz.rycerz.apofis.e2e"
