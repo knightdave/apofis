@@ -126,37 +126,29 @@ class IntentGateTest {
 
     /**
      * Until Room has run every query handed to it, the main thread has run what those resumed, and the notifier's lane
-     * is empty, with nothing new handed to Room meanwhile. One 10 s watchdog covers the whole wait and names the stage
-     * that did not finish; at the deadline it also interrupts a main-thread task that blocks.
+     * is empty, with nothing new handed to Room meanwhile. One 10 s limit covers Room, every main-thread task that
+     * returns, and the notifier, and names the stage that did not finish; a main-thread task that never returns blocks
+     * the test like any blocked main thread (bounded only by the job's time limit).
      */
     private fun drain() {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
         var stage = "Room"
         fun left(): Long = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).also { check(it > 0) { "$stage did not finish within 10 s" } }
         val looper = shadowOf(Looper.getMainLooper())
-        val test = Thread.currentThread()
-        val watchdog = Executors.newSingleThreadScheduledExecutor().apply { schedule({ test.interrupt() }, 10, TimeUnit.SECONDS) }
-        try {
-            do {
-                stage = "Room"
-                val seen = synchronized(lock) {
-                    while (inFlight > 0) lock.wait(left())
-                    handed
-                }
-                stage = "The main thread"
-                while (!looper.isIdle) {
-                    left()
-                    looper.runOneTask()
-                }
-                stage = "The notifier"
-                runBlocking { withTimeoutOrNull(left()) { app.container.notifier.idle() } } ?: error("$stage did not finish within 10 s")
-            } while (synchronized(lock) { inFlight > 0 || handed != seen })
-        } catch (e: InterruptedException) {
-            throw AssertionError("$stage did not finish within 10 s", e)
-        } finally {
-            watchdog.shutdownNow()
-            Thread.interrupted() // a late interrupt must not reach the next step of the test
-        }
+        do {
+            stage = "Room"
+            val seen = synchronized(lock) {
+                while (inFlight > 0) lock.wait(left())
+                handed
+            }
+            stage = "The main thread"
+            while (!looper.isIdle) {
+                left()
+                looper.runOneTask()
+            }
+            stage = "The notifier"
+            runBlocking { withTimeoutOrNull(left()) { app.container.notifier.idle() } } ?: error("$stage did not finish within 10 s")
+        } while (synchronized(lock) { inFlight > 0 || handed != seen })
     }
 
     /** [deliver] a tap for [k]: once its work ended, its chat is requested and its notification is gone. */
