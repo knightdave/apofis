@@ -353,7 +353,7 @@ class PushE2eTest {
         }.firstOrNull()
 
     /** Discovers the row by the bounded scroll first (it may not exist until the list has scrolled to it). */
-    private fun showRow() = reveal("the Notifications row", settingsList() ?: fail("No Settings list")) { rowTitle() }
+    private fun showRow() = discover("the Notifications row", ::settingsList) { rowTitle() }
 
     /** The row's value, by the app's own string names (reading needs no scrolling: the value is its own node text). */
     private fun rowValue(): String? {
@@ -400,18 +400,26 @@ class PushE2eTest {
     /** A sheet action by its string: discovered by the bounded scroll in the sheet (its root kept), then enabled. */
     private fun sheetAction(stringName: String): AccessibilityNodeInfo {
         val label = app.str(stringName)
-        var root: AccessibilityNodeInfo? = null
-        app.waitFor("the sheet", 10_000) { sheet().also { root = it } != null }
-        val found = reveal("\"$label\" in the sheet", root!!) { labelIn(root!!, label) }
+        val found = discover("\"$label\" in the sheet", ::sheet) { root -> labelIn(root, label) }
         app.waitFor("an enabled \"$label\" in the sheet", 30_000) { found.refresh() && clickableOf(found)?.isEnabled == true }
         return clickableOf(found) ?: fail("\"$label\" in the sheet is not a control")
     }
 
     /**
-     * Finds [what] and brings it on screen by scrolling [container] (kept for the whole search) with [revealIn];
-     * progress is what is visible in it, texts and bounds. Logs how many scrolls it took.
+     * Discovers [what] on screen: one bounded scrolling search ([reveal]) in the [container] selected for it, repeated
+     * until the target exists (a row or sheet still loading) or 30 s pass.
      */
-    private fun reveal(what: String, container: AccessibilityNodeInfo, finder: () -> AccessibilityNodeInfo?): AccessibilityNodeInfo {
+    private fun discover(what: String, container: () -> AccessibilityNodeInfo?, finder: (AccessibilityNodeInfo) -> AccessibilityNodeInfo?): AccessibilityNodeInfo {
+        var found: AccessibilityNodeInfo? = null
+        app.waitFor("$what, scrolled to", 30_000) { container()?.let { c -> reveal(what, c) { finder(c) } }?.also { found = it } != null }
+        return found!!
+    }
+
+    /**
+     * Looks for [what] and brings it on screen by scrolling [container] (kept for the whole search) with [revealIn];
+     * progress is what is visible in it, texts and bounds. Logs how many scrolls it took; null when not found.
+     */
+    private fun reveal(what: String, container: AccessibilityNodeInfo, finder: () -> AccessibilityNodeInfo?): AccessibilityNodeInfo? {
         fun visible(n: AccessibilityNodeInfo): List<String> = (if (n.isVisibleToUser) listOf("${n.text}@" + Rect().also(n::getBoundsInScreen)) else emptyList()) +
             (0 until n.childCount).mapNotNull(n::getChild).flatMap(::visible)
         val (found, scrolls) = revealIn(object : ScrollList<AccessibilityNodeInfo> {
@@ -424,8 +432,8 @@ class PushE2eTest {
             }
             override fun shown(): Any = container.also { it.refresh() }.let(::visible)
         })
-        app.log("$what ${if (found != null) "found" else "not found"} after $scrolls scroll(s)")
-        return found ?: fail("Not found on screen after $scrolls scroll(s): $what. Screen: ${app.screen()}")
+        if (found != null) app.log("$what found after $scrolls scroll(s)")
+        return found
     }
 
     /** Turns push on from the row (Off: one tap enables) and waits for On. */
