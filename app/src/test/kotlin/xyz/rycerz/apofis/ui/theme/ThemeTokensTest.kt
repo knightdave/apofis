@@ -2,6 +2,7 @@ package xyz.rycerz.apofis.ui.theme
 
 import androidx.compose.material3.ColorScheme
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.compositeOver
 import kotlin.math.abs
 import org.junit.Assert.assertEquals
@@ -102,6 +103,77 @@ class ThemeTokensTest {
         assertEquals(emptyList<String>(), failures)
     }
 
+    /**
+     * With blur on (the Settings switch), the glass shows blurred content of any color: every foreground on it keeps its
+     * floor over black, white, the text color, primary and every grey between, and the glass stays translucent, in all 12
+     * palettes. Selected text is not one of the floors (ruling): its worst case is pinned as a known limit instead.
+     */
+    @Test
+    fun blurredGlassKeepsItsFloorsOverAnyContent() {
+        val failures = mutableListOf<String>()
+        val table = StringBuilder("theme | composer alpha | text | placeholder | expand | primary | button alpha | arrow | selected text | selected, blur off\n")
+        var worstSelected = Double.MAX_VALUE to ""
+        var worstSelectedOff = Double.MAX_VALUE
+        for ((name, scheme, _) in themes) {
+            val dark = scheme.surface.luminance() < 0.5f
+            val contents = listOf(Color.Black, Color.White, scheme.onSurface, scheme.primary) + (0..255).map { Color(it, it, it) }
+            fun worst(fg: Color, glass: Color, over: Color = Color.Transparent) =
+                contents.minOf { content -> contrastRatio(fg, over.compositeOver(glass.compositeOver(content))) }
+            val c = blurredColors(scheme, dark) ?: run { failures += "$name: no blur"; null } ?: continue
+            val pairs = listOf(
+                Triple("text", scheme.onSurface to c.glassFill, 4.5),
+                Triple("placeholder", c.muted to c.glassFill, 4.5),
+                Triple("expand icon", c.expandIcon to c.glassFill, 3.0),
+                Triple("send fill and stop outline", scheme.primary to c.glassFill, 3.0),
+                Triple("scroll arrow", scheme.onSurface to c.glassButtonFill, 3.0),
+            )
+            val ratios = pairs.map { (what, colors, min) ->
+                val ratio = worst(colors.first, colors.second)
+                if (ratio < min) failures += "$name: $what is %.2f:1 over some content, needs $min".format(ratio)
+                ratio
+            }
+            for ((what, glass) in listOf("composer" to c.glassFill, "scroll button" to c.glassButtonFill)) {
+                if (glass.alpha >= 1f) failures += "$name: the $what glass is opaque"
+            }
+            // Selected text: on Material's selection background (primary at 0.40) over the raised glass; and with blur off,
+            // over the fill-only glass on its page backplate.
+            val selection = scheme.primary.copy(alpha = 0.4f)
+            val selected = worst(scheme.onSurface, c.glassFill, selection)
+            val off = apofisColors(scheme, dark)
+            val selectedOff = contrastRatio(scheme.onSurface, selection.compositeOver(off.glassFill.compositeOver(scheme.surface)))
+            if (selected < worstSelected.first) worstSelected = selected to name
+            worstSelectedOff = minOf(worstSelectedOff, selectedOff)
+            table.append("$name | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f\n".format(c.glassFill.alpha, ratios[0], ratios[1], ratios[2], ratios[3], c.glassButtonFill.alpha, ratios[4], selected, selectedOff))
+        }
+        table.append("worst selected text with blur: %.3f in %s; with blur off: %.3f\n".format(worstSelected.first, worstSelected.second, worstSelectedOff))
+        println(table)
+        // Known limit (ruling): with blur on, selected text can fall below 4.5:1 over bright content. Pinned, so worse fails.
+        assertTrue("selected text with blur: ${worstSelected.first} in ${worstSelected.second}", worstSelected.first >= SELECTED_WITH_BLUR)
+        assertEquals(emptyList<String>(), failures)
+        // Without blur nothing changes: the glass keeps the UI map's alpha over its page backplate.
+        for ((_, scheme, c) in themes) {
+            val dark = scheme.surface.luminance() < 0.5f
+            assertEquals(if (dark) 0.74f else 0.82f, c.glassFill.alpha, 0.002f)
+            assertEquals(if (dark) 0.40f else 0.85f, c.glassButtonFill.alpha, 0.002f)
+        }
+    }
+
+    /** The switch: its outline when off and its fill when on reach 3:1 on the card; the thumb when on reaches 3:1 on its track. */
+    @Test
+    fun switchReaches3to1OnTheCard() {
+        val failures = mutableListOf<String>()
+        for ((name, scheme, c) in themes) {
+            fun floor(what: String, fg: Color, bg: Color) {
+                val ratio = contrastRatio(fg, bg)
+                if (ratio < 3.0) failures += "$name: $what is %.2f:1".format(ratio)
+            }
+            floor("off outline on the card", scheme.outline, c.cardFill)
+            floor("on track on the card", scheme.primary, c.cardFill)
+            floor("on thumb on its track", scheme.onPrimary, scheme.primary)
+        }
+        assertEquals(emptyList<String>(), failures)
+    }
+
     /** The wave's brightest phase (reply dots on the page, mini dots on the timeline card) reaches 3:1; dimmer phases are decorative. */
     @Test
     fun theWavePeakReaches3to1() {
@@ -154,5 +226,10 @@ class ThemeTokensTest {
         assertTrue(contrastRatio(shifted, darkCodeFill) >= 4.5)
         assertNotEquals(grey, shifted)
         assertEquals(darkOnSurface, readableOn(darkOnSurface, darkCodeFill, toward = Color.White))
+    }
+
+    private companion object {
+        /** The measured worst case of selected text in the composer with frosted glass on, over any content (known limit). */
+        const val SELECTED_WITH_BLUR = 3.729 // green dark, pure off
     }
 }

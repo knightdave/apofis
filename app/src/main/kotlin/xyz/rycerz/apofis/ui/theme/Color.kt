@@ -10,6 +10,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * Tokens Material has no slot for. The UI map's alpha recipes are resolved here, once per theme, to opaque colors;
@@ -45,6 +46,7 @@ data class ApofisColors(
     val actionIcon: Color,
     val expandIcon: Color, // non-text: 3:1
     val switchOffTrack: Color,
+    val switchOffThumb: Color,
     val glassFill: Color,
     val glassBorder: Color,
     val glassButtonFill: Color,
@@ -182,6 +184,7 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
         actionIcon = on.at(0.9f, page),
         expandIcon = on.at(if (dark) 0.45f else 0.49f, page), // light 0.49: the smallest alpha that reaches 3:1
         switchOffTrack = on.at(0.08f, page),
+        switchOffThumb = if (dark) scheme.onSurfaceVariant else White,
         glassFill = (if (dark) on.at(0.07f, page) else scheme.primary.at(0.02f, page)).copy(alpha = if (dark) 0.74f else 0.82f),
         glassBorder = if (dark) on.copy(alpha = 0.10f) else scheme.outline.copy(alpha = 0.20f),
         glassButtonFill = page.copy(alpha = if (dark) 0.40f else 0.85f),
@@ -191,6 +194,37 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
         // The sheet handle is a non-text cue: the UI map's 0.2, raised in 0.05 steps until it reaches 3:1 over the page.
         handle = on.copy(alpha = (4..20).map { it * 0.05f }.first { contrastRatio(on.at(it, page), page) >= 3.0 || it >= 1f }),
     )
+}
+
+/**
+ * The tokens with blur on, or null when blur must not be drawn. The glass then shows blurred content of any color instead
+ * of a page backplate, so each fill is raised from the UI map's alpha to the smallest translucent one at which every
+ * resting foreground on it keeps its floor over any content: the composer's text, placeholder and primary controls, and
+ * the scroll button's arrow. The expand icon takes the placeholder's tone, as in the map. When no translucent fill passes
+ * for either surface, null: the theme keeps the blur-off tokens and no blur.
+ */
+internal fun blurredColors(scheme: ColorScheme, dark: Boolean): ApofisColors? {
+    val c = apofisColors(scheme, dark)
+    val on = scheme.onSurface
+    val card = glassAlpha(c.glassFill, on to 4.5, c.muted to 4.5, scheme.primary to 3.0) ?: return null
+    val button = glassAlpha(c.glassButtonFill, on to 3.0) ?: return null
+    return c.copy(expandIcon = c.muted, glassFill = c.glassFill.copy(alpha = card), glassButtonFill = c.glassButtonFill.copy(alpha = button))
+}
+
+/** The smallest alpha, from [glass]'s own up in 1 % steps and below 1, at which each foreground keeps its floor over any content; null if none. */
+private fun glassAlpha(glass: Color, vararg floors: Pair<Color, Double>): Float? =
+    ((glass.alpha * 100).roundToInt()..99).map { it / 100f }
+        .firstOrNull { a -> floors.all { (fg, min) -> worstContrast(fg, glass.copy(alpha = a)) >= min } }
+
+/**
+ * The lowest contrast of [foreground] on [glass] (translucent) over content of any color: the glass over black and over
+ * white bound the luminance it can show, and every luminance between occurs, so a foreground inside that range has 1:1.
+ */
+internal fun worstContrast(foreground: Color, glass: Color): Double {
+    val overBlack = glass.compositeOver(Black)
+    val overWhite = glass.compositeOver(White)
+    if (foreground.luminance() in overBlack.luminance()..overWhite.luminance()) return 1.0
+    return min(contrastRatio(foreground, overBlack), contrastRatio(foreground, overWhite))
 }
 
 /** WCAG 2.x contrast ratio of two opaque colors. */

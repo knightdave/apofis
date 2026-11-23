@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.settings
 
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -36,14 +37,23 @@ class NotificationsScreenshotTest {
         themeMode = ThemeMode.SYSTEM,
         dynamicColor = true,
         pureBlack = false,
+        blur = false,
+        chatFontScale = 1f,
+        enterToSend = false,
+        haptics = true,
         versionName = "0.1.0",
         notifications = { NotificationsRow(NotificationsUi(ALLOWED, PushUi(push), null)) {} },
         onConnection = {},
         onThemeMode = {},
         onDynamicColor = {},
         onPureBlack = {},
+        onBlur = {},
+        onChatFontScale = {},
+        onEnterToSend = {},
+        onHaptics = {},
         onLicenses = {},
         onBack = {},
+        scrollState = rememberScrollState(Int.MAX_VALUE), // scrolled to the end: the Notifications and About cards
     )
 
     @Composable

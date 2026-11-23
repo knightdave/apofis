@@ -1,5 +1,7 @@
 package xyz.rycerz.apofis.ui.drawer
 
+import xyz.rycerz.apofis.ui.clippedTexts
+
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -70,5 +72,18 @@ class SessionActionsSheetTest {
         host()
         rule.onNodeWithText("Delete").performScrollTo().assertIsDisplayed().performClick()
         assertEquals(listOf(1L), deletes)
+    }
+
+    /** A failed rename or delete in Polish, at double size in a 320 dp window: the whole error sentence is laid out. */
+    @Test
+    @Config(qualifiers = "pl-w320dp-h760dp-xhdpi", fontScale = 2f)
+    fun aPolishErrorInADialogWrapsInsteadOfBeingCut() {
+        host()
+        for (kind in listOf(PromptKind.RENAME, PromptKind.DELETE)) {
+            prompt = Prompt(kind, "apofis-1", "Garden", pinned = false, archived = false, running = true, token = 2, error = ActionError.NOT_FOUND)
+            rule.waitForIdle()
+            rule.onNodeWithText("Serwer nie znalazł tego czatu").assertExists()
+            assertEquals("$kind", emptyList<String>(), rule.clippedTexts())
+        }
     }
 }
