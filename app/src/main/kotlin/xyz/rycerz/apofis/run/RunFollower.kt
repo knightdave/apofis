@@ -306,7 +306,13 @@ class RunFollower(
                 applying.withLock {
                     val ordered = ticket != null && status !in TERMINAL
                     if (ordered && ticket!! <= applied) return@withLock
-                    val held = db.activeRunDao().storeStatus(run.runId, stored(status))
+                    // Fenced like the finish write: checked in the write's own transaction, so once a switch has closed
+                    // this connection and written (the cache clear or the key quarantine), no store of it lands.
+                    var closed = false
+                    val held = db.withTransaction {
+                        if (active()) db.activeRunDao().storeStatus(run.runId, stored(status)) else null.also { closed = true }
+                    }
+                    if (closed) return@withLock // a closed connection's read shows and hands over nothing
                     if (ordered) applied = ticket!!
                     if (held == null) {
                         state(run.sessionKey).update { if (it?.runId == run.runId) null else it }

@@ -44,6 +44,8 @@ import xyz.rycerz.apofis.push.PushStore
 import xyz.rycerz.apofis.push.PushRegistrar
 import xyz.rycerz.apofis.push.RealUnifiedPush
 import xyz.rycerz.apofis.push.UnifiedPushPort
+import xyz.rycerz.apofis.push.Wake
+import xyz.rycerz.apofis.push.WakeRequest
 import xyz.rycerz.apofis.push.TestPush
 import xyz.rycerz.apofis.ui.settings.PushCommands
 import xyz.rycerz.apofis.push.pushPolicy
@@ -161,6 +163,13 @@ class AppContainer(
     // One database for the app's lifetime; it outlives credential changes.
     private val db by lazy(openDatabase)
     private val cachePrefs = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
+    private val reconcile = WakeRequest.Reconcile { db.activeRunDao().any() } // read by the wake lane when it acts
+
+    init {
+        // The fallback check runs while any run is stored, push on or off; also reconciled when a connection is published.
+        // Every emission posts: the lane reads the table itself and skips only what it already applied.
+        scope.launch { db.activeRunDao().observeAny().collect { Wake.post(app, reconcile) } }
+    }
 
     // Guarded by this.
     @Volatile private var current: Connected? = null
@@ -398,7 +407,7 @@ class AppContainer(
         } else {
             credentials.load()?.let(::build)?.also {
                 scope.launch { scheduleQueuedSends() }
-                scope.launch { notifier.replayOutbox() } // notices a process death left between the commit and the post
+                scope.launch { notifier.replayOutbox(it.generation) } // notices a process death left between the commit and the post
             }
         }
         // Another epoch's leftovers (a switch a death interrupted); reads nothing about chats, posts nothing.
@@ -425,7 +434,15 @@ class AppContainer(
     private suspend fun afterSwitch() {
         runCatching { PublishWorker.recover(app) }.onFailure(::logFailure) // push work skipped while the switch ran
         if (current != null) scheduleQueuedSends()
+        if (current != null) onPublished()
         foreground.refresh()
+    }
+
+    // A connection was published: a wake pending for its epoch is served now, with no further push; its periodic check
+    // is created from the stored runs (the switch cancelled the old one).
+    private fun onPublished() {
+        Wake.recover(app)
+        Wake.post(app, reconcile)
     }
 
     // On every start with a connection and after every switch, so a process death between cancelling the durable

@@ -277,9 +277,11 @@ class Notifier(
     /**
      * On the connected path, at start and at every background check: stale state removed, notifications no longer
      * matching stored state retired (a request whose run is gone, an event superseded by a later decision), then
-     * every outbox row of the current epoch posted silently, oldest run first.
+     * every outbox row of the current epoch posted silently, oldest run first. Only while [epoch], the caller's
+     * connection, is still the current one when the lane gets to it; otherwise nothing at all.
      */
-    suspend fun replayOutbox() = inLane {
+    suspend fun replayOutbox(epoch: Long) = inLane {
+        if (epoch != generation()) return@inLane
         sweep()
         val current = generation()
         for (sbn in nm.activeNotifications) {
