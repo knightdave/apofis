@@ -1,14 +1,21 @@
 package xyz.rycerz.apofis
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
 import android.os.Looper
+import androidx.arch.core.executor.ArchTaskExecutor
+import androidx.arch.core.executor.TaskExecutor
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -16,7 +23,6 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -39,7 +45,11 @@ private const val SENTINEL = "apofis-c"
  * MainActivity acts on the launcher intent and on notification taps through the non-exported alias only. The decision
  * is [gate]; the activity cases run the real container (no connection: Robolectric has no keystore) and observe the one
  * channel from an intent to the selection, [AppContainer.chatToOpen], and the tapped chat's notification.
+ *
+ * A hand-over waits only for Room (its IO executor), the main thread and the notifier's lane. Room's executor is counted
+ * here, so [drain] returns once all three are quiet: every check runs after the delivered intent's own work has ended.
  */
+@SuppressLint("RestrictedApi") // ArchTaskExecutor: Room's default IO executor, replaced for the test
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [37])
 class IntentGateTest {
@@ -47,6 +57,11 @@ class IntentGateTest {
     private val nm = app.getSystemService(NotificationManager::class.java)
     private val db = Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").allowMainThreadQueries().build() // the container's file
     private val epoch get() = app.container.epoch()
+    private var run = 0L
+    private val io = Executors.newCachedThreadPool()
+    private val lock = Object()
+    private var inFlight = 0 // guarded by lock
+    private var handed = 0L // guarded by lock
 
     private fun uri(k: String): Uri = chatUri(epoch, k)
     private fun tap(k: String) = Intent(Intent.ACTION_VIEW, uri(k)).setClassName(app, OPEN_CHAT)
@@ -55,6 +70,20 @@ class IntentGateTest {
 
     @Before
     fun setUp() = runBlocking {
+        ArchTaskExecutor.getInstance().setDelegate(object : TaskExecutor() {
+            override fun executeOnDiskIO(runnable: Runnable) {
+                synchronized(lock) { inFlight++; handed++ }
+                io.execute {
+                    try {
+                        runnable.run()
+                    } finally {
+                        synchronized(lock) { inFlight--; lock.notifyAll() }
+                    }
+                }
+            }
+            override fun postToMainThread(runnable: Runnable) { Handler(Looper.getMainLooper()).post(runnable) }
+            override fun isMainThread() = Looper.getMainLooper().thread === Thread.currentThread()
+        })
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
         shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
         for (k in listOf(TMP, OTHER, SENTINEL)) {
@@ -62,13 +91,15 @@ class IntentGateTest {
         }
         db.messageDao().insertAll(listOf(MessageEntity(TMP, 0, 1, "user", null, "hello", null, null, null, null, 1.0, null)))
         app.container.preferences.lastChat = TMP // the open chat, restored by a plain start
-        for (k in listOf(OTHER, SENTINEL)) app.container.notifier.notice(k, "run_$k", 1, Notice.FINISHED, "run:run_$k", epoch, replay = false)
-        app.container.notifier.idle()
-        assertNotNull(shown(OTHER))
     }
 
     @After
-    fun tearDown() = db.close()
+    fun tearDown() {
+        activity?.pause()?.stop()?.destroy()
+        db.close()
+        ArchTaskExecutor.getInstance().setDelegate(null)
+        io.shutdown()
+    }
 
     private fun shown(k: String) = nm.activeNotifications.firstOrNull { it.tag == k }
 
@@ -81,29 +112,61 @@ class IntentGateTest {
         }
     }
 
-    private fun until(what: String, check: () -> Boolean) {
-        repeat(1000) { // a watchdog of 10 s, not a synchronisation: it ends as soon as the check holds
-            shadowOf(Looper.getMainLooper()).idle()
-            if (check()) return
-            Thread.sleep(10)
+    /** An empty tap slot and a fresh notification for each of [keys]: the next check sees only what the next intent does. */
+    private fun arm(vararg keys: String) = runBlocking {
+        app.container.chatToOpen.value?.let(app.container::chatOpened) // no connection: nothing else consumes it
+        for (k in keys) {
+            run++
+            app.container.notifier.notice(k, "run_$run", run, Notice.FINISHED, "run:run_$run", epoch, replay = false)
         }
-        fail("timed out waiting for $what")
+        app.container.notifier.idle()
+        for (k in keys) assertNotNull(shown(k))
     }
 
-    private fun start(intent: Intent): ActivityController<MainActivity> = Robolectric.buildActivity(MainActivity::class.java, intent).setup()
-
-    /** A real tap for [SENTINEL], waited for: a hand-over of an earlier intent would have run before it. */
-    private fun settle(c: ActivityController<MainActivity>) {
-        c.newIntent(tap(SENTINEL))
-        until("the sentinel tap") { app.container.chatToOpen.value == epoch to SENTINEL && shown(SENTINEL) == null }
+    /**
+     * Until Room has run every query handed to it, the main thread has run what those resumed, and the notifier's lane
+     * is empty, with nothing new handed to Room meanwhile. A blocking wait on that condition; 10 s is a watchdog only.
+     */
+    private fun drain() {
+        do {
+            val seen = synchronized(lock) {
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                while (inFlight > 0) {
+                    val left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+                    check(left > 0) { "Room work still running after 10 s" }
+                    lock.wait(left)
+                }
+                handed
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+            runBlocking { app.container.notifier.idle() }
+        } while (synchronized(lock) { inFlight > 0 || handed != seen })
     }
 
-    /** Nothing but the sentinel was opened: [OTHER] keeps its notification and the open chat stays [TMP]. */
-    private fun assertOnlySentinelOpened(before: List<String>) {
+    /** [deliver] a tap for [k]: once its work ended, its chat is requested and its notification is gone. */
+    private fun assertTapOpens(k: String, deliver: (Intent) -> Unit) {
+        arm(k)
+        deliver(tap(k))
+        drain()
+        assertEquals(epoch to k, app.container.chatToOpen.value)
+        assertNull(shown(k))
+    }
+
+    /** Delivers [intent] after arming [OTHER]; afterwards nothing was requested and every row is as before. */
+    private fun assertIgnored(intent: Intent, deliver: (Intent) -> Unit) {
+        arm(OTHER)
+        val before = tables()
+        deliver(intent)
+        drain()
+        assertNull(app.container.chatToOpen.value)
         assertNotNull(shown(OTHER))
         assertEquals(TMP, app.container.preferences.lastChat)
         assertEquals(before, tables())
     }
+
+    private var activity: ActivityController<MainActivity>? = null
+    private fun start(intent: Intent) { activity = Robolectric.buildActivity(MainActivity::class.java, intent).setup() }
+    private val warm: (Intent) -> Unit = { activity!!.newIntent(it) }
 
     @Test
     fun externalChatViewIgnored() {
@@ -112,25 +175,18 @@ class IntentGateTest {
         assertFalse(gate(Intent(Intent.ACTION_VIEW, uri(OTHER)).setClassName("com.example", OPEN_CHAT), fresh = true, app.packageName))
         assertFalse(gate(Intent(Intent.ACTION_VIEW, uri(OTHER)).setClassName(app, OPEN_CHAT + "X"), fresh = true, app.packageName))
 
-        val before = tables()
-        val c = start(explicit(OTHER))
-        settle(c)
-        assertOnlySentinelOpened(before)
-        c.newIntent(explicit(OTHER)) // warm: a VIEW aimed at the running activity
-        settle(c)
-        assertOnlySentinelOpened(before)
-        c.pause().stop().destroy()
+        assertIgnored(explicit(OTHER), ::start) // cold
+        assertTapOpens(SENTINEL, warm) // the activity hands taps over
+        assertIgnored(explicit(OTHER), warm) // warm: a VIEW aimed at the running activity
     }
 
     @Test
     fun notificationTapThroughAliasOpensChat() {
         assertTrue(gate(tap(OTHER), fresh = true, app.packageName))
 
-        val c = start(tap(OTHER))
-        until("the tap") { app.container.chatToOpen.value == epoch to OTHER && shown(OTHER) == null }
-        assertEquals(launcher().component, c.get().intent.component) // handed over once: a later reader sees a plain start
-        settle(c) // and through onNewIntent
-        c.pause().stop().destroy()
+        assertTapOpens(OTHER, ::start)
+        assertEquals(launcher().component, activity!!.get().intent.component) // handed over once: a later reader sees a plain start
+        assertTapOpens(SENTINEL, warm)
     }
 
     @Test
@@ -139,11 +195,16 @@ class IntentGateTest {
         assertFalse(gate(replayed, fresh = true, app.packageName))
         assertFalse(gate(tap(OTHER), fresh = false, app.packageName)) // the activity was recreated
 
-        val before = tables()
-        val c = start(replayed)
-        settle(c)
-        assertOnlySentinelOpened(before)
-        c.pause().stop().destroy()
+        assertIgnored(replayed, ::start)
+        assertTapOpens(SENTINEL, warm)
+        assertIgnored(replayed, warm)
+    }
+
+    @Test
+    fun restoredActivityIgnoresItsTap() {
+        // A rotation or a restore delivers the old tap again, with saved state.
+        assertIgnored(tap(OTHER)) { activity = Robolectric.buildActivity(MainActivity::class.java, it).setup(Bundle()) }
+        assertTapOpens(SENTINEL, warm)
     }
 
     @Test
@@ -152,27 +213,29 @@ class IntentGateTest {
         assertFalse(gate(odd, fresh = true, app.packageName))
         assertFalse(gate(launcher(), fresh = true, app.packageName))
 
-        val before = tables()
-        val c = start(odd)
-        settle(c)
-        assertOnlySentinelOpened(before)
-        c.pause().stop().destroy()
+        assertIgnored(odd, ::start)
+        assertTapOpens(SENTINEL, warm)
+        assertIgnored(odd, warm)
+    }
+
+    // The two cold starts run as separate tests: each gets its own application and container, never loaded before.
+
+    @Test
+    fun coldClearedLauncherStartChangesNothing() {
+        val cleared = launcher().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        assertFalse(gate(cleared, fresh = true, app.packageName))
+
+        assertIgnored(cleared, ::start)
+        assertTapOpens(SENTINEL, warm)
     }
 
     @Test
     fun coldExternalStartChangesNothing() {
-        val cleared = launcher().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        assertFalse(gate(cleared, fresh = true, app.packageName))
-        val extras = explicit(OTHER).putExtra("sessionKey", OTHER).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        assertFalse(gate(extras, fresh = true, app.packageName))
+        val external = explicit(OTHER).putExtra("sessionKey", OTHER).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        assertFalse(gate(external, fresh = true, app.packageName))
 
-        val before = tables()
-        for (intent in listOf(cleared, extras)) {
-            val c = start(intent) // the container is fresh, as after Android reclaimed the process
-            settle(c)
-            assertOnlySentinelOpened(before)
-            c.pause().stop().destroy()
-        }
+        assertIgnored(external, ::start)
+        assertTapOpens(SENTINEL, warm)
     }
 
     @Test
