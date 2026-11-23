@@ -125,16 +125,18 @@ class Fake:
             held = self.held()
         if not held:
             return "released"
+        killed = False
         for pid in held:
             if pid is not None:
                 try:
                     os.killpg(pid, signal.SIGKILL)  # the child runs in its own session: its group id is its pid
+                    killed = True
                 except OSError:
                     pass
         end = time.monotonic() + 5
         while self.held() and time.monotonic() < end:
             time.sleep(0.05)
-        return "unaccounted" if self.held() else "killed"
+        return "unaccounted" if self.held() or not killed else "killed"
 
     def held(self) -> list:
         """The published pid (or None) of each slot a hook child of this home still holds."""

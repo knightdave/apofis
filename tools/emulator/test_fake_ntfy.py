@@ -243,7 +243,9 @@ class RealTrigger(Base):
         self.assertTrue(entered.wait(WATCHDOG))
         pid = slot_pid(self.home())
         self.assertTrue(pid and alive(pid))
+        started = time.monotonic()
         self.assertEqual("killed", f.stop())  # the teardown kills the child's process group
+        self.assertLess(time.monotonic() - started, 4)  # not its own 5 s request timeout
         self.assertFalse(alive(pid))
         with self.assertRaises(ProcessLookupError):
             os.killpg(pid, 0)
@@ -315,12 +317,17 @@ class RealTrigger(Base):
             with socket.socket() as s:  # a free port, then the fake on it
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
+            r, w = os.pipe()  # a descriptor the fake inherits (as from the harness's shell) and must close
             p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "fake_ntfy.py"), "--run-dir",
                                   os.path.join(root, "run"), "--port", str(port), "--topic", TOPIC, "--script", SCRIPT,
                                   "--wake-install", INSTALL], cwd=root, env=env, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL)
+                                 stderr=subprocess.DEVNULL, pass_fds=(w,))
             try:
                 self.assertEqual(b"READY\n", p.stdout.readline())
+                inherited = "pipe:[%d]" % os.fstat(w).st_ino
+                self.assertNotIn(inherited, {path for path, _ in open_files(p.pid)})
+                os.close(w)
+                os.close(r)
                 self.assertEqual(200, request(port, "POST", "/trigger")[0])
                 self.assertEqual((200, b'{"kind":"needs_input"}'), request(port, "GET", "/%s/poll" % TOPIC))
             finally:
