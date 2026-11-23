@@ -569,6 +569,365 @@ for f in "$here"/../../e2e/src/main/kotlin/xyz/rycerz/apofis/e2e/*.kt; do
   check "$(basename "$f" .kt) writes result rows (Evidence rule)" 'grep -q "@get:Rule val evidence = Evidence(" "$f"'
 done
 
+# 14. Milestone 3: the selection matrix, the model-start ledger, push provisioning and push record cleanup (rule C3).
+sel() { push=() models=() tests=''; select_tests "$@"; }
+check "selection: an unknown selection is refused" '! sel bogus && ! sel test PushE2eTest && ! sel test PushE2eTest#nope && ! sel test PushE2eTestX#connectorLifecycle'
+check "selection: --full never selects a push test nor a ledgered method, and its filter excludes PushE2eTest" \
+  'sel full && [ "$tests" = all ] && [ "${#push[@]}" = 0 ] && [ "${#models[@]}" = 0 ] && [ "$(instrument_filter all)" = "-e package $PKG -e notClass $PKG.PushE2eTest" ]'
+check "selection: --push provisions the three gate 1 scenarios, no model start" \
+  'sel push && [ "${push[*]}" = "connectorLifecycle hostilePushes permissionAndTestPush" ] && [ "${#models[@]}" = 0 ] && [ "$(instrument_filter push)" = "-e class $PKG.PushE2eTest#connectorLifecycle,$PKG.PushE2eTest#hostilePushes,$PKG.PushE2eTest#permissionAndTestPush" ]'
+check "selection: --push-model reserves the three model methods and provisions only the push one" \
+  'sel push-model && [ "${models[*]}" = "${PUSH_MODEL[*]}" ] && [ "${push[*]}" = pushWakesKilledApp ] && [ "$(instrument_filter push-model)" = "-e class $PKG.PushE2eTest#pushWakesKilledApp,$PKG.SurvivalE2eTest#connectAndChat,$PKG.SurvivalE2eTest#replySurvivesProcessDeath" ]'
+check "selection: --test PushE2eTest#x provisions like its row" \
+  'sel test PushE2eTest#hostilePushes && [ "${push[*]}" = hostilePushes ] && [ "${#models[@]}" = 0 ] && sel test PushE2eTest#pushWakesKilledApp && [ "${push[*]}" = pushWakesKilledApp ] && [ "${models[*]}" = PushE2eTest#pushWakesKilledApp ]'
+check "selection: --test of a model method of the survival suite is ledgered, without push" \
+  'sel test SurvivalE2eTest#replySurvivesProcessDeath && [ "${models[*]}" = SurvivalE2eTest#replySurvivesProcessDeath ] && [ "${#push[@]}" = 0 ]'
+check "selection: suite names are never --test arguments" '! sel test push-model && ! sel test push && ! sel test all && ! sel test smoke'
+check "selection: an unknown class, method or scenario is refused" '! sel test FooE2eTest && ! sel test SurvivalE2eTest#nope && ! sel test survivalE2eTest && ! sel scenario bogus && ! sel scenario "connectAndChat x"'
+check "selection: the legacy survival selections keep working, unledgered but model-capable, with their filters" \
+  'sel test SurvivalE2eTest && [ -n "$model_capable" ] && [ "${#models[@]}" = 0 ] && [ "$(instrument_filter "$tests")" = "-e class $PKG.SurvivalE2eTest" ] && sel scenario steerDuringRun && [ -n "$model_capable" ] && [ "${#models[@]}" = 0 ] && [ "$(instrument_filter "$tests")" = "-e class $PKG.SurvivalE2eTest#steerDuringRun" ] && sel test SurvivalE2eTest#steerDuringRun && [ -n "$model_capable" ] && [ "${#models[@]}" = 0 ]'
+check "selection: --full is model-capable; smoke, push and their methods are not" \
+  'sel full && [ -n "$model_capable" ] && sel smoke && [ -z "$model_capable" ] && sel push && [ -z "$model_capable" ] && sel test SmokeE2eTest#connectViaLoopback && [ -z "$model_capable" ] && sel test PushE2eTest#hostilePushes && [ -z "$model_capable" ] && sel test HarnessSelfTest && [ -z "$model_capable" ]'
+check "selection: gate 2 (--test PushE2eTest#pushWakesKilledApp) reserves 1, provisions push, and runs only that method" \
+  'sel test PushE2eTest#pushWakesKilledApp && [ "${models[*]}" = PushE2eTest#pushWakesKilledApp ] && [ "${MODEL_BOUND[${models[0]}]}" = 1 ] && [ "${push[*]}" = pushWakesKilledApp ] && [ -n "$model_capable" ] && [ "$(instrument_filter "$tests")" = "-e class $PKG.PushE2eTest#pushWakesKilledApp" ]'
+check "selection: a multi-line scenario with one valid line is refused, selecting nothing" '! sel scenario "$(printf "connectAndChat\nbogus")" && [ -z "$tests" ] && ! sel test "$(printf "SurvivalE2eTest#connectAndChat\nX")"'
+# shellcheck disable=SC2329 # the class lookup accepts anything here: the token check alone must refuse
+check "selection: the strict token check refuses a multi-line name even past the class lookup" '! (known_test() { return 0; }; sel test "$(printf "SurvivalE2eTest\nX")")'
+rc=0; o=$( (no_core_dumps() { echo "PASSED THE CHECKS"; return 1; }; main --scenario "$(printf 'connectAndChat\nconnectAndChat x')") 2>&1) || rc=$?
+check "main: a multi-line scenario is refused before the lock" '[ "$rc" != 0 ] && lacks "$o" "PASSED THE CHECKS"'
+for a in "--test push-model" "--push extra" "--test" "--test SurvivalE2eTest#connectAndChat extra" "--scenario bogus"; do
+  read -ra words <<<"$a"
+  # The first step after the checks is stubbed to stop: a refusal that failed ends there, before any lock or the key.
+  # shellcheck disable=SC2329
+  rc=0; o=$( (no_core_dumps() { echo "PASSED THE CHECKS"; return 1; }; main "${words[@]}") 2>&1) || rc=$?
+  check "main: '$a' refused before any side effect" '[ "$rc" != 0 ] && lacks "$o" "PASSED THE CHECKS"'
+done
+mkdir -p "$t/hw/.hermes"
+printf 'x apofis_push.py\ny apofis_push.py\n' >"$t/hw/.hermes/config.yaml"
+o=$(HOME=$t/hw hook_warning 2>&1)
+check "hook warning: counts, and 0 for a missing file" 'has "$o" "config.yaml=2" && has "$o" "shell-hooks-allowlist.json=0"'
+chmod 000 "$t/hw/.hermes/config.yaml"
+o=$(HOME=$t/hw hook_warning 2>&1)
+chmod 600 "$t/hw/.hermes/config.yaml"
+check "hook warning: an unreadable file is unknown, not 0" 'has "$o" "config.yaml=unknown"'
+check "selection: every ledgered method has a proved bound of 1" 'for m in "${PUSH_MODEL[@]}"; do [ "${MODEL_BOUND[$m]}" = 1 ] || exit 1; done; [ "${#MODEL_BOUND[@]}" = 3 ]'
+
+L=$t/ledger/model-budget
+# shellcheck disable=SC2034 # read by check
+R1=20261123-120000-aaaa R2=20261123-130000-bbbb R3=20261123-140000-cccc
+check "ledger: a first reservation creates the ledger and records it" \
+  'ledger_reserve "$L" 8 $R1 PushE2eTest#pushWakesKilledApp=1 SurvivalE2eTest#connectAndChat=1 SurvivalE2eTest#replySurvivesProcessDeath=1 && [ "$(grep -c "^reserve $R1 " "$L")" = 3 ] && [ "$(ledger_total "$L")" = 3 ]'
+check "ledger: a release is recorded apart from the reservation and ends its count" \
+  'ledger_release "$L" $R1 SurvivalE2eTest#connectAndChat && grep -qx "reserve $R1 SurvivalE2eTest#connectAndChat 1" "$L" && grep -qx "observed $R1 SurvivalE2eTest#connectAndChat 0" "$L" && [ "$(ledger_total "$L")" = 2 ]'
+check "ledger: a reservation is released once, never one that does not exist" \
+  '! ledger_release "$L" $R1 SurvivalE2eTest#connectAndChat && ! ledger_release "$L" $R2 SurvivalE2eTest#connectAndChat && [ "$(ledger_total "$L")" = 2 ]'
+cp "$L" "$t/ledger.tab"
+printf 'reserve\t%s\tX#y\t1\n' $R3 >>"$t/ledger.tab" # parseable by a whitespace parser, not one of the two forms
+check "ledger: an entry with tab separators is refused alike by the total and by a proposal collision check" \
+  '! ledger_total "$t/ledger.tab" >/dev/null && ! ledger_reserve "$t/ledger.tab" 8 $R3 X#y=1 && ! ledger_reserve "$t/ledger.tab" 8 $R2 X#z=1'
+cp "$L" "$t/ledger.before"
+check "ledger: a reservation that would pass 8 is refused and appends nothing" \
+  'ledger_reserve "$L" 8 $R2 PushE2eTest#pushWakesKilledApp=6 && ! ledger_reserve "$L" 8 $R3 SurvivalE2eTest#connectAndChat=1 && [ "$(ledger_total "$L")" = 8 ] && ! grep -q $R3 "$L"'
+cp "$t/ledger.before" "$L"
+printf 'reserve %s X#y 1\nsomething else\n' $R3 >>"$L"
+check "ledger: a malformed line refuses every reservation" '! ledger_total "$L" >/dev/null && ! ledger_reserve "$L" 8 $R2 X#y=1 && ! grep -q $R2 "$L"'
+cp "$t/ledger.before" "$L"
+printf 'spent %s X#y 1\n' $R3 >>"$L"
+check "ledger: a well-formed line of another kind refuses too" '! ledger_reserve "$L" 8 $R2 X#y=1'
+cp "$t/ledger.before" "$L"
+printf 'reserve %s PushE2eTest#pushWakesKilledApp 1\n' $R1 >>"$L"
+check "ledger: a second reservation of one run's method is ambiguous: refused" '! ledger_reserve "$L" 8 $R2 X#y=1'
+cp "$t/ledger.before" "$L"
+printf 'observed %s X#y 1\n' $R3 >>"$L"
+check "ledger: an observation without its reservation is ambiguous: refused" '! ledger_reserve "$L" 8 $R2 X#y=1'
+cp "$t/ledger.before" "$L"
+chmod 000 "$L"
+check "ledger: an unreadable ledger refuses" '! ledger_reserve "$L" 8 $R2 X#y=1'
+chmod 600 "$L"
+cp "$t/ledger.before" "$L"
+printf 'reserve %s X#y 1' $R3 >>"$L" # torn: no line break
+check "ledger: a torn last line refuses, appending nothing" '! ledger_total "$L" >/dev/null && ! ledger_reserve "$L" 8 $R2 X#y=1 && ! grep -q $R2 "$L"'
+cp "$t/ledger.before" "$L"
+check "ledger: a proposal that repeats a run and method, or one already reserved, is refused" \
+  '! ledger_reserve "$L" 8 $R2 X#y=1 X#y=1 && ! ledger_reserve "$L" 8 $R1 SurvivalE2eTest#connectAndChat=1 && cmp -s "$L" "$t/ledger.before"' 
+check "ledger: a method without a proved bound cannot be reserved" '! ledger_reserve "$L" 8 $R2 SurvivalE2eTest#steerDuringRun= && ! ledger_reserve "$L" 8 $R2 SurvivalE2eTest#steerDuringRun'
+mkfifo "$t/held" "$t/release"
+( flock 9; echo held >"$t/held"; read -r _ <"$t/release" ) 9>>"$L.lock" &
+holder=$!
+read -r _ <"$t/held" # the holder has the lock now
+( sleep 2; echo go >"$t/release" ) &
+s=$SECONDS
+check "ledger: appends wait for the shared flock" 'ledger_reserve "$L" 8 $R2 X#y=1 && [ $((SECONDS - s)) -ge 1 ]'
+wait "$holder"
+check "ledger: the shared path is outside any checkout" '[ "$LEDGER" = "$HOME/.local/state/apofis-e2e/model-budget-m3" ] && [ "$LEDGER_LIMIT" = 8 ]'
+
+# Push records: a synthetic database stands in for the live one, read by the real listing (the real script).
+PUSH_SCRIPT=$here/../../server/apofis-push/apofis_push.py
+LIVE_DB=$t/live/state.db
+mkdir -p "$t/live"
+python3 -I - "$LIVE_DB" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("""CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL);
+CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, model_config TEXT, system_prompt TEXT,
+  system_prompt_hash TEXT, parent_session_id TEXT, started_at REAL NOT NULL, end_reason TEXT, title TEXT,
+  hidden INTEGER NOT NULL DEFAULT 0);""")
+c.close()
+EOF
+row() { python3 -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("INSERT INTO sessions (id, source, hidden, started_at, title) VALUES (?, ?, 1, 0, ?)", sys.argv[2:5]); c.commit()' "$LIVE_DB" "$@"; }
+IA=0a1b2c3d-0000-4000-8000-00000000000a IB=0a1b2c3d-0000-4000-8000-00000000000b IF=0a1b2c3d-0000-4000-8000-0000000000ff
+push_dir=$t/pushdir
+mkdir -p "$push_dir/check-home"
+check "listing: an empty namespace lists nothing" 'o=$(push_listing $IA) && [ -z "$o" ]'
+row "apofis-push-$IA-1" api_server "apofis-push-$IA-1 op-0123456789abcdef e2e-$nonce"
+check "listing: a record under the install is listed by id only" 'o=$(push_listing $IA) && [ "$o" = "apofis-push-$IA-1" ] && o=$(push_listing $IB) && [ -z "$o" ]'
+check "listing: a failed listing (no database) fails, never empty" '! (LIVE_DB=$t/live/missing.db push_listing $IA)'
+python3 -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.executemany("INSERT INTO sessions (id, source, hidden, started_at) VALUES (?, ?, 1, 0)", [("apofis-push-%s-%d" % (sys.argv[2], i), "api_server") for i in range(1, 34)]); c.commit()' "$LIVE_DB" "$IB"
+check "listing: an incomplete listing (more than 32 records, exit 4) fails" '! push_listing $IB >/dev/null'
+printf 'print("apofis-push-%s-1\\tt\\tapi_server\\t1")\n' "$IA" >"$t/noheader.py"
+check "listing: output without the read-only header fails, whatever the exit" '! (PUSH_SCRIPT=$t/noheader.py push_listing $IA)'
+printf 'import sys\nprint("python 3\\nSSL_CERT_FILE unset\\norigins none\\ndb opened read-only")\nsys.exit(3)\n' >"$t/badexit.py"
+check "listing: a failing exit fails, even after a complete-looking header" '! (PUSH_SCRIPT=$t/badexit.py push_listing $IA)'
+check "listing: the run-private home stays empty" '[ -z "$(ls -A "$push_dir/check-home")" ]'
+# shellcheck disable=SC2329 # the namespace check before launch, with a listing that finds a record
+nonempty_case() { push=(connectorLifecycle hostilePushes); tmp=$t/prov; mkdir -p "$tmp"; push_listing() { [ "$1" != "${install_of[hostilePushes]:-}" ] || echo "apofis-push-$1-1"; }; provision_push; }
+rc=0; o=$( (nonempty_case) 2>&1) || rc=$?
+check "provisioning: a namespace that is not empty stops the run before launch" '[ "$rc" != 0 ] && has "$o" "already has records on the server; nothing started"'
+# shellcheck disable=SC2329
+failing_case() { push=(connectorLifecycle); tmp=$t/prov2; mkdir -p "$tmp"; push_listing() { return 1; }; provision_push; }
+rc=0; o=$( (failing_case) 2>&1) || rc=$?
+check "provisioning: a failed listing stops the run before launch" '[ "$rc" != 0 ] && has "$o" "listing of connectorLifecycle'"'"'s new install failed"'
+# shellcheck disable=SC2329
+three_case() { push=("${PUSH_TESTS[@]}"); tmp=$t/prov3; mkdir -p "$tmp"; push_listing() { :; }; provision_push >/dev/null 2>&1; printf '%s\n' "$push_installs" "$push_topic"; }
+o=$(three_case)
+check "provisioning: one distinct install per scenario (no retired id is ever expected again) and a topic" \
+  '[ "$(head -1 <<<"$o" | tr , "\n" | cut -d= -f2 | sort -u | grep -cE "^$UUID_RE$")" = 3 ] && [[ $(tail -1 <<<"$o") =~ ^up[A-Za-z0-9]{12}$ ]] && push_args_ok 18650 "$(tail -1 <<<"$o")" "$(head -1 <<<"$o")"'
+check "push arguments: anything but the exact forms is refused" '! push_args_ok 18650 up123 "a=$IA" && ! push_args_ok 18650 upAbC123xyz09q "a=$IA;x" && ! push_args_ok - upAbC123xyz09q - && push_args_ok - - -'
+
+T1="apofis-push-$IA-1 op-0123456789abcdef e2e-$nonce"
+check "journal: a push intent and a missing export are journal lines" \
+  'journal_line_ok "pushintent apofis-push-$IA-1 $T1" && journal_line_ok "pushintent-missing hostilePushes"'
+check "journal: an intent whose title names another id, or without the marker, is malformed" \
+  '! journal_line_ok "pushintent apofis-push-$IA-2 $T1" && ! journal_line_ok "pushintent apofis-push-$IA-1 apofis-push-$IA-1 e2e-$nonce" && ! journal_line_ok "pushintent apofis-push-$IA-01 apofis-push-$IA-01 op-0123456789abcdef e2e-$nonce"'
+
+# The cleanup against a stub server holding rows by id (title and source), counting every request.
+# shellcheck disable=SC2329 # replaces the real server call
+hermes() {
+  local id=${2#api/sessions/}
+  echo "$1 $2" >>"$t/server-calls"
+  case $1 in
+    GET) if grep -q "^$id	" "$t/server-rows" 2>/dev/null; then
+           jq -n --arg id "$id" --arg s "$(grep "^$id	" "$t/server-rows" | cut -f2)" --arg t "$(grep "^$id	" "$t/server-rows" | cut -f3)" \
+             '{session: {id: $id, source: $s, title: $t}}' >"$3"; echo 200; else echo 404; fi ;;
+    DELETE) grep -v "^$id	" "$t/server-rows" >"$t/rows.new"; mv "$t/rows.new" "$t/server-rows"; printf '{"id":"%s","deleted":true}' "$id" >"$3"; echo 200
+            [ "${CONFIRM_FAILS:-}" != 1 ] || { echo 1 >"$t/confirm-fails"; } ;;
+  esac
+  # A transfer that fails after the status was printed (the confirming GET after a DELETE, when asked).
+  if [ "$1" = GET ] && [ -e "$t/confirm-fails" ] && grep -q "^DELETE api/sessions/$id$" "$t/server-calls"; then rm -f "$t/confirm-fails"; return 28; fi
+}
+# shellcheck disable=SC2329 # the listing, from the stub server's rows
+push_listing() { [ "${LISTING_FAILS:-}" != 1 ] || return 1; grep "^apofis-push-$1-" "$t/server-rows" | cut -f1 || true; }
+push_case() { # <journal lines...>: two installs (A for connectorLifecycle, B for hostilePushes), the rows as set up
+  push=(connectorLifecycle hostilePushes) install_of=([connectorLifecycle]=$IA [hostilePushes]=$IB)
+  key_sent_local=1 sessions_state=ok journal=("$@")
+  rm -f "$t/server-calls"
+  rc=0; o=$(check_push 2>&1) || rc=$?
+}
+srow() { printf '%s\t%s\t%s\n' "$1" "${2:-api_server}" "${3:-$1 op-0123456789abcdef e2e-$nonce}" >>"$t/server-rows"; }
+calls() { cat "$t/server-calls" 2>/dev/null; }
+: >"$t/server-rows"; srow "apofis-push-$IA-1"; srow "apofis-push-$IB-1"
+push_case "pushintent apofis-push-$IB-1 apofis-push-$IB-1 op-0123456789abcdef e2e-$nonce" "pushintent apofis-push-$IA-1 $T1"
+check "cleanup: scenarios in reversed order: each one's own -1 is proved, deleted and checked gone; passes" \
+  '[ "$rc" = 0 ] && [ "$(calls)" = "$(printf "GET api/sessions/%s\nDELETE api/sessions/%s\nGET api/sessions/%s\n" apofis-push-$IB-1 apofis-push-$IB-1 apofis-push-$IB-1 apofis-push-$IA-1 apofis-push-$IA-1 apofis-push-$IA-1 | head -c -1)" ] && [ ! -s "$t/server-rows" ]'
+: >"$t/server-rows"; srow "apofis-push-$IF-1"
+push_case "pushintent apofis-push-$IF-1 apofis-push-$IF-1 op-0123456789abcdef e2e-$nonce"
+check "cleanup: a forged intent naming a valid hidden record under another install: zero requests" '[ "$rc" = 1 ] && [ -z "$(calls)" ] && grep -q "apofis-push-$IF-1" "$t/server-rows"'
+: >"$t/server-rows"; srow "apofis-push-$IA-3" api_server "apofis-push-$IA-3"
+push_case
+check "cleanup: a canonical row under this run's install without an intent and marker: reported, not deleted" \
+  '[ "$rc" = 1 ] && has "$o" "push records may remain (not deleted): apofis-push-$IA-3" && ! grep -q DELETE <<<"$(calls)" && grep -q "apofis-push-$IA-3" "$t/server-rows"'
+: >"$t/server-rows"; srow "apofis-push-$IA-1" api_server "apofis-push-$IA-1 op-ffffffffffffffff e2e-$nonce"
+push_case "pushintent apofis-push-$IA-1 $T1"
+check "cleanup: a journaled id whose server title is not the journaled one: left alone, reported" \
+  '[ "$rc" = 1 ] && [ "$(calls)" = "GET api/sessions/apofis-push-$IA-1" ] && has "$o" "may remain (not deleted): apofis-push-$IA-1"'
+: >"$t/server-rows"; srow "apofis-push-$IA-1" cli
+push_case "pushintent apofis-push-$IA-1 $T1"
+check "cleanup: a journaled id whose server row is not api_server: left alone" '[ "$rc" = 1 ] && ! grep -q DELETE <<<"$(calls)"'
+: >"$t/server-rows"; srow "apofis-push-$IA-01"
+push_case
+check "cleanup: a malformed suffix row: reported, not deleted" '[ "$rc" = 1 ] && has "$o" "apofis-push-$IA-01" && [ -z "$(calls)" ]'
+: >"$t/server-rows"; srow "apofis-push-$IA-1"
+push_case "pushintent apofis-push-$IA-1 apofis-push-$IA-1 op-0123456789abcdef e2e-00000000"
+check "cleanup: an intent with another run's nonce: zero requests, reported" '[ "$rc" = 1 ] && [ -z "$(calls)" ] && has "$o" "apofis-push-$IA-1"'
+: >"$t/server-rows"; srow "apofis-push-$IA-1"
+push_case "pushintent-missing connectorLifecycle" "pushintent apofis-push-$IA-1 $T1"
+check "cleanup: an install whose export failed is not cleaned at all, and reported" \
+  '[ "$rc" = 1 ] && [ -z "$(calls)" ] && has "$o" "intents of connectorLifecycle could not be read" && has "$o" "may remain (not deleted): apofis-push-$IA-1"'
+: >"$t/server-rows"; srow "apofis-push-$IA-1"
+push=(connectorLifecycle hostilePushes) install_of=([connectorLifecycle]=$IA [hostilePushes]=$IB)
+key_sent_local=1 sessions_state=unknown journal=("pushintent apofis-push-$IA-1 $T1")
+rm -f "$t/server-calls"
+rc=0; o=$(check_push 2>&1) || rc=$?
+check "cleanup: an unknown journal deletes nothing and still lists" '[ "$rc" = 1 ] && [ -z "$(calls)" ] && has "$o" "no push record is deleted" && has "$o" "may remain (not deleted): apofis-push-$IA-1"'
+: >"$t/server-rows"
+push_case "pushintent apofis-push-$IA-1 $T1"
+check "cleanup: an intent whose record was never created: one GET, nothing else; passes" '[ "$rc" = 0 ] && [ "$(calls)" = "GET api/sessions/apofis-push-$IA-1" ]'
+: >"$t/server-rows"; srow "apofis-push-$IA-1"
+CONFIRM_FAILS=1 push_case "pushintent apofis-push-$IA-1 $T1"
+check "cleanup: a confirming GET whose transfer failed after printing 404 is not taken as gone" '[ "$rc" = 1 ] && has "$o" "deleting apofis-push-$IA-1 answered" && lacks "$o" "deleted and verified gone"'
+: >"$t/server-rows"
+push=(connectorLifecycle hostilePushes) install_of=([connectorLifecycle]=$IA) key_sent_local=1 sessions_state=ok journal=()
+rc=0; o=$(check_push 2>&1) || rc=$?
+check "cleanup: an install never minted (the run stopped before) is not listed nor reported" '[ "$rc" = 0 ] && lacks "$o" hostilePushes && has "$o" "no record left under connectorLifecycle"'
+LISTING_FAILS=1 push_case
+check "cleanup: a failed final listing fails the run and is never taken as empty" '[ "$rc" = 1 ] && has "$o" "push records may remain: the listing" && lacks "$o" "no record left"'
+unset -f hermes push_listing
+
+# pushWakesKilledApp is under the same send/chat completeness rule as the survival scenarios.
+mkdir -p "$E2E_OUT/sess"
+printf 'PushE2eTest.pushWakesKilledApp PASS\n' >"$E2E_OUT/sess/results.txt"
+instrument_for <"$E2E_OUT/sess/results.txt" >"$E2E_OUT/sess/instrument.txt"
+mode=push-model key_sent_local=1 sessions_state=ok published=1 run_id=sess journal=()
+# shellcheck disable=SC2329
+hermes() { echo "$1 $2" >>"$t/server-calls"; echo 404; }
+rm -f "$t/server-calls"
+rc=0; o=$(check_sessions 2>&1) || rc=$?
+check "completeness: pushWakesKilledApp passed without send and chat lines: fails, no request" '[ "$rc" = 1 ] && has "$o" "sessions this run created may remain" && [ ! -e "$t/server-calls" ]'
+unset -f hermes
+rm -f "$E2E_OUT/sess/results.txt" "$E2E_OUT/sess/instrument.txt"
+rmdir "$E2E_OUT/sess"
+
+# The ledger after a run: a reservation belongs to the invocation that made it; once the key was handed to the device
+# it stays at its bound whatever was observed; it is released only when the key never left this host.
+mkdir -p "$E2E_OUT/$R1"
+printf 'SurvivalE2eTest.connectAndChat FAIL\n' >"$E2E_OUT/$R1/results.txt"
+instrument_for <"$E2E_OUT/$R1/results.txt" >"$E2E_OUT/$R1/instrument.txt"
+LEDGER=$t/ledger-cap models=(SurvivalE2eTest#connectAndChat) mode=test key_sent_local=1 sessions_state=ok published=1 run_id=$R1 journal=()
+ledger_reserve "$LEDGER" 8 20261123-100000-0000 X#y=7
+ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1 && owned=("${models[@]}")
+# shellcheck disable=SC2329
+hermes() { echo "$1 $2" >>"$t/server-calls"; echo 404; }
+(check_sessions; observe_starts) >"$t/ledger-run.out" 2>&1 || true
+check "ledger: a method that failed after the hand-over, its journal without send lines, keeps its place; the cap then refuses" \
+  'has "$(cat "$t/ledger-run.out")" "stays at its reserved 1" && ! grep -q "^observed" "$LEDGER" && [ "$(ledger_total "$LEDGER")" = 8 ] && ! ledger_reserve "$LEDGER" 8 $R2 SurvivalE2eTest#connectAndChat=1'
+unset -f hermes
+rm -f "$E2E_OUT/$R1/results.txt" "$E2E_OUT/$R1/instrument.txt"
+rmdir "$E2E_OUT/$R1"
+# A refused collision: the run id and method are already reserved (by another invocation). Nothing is owned, so the real
+# cleanup path changes nothing, byte for byte.
+LEDGER=$t/ledger-collide owned=() key_sent_local='' run_id=$R1
+ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1
+cp "$LEDGER" "$t/collide.before"
+if ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1; then owned=("${models[@]}"); fi
+observe_starts >"$t/collide.out" 2>&1
+check "ledger: a refused collision followed by the cleanup leaves the ledger byte for byte unchanged" '[ "${#owned[@]}" = 0 ] && cmp -s "$LEDGER" "$t/collide.before"'
+# The key never handed off: the invocation's own reservation is released.
+LEDGER=$t/ledger-release owned=() key_sent_local=''
+ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1 PushE2eTest#pushWakesKilledApp=1 &&
+  owned=(SurvivalE2eTest#connectAndChat PushE2eTest#pushWakesKilledApp)
+observe_starts >/dev/null 2>&1
+check "ledger: with the key never handed off, each reservation of this invocation is released" \
+  '[ "$(grep -c "^observed $R1 .* 0$" "$LEDGER")" = 2 ] && [ "$(ledger_total "$LEDGER")" = 0 ]'
+LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m3 models=() owned=() key_sent_local='' sessions_state='' journal=() mode=smoke
+
+# A push check with nothing minted or no private directory touches no path (a recording seam for every file operation).
+# shellcheck disable=SC2329,SC2032 # the recorders replace the real commands inside the subshells below
+seam_case() { # <push_dir> <installs: "" or one>
+  (
+    # Record every call and refuse it without executing anything, except the one fixture: a file made from the exact
+    # template inside this test's own owned directory, and the removal of exactly the file so made.
+    mktemp() {
+      echo "mktemp $*" >>"$t/fileops"
+      [ "$*" = "$t/owned-push/body.XXXXXX" ] || return 1
+      command mktemp "$@" | tee "$t/made"
+    }
+    rm() {
+      echo "rm $*" >>"$t/fileops"
+      [ -s "$t/made" ] && [ "$*" = "-f -- $(cat "$t/made")" ] || return 1
+      command rm -f -- "$(cat "$t/made")"
+    }
+    push_listing() { :; }
+    push=(connectorLifecycle) push_dir=$1 key_sent_local='' sessions_state=ok journal=()
+    if [ -n "$2" ]; then install_of=([connectorLifecycle]=$2); else install_of=(); fi
+    check_push
+  ) >/dev/null 2>&1 && echo 0 >"$t/seam-rc" || echo 1 >"$t/seam-rc"
+}
+: >"$t/fileops"
+seam_case '' ''
+check "push check: nothing minted and no private directory (a refused reservation): passes, no file operation at all" '[ ! -s "$t/fileops" ] && [ "$(cat "$t/seam-rc")" = 0 ]'
+: >"$t/fileops"
+seam_case '' "$IA"
+check "push check: installs but no private directory: refused (exit 1), still no file operation" '[ ! -s "$t/fileops" ] && [ "$(cat "$t/seam-rc")" = 1 ]'
+mkdir -p "$t/owned-push"
+: >"$t/fileops"
+seam_case "$t/owned-push" "$IA"
+check "push check: the response file is made inside the owned private directory and only that file is removed" \
+  '[ "$(grep -c "^mktemp $t/owned-push/body\.XXXXXX$" "$t/fileops")" = 1 ] && [ "$(grep -c "^rm " "$t/fileops")" = 1 ] && grep -qE "^rm -f -- $t/owned-push/body\.[A-Za-z0-9]{6}$" "$t/fileops" && [ -z "$(ls -A "$t/owned-push")" ]'
+
+# The fake ntfy as the harness starts and stops it: listening, then its port closed.
+push=(connectorLifecycle) install_of=([connectorLifecycle]=$IA) push_dir=$t/fakerun push_topic=upAbC123xyz09q
+mkdir -p "$push_dir/fake"
+push_port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+cd "$here/../.."
+start_fake || true
+cd - >/dev/null
+check "fake: started by the harness, listening on its port" '[ -n "$fake_pid" ] && [ -n "$(ss -Hltn "sport = :$push_port")" ]'
+stop_fake >"$t/stop.out" 2>&1 && rc=0 || rc=$? # in this shell: the fake is its child
+o=$(cat "$t/stop.out")
+check "fake: stopped, every child accounted for, its port closed" '[ "$rc" = 0 ] && has "$o" "port $push_port closed" && [ -z "$(ss -Hltn "sport = :$push_port")" ] && [ -z "$fake_pid" ]'
+# The harness dying without its cleanup: the fake it started stops when reparented, even while another child that
+# inherited the harness's descriptors (as the tunnel's ssh does) stays alive.
+(
+  cd "$here/../.."
+  start_fake >/dev/null 2>&1
+  echo "$fake_pid" >"$t/owner.fake"
+  sleep 300 &
+  echo $! >"$t/owner.sibling"
+  exec sleep 300
+) &
+owner=$!
+wait_gone 20 eval '[ ! -s "$t/owner.sibling" ]'
+# shellcheck disable=SC2034 # read by check
+gone_pid=$(cat "$t/owner.fake") sibling=$(cat "$t/owner.sibling")
+kill -KILL "$owner"
+wait "$owner" 2>/dev/null || true
+check "fake: when the harness that started it dies, it stops and closes its port though another child holds the harness's descriptors" \
+  'wait_gone 10 alive "$gone_pid" && alive "$sibling" && [ -z "$(ss -Hltn "sport = :$push_port")" ] && grep -qx "stopped: child released, owner gone" "$push_dir/fake.log"'
+stop_pid "$gone_pid" # only if that check failed: never leave a fake behind
+kill -KILL "$sibling" 2>/dev/null || true
+fake_pid=''
+python3 -I -c 'import socket, time; s = socket.socket(); s.bind(("127.0.0.1", int(__import__("sys").argv[1]))); s.listen(); time.sleep(30)' "$push_port" &
+squatter=$!
+wait_gone 10 eval '[ -z "$(ss -Hltn "sport = :$push_port")" ]' # until it listens
+bash -c 'trap "" TERM; echo stopped: child released; sleep 1' >"$push_dir/fake.log" &
+fake_pid=$!
+stop_fake >"$t/stop.out" 2>&1 && rc=0 || rc=$?
+o=$(cat "$t/stop.out")
+check "fake: a port still open after the stop fails" '[ "$rc" = 1 ] && has "$o" "did not stop cleanly"'
+kill "$squatter" 2>/dev/null; wait "$squatter" 2>/dev/null || true
+keep_push=''
+bash -c 'echo stopped: child unaccounted; exit 1' >"$push_dir/fake.log" &
+fake_pid=$!
+stop_fake >"$t/stop.out" 2>&1 && rc=0 || rc=$?
+o=$(cat "$t/stop.out")
+check "fake: a child unaccounted for fails and keeps the evidence for inspection" '[ "$rc" = 1 ] && has "$o" "kept for inspection: $push_dir" && [ -n "$keep_push" ]'
+tmp=$t/endlocal
+mkdir -p "$tmp"
+end_local
+check "fake: the kept evidence survives the end of the run" '[ -e "$push_dir/fake.log" ]'
+push=() install_of=() push_dir='' push_port='' fake_pid='' keep_push=''
+rc=0
+APOFIS_E2E_LIB=1 bash -c '
+  source "$1/run-e2e.sh"
+  set +e
+  TRAP_LIMIT=2 tmp=$(mktemp -d) key=x
+  install_of=([connectorLifecycle]=0a1b2c3d-0000-4000-8000-00000000000a)
+  check_sessions() { while :; do sleep 0.2; done; }
+  trap local_cleanup EXIT
+  exit 0' _ "$here" >"$t/out-overrun" 2>&1 || rc=$?
+check "cleanup over its limit with push installs: says push records may remain, naming the installs" \
+  '[ "$rc" = 1 ] && has "$(cat "$t/out-overrun")" "push records may remain under the installs 0a1b2c3d-0000-4000-8000-00000000000a"'
+
 remove_tree "$t"
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]
