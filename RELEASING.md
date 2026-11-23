@@ -1,6 +1,6 @@
 # Releasing Apofis
 
-Pre-releases need nothing: every push to `main` builds, signs and publishes `0.1.0-pre.N` (tag `pre-N`, versionCode `N` = the CI run number). This file is about normal releases, tags `vX.Y.Z`.
+Pre-releases need nothing: every push to `main` triggers a pre-release build that signs and publishes `0.1.0-pre.N` unless a newer one supersedes it (tag `pre-N`, versionCode `N` = the CI run number). This file is about normal releases, tags `vX.Y.Z`.
 
 ## The rules that never change
 
@@ -11,7 +11,7 @@ Pre-releases need nothing: every push to `main` builds, signs and publishes `0.1
 
 ## The freeze
 
-From the moment a candidate is recorded, nothing merges to `main` except a commit that replaces the candidate (a fix needed by the scenario set, or a release repair under "Rollback" below). That commit becomes the new candidate and reruns the full scenario set. The freeze ends when the release job is green and both checks under "Verify" have passed. If the outcome is "no tag" or "tag not pushed", the freeze stays until the owner decides.
+From the moment a candidate is recorded, nothing merges to `main` except a commit that replaces the candidate (a fix needed by the scenario set, or a release repair under "Rollback" below). That commit becomes the new candidate and reruns the full scenario set. The freeze ends when the release job is green and both checks under "Verify" have passed. If the outcome is "no tag" or "tag not pushed", the freeze stays until the owner decides. The owner's report from the Pixel is a trial check, not a merge gate; if 0.1.0 cannot be installed, the fix is the next patch release.
 
 ## Make the tag
 
@@ -24,17 +24,21 @@ git fetch origin && git show <SHA>:scripts/tag-release.sh | bash -s -- <version>
 It stops with a message and pushes nothing unless, in order:
 
 1. the last line of the ledger file that starts with `Candidate passed: ` is exactly `Candidate passed: <SHA>`;
-2. `git fetch origin` succeeds and `origin/main` is exactly `<SHA>`;
-3. the newest push run of `ci.yml` on `main` for `<SHA>` succeeded (`gh run list --branch main`, so a pull request run or the tag's own run never counts);
+2. `git fetch origin` succeeds and `main` on origin, as `git ls-remote` reads it now, is exactly `<SHA>`;
+3. the newest push run of `ci.yml` on `main` for `<SHA>` in origin's repository succeeded (`gh run list --repo <origin URL> --branch main --event push`, so a pull request run, the tag's own run or a fork's run never counts);
 4. the allowed signers are read from `<SHA>:release/allowed-signers`, not from the working tree;
-5. if `v<version>` already exists here or on `origin`, it is an annotated tag on `<SHA>` signed by the expected key; it is then pushed if `origin` lacks it, and otherwise the script stops. It never retags or deletes;
-6. otherwise it creates the signed annotated tag `v<version>` on `<SHA>` (`git tag -s`, message `Apofis <version>`), verifies it against the allowed signers, compares the fingerprint with the expected one and pushes the tag.
+5. if `v<version>` already exists on `origin`, the object origin holds must pass the check below, and the script stops there; if it exists only here, that object must pass the check and is pushed. It never retags or deletes;
+6. otherwise it creates the signed annotated tag `v<version>` on `<SHA>` (`git tag -s`, message `Apofis <version>`), which then passes the same check.
+
+The check works on the tag object's id, read once: an annotated tag whose own name is `v<version>`, on `<SHA>`, verified against the allowed signers with the expected fingerprint. Exactly that object is pushed, with `--no-follow-tags` and without force, so no other tag goes along.
+
+Every run of the procedure ends with a line that starts with `tag-release:`. No such line means the script did not run: a failed `git show` feeds bash an empty script, which succeeds. After a failed or unconfirmed push, run the same command again; it checks the tag on origin and never retags. A local tag that was never pushed and fails the check stays; it is the owner's to remove with `git tag -d v<version>`, since the script never deletes.
 
 If signing fails, nothing is pushed: put "tag not pushed: signing failed" and the filled-in command in the handoff, to be run from the main checkout once signing works.
 
 ## The tag guard in CI
 
-The release job checks every ref before it touches a secret. A tag must match `^v[0-9]+\.[0-9]+\.[0-9]+$`, its commit must be an ancestor of `origin/main`, and the tag must be annotated, on that commit, and signed by the key in that commit's `release/allowed-signers` (`scripts/check-release-tag.sh`). A push to any branch other than `main` stops. The guard catches mistakes; it is not a trust boundary, since anyone who can push a tag can also change the workflow. A GitHub tag protection rule for `v*` is the owner's option.
+The release job checks every ref before any APK signing secret is used. A tag must match `^v[0-9]+\.[0-9]+\.[0-9]+$`, its commit must be an ancestor of `origin/main`, and the tag must be annotated, carry its own name, sit on that commit, and have a good SSH signature by the key in that commit's `release/allowed-signers` (`scripts/check-release-tag.sh`). A push to any branch other than `main` stops. The guard catches mistakes; it is not a trust boundary, since anyone who can push a tag can also change the workflow. A GitHub tag protection rule for `v*` is the owner's option.
 
 After the build, `scripts/check-signing-cert.sh` requires exactly one signer whose certificate digest equals `release/signing-cert.sha256`, before the publish lock is taken.
 
@@ -49,11 +53,11 @@ After the build, `scripts/check-signing-cert.sh` requires exactly one signer who
 2. `gh api repos/knightdave/apofis/releases/latest --jq .tag_name` prints `v<version>`. Download the asset (`gh release download v<version> -p '*.apk'`) and check it:
 
    ```sh
-   scripts/check-signing-cert.sh "$ANDROID_HOME/build-tools/<version>/apksigner" apofis-<version>.apk release/signing-cert.sha256
-   "$ANDROID_HOME/build-tools/<version>/aapt2" dump badging apofis-<version>.apk | head -1
+   scripts/check-signing-cert.sh "$ANDROID_HOME/build-tools/<build-tools>/apksigner" apofis-<version>.apk release/signing-cert.sha256
+   "$ANDROID_HOME/build-tools/<build-tools>/aapt2" dump badging apofis-<version>.apk | head -1
    ```
 
-   The badging shows package `xyz.rycerz.apofis`, `versionName='<version>'` and the versionCode N of step 1. The build-tools version is the one `scripts/sdk-versions.sh` prints.
+   The badging shows package `xyz.rycerz.apofis`, `versionName='<version>'` and the versionCode N of step 1. `<build-tools>` is the `build_tools` value that `scripts/sdk-versions.sh` prints.
 
 ## Rollback
 
