@@ -268,12 +268,12 @@ class ChatViewModelTest {
         val vm = vm()
         var accepted = 0
         backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.sendAccepted.collect { accepted++ } }
-        vm.onSendClick() // a stale enabled button with nothing to send: the composer takes nothing
+        assertFalse(vm.onSendClick()) // a stale enabled button with nothing to send: the composer takes nothing
         assertEquals(0, accepted)
 
         vm.onDraftChange("hello")
         vm.await { it.draft.isNotEmpty() }
-        vm.onSendClick()
+        assertTrue("the screen is told the holder took it", vm.onSendClick())
         vm.await { it.draft.isEmpty() }
         assertEquals(1, accepted)
     }
@@ -685,8 +685,8 @@ class ChatViewModelTest {
         val held = CompletableDeferred<Unit>().also { storeGate = it }
         vm.onDraftChange("fir")
         vm.onDraftChange("first") // edited after the button was drawn: the send takes what is typed now
-        vm.onSendClick()
-        vm.onSendClick() // a second tap before the screen redraws
+        assertTrue(vm.onSendClick())
+        assertFalse(vm.onSendClick()) // a second tap before the screen redraws
         assertEquals("first", vm.await { it.sending }.draft)
         vm.onDraftChange("second")
         vm.onSendClick() // still in flight: ignored

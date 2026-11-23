@@ -17,7 +17,6 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
@@ -37,7 +36,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.LocalDate
@@ -1037,7 +1035,6 @@ internal fun MessageList(
                 }
             }
         }
-        RunEndAnnouncer(live?.runId, contentPadding.calculateTopPadding())
     }
 }
 
@@ -1087,9 +1084,9 @@ private val TERMINAL_STATUSES = setOf("completed", "failed", "cancelled", "inter
 internal const val ANNOUNCE_MS = 1000L
 
 /**
- * One persistent, invisible 1 dp node just below the list's top content padding (the top bar's measured height plus
- * its gap), so it lies in the uncovered transcript, not under the bar or the composer and keyboard, which hide from
- * accessibility what is under them. A polite live region the whole time; its state description exists only while it
+ * One persistent, invisible 1 dp node; the chat screen places it just below the top bar, above the bar and the bottom
+ * area (which hide from accessibility what is under them), so it is never covered, the expanded editor included. It
+ * draws nothing and takes no touches. A polite live region the whole time; its state description exists only while it
  * says "Reply ended" (one neutral line for finished, stopped and failed), for [ANNOUNCE_MS] after a run ended: idle,
  * an empty description would still make it a screen-reader focus stop. Ended
  * means the live run id was set and is now another one or none, so run A followed directly by run B still announces A.
@@ -1098,7 +1095,7 @@ internal const val ANNOUNCE_MS = 1000L
  * whole time and only its state description changes, so Compose sends the change from this node itself.
  */
 @Composable
-private fun BoxScope.RunEndAnnouncer(runId: String?, top: Dp) {
+internal fun RunEndAnnouncer(runId: String?, modifier: Modifier = Modifier) {
     val ended = stringResource(R.string.chat_reply_ended)
     val previous = remember { arrayOf(runId) }
     var ends by remember { mutableIntStateOf(0) }
@@ -1114,7 +1111,7 @@ private fun BoxScope.RunEndAnnouncer(runId: String?, top: Dp) {
         said = null
     }
     Box(
-        Modifier.align(Alignment.TopCenter).padding(top = top).size(1.dp).semantics {
+        modifier.size(1.dp).semantics {
             liveRegion = LiveRegionMode.Polite
             said?.let { stateDescription = it }
         },

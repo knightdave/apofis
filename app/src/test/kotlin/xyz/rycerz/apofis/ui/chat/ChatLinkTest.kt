@@ -46,7 +46,7 @@ class ChatLinkTest {
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                 CompositionLocalProvider(LocalUriHandler provides handler) {
-                    ChatScreen(state, object : ChatActions {}, onOpenConnection = {})
+                    ChatScreen(state, object : ChatActions { override fun onSendClick() = true }, onOpenConnection = {}) // the holder takes the draft
                 }
             }
         }

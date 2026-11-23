@@ -91,10 +91,15 @@ class StreamingUiTest {
         ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = reduceMotion, blur = false, content = content)
 
     @Composable
-    private fun Messages(items: List<ChatItem>, live: LiveReply?, state: LazyListState = rememberLazyListState(), onRevealGrew: () -> Unit = {}) = MessageList(
-        items, live, emptyMap(), answering = false, actions = object : ChatActions {}, onCancel = {}, onStep = {},
-        listState = state, contentPadding = PaddingValues(), zone = ZoneOffset.UTC, today = FIXED_TODAY, onRevealGrew = onRevealGrew,
-    )
+    private fun Messages(items: List<ChatItem>, live: LiveReply?, state: LazyListState = rememberLazyListState(), onRevealGrew: () -> Unit = {}) {
+        androidx.compose.foundation.layout.Box {
+            MessageList(
+                items, live, emptyMap(), answering = false, actions = object : ChatActions {}, onCancel = {}, onStep = {},
+                listState = state, contentPadding = PaddingValues(), zone = ZoneOffset.UTC, today = FIXED_TODAY, onRevealGrew = onRevealGrew,
+            )
+            RunEndAnnouncer(live?.runId) // the chat screen hosts it in its own slot; here beside the list, as before
+        }
+    }
 
     private fun run(id: String, text: String, connection: Connection = Connection.LIVE) = LiveReply(id, "running", text, emptyList(), null, connection)
 
