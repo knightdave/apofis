@@ -118,7 +118,7 @@ internal fun TextBlock(row: TextRow, onLink: (String) -> Unit = {}, tableScroll:
         Text(
             text,
             Modifier
-                .sidewaysScroll(rememberScrollState())
+                .sidewaysScroll(rememberScrollState(), LocalDensity.current)
                 .padding(start = 12.dp, end = 12.dp, top = if (row.first) 8.dp else 0.dp, bottom = if (row.joinBelow) 0.dp else 8.dp),
             style = scaled(ChatText.code),
             color = if (tokens != null) syntax[Tone.CODE.ordinal] else onSurface,

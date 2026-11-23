@@ -169,10 +169,7 @@ fun ChatScreen(
             val c = barCallbacks.value
             val input = barInput.value // read here, so this slot (and its probe) recomposes when the bar's inputs change
             val modifier = drag.value.blockTouchesBelow().coverForAccessibility(order = -1f)
-            // The slots' own buttons (the drawer button, New chat) go through the same gate (LocalChatGate).
-            CompositionLocalProvider(LocalChatGate provides passGate) {
-                ChatTopBar(input, openConnection, retryLoad, c.navigationIcon, c.appBarActions, modifier)
-            }
+            ChatTopBar(input, openConnection, retryLoad, c.navigationIcon, c.appBarActions, modifier)
         }
     }
     val bottomSlot = remember {
@@ -330,10 +327,13 @@ fun ChatScreen(
         }
         measure
     }
-    SubcomposeLayout(
-        modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
-        policy,
-    )
+    // Controls inside the layout (the bar slots' buttons, the approval's More) reach the same gate.
+    CompositionLocalProvider(LocalChatGate provides passGate) {
+        SubcomposeLayout(
+            modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
+            policy,
+        )
+    }
 
     state.confirmCancel?.let { id ->
         // The dialog follows its own row: it rewords once a request may have gone out, and closes once the row is
@@ -527,22 +527,25 @@ internal class Gate(private val covered: () -> Boolean) {
     }
 }
 
-/** [actions] through [gate]; typing ([onDraftChange]) is not an action and always reaches the draft. */
+/**
+ * [actions] through [gate]. Exempt, and passed straight on: typing ([onDraftChange]), which dropping could lose, and
+ * the six confirm and dismiss callbacks of the confirmation dialogs, which are their own windows above the drawer.
+ */
 internal class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
     override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
     // shortcut: returns Unit here; at the Task 8 merge (onSendClick(): Boolean) return false while covered and the delegate's result otherwise.
     override fun onSendClick() = gate.pass { actions().onSendClick() }
     override fun onStopClick(runId: String) = gate.pass { actions().onStopClick(runId) }
     override fun onRetry(idempotencyKey: String) = gate.pass { actions().onRetry(idempotencyKey) }
-    override fun onConfirmRetry(idempotencyKey: String) = gate.pass { actions().onConfirmRetry(idempotencyKey) }
-    override fun onDismissRetry(idempotencyKey: String) = gate.pass { actions().onDismissRetry(idempotencyKey) }
+    override fun onConfirmRetry(idempotencyKey: String) = actions().onConfirmRetry(idempotencyKey)
+    override fun onDismissRetry(idempotencyKey: String) = actions().onDismissRetry(idempotencyKey)
     override fun onCancel(idempotencyKey: String) = gate.pass { actions().onCancel(idempotencyKey) }
-    override fun onConfirmCancel(idempotencyKey: String, mayHaveSentShown: Boolean) = gate.pass { actions().onConfirmCancel(idempotencyKey, mayHaveSentShown) }
-    override fun onDismissCancel(idempotencyKey: String) = gate.pass { actions().onDismissCancel(idempotencyKey) }
+    override fun onConfirmCancel(idempotencyKey: String, mayHaveSentShown: Boolean) = actions().onConfirmCancel(idempotencyKey, mayHaveSentShown)
+    override fun onDismissCancel(idempotencyKey: String) = actions().onDismissCancel(idempotencyKey)
     override fun onPutBack() = gate.pass { actions().onPutBack() }
     override fun onDiscardUnsent() = gate.pass { actions().onDiscardUnsent() }
-    override fun onConfirmDiscard(id: Long) = gate.pass { actions().onConfirmDiscard(id) }
-    override fun onDismissDiscard() = gate.pass { actions().onDismissDiscard() }
+    override fun onConfirmDiscard(id: Long) = actions().onConfirmDiscard(id)
+    override fun onDismissDiscard() = actions().onDismissDiscard()
     override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) = gate.pass { actions().onApproval(requestId, executionGeneration, choice) }
     override fun onClarify(requestId: String, executionGeneration: Long, answer: String) = gate.pass { actions().onClarify(requestId, executionGeneration, answer) }
     override fun onResolveUnknown() = gate.pass { actions().onResolveUnknown() }

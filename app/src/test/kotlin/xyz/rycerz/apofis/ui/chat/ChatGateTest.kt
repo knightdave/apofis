@@ -12,8 +12,14 @@ import xyz.rycerz.apofis.api.ApprovalChoice
  * new callback parameter of [ChatScreen] fails here until it is gated or listed as harmless with its reason.
  */
 class ChatGateTest {
-    /** Not actions: typing reaches the draft even while covered, because dropping it could lose text. */
-    private val notActions = setOf("onDraftChange")
+    /**
+     * Exempt, passed straight on: typing (dropping it could lose text) and the six confirm and dismiss callbacks of the
+     * confirmation dialogs, which are their own windows above the drawer, seen whole and answered deliberately.
+     */
+    private val notActions = setOf(
+        "onDraftChange",
+        "onConfirmRetry", "onDismissRetry", "onConfirmCancel", "onDismissCancel", "onConfirmDiscard", "onDismissDiscard",
+    )
 
     private val methods: List<Method> = ChatActions::class.java.methods.filter { it.declaringClass == ChatActions::class.java && !Modifier.isStatic(it.modifiers) }
 

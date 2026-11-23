@@ -7,6 +7,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 
 /**
  * Pointers that went down on an element that owns sideways drags (a sideways scroller that can scroll, an editable
@@ -28,10 +30,14 @@ internal object SidewaysClaims {
     }
 }
 
-/** This element owns every sideways drag that starts on it: the push drawer never moves for that gesture. */
-fun Modifier.claimSideways(): Modifier = pointerInput(Unit) {
+/**
+ * This element owns every sideways drag that starts on it, while [owns] says so at the down: the push drawer never
+ * moves for that gesture.
+ */
+fun Modifier.claimSideways(owns: () -> Boolean = { true }): Modifier = pointerInput(Unit) {
     awaitEachGesture {
         val id = awaitFirstDown(requireUnconsumed = false).id
+        if (!owns()) return@awaitEachGesture
         SidewaysClaims.claim(id)
         try {
             do {
@@ -44,9 +50,17 @@ fun Modifier.claimSideways(): Modifier = pointerInput(Unit) {
 }
 
 /**
- * A sideways scroller (code row, table, approval command). It takes sideways drags only when its content is really
- * wider than it is ([canScroll]); then it owns every drag that starts on it. A row that fits leaves the drag to the
- * push drawer around it.
+ * The one rule for every sideways scroller: it scrolls, and owns the swipe, only when its measured range is known (not
+ * the unmeasured Int.MAX_VALUE) and larger than a 2 dp rounding tolerance ([tolerancePx]).
  */
-fun Modifier.sidewaysScroll(state: ScrollState, canScroll: Boolean = state.maxValue > 0): Modifier =
-    (if (canScroll) claimSideways() else this).horizontalScroll(state, enabled = canScroll)
+internal fun ScrollState.scrollsSideways(tolerancePx: Float): Boolean = maxValue != Int.MAX_VALUE && maxValue > tolerancePx
+
+/**
+ * A sideways scroller (code row, table, approval command) under [scrollsSideways]: the same answer drives scrolling
+ * (read in composition) and the claim (read live at the down). A disabled horizontalScroll still measures and publishes
+ * its range, so the answer cannot flip back and forth.
+ */
+fun Modifier.sidewaysScroll(state: ScrollState, density: Density): Modifier {
+    val tolerance = with(density) { 2.dp.toPx() }
+    return claimSideways { state.scrollsSideways(tolerance) }.horizontalScroll(state, enabled = state.scrollsSideways(tolerance))
+}

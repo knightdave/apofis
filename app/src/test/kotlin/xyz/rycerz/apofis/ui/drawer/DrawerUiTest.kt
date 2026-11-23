@@ -117,6 +117,10 @@ import xyz.rycerz.apofis.ui.theme.Haptics
 import xyz.rycerz.apofis.ui.theme.LocalHaptics
 import xyz.rycerz.apofis.ui.theme.PulseProbe
 import xyz.rycerz.apofis.ui.theme.sidewaysScroll
+import xyz.rycerz.apofis.ui.markdown.DisplayChunk
+import xyz.rycerz.apofis.ui.markdown.MdBlock
+import xyz.rycerz.apofis.ui.markdown.MarkdownChunk
+import xyz.rycerz.apofis.ui.markdown.parseMarkdown
 
 /**
  * The push drawer driven by touch, keys, Back and accessibility on a manual clock stepped in whole frames. Pointers
@@ -326,6 +330,30 @@ class DrawerUiTest {
         assertClosed()
     }
 
+    /** The same fast moves, then the finger held still 200 ms before it lifts: the release is slow, so position wins. */
+    @Test
+    fun aFlickHeldBeforeTheUpSettlesByPosition() {
+        show()
+        rule.onRoot().performTouchInput {
+            down(center)
+            repeat(4) { moveBy(Offset(0.05f * panel, 0f)) }
+            advanceEventTime(200)
+            up()
+        }
+        settled()
+        assertClosed()
+        runCode { state.open() }
+        settled()
+        rule.onNodeWithTag("drawer.scrim").performTouchInput {
+            down(Offset(width - 40f, centerY))
+            repeat(4) { moveBy(Offset(-0.05f * panel, 0f)) }
+            advanceEventTime(200)
+            up()
+        }
+        settled()
+        assertOpen()
+    }
+
     @Test
     fun rightToLeftComesFromTheStartEdge() {
         show(direction = LayoutDirection.Rtl)
@@ -362,7 +390,7 @@ class DrawerUiTest {
 
     private fun codeRow(code: ScrollState, contentWidth: Int): @Composable (Modifier) -> Unit = { drag ->
         Box(Modifier.fillMaxSize().then(drag)) {
-            Row(Modifier.align(Alignment.Center).fillMaxWidth().sidewaysScroll(code).testTag("code")) { Box(Modifier.width(contentWidth.dp).height(100.dp)) }
+            Row(Modifier.align(Alignment.Center).fillMaxWidth().sidewaysScroll(code, LocalDensity.current).testTag("code")) { Box(Modifier.width(contentWidth.dp).height(100.dp)) }
         }
     }
 
@@ -539,6 +567,51 @@ class DrawerUiTest {
         assertOpen()
     }
 
+    private fun table(columns: Int, cell: String): DisplayChunk.TableSlice {
+        val md = "|" + (1..columns).joinToString("|") { " $cell " } + "|\n|" + "---|".repeat(columns) + "\n|" + (1..columns).joinToString("|") { " $cell " } + "|"
+        val parsed = parseMarkdown(md).single() as MdBlock.Table
+        return DisplayChunk.TableSlice(parsed, 0, 1, List(columns) { cell.length }, first = true, last = true)
+    }
+
+    /**
+     * Seven short columns clamped to 48 dp with six 1 dp dividers in a 768 px viewport at 2.25x: the ideal width exceeds
+     * the viewport by 1.5 px but the measured cells fit exactly, so the table does not scroll and the swipe moves the drawer.
+     */
+    @Test
+    @Config(qualifiers = "w400dp-h800dp-360dpi")
+    fun aZeroRangeTableLetsTheDrawerMove() {
+        val scroll = ScrollState(0)
+        show(drawer = drawerOf(emptyList())) { drag ->
+            Box(Modifier.fillMaxSize().then(drag)) {
+                Box(Modifier.align(Alignment.Center).width(with(LocalDensity.current) { 768.toDp() })) { MarkdownChunk(table(7, "x"), {}, Modifier.testTag("table"), tableScroll = scroll) }
+            }
+        }
+        assertEquals(0, scroll.maxValue)
+        drag(0.6f * state.width, 40, rule.onNodeWithTag("table"), release = false)
+        frames()
+        assertTrue("the fitted table kept the swipe", state.fraction > 0.2f)
+        up()
+        settled()
+        assertOpen()
+    }
+
+    /** A genuinely wide table scrolls sideways under the swipe while the drawer stays still. */
+    @Test
+    fun aWideTableScrollsAndTheDrawerStays() {
+        val scroll = ScrollState(0)
+        show(drawer = drawerOf(emptyList())) { drag ->
+            Box(Modifier.fillMaxSize().then(drag)) {
+                Box(Modifier.align(Alignment.Center).fillMaxWidth()) { MarkdownChunk(table(5, "a long cell of text"), {}, Modifier.testTag("table"), tableScroll = scroll) }
+            }
+        }
+        assertTrue(scroll.maxValue > 100)
+        drag(-0.5f * panel, 30, rule.onNodeWithTag("table"), release = false)
+        shutFor(3)
+        assertTrue("the table did not scroll", scroll.value > 50)
+        up()
+        shutFor(30)
+    }
+
     /** The element under the finger goes away mid-drag (a row re-keyed): the drawer neither picks the gesture up nor jumps. */
     @Test
     fun ownerRemovedMidDragNoJump() {
@@ -546,7 +619,7 @@ class DrawerUiTest {
         var shown by mutableStateOf(true)
         show(drawer = drawerOf(emptyList())) { drag ->
             Box(Modifier.fillMaxSize().then(drag)) {
-                if (shown) Row(Modifier.align(Alignment.Center).fillMaxWidth().sidewaysScroll(code).testTag("code")) { Box(Modifier.width(900.dp).height(100.dp)) }
+                if (shown) Row(Modifier.align(Alignment.Center).fillMaxWidth().sidewaysScroll(code, LocalDensity.current).testTag("code")) { Box(Modifier.width(900.dp).height(100.dp)) }
             }
         }
         runCode { code.scrollTo(code.maxValue) }
@@ -560,6 +633,146 @@ class DrawerUiTest {
         up()
         shutFor(30)
         assertClosed()
+    }
+
+    /** A drag on plain transcript text that pauses (a move with no sideways change) keeps moving the drawer; the list never takes it. */
+    @Test
+    fun aPauseInADragKeepsItTheDrawers() {
+        show()
+        val before = list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset
+        rule.onNodeWithText("Answer 29, long enough to wrap onto a second line of the chat screen.").performTouchInput {
+            down(center)
+            // 5 x 7 + 1 = 36 px of vertical drift: past this device's 32 px touch slop, so a list that picked the gesture
+            // up at the pause would take it.
+            repeat(5) { moveBy(Offset(20f, 7f)) }
+            moveBy(Offset(0f, 1f))
+            repeat(5) { moveBy(Offset(20f, 0f)) }
+        }
+        frames()
+        assertEquals("the drawer did not follow all of the drag", 200f - android.view.ViewConfiguration.get(rule.activity).scaledTouchSlop, state.fraction * state.width, 1f)
+        assertEquals("the list moved", before, list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset)
+        up()
+        settled()
+        // The mirror: a closing drag on the open panel's rows, with the same pause.
+        runCode { state.open() }
+        settled()
+        rule.onNodeWithText("Garden beds").performTouchInput {
+            down(center)
+            repeat(5) { moveBy(Offset(-20f, 7f)) }
+            moveBy(Offset(0f, 1f))
+            repeat(5) { moveBy(Offset(-20f, 0f)) }
+        }
+        frames()
+        assertEquals(1f - (200f - android.view.ViewConfiguration.get(rule.activity).scaledTouchSlop) / state.width, state.fraction, 0.003f)
+        up()
+        settled()
+    }
+
+    /** Absolute centre of [node] in px, for multi-finger input injected on the root. */
+    private fun centreOf(node: SemanticsNodeInteraction): Offset = node.fetchSemanticsNode().boundsInRoot.center
+
+    /**
+     * One finger per gesture, with a claimed second finger (the clarify field, then a code row that scrolls): whatever
+     * the order and whether the lead lifts before or after the slop, the claimed finger never moves the drawer.
+     */
+    @Test
+    fun aClaimedSecondFingerNeverTakesTheDrawer() {
+        shownChat = replyWith("Code:\n\n```\n$longLine\n```")
+        show()
+        val plainAt = centreOf(rule.onNodeWithText("Answer 1, long enough to wrap onto a second line of the chat screen.", substring = true))
+        val codeAt = centreOf(rule.onNodeWithText(longLine, substring = true))
+        val plain = { plainAt }
+        for (claimed in listOf({ codeAt })) {
+            // Lead on plain text lifts before the slop; then the claimed finger moves sideways.
+            rule.onRoot().performTouchInput {
+                down(0, plain())
+                down(1, claimed())
+                up(0)
+                repeat(10) { moveBy(1, Offset(4f, 0f)) }
+            }
+            shutFor(3)
+            rule.onRoot().performTouchInput { up(1) }
+            shutFor(30)
+            // Lead past the slop, then lifted mid-drag: the drawer settles; the claimed finger's moves do nothing.
+            rule.onRoot().performTouchInput {
+                down(0, plain())
+                down(1, claimed())
+                repeat(5) { moveBy(0, Offset(20f, 0f), delayMillis = 100) } // slow: its release settles by position
+            }
+            frames()
+            assertTrue(state.fraction > 0f)
+            rule.onRoot().performTouchInput { up(0) }
+            settled()
+            assertClosed()
+            rule.onRoot().performTouchInput { repeat(10) { moveBy(1, Offset(20f, 0f)) } }
+            shutFor(3)
+            rule.onRoot().performTouchInput { up(1) }
+            shutFor(30)
+            // Claimed finger first: the lead on plain text does nothing either.
+            rule.onRoot().performTouchInput {
+                down(1, claimed())
+                down(0, plain())
+                repeat(10) { moveBy(0, Offset(20f, 0f)) }
+            }
+            shutFor(3)
+            rule.onRoot().performTouchInput {
+                up(0)
+                up(1)
+            }
+            shutFor(30)
+        }
+        drag(0.6f * panel, 30) // an ordinary fresh drag
+        settled()
+        assertOpen()
+    }
+
+    /** The same with the clarify field as the claimed finger. */
+    @Test
+    fun aClaimedSecondFingerOnTheClarifyFieldNeverTakesTheDrawer() {
+        shownChat = withPending(clarify)
+        show()
+        frames(3)
+        val plainAt = centreOf(rule.onNodeWithText("Answer 1, long enough to wrap onto a second line of the chat screen.", substring = true))
+        val fieldAt = centreOf(rule.onNode(hasSetTextAction() and !hasTestTag("composer.field")))
+        val plain = { plainAt }
+        val claimed = { fieldAt }
+        rule.onRoot().performTouchInput {
+            down(0, plain())
+            down(1, claimed())
+            up(0)
+            repeat(10) { moveBy(1, Offset(4f, 0f)) }
+        }
+        shutFor(3)
+        rule.onRoot().performTouchInput { up(1) }
+        shutFor(30)
+        rule.onRoot().performTouchInput {
+            down(0, plain())
+            down(1, claimed())
+            repeat(5) { moveBy(0, Offset(20f, 0f), delayMillis = 100) } // slow: its release settles by position
+        }
+        frames()
+        assertTrue(state.fraction > 0f)
+        rule.onRoot().performTouchInput { up(0) }
+        settled()
+        assertClosed()
+        rule.onRoot().performTouchInput { repeat(10) { moveBy(1, Offset(20f, 0f)) } }
+        shutFor(3)
+        rule.onRoot().performTouchInput { up(1) }
+        shutFor(30)
+        rule.onRoot().performTouchInput {
+            down(1, claimed())
+            down(0, plain())
+            repeat(10) { moveBy(0, Offset(20f, 0f)) }
+        }
+        shutFor(3)
+        rule.onRoot().performTouchInput {
+            up(0)
+            up(1)
+        }
+        shutFor(30)
+        drag(0.6f * panel, 30)
+        settled()
+        assertOpen()
     }
 
     @Test
@@ -871,6 +1084,30 @@ class DrawerUiTest {
         rule.onNodeWithContentDescription("New chat").performClick()
         frames()
         assertEquals(1, newChats)
+    }
+
+    /** The approval's More, held while another finger drags the drawer out, opens no menu; uncovered it opens. */
+    @Test
+    fun theApprovalMenuDoesNotOpenUnderTheDrawer() {
+        shownChat = withPending(approval)
+        show()
+        frames(40)
+        rule.onNodeWithContentDescription("More approval options").performTouchInput { down(0, center) }
+        rule.onNodeWithTag("chat.topbar").performTouchInput {
+            down(1, center)
+            repeat(8) { moveBy(1, Offset(6f, 0f)) }
+        }
+        frames()
+        assertTrue(state.fraction > 0f)
+        rule.onRoot().performTouchInput { up(0) }
+        frames(3)
+        rule.onNodeWithText("Allow for this chat").assertDoesNotExist()
+        rule.onRoot().performTouchInput { up(1) }
+        settled()
+        assertClosed()
+        rule.onNodeWithContentDescription("More approval options").performClick()
+        frames(3)
+        rule.onNodeWithText("Allow for this chat").assertExists()
     }
 
     /** A one-finger drag that starts on a button moves the drawer and presses nothing. */

@@ -7,13 +7,13 @@ import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.MutatorMutex
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
-import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
+import kotlin.math.sign
 import kotlinx.coroutines.isActive
 import xyz.rycerz.apofis.ui.theme.SidewaysClaims
 import androidx.compose.foundation.background
@@ -160,7 +160,9 @@ class PushDrawerState internal constructor(initial: PushDrawerValue) {
     internal fun endDrag(owner: DragOwner, velocityDpPerSecond: Float, lost: Boolean) {
         if (this.owner !== owner) return
         if (lost || scope?.isActive != true) this.owner = null // nothing to keep, or nothing can settle now: the idle rule will
-        settleJob = scope?.launch {
+        // Undispatched: the identity-checked cleanup is installed before anything can cancel the job, and the settle has
+        // entered the mutex before a later code command, which then supersedes it by priority.
+        settleJob = scope?.launch(start = CoroutineStart.UNDISPATCHED) {
             try {
                 motion.mutate { settle(settleTo(fraction, velocityDpPerSecond)) }
             } finally {
@@ -197,35 +199,55 @@ class PushDrawerState internal constructor(initial: PushDrawerValue) {
 }
 
 /**
- * The drawer's drag recognizer: horizontal touch slop, then the finger moves the drawer until it lifts. Whether a
- * gesture may move the drawer is decided at its down: one that began on an element owning sideways drags
- * ([SidewaysClaims]) never does. It takes part in no nested scrolling and never picks up a gesture an inner element
- * consumed: that gesture is over for the drawer until every finger is up.
+ * The drawer's drag recognizer, one finger per gesture: it follows only the finger whose down it checked, through the
+ * touch slop and the drag, and never hands over to another finger. A gesture whose down began on an element owning
+ * sideways drags ([SidewaysClaims]) never moves the drawer. Before the slop, other fingers are ignored and nothing of
+ * theirs is consumed; if the checked finger lifts or another element consumed its move, the gesture ends without moving
+ * the drawer. During the drag every event of that finger goes to the velocity tracker (the up included) and is consumed
+ * (also without sideways motion, so no list picks the gesture up); its up ends the drag with that velocity, a consumed
+ * or missing change ends it as a cancel. Other fingers are drained until all are up. No nested scrolling.
  */
 private fun Modifier.drawerDrag(state: PushDrawerState, rtl: Boolean, fromScrim: Boolean): Modifier = pointerInput(state, rtl, fromScrim) {
     val sign = if (rtl) -1f else 1f
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
         if (SidewaysClaims.isClaimed(down.id)) return@awaitEachGesture
+        val id = down.id
         val owner = DragOwner(fromScrim)
         val velocity = VelocityTracker().apply { addPointerInputChange(down) }
+        val slop = viewConfiguration.touchSlop
         var started = false
         var ended = false
         try {
-            val slop = awaitHorizontalTouchSlopOrCancellation(down.id) { change, over ->
-                started = state.startDrag(owner)
-                change.consume()
-                if (started) state.dragBy(owner, sign * over)
-            }
-            if (slop == null || !started) return@awaitEachGesture
-            velocity.addPointerInputChange(slop)
-            val lifted = horizontalDrag(slop.id) { change ->
+            var dx = 0f
+            while (!started) {
+                val change = awaitPointerEvent().changes.firstOrNull { it.id == id } ?: return@awaitEachGesture
+                if (!change.pressed || change.isConsumed) return@awaitEachGesture
                 velocity.addPointerInputChange(change)
+                dx += change.positionChange().x
+                if (abs(dx) > slop) {
+                    started = state.startDrag(owner)
+                    if (!started) return@awaitEachGesture // code is moving the drawer
+                    change.consume()
+                    state.dragBy(owner, sign * (dx - slop * dx.sign))
+                }
+            }
+            while (true) {
+                val change = awaitPointerEvent().changes.firstOrNull { it.id == id }
+                if (change == null || change.isConsumed) {
+                    ended = true
+                    state.endDrag(owner, 0f, lost = false)
+                    return@awaitEachGesture
+                }
+                velocity.addPointerInputChange(change)
+                if (!change.pressed) {
+                    ended = true
+                    state.endDrag(owner, sign * velocity.calculateVelocity().x / density, lost = false)
+                    return@awaitEachGesture
+                }
                 state.dragBy(owner, sign * change.positionChange().x)
                 change.consume()
             }
-            ended = true
-            state.endDrag(owner, if (lifted) sign * velocity.calculateVelocity().x / density else 0f, lost = false)
         } finally {
             if (started && !ended) state.endDrag(owner, 0f, lost = true)
         }
