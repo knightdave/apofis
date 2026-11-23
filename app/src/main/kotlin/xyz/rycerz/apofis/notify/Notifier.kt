@@ -26,7 +26,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
-import xyz.rycerz.apofis.MainActivity
+import xyz.rycerz.apofis.OPEN_CHAT
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.NoticeStateEntity
@@ -425,7 +425,8 @@ class Notifier(
                 Notice.NEEDS_ANSWER -> R.string.notif_needs_answer
             },
         )
-        val open = Intent(Intent.ACTION_VIEW, chatUri(e.generation, e.sessionKey)).setClass(context, MainActivity::class.java)
+        // Through the non-exported alias: MainActivity opens a chat only for an intent aimed at it.
+        val open = Intent(Intent.ACTION_VIEW, chatUri(e.generation, e.sessionKey)).setClassName(context, OPEN_CHAT)
         val public = Notification.Builder(context, channel)
             .setSmallIcon(R.drawable.lucide_bell)
             .setContentTitle(context.getString(R.string.app_name))

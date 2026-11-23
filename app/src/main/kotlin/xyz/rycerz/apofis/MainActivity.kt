@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis
 
+import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
@@ -28,7 +29,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val container = (application as ApofisApp).container
-        if (savedInstanceState == null) openChat(intent) // a recreated activity must not reopen a tapped chat
+        handle(intent, fresh = savedInstanceState == null) // a recreated activity must not reopen a tapped chat
         // The activity's own lifecycle: Apofis has one activity, and no foreground service keeps streams alive.
         lifecycle.addObserver(
             LifecycleEventObserver { _, event ->
@@ -74,12 +75,26 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        openChat(intent)
+        handle(intent, fresh = true)
     }
 
-    /** A notification tap; the container ignores anything but a chat of the current connection. */
-    private fun openChat(intent: Intent) {
+    /** The only reader of launch and new intents: a notification tap goes to the container, anything else changes nothing. */
+    private fun handle(intent: Intent, fresh: Boolean) {
+        if (!gate(intent, fresh, packageName)) return
         val container = (application as ApofisApp).container
-        lifecycleScope.launch { container.openChat(intent) }
+        lifecycleScope.launch { container.openChat(intent) } // which opens only a chat of the current connection
+        setIntent(Intent(this, MainActivity::class.java)) // handed over once: a later reader sees a plain start
     }
 }
+
+/** The non-exported alias of [MainActivity] that notification taps go through: no other app can start it. */
+internal const val OPEN_CHAT = "xyz.rycerz.apofis.OpenChat"
+
+/**
+ * The intent gate: true only for a notification tap, a VIEW whose component is the alias, delivered fresh (not to a
+ * recreated activity) and not replayed from Recents. Everything else, an explicit VIEW at MainActivity and any extras
+ * included, is ignored; a launcher start restores the stored chat by itself.
+ */
+internal fun gate(intent: Intent, fresh: Boolean, packageName: String): Boolean =
+    fresh && intent.action == Intent.ACTION_VIEW && intent.component == ComponentName(packageName, OPEN_CHAT) &&
+        intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0

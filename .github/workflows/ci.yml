@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: python3 -I -m unittest discover -s server/apofis-push -p 'test_*.py' -v
+      - run: python3 -I -m unittest discover -s tools/emulator -p 'test_*.py' -v
+      # The harness's own safeguards: fake ssh and rsync, a fake key, synthetic databases; no host, emulator or server.
+      - run: bash tools/emulator/run-e2e-selftest.sh
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -29,6 +32,8 @@ jobs:
       - run: bash scripts/check-apk-permissions-test.sh
       - run: scripts/release-lock-test.sh
       - run: bash scripts/check-apk-permissions.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/aapt2" app/build/outputs/apk/debug/app-debug.apk
+      # Tag guard, certificate check and tag procedure against temporary repositories, throwaway keys and a stub gh.
+      - run: scripts/release-guards-test.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/apksigner" app/build/outputs/apk/debug/app-debug.apk
 
   release:
     if: github.event_name == 'push'
@@ -42,17 +47,32 @@ jobs:
       group: publish-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
+      # Pinned to commits; the comment names the release each commit is.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tag guard needs origin/main and the tag object
+
+      # Before any secret: a tag must be a signed vX.Y.Z on a commit of main; any other ref but main stops.
+      - name: Check release ref
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            git fetch --no-tags origin "+$GITHUB_REF:$GITHUB_REF"
+            scripts/check-release-tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
+          elif [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Releases are built only for main and v tags, not $GITHUB_REF"
+            exit 1
+          fi
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '21'
       - id: sdk
         run: scripts/sdk-versions.sh >> "$GITHUB_OUTPUT"
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           packages: ${{ steps.sdk.outputs.packages }}
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
       - name: Set version
         run: |
@@ -97,6 +117,10 @@ jobs:
 
       - name: Check permissions
         run: bash scripts/check-apk-permissions.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/aapt2" app/build/outputs/apk/release/app-release.apk
+
+      # A mismatch is a stop for the owner, never a reason to change the recorded digest (RELEASING.md).
+      - name: Check signing certificate
+        run: scripts/check-signing-cert.sh "$ANDROID_HOME/build-tools/${{ steps.sdk.outputs.build_tools }}/apksigner" app/build/outputs/apk/release/app-release.apk release/signing-cert.sha256
 
       - name: Acquire publish lock
         env:
