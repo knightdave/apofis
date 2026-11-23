@@ -334,12 +334,20 @@ class PushE2eTest {
         }
     }
 
-    /** The Settings screen's own scrolling container: a visible scrollable holding its section headings (the sheet has none). */
+    /** Whether [n] or a node below it matches [p]. */
+    private fun has(n: AccessibilityNodeInfo, p: (AccessibilityNodeInfo) -> Boolean): Boolean =
+        p(n) || (0 until n.childCount).mapNotNull(n::getChild).any { has(it, p) }
+
+    /**
+     * The Settings screen's own scrolling container: in the app window showing the "Settings" title (a sheet is a window
+     * of its own without it), the visible scrollable holding its section headings.
+     */
     private fun settingsList(): AccessibilityNodeInfo? {
         val titles = SECTIONS.map(app::str)
-        fun heading(n: AccessibilityNodeInfo): Boolean =
-            (n.isHeading && n.text?.toString() in titles) || (0 until n.childCount).mapNotNull(n::getChild).any(::heading)
-        return app.nodes { it.isScrollable && it.isVisibleToUser && heading(it) }.firstOrNull()
+        fun scrollable(n: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+            if (n.isScrollable && n.isVisibleToUser && has(n) { it.isHeading && it.text?.toString() in titles }) n
+            else (0 until n.childCount).mapNotNull(n::getChild).firstNotNullOfOrNull(::scrollable)
+        return app.appRoots().filter { r -> has(r) { it.text?.toString() == app.str("settings_title") } }.firstNotNullOfOrNull(::scrollable)
     }
 
     /** The Notifications row: the clickable node whose texts start with the row title (not the section heading). */
@@ -373,15 +381,16 @@ class PushE2eTest {
     }
 
     /**
-     * The open Notifications sheet: the app window that shows the "Notifications" title and none of Settings' section
-     * headings (the sheet is a window of its own, where test tags are not exposed); its scrolling column when it has one.
+     * The open Notifications sheet: the app window that shows the "Notifications" title and not the "Settings" title (the
+     * sheet is a window of its own, where test tags are not exposed); its scrolling column when it has one.
      */
     private fun sheet(): AccessibilityNodeInfo? {
         val title = app.str("settings_notifications")
-        fun has(n: AccessibilityNodeInfo, p: (AccessibilityNodeInfo) -> Boolean): Boolean = p(n) || (0 until n.childCount).mapNotNull(n::getChild).any { has(it, p) }
         fun scrollable(n: AccessibilityNodeInfo): AccessibilityNodeInfo? =
             if (n.isScrollable) n else (0 until n.childCount).mapNotNull(n::getChild).firstNotNullOfOrNull(::scrollable)
-        val root = app.appRoots().singleOrNull { r -> has(r) { it.text?.toString() == title } && !has(r) { it.isHeading } } ?: return null
+        val root = app.appRoots().singleOrNull { r ->
+            has(r) { it.text?.toString() == title } && !has(r) { it.text?.toString() == app.str("settings_title") }
+        } ?: return null
         return scrollable(root) ?: root
     }
 
