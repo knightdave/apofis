@@ -255,7 +255,7 @@ fun ChatScreen(
                         busy = input.sending,
                         enterToSend = input.enterToSend,
                         expanded = input.expanded,
-                        onExpandedChange = { expandedIn.value = if (it) input.sessionKey else null },
+                        onExpandedChange = { grow -> gate.pass { expandedIn.value = if (grow) input.sessionKey else null } }, // a user action of the covered layout
                         backdrop = objects.value.backdrop,
                         subject = if (input.mode == ComposerMode.STOP || input.mode == ComposerMode.STEER) input.runId else input.sessionKey,
                     )

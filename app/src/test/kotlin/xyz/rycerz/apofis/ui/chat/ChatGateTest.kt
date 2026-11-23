@@ -56,6 +56,24 @@ class ChatGateTest {
         assertEquals(methods.map { it.name }.sorted(), callAll(covered = false).sorted())
     }
 
+    /** Send's acceptance: covered gives false without calling the delegate; uncovered passes the delegate's own result. */
+    @Test
+    fun sendResultPassesThroughOnlyWhenUncovered() {
+        for (result in listOf(true, false)) {
+            var calls = 0
+            val delegate = object : ChatActions {
+                override fun onSendClick(): Boolean {
+                    calls++
+                    return result
+                }
+            }
+            assertEquals(false, CoveredActions({ delegate }, Gate { true }).onSendClick())
+            assertEquals(0, calls)
+            assertEquals(result, CoveredActions({ delegate }, Gate { false }).onSendClick())
+            assertEquals(1, calls)
+        }
+    }
+
     /**
      * ChatScreen's callback parameters: onOpenConnection and onRetryLoad (gated); navigationIcon and appBarActions (slots
      * whose buttons use LocalChatGate: DrawerButton, NewChatButton); currentState (a read-only supplier, not an action);

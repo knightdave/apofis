@@ -1111,6 +1111,30 @@ class DrawerUiTest {
         rule.onNodeWithText("Allow for this chat").assertExists()
     }
 
+    /** Expand, held while another finger drags the drawer out, does not grow the editor; uncovered it does. */
+    @Test
+    fun aHeldExpandDoesNothingUnderTheDrawer() {
+        shownChat = chat.copy(draft = "one\ntwo\nthree")
+        show()
+        frames(3)
+        rule.onNodeWithContentDescription("Expand the editor").performTouchInput { down(0, center) }
+        rule.onNodeWithTag("chat.topbar").performTouchInput {
+            down(1, center)
+            repeat(8) { moveBy(1, Offset(6f, 0f)) }
+        }
+        frames()
+        assertTrue(state.fraction > 0f)
+        rule.onRoot().performTouchInput { up(0) }
+        frames(3)
+        rule.onRoot().performTouchInput { up(1) }
+        settled()
+        assertClosed()
+        rule.onNodeWithContentDescription("Collapse the editor").assertDoesNotExist()
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        frames(3)
+        rule.onNodeWithContentDescription("Collapse the editor").assertExists()
+    }
+
     /** A one-finger drag that starts on a button moves the drawer and presses nothing. */
     @Test
     fun aDragThatStartsOnAButtonActsNot() {
