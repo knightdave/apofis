@@ -17,6 +17,7 @@ import androidx.work.testing.WorkManagerTestInitHelper
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -125,22 +126,37 @@ class IntentGateTest {
 
     /**
      * Until Room has run every query handed to it, the main thread has run what those resumed, and the notifier's lane
-     * is empty, with nothing new handed to Room meanwhile. A blocking wait on that condition; 10 s is a watchdog only.
+     * is empty, with nothing new handed to Room meanwhile. One 10 s watchdog covers the whole wait and names the stage
+     * that did not finish; at the deadline it also interrupts a main-thread task that blocks.
      */
     private fun drain() {
-        do {
-            val seen = synchronized(lock) {
-                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-                while (inFlight > 0) {
-                    val left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
-                    check(left > 0) { "Room work still running after 10 s" }
-                    lock.wait(left)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        var stage = "Room"
+        fun left(): Long = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).also { check(it > 0) { "$stage did not finish within 10 s" } }
+        val looper = shadowOf(Looper.getMainLooper())
+        val test = Thread.currentThread()
+        val watchdog = Executors.newSingleThreadScheduledExecutor().apply { schedule({ test.interrupt() }, 10, TimeUnit.SECONDS) }
+        try {
+            do {
+                stage = "Room"
+                val seen = synchronized(lock) {
+                    while (inFlight > 0) lock.wait(left())
+                    handed
                 }
-                handed
-            }
-            shadowOf(Looper.getMainLooper()).idle()
-            runBlocking { app.container.notifier.idle() }
-        } while (synchronized(lock) { inFlight > 0 || handed != seen })
+                stage = "The main thread"
+                while (!looper.isIdle) {
+                    left()
+                    looper.runOneTask()
+                }
+                stage = "The notifier"
+                runBlocking { withTimeoutOrNull(left()) { app.container.notifier.idle() } } ?: error("$stage did not finish within 10 s")
+            } while (synchronized(lock) { inFlight > 0 || handed != seen })
+        } catch (e: InterruptedException) {
+            throw AssertionError("$stage did not finish within 10 s", e)
+        } finally {
+            watchdog.shutdownNow()
+            Thread.interrupted() // a late interrupt must not reach the next step of the test
+        }
     }
 
     /** [deliver] a tap for [k]: once its work ended, its chat is requested and its notification is gone. */
