@@ -106,8 +106,13 @@ class AppDriver {
         val xml = "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n" +
             "    <string name=\"install_id\">$install</string>\n    <string name=\"e2e_nonce\">$nonce</string>\n" +
             "    <string name=\"e2e_origin\">$origin</string>\n</map>"
-        val read = shell("run-as $APP sh", "mkdir -p shared_prefs && cat > shared_prefs/push.xml <<'EOF'\n$xml\nEOF\ncat shared_prefs/push.xml\n")
-        if (!injectionConfirmed(read, install, nonce, origin)) fail("The push identity was not read back as written; push stays off")
+        shell("run-as $APP mkdir -p shared_prefs")
+        shell("run-as $APP tee shared_prefs/push.xml", "$xml\n") // stdin passes through run-as, as for sqlite3
+        val read = shell("run-as $APP cat shared_prefs/push.xml")
+        if (!injectionConfirmed(read, install, nonce, origin)) {
+            log("push identity read back as: ${read.take(600).replace("\n", "\\n")}") // the injected values only, never the key
+            fail("The push identity was not read back as written; push stays off")
+        }
         log("push identity written and read back")
     }
 
@@ -117,7 +122,9 @@ class AppDriver {
      */
     fun exportPushIntents(ifUnreadable: Collection<String>) {
         val read = sh("run-as $APP sh -c 'if [ -e shared_prefs/push.xml ]; then cat shared_prefs/push.xml && echo && echo @@READ; else echo @@NONE; fi'")
-        pushIntentLines(read, ifUnreadable).forEach(::journal)
+        val lines = pushIntentLines(read, ifUnreadable)
+        if (lines.any { it.startsWith("pushintent-missing") }) log("push prefs read as: ${read.take(600).replace("\n", "\\n")}")
+        lines.forEach(::journal)
     }
 
     /** The device clock in seconds, for `logcat -T`. */

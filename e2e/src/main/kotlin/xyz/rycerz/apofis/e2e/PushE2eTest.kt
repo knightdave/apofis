@@ -219,8 +219,9 @@ class PushE2eTest {
         app.device.pressHome()
         val (rc, pid) = app.pidof()
         if (rc != 0 || !Regex("\\d+").matches(pid)) fail("Could not read the app's pid before killing it (exit $rc)")
-        app.shell("am kill $APP")
-        app.waitFor("the app process $pid gone after am kill", 15_000) {
+        // am kill ends only a process that is safe to kill (cached): asked again until background work has ended. Never
+        // force-stop, which would leave the app stopped, so no distributor broadcast could start it.
+        app.waitFor("the app process $pid gone after am kill", 90_000, meanwhile = { app.shell("am kill $APP") }) {
             val (after, pids) = app.pidof()
             after == 1 && pids.isEmpty() && app.processGone(pid)
         }
