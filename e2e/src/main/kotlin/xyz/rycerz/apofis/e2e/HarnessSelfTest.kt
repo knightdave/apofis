@@ -232,13 +232,22 @@ class HarnessSelfTest {
         val prefs = prefsXml("install_id" to install, "endpoint" to "http://127.0.0.1:18650/$secret?up=1", "registration" to "g1\t$token")
         val reads = listOf(prefs, prefs.dropLast(20), prefs.replace("<map>", "<map><string name=\"x\">$secret"), "$secret\n$token", "")
         for (r in reads) {
-            for (d in listOf(identityDiagnostic(r), exportDiagnostic(r), exportDiagnostic("$r\n@@READ"))) {
+            // Only a fixed category, whatever was read: no byte of it can reach the log.
+            assertTrue(identityDiagnostic(r), identityDiagnostic(r) in setOf("not a whole prefs file", "values differ"))
+            for (d in listOf(exportDiagnostic(r), exportDiagnostic("$r\n@@READ"))) {
+                assertTrue(d, d in setOf("no prefs file", "unreadable", "malformed", "read"))
                 assertFalse(d, secret in d || token in d || install in d)
             }
         }
         assertEquals("malformed", exportDiagnostic(prefs.dropLast(20) + "\n@@READ"))
+    }
+
+    @Test
+    fun distributorLogsOnlyKnownActionsFromTheApp() {
+        val secret = "SENTINELaction0123"
         assertEquals("distributor: REGISTER from the app", distributorLog("org.unifiedpush.android.distributor.REGISTER", "xyz.rycerz.apofis"))
         assertNull("an action from another app", distributorLog("org.unifiedpush.android.distributor.REGISTER", "com.example.$secret"))
+        assertNull("no sender identity", distributorLog("org.unifiedpush.android.distributor.REGISTER", null))
         assertNull("an unknown action", distributorLog("org.unifiedpush.android.distributor.$secret", "xyz.rycerz.apofis"))
     }
 

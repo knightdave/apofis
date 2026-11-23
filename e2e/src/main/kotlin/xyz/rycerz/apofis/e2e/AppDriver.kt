@@ -246,6 +246,9 @@ class AppDriver {
         return found
     }
 
+    /** The root of each of the app's own windows (a bottom sheet or dialog is a window of its own). */
+    fun appRoots(): List<AccessibilityNodeInfo> = roots().filter { it.packageName == APP }
+
     private fun roots(): List<AccessibilityNodeInfo> {
         val ua = instrumentation.uiAutomation
         ua.clearCache() // nodes from another process can be stale otherwise

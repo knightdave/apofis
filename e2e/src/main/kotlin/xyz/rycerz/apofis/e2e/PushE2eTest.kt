@@ -337,12 +337,12 @@ class PushE2eTest {
         }
     }
 
-    /** The Settings screen's own scrolling container: a visible scrollable (not the sheet) holding its section headings. */
+    /** The Settings screen's own scrolling container: a visible scrollable holding its section headings (the sheet has none). */
     private fun settingsList(): AccessibilityNodeInfo? {
         val titles = SECTIONS.map(app::str)
         fun heading(n: AccessibilityNodeInfo): Boolean =
             (n.isHeading && n.text?.toString() in titles) || (0 until n.childCount).mapNotNull(n::getChild).any(::heading)
-        return app.nodes { it.isScrollable && it.isVisibleToUser && it.viewIdResourceName != SHEET && heading(it) }.firstOrNull()
+        return app.nodes { it.isScrollable && it.isVisibleToUser && heading(it) }.firstOrNull()
     }
 
     /** The Notifications row: the clickable node whose texts start with the row title (not the section heading). */
@@ -365,8 +365,18 @@ class PushE2eTest {
         if (!row().performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping the Notifications row failed")
     }
 
-    /** The open sheet, by its tag. */
-    private fun sheet(): AccessibilityNodeInfo? = app.nodes { it.viewIdResourceName == SHEET }.singleOrNull()
+    /**
+     * The open Notifications sheet: the app window that shows the "Notifications" title and none of Settings' section
+     * headings (the sheet is a window of its own, where test tags are not exposed); its scrolling column when it has one.
+     */
+    private fun sheet(): AccessibilityNodeInfo? {
+        val title = app.str("settings_notifications")
+        fun has(n: AccessibilityNodeInfo, p: (AccessibilityNodeInfo) -> Boolean): Boolean = p(n) || (0 until n.childCount).mapNotNull(n::getChild).any { has(it, p) }
+        fun scrollable(n: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+            if (n.isScrollable) n else (0 until n.childCount).mapNotNull(n::getChild).firstNotNullOfOrNull(::scrollable)
+        val root = app.appRoots().singleOrNull { r -> has(r) { it.text?.toString() == title } && !has(r) { it.isHeading } } ?: return null
+        return scrollable(root) ?: root
+    }
 
     private fun inSheet(label: String): AccessibilityNodeInfo? {
         fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? = if (n.isClickable) n else n.parent?.let(::clickableOf)
@@ -418,7 +428,6 @@ class PushE2eTest {
 
     companion object {
         const val OTHER = "com.example.other"
-        const val SHEET = "notifications.sheet"
         val TERMINAL_RUN = setOf("completed", "failed", "cancelled", "interrupted") // RunFollower.kt
         val SECTIONS = listOf("settings_connection", "settings_appearance", "settings_behaviour", "settings_notifications", "settings_about")
         val VALUES = listOf(

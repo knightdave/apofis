@@ -871,6 +871,7 @@ gone_pid=$fake_pid
 exec {fake_fd}>&-
 check "fake: when the pipe the harness holds closes (the harness died), the fake stops and closes its port" \
   'wait_gone 30 alive "$gone_pid" && [ -z "$(ss -Hltn "sport = :$push_port")" ] && grep -qx "stopped: child released, owner gone" "$push_dir/fake.log"'
+stop_pid "$gone_pid" # only if that check failed: never leave a fake behind
 fake_pid='' fake_fd=''
 python3 -I -c 'import socket, time; s = socket.socket(); s.bind(("127.0.0.1", int(__import__("sys").argv[1]))); s.listen(); time.sleep(30)' "$push_port" &
 squatter=$!
