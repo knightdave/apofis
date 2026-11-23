@@ -1,0 +1,777 @@
+package xyz.rycerz.apofis.images
+
+import android.app.Application
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.pm.ProviderInfo
+import android.content.res.AssetFileDescriptor
+import android.database.Cursor
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.ImageDecoder
+import android.net.Uri
+import android.os.CancellationSignal
+import android.os.Looper
+import android.os.ParcelFileDescriptor
+import androidx.test.core.app.ApplicationProvider
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.io.File
+import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.CRC32
+import java.util.zip.Deflater
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.withTimeout
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.Robolectric
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
+import xyz.rycerz.apofis.images.ImageFailure.BUSY
+import xyz.rycerz.apofis.images.ImageFailure.NOT_AN_IMAGE
+import xyz.rycerz.apofis.images.ImageFailure.TOO_LARGE
+import xyz.rycerz.apofis.images.ImageFailure.UNREADABLE
+
+private const val OTHER = "com.other.files"
+private const val OWN_REGISTERED = "xyz.rycerz.apofis.files"
+private const val OWN_MERGED = "xyz.rycerz.apofis.androidx-startup" // WorkManager's merged startup provider
+private const val USER_INFO = "0@com.other.files"
+
+/** A provider of another package; each URI path names a route set by the test. */
+class RouteProvider : ContentProvider() {
+    companion object {
+        val routes = ConcurrentHashMap<String, () -> AssetFileDescriptor?>()
+        val opens = ConcurrentHashMap<String, AtomicInteger>()
+        val threads = CopyOnWriteArrayList<Thread>()
+    }
+
+    override fun openAssetFile(uri: Uri, mode: String, signal: CancellationSignal?): AssetFileDescriptor? {
+        val path = uri.lastPathSegment!!
+        threads += Thread.currentThread()
+        opens.getOrPut(path) { AtomicInteger() }.incrementAndGet()
+        return routes.getValue(path)()
+    }
+
+    override fun openAssetFile(uri: Uri, mode: String): AssetFileDescriptor? = openAssetFile(uri, mode, null)
+    override fun onCreate() = true
+    override fun query(uri: Uri, p: Array<out String>?, s: String?, a: Array<out String>?, o: String?): Cursor? = null
+    override fun getType(uri: Uri): String? = null
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+    override fun delete(uri: Uri, s: String?, a: Array<out String>?) = 0
+    override fun update(uri: Uri, v: ContentValues?, s: String?, a: Array<out String>?) = 0
+}
+
+private typealias Decoder = (ImageDecoder.Source, ImageDecoder.OnHeaderDecodedListener) -> Bitmap
+
+@OptIn(ExperimentalCoroutinesApi::class)
+@RunWith(RobolectricTestRunner::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+@Config(sdk = [37])
+class DecodeTest {
+    private val ctx: Application = ApplicationProvider.getApplicationContext()
+    private val cleanups = CopyOnWriteArrayList<() -> Unit>()
+
+    // Deadlines and the gate wait run on this clock, stepped by hand: nothing waits in real time for them.
+    private val clock = TestCoroutineScheduler()
+    private val virtual = UnconfinedTestDispatcher(clock)
+
+    private val real: Decoder = ImageDecoder::decodeBitmap
+
+    @Before
+    fun setUp() {
+        RouteProvider.routes.clear()
+        RouteProvider.opens.clear()
+        RouteProvider.threads.clear()
+        register(OTHER, "com.other")
+        // Robolectric keys providers by component: one package per authority, or a later one replaces an earlier.
+        register(USER_INFO, "com.other.user")
+        register(OWN_REGISTERED, ctx.packageName)
+        assertEquals("com.other", ctx.packageManager.resolveContentProvider(OTHER, 0)?.packageName)
+    }
+
+    @After
+    fun tearDown() = runBlocking {
+        cleanups.forEach { it() }
+        withTimeout(10_000) { decodeWork.coroutineContext.job.children.toList().joinAll() }
+        // Every success, failure, timeout and cancellation above has deleted its temp file.
+        assertEquals(emptyList<String>(), temps())
+    }
+
+    private fun register(authority: String, pkg: String) {
+        val info = ProviderInfo().apply {
+            this.authority = authority
+            packageName = pkg
+            name = RouteProvider::class.java.name
+            exported = true
+        }
+        Robolectric.buildContentProvider(RouteProvider::class.java).create(info)
+        shadowOf(ctx.packageManager).addOrUpdateProvider(info)
+    }
+
+    private fun temps() = ctx.cacheDir.list()!!.filter { it.startsWith("decode-") && it.endsWith(".tmp") }.sorted()
+    private fun uri(path: String, authority: String = OTHER) = Uri.parse("content://$authority/$path")
+    private fun opens(path: String) = RouteProvider.opens[path]?.get() ?: 0
+    private fun route(path: String, open: () -> AssetFileDescriptor?) { RouteProvider.routes[path] = open }
+
+    private fun fileAfd(bytes: ByteArray, declared: Long = AssetFileDescriptor.UNKNOWN_LENGTH): AssetFileDescriptor {
+        val file = File.createTempFile("source", ".bin", ctx.filesDir).apply { writeBytes(bytes) }
+        return AssetFileDescriptor(ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY), 0, declared)
+    }
+
+    /**
+     * A route whose open returns the read side of a FIFO (Robolectric's pipe is a plain file, which never blocks).
+     * The test holds the FIFO open for writing, so a read blocks until [end] closes it.
+     */
+    private inner class Stall(path: String, prefix: ByteArray = ByteArray(0)) {
+        val opened = CompletableDeferred<Unit>()
+        private val fifo = File(ctx.filesDir, "fifo-$path")
+        private val writer: java.io.RandomAccessFile
+
+        init {
+            fifo.delete()
+            check(ProcessBuilder("mkfifo", fifo.path).start().waitFor() == 0)
+            writer = java.io.RandomAccessFile(fifo, "rw") // O_RDWR on a FIFO opens without waiting for a reader
+            writer.write(prefix)
+            route(path) {
+                // Signalled after the open: a reader opening after end() would wait for a writer forever.
+                val read = ParcelFileDescriptor.open(fifo, ParcelFileDescriptor.MODE_READ_ONLY)
+                opened.complete(Unit)
+                AssetFileDescriptor(read, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
+            }
+            cleanups += ::end
+        }
+
+        fun end() { runCatching { writer.close() } }
+    }
+
+    /** A route whose open blocks until the test releases it (at most 10 s). */
+    private inner class BlockingOpen(path: String) {
+        val opened = CompletableDeferred<Unit>()
+        private val release = CountDownLatch(1)
+
+        init {
+            route(path) {
+                opened.complete(Unit)
+                release.await(10, TimeUnit.SECONDS)
+                fileAfd(png(4, 4))
+            }
+            cleanups += { release.countDown() }
+        }
+    }
+
+    /** A decoder that holds its caller (at most 10 s) and then decodes for real. */
+    private inner class Held {
+        val entered = CompletableDeferred<Unit>()
+        val calls = AtomicInteger()
+        private val release = CountDownLatch(1)
+        val decoder: Decoder = { source, listener ->
+            calls.incrementAndGet()
+            entered.complete(Unit)
+            release.await(10, TimeUnit.SECONDS)
+            ImageDecoder.decodeBitmap(source, listener)
+        }
+
+        init { cleanups += ::release }
+        fun release() = release.countDown()
+    }
+
+    private fun counting(calls: AtomicInteger, inner: Decoder = real): Decoder = { s, l -> calls.incrementAndGet(); inner(s, l) }
+
+    private suspend fun decode(
+        input: ImageInput,
+        side: Int = ImageLimits.VIEW_SIDE,
+        limits: DecodeLimits = DecodeLimits(),
+        decoder: Decoder = real,
+        software: Boolean = true,
+    ) = decodeBounded(ctx, input, side, software, limits, decoder)
+
+    private fun CoroutineScope.onClock(input: ImageInput, decoder: Decoder = real): Deferred<Decoded> =
+        async(virtual) { decode(input, decoder = decoder) }
+
+    private fun step(ms: Long) {
+        clock.advanceTimeBy(ms)
+        clock.runCurrent()
+    }
+
+    private suspend fun <T> within10s(block: suspend () -> T): T = withTimeout(10_000) { block() }
+    private fun Decoded.reason() = (this as? Decoded.Failed)?.reason
+    private fun Decoded.bitmap() = (this as Decoded.Ok).bitmap
+
+    // Fixtures, all built here.
+
+    private fun png(w: Int, h: Int, color: Int = Color.RED, config: Bitmap.Config = Bitmap.Config.ARGB_8888): ByteArray {
+        val bitmap = Bitmap.createBitmap(w, h, config).apply { eraseColor(color) }
+        return ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+    }
+
+    private fun jpeg(w: Int, h: Int, color: Int = Color.GREEN): ByteArray {
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply { eraseColor(color) }
+        return ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+    }
+
+    /** A real PNG header with the given size and a few compressed bytes: what a decompression bomb looks like at first. */
+    private fun pngHeader(w: Int, h: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
+        fun chunk(type: String, data: ByteArray) = DataOutputStream(out).run {
+            val body = type.toByteArray() + data
+            writeInt(data.size)
+            write(body)
+            writeInt(CRC32().apply { update(body) }.value.toInt())
+        }
+        chunk("IHDR", ByteBuffer.allocate(13).putInt(w).putInt(h).put(8).put(2).put(0).put(0).put(0).array())
+        val deflater = Deflater().apply { setInput(ByteArray(4096)); finish() }
+        val idat = ByteArray(1024).let { it.copyOf(deflater.deflate(it)) }
+        chunk("IDAT", idat)
+        chunk("IEND", ByteArray(0))
+        return out.toByteArray()
+    }
+
+    /** Animated GIF, palette 0 red and 1 blue, one frame per entry of [frames]; LZW with a clear code before each pixel. */
+    private fun gif(w: Int, h: Int, frames: List<Int>): ByteArray {
+        val o = ByteArrayOutputStream()
+        fun le(v: Int) { o.write(v and 0xff); o.write(v shr 8 and 0xff) }
+        o.write("GIF89a".toByteArray()); le(w); le(h); o.write(0x80); o.write(0); o.write(0)
+        o.write(byteArrayOf(0xff.toByte(), 0, 0, 0, 0, 0xff.toByte()))
+        o.write(byteArrayOf(0x21, 0xff.toByte(), 11)); o.write("NETSCAPE2.0".toByteArray()); o.write(byteArrayOf(3, 1, 0, 0, 0))
+        for (color in frames) {
+            o.write(byteArrayOf(0x21, 0xf9.toByte(), 4, 0, 10, 0, 0, 0))
+            o.write(0x2c); le(0); le(0); le(w); le(h); o.write(0)
+            o.write(2)
+            val codes = (0 until w * h).flatMap { listOf(4, color) } + 5
+            val data = ByteArrayOutputStream()
+            var acc = 0
+            var n = 0
+            for (code in codes) {
+                acc = acc or (code shl n); n += 3
+                while (n >= 8) { data.write(acc and 0xff); acc = acc shr 8; n -= 8 }
+            }
+            if (n > 0) data.write(acc and 0xff)
+            val d = data.toByteArray()
+            var i = 0
+            while (i < d.size) { val len = minOf(255, d.size - i); o.write(len); o.write(d, i, len); i += len }
+            o.write(0)
+        }
+        o.write(0x3b)
+        return o.toByteArray()
+    }
+
+    /** A JPEG with an EXIF APP1 segment holding only the orientation tag. */
+    private fun exifJpeg(w: Int, h: Int, orientation: Int): ByteArray {
+        val plain = jpeg(w, h)
+        val tiff = byteArrayOf(0x4d, 0x4d, 0, 0x2a, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, orientation.toByte(), 0, 0, 0, 0, 0, 0)
+        val payload = "Exif".toByteArray() + byteArrayOf(0, 0) + tiff
+        val len = payload.size + 2
+        return byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xe1.toByte(), (len shr 8).toByte(), len.toByte()) +
+            payload + plain.copyOfRange(2, plain.size)
+    }
+
+    /** True when a marker segment before the scan data is APP1 "Exif". */
+    private fun hasExif(jpeg: ByteArray): Boolean {
+        var i = 2
+        while (i + 8 <= jpeg.size && jpeg[i] == 0xff.toByte()) {
+            val marker = jpeg[i + 1].toInt() and 0xff
+            if (marker == 0xda) return false
+            if (marker == 0xe1 && String(jpeg, i + 4, 4, Charsets.US_ASCII) == "Exif") return true
+            i += 2 + (((jpeg[i + 2].toInt() and 0xff) shl 8) or (jpeg[i + 3].toInt() and 0xff))
+        }
+        return false
+    }
+
+    private fun bounds(bytes: ByteArray) = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        .also { BitmapFactory.decodeByteArray(bytes, 0, bytes.size, it) }.let { it.outWidth to it.outHeight }
+
+    private fun decodeJpeg(bytes: ByteArray) = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)!!
+
+    // Step 1: named checks of the platform decoder under Robolectric.
+
+    @Test
+    fun robolectricDecodesRealBytes() = runBlocking {
+        val bytes = png(100, 50)
+        assertTrue(bytes.size < 10_000)
+        assertEquals(100 to 50, bounds(bytes))
+        var thread: Thread? = null
+        val result = decode(ImageInput.Bytes(bytes), decoder = { s, l -> thread = Thread.currentThread(); real(s, l) })
+        val bitmap = result.bitmap()
+        assertEquals(100 to 50, bitmap.width to bitmap.height)
+        assertEquals(Color.RED, bitmap.getPixel(50, 25))
+        assertNotEquals(Looper.getMainLooper().thread, thread)
+    }
+
+    @Test
+    fun exifOrientationApplied() = runBlocking {
+        val bytes = exifJpeg(4, 2, orientation = 6)
+        assertTrue(hasExif(bytes))
+        assertEquals(4 to 2, bounds(bytes)) // BitmapFactory ignores the tag
+        val bitmap = decode(ImageInput.Bytes(bytes)).bitmap()
+        assertEquals(2 to 4, bitmap.width to bitmap.height)
+    }
+
+    @Test
+    fun headerAbortReachesCaller() = runBlocking {
+        for (side in listOf(9000, 30_000)) {
+            val bytes = pngHeader(side, side)
+            assertTrue(bytes.size < 1024)
+            assertEquals(side to side, bounds(bytes))
+            var returned = false
+            val result = decode(ImageInput.Bytes(bytes), decoder = { s, l -> real(s, l).also { returned = true } })
+            // A decode that started would fail on the cut-off data as UNREADABLE; TOO_LARGE comes only from the header.
+            assertEquals(TOO_LARGE, result.reason())
+            assertFalse(returned)
+        }
+    }
+
+    @Test
+    fun pixelCapAtInjectedThreshold() = runBlocking {
+        val bytes = png(100, 100)
+        assertTrue(bytes.size < ImageLimits.MAX_SOURCE_BYTES)
+        assertEquals(100 to 100, bounds(bytes))
+        var bitmaps = 0
+        val decoder: Decoder = { s, l -> real(s, l).also { bitmaps++ } }
+        assertEquals(TOO_LARGE, decode(ImageInput.Bytes(bytes), limits = DecodeLimits(maxPixels = 9_999), decoder = decoder).reason())
+        assertEquals(0, bitmaps)
+        val ok = decode(ImageInput.Bytes(bytes), limits = DecodeLimits(maxPixels = 10_000), decoder = decoder).bitmap()
+        assertEquals(100 to 100, ok.width to ok.height)
+        assertEquals(1, bitmaps)
+    }
+
+    @Test
+    fun animatedGifFirstFrame() = runBlocking {
+        val blueOnly = gif(3, 2, listOf(1))
+        assertEquals(3 to 2, bounds(blueOnly))
+        assertEquals(Color.BLUE, decode(ImageInput.Bytes(blueOnly)).bitmap().getPixel(1, 1))
+        val bitmap = decode(ImageInput.Bytes(gif(3, 2, listOf(0, 1)))).bitmap()
+        assertEquals(3 to 2, bitmap.width to bitmap.height)
+        assertEquals(Color.RED, bitmap.getPixel(1, 1))
+    }
+
+    @Test
+    fun alphaBecomesWhite() = runBlocking {
+        val bytes = png(20, 10, Color.TRANSPARENT)
+        assertEquals(0, Color.alpha(BitmapFactory.decodeByteArray(bytes, 0, bytes.size).getPixel(5, 5)))
+        val jpeg = (toUploadJpeg(ctx, ImageInput.Bytes(bytes)) as Encoded.Ok).jpeg
+        val pixel = decodeJpeg(jpeg).getPixel(10, 5)
+        for (channel in listOf(Color.red(pixel), Color.green(pixel), Color.blue(pixel))) assertTrue("pixel ${Integer.toHexString(pixel)}", channel >= 250)
+    }
+
+    @Test
+    fun noExifInUpload() = runBlocking {
+        val bytes = exifJpeg(4, 2, orientation = 6)
+        assertTrue(hasExif(bytes))
+        val jpeg = (toUploadJpeg(ctx, ImageInput.Bytes(bytes)) as Encoded.Ok).jpeg
+        assertEquals(0xd8, jpeg[1].toInt() and 0xff)
+        assertFalse(hasExif(jpeg))
+        // The rotation is in the pixels now, not in a tag.
+        assertEquals(2 to 4, bounds(jpeg))
+    }
+
+    // Step 2: content URIs.
+
+    @Test
+    fun ownAuthorityRefused() = runBlocking {
+        assertEquals(ctx.packageName, ctx.packageManager.resolveContentProvider(OWN_MERGED, 0)?.packageName)
+        assertEquals(ctx.packageName, ctx.packageManager.resolveContentProvider(OWN_REGISTERED, 0)?.packageName)
+        route("x") { fileAfd(png(4, 4)) }
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(uri("x", OWN_MERGED))).reason())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(uri("x", OWN_REGISTERED))).reason())
+        assertEquals(0, opens("x"))
+        // The same route through another package's authority is read: the refusal is the authority's.
+        assertTrue(decode(ImageInput.Content(uri("x"))) is Decoded.Ok)
+    }
+
+    @Test
+    fun unresolvableAuthorityRefused() = runBlocking {
+        assertNull(ctx.packageManager.resolveContentProvider("nobody.home", 0))
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(uri("x", "nobody.home"))).reason())
+    }
+
+    @Test
+    fun userInfoAuthorityRefused() = runBlocking {
+        assertEquals("com.other.user", ctx.packageManager.resolveContentProvider(USER_INFO, 0)?.packageName)
+        route("x") { fileAfd(png(4, 4)) }
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(uri("x", USER_INFO))).reason())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(Uri.parse("content://0%40$OTHER/x"))).reason())
+        assertEquals(0, opens("x"))
+    }
+
+    @Test
+    fun fileSchemeRefused() = runBlocking {
+        val file = File(ctx.filesDir, "photo.png").apply { writeBytes(png(4, 4)) }
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(Uri.fromFile(file))).reason())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(Uri.parse("android.resource://${ctx.packageName}/1"))).reason())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(Uri.parse("CONTENT://$OTHER/x"))).reason())
+    }
+
+    @Test
+    fun securityExceptionUnreadable() = runBlocking {
+        route("x") { throw SecurityException("no grant") }
+        assertEquals(UNREADABLE, decode(ImageInput.Content(uri("x"))).reason())
+        assertEquals(1, opens("x"))
+    }
+
+    @Test
+    fun vanishingProvider() = runBlocking {
+        val whole = png(64, 64, Color.BLUE)
+        // The provider writes half the image and goes away.
+        val half = Stall("half", whole.copyOf(whole.size / 2))
+        val result = async(Dispatchers.Default) { decode(ImageInput.Content(uri("half"))) }
+        within10s { half.opened.await() }
+        half.end()
+        assertEquals(UNREADABLE, within10s { result.await() }.reason())
+        // Or answers nothing at all.
+        route("gone") { null }
+        assertEquals(UNREADABLE, decode(ImageInput.Content(uri("gone"))).reason())
+        route("missing") { throw java.io.FileNotFoundException("deleted") }
+        assertEquals(UNREADABLE, decode(ImageInput.Content(uri("missing"))).reason())
+    }
+
+    @Test
+    fun endlessStream() = runBlocking {
+        val zero = File("/dev/zero")
+        assertTrue(zero.exists())
+        route("zero") { AssetFileDescriptor(ParcelFileDescriptor.open(zero, ParcelFileDescriptor.MODE_READ_ONLY), 0, AssetFileDescriptor.UNKNOWN_LENGTH) }
+        val result = within10s { decode(ImageInput.Content(uri("zero")), limits = DecodeLimits(maxSourceBytes = 1L shl 20)) }
+        assertEquals(TOO_LARGE, result.reason())
+    }
+
+    @Test
+    fun negativeDeclaredSizeIgnored() = runBlocking {
+        val bytes = png(30, 20)
+        route("negative") { fileAfd(bytes, declared = -5) }
+        val bitmap = decode(ImageInput.Content(uri("negative"))).bitmap()
+        assertEquals(30 to 20, bitmap.width to bitmap.height)
+        // A huge declared size does not lift the cap either: bytes read are counted.
+        route("huge") {
+            AssetFileDescriptor(ParcelFileDescriptor.open(File("/dev/zero"), ParcelFileDescriptor.MODE_READ_ONLY), 0, Long.MAX_VALUE / 2)
+        }
+        assertEquals(TOO_LARGE, within10s { decode(ImageInput.Content(uri("huge")), limits = DecodeLimits(maxSourceBytes = 1L shl 20)) }.reason())
+    }
+
+    @Test
+    fun contentCopiedAndDecodedOffMainThread() = runBlocking {
+        route("x") { fileAfd(png(8, 8)) }
+        var thread: Thread? = null
+        val result = decode(ImageInput.Content(uri("x")), decoder = { s, l -> thread = Thread.currentThread(); real(s, l) })
+        assertTrue(result is Decoded.Ok)
+        val main = Looper.getMainLooper().thread
+        assertNotEquals(main, thread)
+        assertFalse(RouteProvider.threads.isEmpty())
+        assertTrue(RouteProvider.threads.none { it == main })
+    }
+
+    @Test
+    fun stalledProviderTimesOut() = runBlocking {
+        val stall = Stall("stall")
+        val result = onClock(ImageInput.Content(uri("stall")))
+        within10s { stall.opened.await() }
+        step(19_999)
+        assertFalse(result.isCompleted)
+        step(1)
+        assertEquals(UNREADABLE, within10s { result.await() }.reason())
+        assertEquals(20_000, clock.currentTime)
+    }
+
+    @Test
+    fun blockingOpenTimesOut() = runBlocking {
+        val open = BlockingOpen("slow")
+        val result = onClock(ImageInput.Content(uri("slow")))
+        within10s { open.opened.await() }
+        step(19_999)
+        assertFalse(result.isCompleted)
+        step(1)
+        assertEquals(UNREADABLE, within10s { result.await() }.reason())
+        assertEquals(20_000, clock.currentTime)
+    }
+
+    @Test
+    fun thirdStuckSourceRejectedAtOnce() = runBlocking {
+        val first = BlockingOpen("one")
+        val second = BlockingOpen("two")
+        val a = onClock(ImageInput.Content(uri("one")))
+        val b = onClock(ImageInput.Content(uri("two")))
+        within10s { first.opened.await(); second.opened.await() }
+        step(20_000)
+        assertEquals(UNREADABLE, within10s { a.await() }.reason())
+        assertEquals(UNREADABLE, within10s { b.await() }.reason())
+        // Both opens still block and keep their slots: a third request fails at once, unopened.
+        route("three") { fileAfd(png(4, 4)) }
+        val c = onClock(ImageInput.Content(uri("three")))
+        assertTrue(c.isCompleted)
+        assertEquals(BUSY, within10s { c.await() }.reason())
+        assertEquals(20_000, clock.currentTime)
+        assertEquals(0, opens("three"))
+    }
+
+    @Test
+    fun slotHeldUntilTempFileDeleted() = runBlocking {
+        val permits = java.util.concurrent.Semaphore(0)
+        val entered = Channel<Unit>(Channel.UNLIMITED)
+        cleanups += { permits.release(10) }
+        val gated: Decoder = { s, l ->
+            entered.trySend(Unit)
+            check(permits.tryAcquire(10, TimeUnit.SECONDS))
+            real(s, l)
+        }
+        val opened = Channel<String>(Channel.UNLIMITED)
+        for (path in listOf("p1", "p2", "p3")) route(path) { opened.trySend(path); fileAfd(png(16, 16)) }
+        route("busy") { fileAfd(png(4, 4)) }
+        val r1 = async(Dispatchers.Default) { decode(ImageInput.Content(uri("p1")), decoder = gated) }
+        val r2 = async(Dispatchers.Default) { decode(ImageInput.Content(uri("p2")), decoder = gated) }
+        within10s { repeat(2) { opened.receive() }; entered.receive() }
+        assertEquals(BUSY, decode(ImageInput.Content(uri("busy"))).reason())
+        assertEquals(0, opens("busy"))
+        assertEquals(2, temps().size)
+        permits.release()
+        val first = within10s { select { r1.onAwait { it }; r2.onAwait { it } } }
+        assertTrue(first is Decoded.Ok)
+        // The finished decode deleted its temp file before it returned, and gave its slot back.
+        assertEquals(1, temps().size)
+        val r3 = async(Dispatchers.Default) { decode(ImageInput.Content(uri("p3")), decoder = gated) }
+        assertEquals("p3", within10s { opened.receive() })
+        permits.release(2)
+        for (r in listOf(r1, r2, r3)) assertTrue(within10s { r.await() } is Decoded.Ok)
+        assertEquals(0, temps().size)
+    }
+
+    @Test
+    fun stalledSourceDoesNotBlockOtherDecodes() = runBlocking {
+        val stall = Stall("stall")
+        val stalled = async(Dispatchers.Default) { decode(ImageInput.Content(uri("stall"))) }
+        within10s { stall.opened.await() }
+        assertTrue(within10s { decode(ImageInput.Bytes(png(10, 10))) } is Decoded.Ok)
+        route("free") { fileAfd(png(10, 10)) }
+        assertTrue(within10s { decode(ImageInput.Content(uri("free"))) } is Decoded.Ok)
+        assertFalse(stalled.isCompleted)
+        stall.end()
+        assertEquals(NOT_AN_IMAGE, within10s { stalled.await() }.reason()) // the pipe ended empty
+    }
+
+    @Test
+    fun blockedDecoderTimesOutWaiters() = runBlocking {
+        val stuck = Held()
+        val first = onClock(ImageInput.Bytes(png(10, 10)), stuck.decoder)
+        within10s { stuck.entered.await() }
+        val calls = AtomicInteger()
+        val later = onClock(ImageInput.Bytes(png(10, 10)), counting(calls))
+        step(ImageLimits.GATE_WAIT_MS - 1)
+        assertFalse(later.isCompleted)
+        step(1)
+        assertEquals(UNREADABLE, within10s { later.await() }.reason())
+        val again = onClock(ImageInput.Bytes(png(10, 10)), counting(calls))
+        step(ImageLimits.GATE_WAIT_MS)
+        assertEquals(UNREADABLE, within10s { again.await() }.reason())
+        assertEquals(0, calls.get())
+        // Its own caller waits with it; cancelled, it leaves at once and the gate stays with the decode.
+        assertFalse(first.isCompleted)
+        within10s { first.cancelAndJoin() }
+        val afterCancel = onClock(ImageInput.Bytes(png(10, 10)), counting(calls))
+        step(ImageLimits.GATE_WAIT_MS)
+        assertEquals(UNREADABLE, within10s { afterCancel.await() }.reason())
+        assertEquals(0, calls.get())
+        stuck.release()
+        within10s { decodeWork.coroutineContext.job.children.toList().joinAll() }
+        assertTrue(decode(ImageInput.Bytes(png(10, 10)), decoder = counting(calls)) is Decoded.Ok)
+        assertEquals(1, calls.get())
+    }
+
+    @Test
+    fun cancelledCallKeepsSlotUntilReadReturns() = runBlocking {
+        val one = Stall("one")
+        val caller = launch(Dispatchers.Default) { decode(ImageInput.Content(uri("one"))) }
+        within10s { one.opened.await() }
+        val copy = decodeWork.coroutineContext.job.children.single()
+        within10s { caller.cancelAndJoin() } // gives up at once, the read still blocks
+        assertTrue(copy.isActive)
+        val two = Stall("two")
+        val second = async(Dispatchers.Default) { decode(ImageInput.Content(uri("two"))) }
+        within10s { two.opened.await() }
+        route("png") { fileAfd(png(4, 4)) }
+        assertEquals(BUSY, decode(ImageInput.Content(uri("png"))).reason())
+        assertEquals(0, opens("png"))
+        assertEquals(2, temps().size)
+        one.end()
+        within10s { copy.join() }
+        assertEquals(1, temps().size)
+        assertTrue(within10s { decode(ImageInput.Content(uri("png"))) } is Decoded.Ok)
+        two.end()
+        within10s { second.await() }
+        Unit
+    }
+
+    // Step 2: sizes, failures, formats.
+
+    @Test
+    fun extremeAspectRatio() = runBlocking {
+        val tall = png(1, 20_000)
+        assertEquals(1 to 20_000, bounds(tall))
+        val t = decode(ImageInput.Bytes(tall), side = ImageLimits.UPLOAD_SIDE).bitmap()
+        assertEquals(1 to 1568, t.width to t.height)
+        val wide = png(20_000, 1)
+        assertEquals(20_000 to 1, bounds(wide))
+        val w = decode(ImageInput.Bytes(wide), side = ImageLimits.THUMB_SIDE).bitmap()
+        assertEquals(320 to 1, w.width to w.height)
+    }
+
+    @Test
+    fun targetArithmeticDoesNotOverflow() = runBlocking {
+        assertEquals(2560 to 2559, targetSize(Int.MAX_VALUE.toLong(), Int.MAX_VALUE - 1L, 2560))
+        assertEquals(1 to 2560, targetSize(1, Int.MAX_VALUE.toLong(), 2560))
+        assertEquals(46_341 to 46_341, targetSize(46_341, 46_341, Int.MAX_VALUE))
+        assertEquals(1568 to 1176, targetSize(4000, 3000, 1568))
+        assertEquals(100 to 50, targetSize(100, 50, 1568))
+        // 46341 x 46341 overflows an Int to a negative product; in Long it is over the cap.
+        val bytes = pngHeader(46_341, 46_341)
+        assertEquals(46_341 to 46_341, bounds(bytes))
+        assertTrue(46_341 * 46_341 < 0)
+        assertEquals(TOO_LARGE, decode(ImageInput.Bytes(bytes)).reason())
+    }
+
+    @Test
+    fun decoderRuntimeExceptionIsUnreadable() = runBlocking {
+        val bytes = png(10, 10)
+        assertEquals(UNREADABLE, decode(ImageInput.Bytes(bytes), decoder = { _, _ -> throw IllegalStateException("codec") }).reason())
+        assertEquals(UNREADABLE, decode(ImageInput.Bytes(bytes), decoder = { _, _ -> throw OutOfMemoryError("big") }).reason())
+        assertEquals(UNREADABLE, decode(ImageInput.Bytes(bytes), decoder = { _, _ -> throw java.util.concurrent.CancellationException("odd") }).reason())
+        // The gate was given back each time.
+        assertTrue(decode(ImageInput.Bytes(bytes)) is Decoded.Ok)
+    }
+
+    @Test
+    fun formatOutsideSetRefused() = runBlocking {
+        val avif = byteArrayOf(0, 0, 0, 0x1c) + "ftypavif".toByteArray() + byteArrayOf(0, 0, 0, 0) + "avifmif1miaf".toByteArray()
+        val heic = byteArrayOf(0, 0, 0, 0x18) + "ftypheic".toByteArray() + byteArrayOf(0, 0, 0, 0) + "mif1heic".toByteArray()
+        assertEquals(ImageFormat.AVIF, sniff(avif))
+        assertEquals(ImageFormat.HEIF, sniff(heic))
+        val calls = AtomicInteger()
+        val reply = DecodeLimits(formats = REPLY_FORMATS)
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Bytes(avif), limits = reply, decoder = counting(calls)).reason())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Bytes(heic), limits = reply, decoder = counting(calls)).reason())
+        assertEquals(0, calls.get())
+        // Uploads take both; these headers are cut off, so the decoder is reached and fails.
+        assertEquals(UNREADABLE, decode(ImageInput.Bytes(avif), decoder = counting(calls)).reason())
+        assertEquals(1, calls.get())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Bytes(png(4, 4)), limits = DecodeLimits(formats = setOf(ImageFormat.JPEG))).reason())
+    }
+
+    @Test
+    fun labelDiffersFromBytesRefused() = runBlocking {
+        val bytes = png(10, 10)
+        val calls = AtomicInteger()
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Bytes(bytes, "image/jpeg"), decoder = counting(calls)).reason())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Bytes(bytes, "text/plain"), decoder = counting(calls)).reason())
+        assertEquals(0, calls.get())
+        assertTrue(decode(ImageInput.Bytes(bytes, "image/png"), decoder = counting(calls)) is Decoded.Ok)
+        assertTrue(decode(ImageInput.Bytes(bytes)) is Decoded.Ok)
+    }
+
+    @Test
+    fun corruptJpeg() = runBlocking {
+        val whole = jpeg(64, 64)
+        assertEquals(64 to 64, bounds(whole))
+        assertEquals(UNREADABLE, decode(ImageInput.Bytes(whole.copyOf(whole.size / 3))).reason())
+        val scrambled = whole.copyOf().also { for (i in 20 until it.size) it[i] = 0x5a }
+        assertEquals(UNREADABLE, decode(ImageInput.Bytes(scrambled)).reason())
+        // A truncated file from a provider too.
+        route("cut") { fileAfd(whole.copyOf(whole.size / 3)) }
+        assertEquals(UNREADABLE, decode(ImageInput.Content(uri("cut"))).reason())
+    }
+
+    @Test
+    fun notAnImage() = runBlocking {
+        val calls = AtomicInteger()
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Bytes("<html>hello</html>".toByteArray()), decoder = counting(calls)).reason())
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Bytes(ByteArray(0)), decoder = counting(calls)).reason())
+        route("empty") { fileAfd(ByteArray(0)) }
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(uri("empty")), decoder = counting(calls)).reason())
+        route("text") { fileAfd("[core]\nkey=value\n".toByteArray()) }
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(uri("text")), decoder = counting(calls)).reason())
+        val stored = File(ctx.filesDir, "notes.jpg").apply { writeBytes("not a jpeg".toByteArray()) }
+        assertEquals(NOT_AN_IMAGE, decode(ImageInput.Stored(stored), decoder = counting(calls)).reason())
+        assertEquals(0, calls.get())
+    }
+
+    @Test
+    fun bytesOverCapRefusedBeforeDecode() = runBlocking {
+        val bytes = png(10, 10)
+        val calls = AtomicInteger()
+        val cap = DecodeLimits(maxSourceBytes = bytes.size - 1L)
+        assertEquals(TOO_LARGE, decode(ImageInput.Bytes(bytes), limits = cap, decoder = counting(calls)).reason())
+        val stored = File(ctx.filesDir, "big.png").apply { writeBytes(bytes) }
+        assertEquals(TOO_LARGE, decode(ImageInput.Stored(stored), limits = cap, decoder = counting(calls)).reason())
+        assertEquals(0, calls.get())
+        assertTrue(decode(ImageInput.Stored(stored)) is Decoded.Ok)
+    }
+
+    @Test
+    fun uploadNeverUpscales() = runBlocking {
+        val jpeg = (toUploadJpeg(ctx, ImageInput.Bytes(png(100, 50))) as Encoded.Ok).jpeg
+        assertEquals(100 to 50, bounds(jpeg))
+    }
+
+    @Test
+    fun uploadLongestSide() = runBlocking {
+        val bytes = png(4000, 3000, Color.GRAY, Bitmap.Config.RGB_565)
+        assertEquals(4000 to 3000, bounds(bytes))
+        val jpeg = (toUploadJpeg(ctx, ImageInput.Bytes(bytes)) as Encoded.Ok).jpeg
+        assertEquals(1568 to 1176, bounds(jpeg))
+        assertEquals(TOO_LARGE, (toUploadJpeg(ctx, ImageInput.Bytes(bytes), DecodeLimits(maxPixels = 11_999_999)) as Encoded.Failed).reason)
+    }
+
+    @Test
+    fun oneDecodeAtATime() = runBlocking {
+        val held = Held()
+        val first = onClock(ImageInput.Bytes(png(10, 10)), held.decoder)
+        within10s { held.entered.await() }
+        val calls = AtomicInteger()
+        val second = onClock(ImageInput.Bytes(png(10, 10)), counting(calls))
+        step(ImageLimits.GATE_WAIT_MS)
+        assertEquals(UNREADABLE, within10s { second.await() }.reason())
+        assertEquals(0, calls.get())
+        held.release()
+        assertTrue(within10s { first.await() } is Decoded.Ok)
+        assertEquals(1, held.calls.get())
+        assertTrue(decode(ImageInput.Bytes(png(10, 10)), decoder = counting(calls)) is Decoded.Ok)
+        assertEquals(1, calls.get())
+    }
+
+    @Test
+    fun leftoverTempsDeleted() {
+        val dir = ctx.cacheDir
+        val leftovers = listOf("decode-1.tmp", "decode-998877.tmp")
+        val others = listOf("decode-1.txt", "other.tmp", "xdecode-1.tmp")
+        (leftovers + others).forEach { File(dir, it).writeText("x") }
+        clearDecodeTemps(dir)
+        assertTrue(leftovers.none { File(dir, it).exists() })
+        assertTrue(others.all { File(dir, it).exists() })
+        others.forEach { File(dir, it).delete() }
+    }
+}
