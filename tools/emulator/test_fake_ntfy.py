@@ -21,6 +21,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import fake_ntfy  # noqa: E402
 
+# Containment: whatever these tests (or a deliberately broken fake) write through HOME or HERMES_HOME lands in a
+# temporary directory, never in the real account.
+_CONTAINER = tempfile.TemporaryDirectory()
+os.environ["HOME"] = os.path.join(_CONTAINER.name, "home")
+os.environ["HERMES_HOME"] = os.path.join(_CONTAINER.name, "hermes-home")
+os.makedirs(os.environ["HOME"])
+
 SCRIPT = os.path.normpath(os.path.join(HERE, "..", "..", "server", "apofis-push", "apofis_push.py"))
 TOPIC = "upAbC123xyz09q"
 INSTALL = "0f8fad5b-d9cb-469f-a165-70867728950e"
@@ -97,6 +104,7 @@ class Base(unittest.TestCase):
         f = fake_ntfy.Fake(self.run_dir, 0, TOPIC, SCRIPT, wake_install, runner=runner)
         self.addCleanup(f.stop)
         f.start()
+        self.f = f
         return f
 
 
@@ -159,9 +167,25 @@ class Http(Base):
 class Trigger(Base):
     def setUp(self):
         self.calls = []
+        self.child = "posts"  # what the stand-in hook does: posts (log line and body), body, log, twice, other, nothing
 
     def runner(self, cmd, env, event):
+        """A stand-in for the hook: records its call and does what self.child says a child would have done."""
         self.calls.append((cmd, env, event))
+        port = self.f.port
+        line = "2026-11-23T00:00:00Z on_human_input_request matched regs=1 http://127.0.0.1:%d=200\n" % port
+        if self.child in ("posts", "log", "twice", "other"):
+            with open(os.path.join(env["HERMES_HOME"], "agent-hooks", "apofis-push.log"), "a") as log:
+                log.write(line)
+        if self.child == "polled":  # two posts with a poll between: the queue ends as one right body, received is two
+            with open(os.path.join(env["HERMES_HOME"], "agent-hooks", "apofis-push.log"), "a") as log:
+                log.write(line)
+            request(port, "POST", "/%s?up=1" % TOPIC, fake_ntfy.WAKE_BODY)
+            request(port, "GET", "/%s/poll" % TOPIC)
+        bodies = {"posts": [fake_ntfy.WAKE_BODY], "body": [fake_ntfy.WAKE_BODY], "twice": [fake_ntfy.WAKE_BODY] * 2,
+                  "other": [b'{"kind":"finished"}'], "polled": [fake_ntfy.WAKE_BODY]}.get(self.child, [])
+        for b in bodies:
+            request(port, "POST", "/%s?up=1" % TOPIC, b)
 
     def test_runs_exactly_the_fixed_command_with_the_run_private_environment(self):
         f = self.fake(runner=self.runner)
@@ -178,8 +202,43 @@ class Trigger(Base):
         f = self.fake(runner=self.runner)
         for _ in range(3):
             self.assertEqual(200, request(f.port, "POST", "/trigger")[0])
+            self.assertEqual((200, fake_ntfy.WAKE_BODY), request(f.port, "GET", "/%s/poll" % TOPIC))
         self.assertEqual(429, request(f.port, "POST", "/trigger")[0])
         self.assertEqual(3, len(self.calls))
+
+    def test_a_trigger_without_proof_of_one_post_is_not_accepted(self):
+        for child in ("nothing", "body", "log", "twice", "other", "polled"):
+            self.calls = []
+            self.child = child
+            f = self.fake(runner=self.runner)
+            with open(f.log_path(), "w") as log:  # an earlier run's line: only lines of this trigger count
+                log.write("2026-11-23T00:00:00Z on_human_input_request matched regs=1 http://127.0.0.1:%d=200\n" % f.port)
+            self.assertEqual(502, request(f.port, "POST", "/trigger")[0], child)
+            self.assertEqual(1, len(self.calls))
+
+    def test_a_queued_message_refuses_the_trigger(self):
+        f = self.fake(runner=self.runner)
+        self.assertEqual(200, request(f.port, "POST", "/" + TOPIC, fake_ntfy.WAKE_BODY)[0])  # preloaded, even the right body
+        self.assertEqual(409, request(f.port, "POST", "/trigger")[0])
+        self.assertEqual([], self.calls)
+
+    def test_one_trigger_at_a_time_and_none_after_stop_began(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow(cmd, env, event):
+            entered.set()
+            release.wait(WATCHDOG)
+            self.runner(cmd, env, event)
+        f = self.fake(runner=slow)
+        first = threading.Thread(target=request, args=(f.port, "POST", "/trigger"), daemon=True)
+        first.start()
+        self.assertTrue(entered.wait(WATCHDOG))
+        self.assertEqual(409, request(f.port, "POST", "/trigger")[0])
+        release.set()
+        first.join(WATCHDOG)
+        f.stop()
+        self.assertEqual(503, f.trigger())
+        self.assertEqual(1, len(self.calls))
 
     def test_takes_no_input(self):
         f = self.fake(runner=self.runner)
@@ -224,6 +283,59 @@ class RealTrigger(Base):
         self.addCleanup(release.set)
         return f, entered, release
 
+    def test_stop_before_slot_acquisition_waits_for_the_hook_and_accounts_for_its_child(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def late(cmd, env, event):  # the hook parent, held before it reserves a slot and spawns its child
+            entered.set()
+            release.wait(WATCHDOG)
+            fake_ntfy.run_hook(cmd, env, event)
+        f = self.fake(runner=late)
+        threading.Thread(target=request, args=(f.port, "POST", "/trigger"), daemon=True).start()
+        self.assertTrue(entered.wait(WATCHDOG))
+        result = []
+        stopper = threading.Thread(target=lambda: result.append(f.stop()), daemon=True)
+        stopper.start()
+        stopper.join(1)
+        self.assertTrue(stopper.is_alive(), "stop waits for the hook still starting")
+        release.set()
+        stopper.join(WATCHDOG)
+        self.assertIn(result[0], ("released", "killed"))
+        fixture = os.path.join(self.run_dir, "fixture.db").encode()
+        for pid in [int(d) for d in os.listdir("/proc") if d.isdigit()]:  # no child of this fixture survives the stop
+            try:
+                with open("/proc/%d/cmdline" % pid, "rb") as c:
+                    self.assertFalse(alive(pid) and fixture in c.read().split(b"\0"), pid)
+            except OSError:
+                pass
+
+    def test_a_slot_held_by_a_foreign_process_is_never_signalled(self):
+        f = self.fake()
+        # It even looks like the hook's send child, in its own session, but for another fixture.
+        dummy = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)", SCRIPT, "send", "--state-db",
+                                  os.path.join(self.run_dir, "other", "fixture.db")], start_new_session=True)
+        self.addCleanup(dummy.kill)
+        path = os.path.join(self.home(), "agent-hooks", fake_ntfy.SLOTS[0])
+        with open(path, "w") as slot:
+            slot.write(str(dummy.pid))
+        fd = os.open(path, os.O_RDONLY)
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)  # held, with a pid that is not this fake's hook child
+        try:
+            self.assertEqual("unaccounted", f.account(0))
+            self.assertIsNone(dummy.poll())
+        finally:
+            os.close(fd)
+
+    def test_a_child_that_released_its_slot_but_lives_is_not_released(self):
+        f = self.fake()
+        child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)", SCRIPT, "send", "--state-db",
+                                  os.path.join(self.run_dir, "fixture.db")], start_new_session=True)
+        self.addCleanup(child.kill)
+        with open(os.path.join(self.home(), "agent-hooks", fake_ntfy.SLOTS[0]), "w") as slot:
+            slot.write(str(child.pid))  # published, slot not locked: released, still running
+        self.assertEqual("unaccounted", f.account(0))
+
     def test_trigger_child_accounted_on_success(self):
         f = self.fake()
         self.assertEqual(200, request(f.port, "POST", "/trigger")[0])
@@ -259,7 +371,7 @@ class RealTrigger(Base):
         self.assertTrue(entered.wait(WATCHDOG))
         pid = slot_pid(self.home())
         t.join(WATCHDOG)
-        self.assertEqual([500], status)
+        self.assertEqual([502], status)
         self.assertFalse(alive(pid))
 
     def test_no_live_db_opened(self):
@@ -285,17 +397,20 @@ class RealTrigger(Base):
                             with open("/proc/%d/environ" % p, "rb") as e:
                                 environ.update(v.split(b"=", 1) for v in e.read().split(b"\0") if b"=" in v)
                         seen.update(open_files(p))
+                        cwd.add(os.readlink("/proc/%d/cwd" % p))
                 except OSError:
                     pass
+        cwd = set()
         w = threading.Thread(target=watch, daemon=True)
         w.start()
-        self.assertEqual(200, request(f.port, "POST", "/trigger")[0])
+        self.assertEqual(502, request(f.port, "POST", "/trigger")[0])  # a skipped hook posted nothing: no proof
         done.set()
         w.join(WATCHDOG)
         lock.execute("COMMIT")
         self.assertEqual(fixture.encode(), argv[argv.index(b"--state-db") + 1])
         self.assertEqual([fixture.encode()], [a for a in argv if b".db" in a])
         self.assertEqual(self.home().encode(), environ[b"HERMES_HOME"])
+        self.assertEqual({self.home()}, cwd)  # its working directory is the private home, not the checkout
         listening = "socket:[%d]" % os.fstat(f.server.fileno()).st_ino
         paths = {path for path, _ in seen}
         self.assertNotIn(listening, paths)  # the fake's own socket was not inherited
@@ -341,6 +456,47 @@ class RealTrigger(Base):
             self.assertIn("run/home/agent-hooks/apofis-push.log", after)
             with socket.socket() as s:  # the port is closed after the teardown
                 self.assertNotEqual(0, s.connect_ex(("127.0.0.1", port)))
+
+
+    def test_owner_loss_stops_the_fake_and_removes_its_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = os.path.join(root, "run")
+            os.mkdir(run)
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            r, w = os.pipe()
+            owner = subprocess.Popen(["sleep", "60"], pass_fds=(w,))  # a dummy owner holding the pipe's write end
+            p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "fake_ntfy.py"), "--run-dir", run, "--port",
+                                  str(port), "--topic", TOPIC, "--script", SCRIPT, "--wake-install", INSTALL,
+                                  "--owner-stdin"], stdin=r, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            os.close(r)
+            os.close(w)
+            try:
+                self.assertEqual(b"READY\n", p.stdout.readline())
+                self.assertEqual(200, request(port, "POST", "/trigger")[0])  # a real child ran and left its files
+                self.assertTrue(os.path.exists(os.path.join(run, "home", "agent-hooks", "apofis-push.log")))
+                owner.kill()  # the owner dies abruptly; nothing signals the fake
+                owner.wait(WATCHDOG)
+                self.assertEqual(0, p.wait(WATCHDOG))
+                self.assertEqual(b"stopped: child released, owner gone", p.stdout.read().splitlines()[-1])
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                p.stdout.close()
+            self.assertEqual([], os.listdir(run))
+            with socket.socket() as s:
+                self.assertNotEqual(0, s.connect_ex(("127.0.0.1", port)))
+
+    def test_length_header_of_ascii_digits_only(self):
+        f = self.fake()
+        for value in ("\u00b2", "123456", "1e3", "-1"):
+            s = socket.create_connection(("127.0.0.1", f.port), timeout=WATCHDOG)
+            with s:
+                s.sendall(("POST /%s HTTP/1.0\r\nContent-Length: %s\r\n\r\n" % (TOPIC, value)).encode("utf-8"))
+                self.assertTrue(s.recv(64).startswith(b"HTTP/1.0 400 "), value)
+        self.assertEqual(400, request(f.port, "POST", "/" + TOPIC, b"x", {"Transfer-Encoding": "chunked"})[0])
+        self.assertEqual(204, request(f.port, "GET", "/%s/poll" % TOPIC)[0])
 
 
 class Cli(unittest.TestCase):

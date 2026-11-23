@@ -6,13 +6,17 @@
 Binds 127.0.0.1:P only. POST /T (or /T?up=1) queues a message (at most 4096 bytes, at most 64 queued); GET /T/poll
 answers the oldest one and removes it (204 when none). At most 8 requests are handled at once.
 
-POST /trigger (no input, at most 3 times) runs the real hook script once with a fixed anonymous approval event,
-against D/fixture.db: a synthetic WAL database built here at start with one hidden record of the --wake-install,
-whose endpoint is this fake. The live state database is never opened. The script runs with HERMES_HOME=D/home, so
-its slot locks and log stay in D, with only PATH besides. The trigger answers once the detached child the script
-starts has released its slot; past CHILD_WAIT it kills the child's process group. On SIGTERM, SIGINT or SIGHUP the
-fake stops serving, kills any child still holding a slot, checks it is gone and exits 0 (1 if one could not be
-accounted for). Python 3.9+ standard library.
+POST /trigger (no input, at most 3 times, one at a time, only with an empty queue) runs the real hook script once
+with a fixed anonymous approval event, against D/fixture.db: a synthetic WAL database built here at start with one
+hidden record of the --wake-install, whose endpoint is this fake. The live state database is never opened. The script
+runs in D/home with HERMES_HOME=D/home, so its slot locks and log stay in D, with only PATH besides. The trigger
+answers once the detached child the script starts has released its slot (past CHILD_WAIT it kills the child's process
+group), and answers 200 only with proof that this invocation's child posted exactly once to this fake: one new hook
+log line "matched regs=1 <this origin>=200", exactly one message received meanwhile, and that message the fixed
+anonymous body. On SIGTERM, SIGINT, SIGHUP, or (with --owner-stdin) end of stdin when its owner dies, the fake admits
+no further trigger, waits for a hook still starting, stops serving, kills any child still holding a slot, checks it
+is gone and exits 0 (1 if one could not be accounted for); after an owner's death it also removes the files it
+created when every child is accounted for. Python 3.9+ standard library.
 """
 from __future__ import annotations
 
@@ -38,6 +42,7 @@ MAX_TRIGGERS = 3
 HANDLER_TIMEOUT = 5  # seconds a connection has to send its request
 CHILD_WAIT = 30.0  # the hook's child is ended by the kernel at 25 s
 SLOTS = ("apofis-push.slot0.lock", "apofis-push.slot1.lock")  # the hook script's slot files (apofis_push.py)
+WAKE_BODY = b'{"kind":"needs_input"}'  # what the hook sends for the event below (apofis_push.push_body)
 EVENT = json.dumps({"hook_event_name": "on_human_input_request", "session_id": "",
                     "extra": {"kind": "approval", "platform": "api_server"}}).encode()
 TOPIC_RE = re.compile(r"up[A-Za-z0-9]{12}")
@@ -68,9 +73,10 @@ def build_fixture(path: str, record_id: str, endpoint: str, now: float) -> None:
 
 
 def run_hook(cmd: list, env: dict, event: bytes) -> None:
-    """The hook parent: the event on stdin, no output, no inherited descriptors; it returns at once."""
-    subprocess.run(cmd, input=event, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
-                   timeout=10, check=False)
+    """The hook parent, in the private home: the event on stdin, no output, no inherited descriptors; it returns at
+    once (its detached child inherits that working directory)."""
+    subprocess.run(cmd, input=event, env=env, cwd=env["HERMES_HOME"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, close_fds=True, timeout=10, check=False)
 
 
 def say(line: str) -> None:
@@ -92,6 +98,10 @@ class Fake:
         self.handlers = threading.BoundedSemaphore(MAX_HANDLERS)
         self.active = 0
         self.triggers = 0
+        self.received = 0  # messages accepted for the topic
+        self.closing = False  # set when stop begins: no trigger is admitted after it
+        self.in_flight = 0  # admitted triggers not yet answered
+        self.starting = 0  # hook parents still running (before or while they spawn their child)
         self.thread: threading.Thread | None = None
         os.makedirs(os.path.join(self.home, "agent-hooks"), mode=0o700, exist_ok=True)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -112,6 +122,15 @@ class Fake:
         return [sys.executable, "-I", self.script, "hook", "--allow-http-origin", "http://127.0.0.1:%d" % self.port,
                 "--state-db", self.fixture, "--delay", "0"]
 
+    def log_path(self) -> str:
+        return os.path.join(self.home, "agent-hooks", "apofis-push.log")
+
+    def log_size(self) -> int:
+        try:
+            return os.path.getsize(self.log_path())
+        except OSError:
+            return 0
+
     def env(self) -> dict:
         return {"HERMES_HOME": self.home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
@@ -124,7 +143,7 @@ class Fake:
             time.sleep(0.05)
             held = self.held()
         if not held:
-            return "released"
+            return "released" if self.children_exited(5) else "unaccounted"
         killed = False
         for pid in held:
             if pid is not None:
@@ -137,6 +156,26 @@ class Fake:
         while self.held() and time.monotonic() < end:
             time.sleep(0.05)
         return "unaccounted" if self.held() or not killed else "killed"
+
+    def children_exited(self, wait: float) -> bool:
+        """Every child pid published in a slot file that is still this fixture's child has exited (a child releases
+        its slot just before it exits)."""
+        end = time.monotonic() + wait
+        while True:
+            pids = []
+            for name in SLOTS:
+                try:
+                    with open(os.path.join(self.home, "agent-hooks", name), "rb") as f:
+                        v = f.read(32)
+                except OSError:
+                    continue
+                if v.isdigit() and self.is_child(int(v)):
+                    pids.append(int(v))
+            if not pids:
+                return True
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.02)
 
     def held(self) -> list:
         """The published pid (or None) of each slot a hook child of this home still holds."""
@@ -165,34 +204,89 @@ class Fake:
         try:
             with open("/proc/%d/cmdline" % pid, "rb") as f:
                 argv = f.read().split(b"\0")
-            return os.getpgid(pid) == pid and self.script.encode() in argv and b"send" in argv
+            return (os.getpgid(pid) == pid and self.script.encode() in argv and b"send" in argv
+                    and (self.fixture or "").encode() in argv)  # this fake's own fixture: its own child
         except OSError:
             return False
 
     def trigger(self) -> int:
         with self.lock:
-            if self.fixture is None:
+            if self.closing:
+                return 503
+            if self.fixture is None or self.in_flight or self.queue:  # one at a time, from an empty topic only
                 return 409
             if self.triggers >= MAX_TRIGGERS:
                 return 429
             self.triggers += 1
-            n = self.triggers
+            self.in_flight += 1
+            self.starting += 1
+            n, received, log_from = self.triggers, self.received, self.log_size()
         try:
-            self.runner(self.command(), self.env(), EVENT)
-            rc = "ran"
-        except Exception as e:  # a hook that did not return in time: its child is still accounted below
-            rc = type(e).__name__
-        child = self.account(self.child_wait)
-        say("trigger %d: hook %s, child %s" % (n, rc, child))
-        return 200 if rc == "ran" and child == "released" else 500
+            try:
+                self.runner(self.command(), self.env(), EVENT)
+                rc = "ran"
+            except Exception as e:  # a hook that did not return in time: its child is still accounted below
+                rc = type(e).__name__
+            finally:
+                with self.lock:
+                    self.starting -= 1
+            child = self.account(self.child_wait)
+            proved = rc == "ran" and child == "released" and self.posted_once(received, log_from)
+            say("trigger %d: hook %s, child %s, %s" % (n, rc, child, "posted once" if proved else "no proof of one post"))
+            return 200 if proved else 502
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+    def posted_once(self, received: int, log_from: int) -> bool:
+        """Since the trigger began: one new hook log line saying it posted to this fake and got 200, exactly one message
+        received, and the queue holding exactly that fixed body."""
+        try:
+            with open(self.log_path(), "rb") as f:
+                f.seek(log_from)
+                lines = f.read(4096).decode("ascii").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return False
+        line = re.compile(r"\S+ on_human_input_request matched regs=1 http://127\.0\.0\.1:%d=200" % self.port)
+        with self.lock:
+            return (len(lines) == 1 and bool(line.fullmatch(lines[0])) and self.received == received + 1
+                    and list(self.queue) == [WAKE_BODY])
 
     def stop(self) -> str:
-        """Stops serving, then accounts for every hook child at once (killing a holder). Safe to call twice."""
+        """Admits no further trigger, waits (bounded) for a hook still starting its child, stops serving, then accounts
+        for every hook child at once (killing a holder) and waits for the admitted triggers to answer. Safe to call
+        twice."""
+        with self.lock:
+            self.closing = True
+        end = time.monotonic() + 15  # the hook parent's own timeout is 10 s
+        while self.starting and time.monotonic() < end:
+            time.sleep(0.05)
+        late = self.starting > 0
         if self.thread is not None:
             self.server.shutdown()
             self.thread = None
         self.server.server_close()
-        return self.account(0)
+        child = self.account(0)
+        end = time.monotonic() + 10
+        while self.in_flight and time.monotonic() < end:
+            time.sleep(0.05)
+        return "unaccounted" if late else child
+
+    def remove_private(self) -> None:
+        """The files this fake and its hook children created in the run directory (named files, then empty dirs)."""
+        names = [os.path.join(self.home, "agent-hooks", n) for n in SLOTS + ("apofis-push.log", "apofis-push.log.lock")]
+        if self.fixture:
+            names += [self.fixture + s for s in ("", "-wal", "-shm", "-journal")]
+        for p in names:
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+        for d in (os.path.join(self.home, "agent-hooks"), self.home):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -234,7 +328,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         n = self.headers.get("Content-Length")
         if n is None:
             return b""
-        if not n.isdigit():
+        if not re.fullmatch(r"[0-9]{1,5}", n):  # ASCII digits only, bounded
             self.reply(400)
             return None
         if int(n) > MAX_BODY:
@@ -264,6 +358,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             full = len(fake.queue) >= MAX_QUEUE
             if not full:
                 fake.queue.append(data)
+                fake.received += 1
         self.reply(429 if full else 200, b"" if full else b'{"id":"fake"}')
 
     def do_GET(self) -> None:  # noqa: N802
@@ -280,6 +375,7 @@ def main(argv: list) -> int:
     for a in ("--run-dir", "--port", "--topic", "--script"):
         p.add_argument(a, required=True)
     p.add_argument("--wake-install")
+    p.add_argument("--owner-stdin", action="store_true")  # the owner holds our stdin: its end means the owner died
     try:
         o = p.parse_args(argv)
     except SystemExit:
@@ -298,12 +394,22 @@ def main(argv: list) -> int:
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(s, lambda *_: stop.set())
     fake = Fake(o.run_dir, int(o.port), o.topic, o.script, o.wake_install)
+    orphaned = threading.Event()
+    if o.owner_stdin:
+        def watch_owner():
+            while sys.stdin.buffer.read(4096):
+                pass
+            orphaned.set()
+            stop.set()
+        threading.Thread(target=watch_owner, daemon=True).start()
     fake.start()
     say("READY")
     while not stop.wait(1):
         pass
     child = fake.stop()
-    say("stopped: child %s" % child)
+    if orphaned.is_set() and child != "unaccounted":
+        fake.remove_private()  # nobody is left to clean up after us; kept as evidence when a child is unaccounted
+    say("stopped: child %s%s" % (child, ", owner gone" if orphaned.is_set() else ""))
     return 1 if child == "unaccounted" else 0
 
 
