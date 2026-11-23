@@ -26,7 +26,7 @@ The fetch names `main` only and never prunes or fetches tags, so no local tag is
 
 It stops with a message and pushes nothing unless, in order:
 
-1. the last line of the ledger file that starts with `Candidate passed: ` is exactly `Candidate passed: <SHA>`;
+1. the ledger is a regular file, and its last line that starts with `Candidate passed: ` is exactly `Candidate passed: <SHA>`;
 2. the same named fetch of `main` succeeds and `main` on origin, as `git ls-remote` reads it now, is exactly `<SHA>`;
 3. origin has exactly one push URL and it equals its fetch URL, so the repository checked is the one that receives the tag;
 4. the newest push run of `ci.yml` on `main` for `<SHA>` in origin's repository succeeded (`gh run list --repo <origin URL> --branch main --event push`, so a pull request run, the tag's own run or a fork's run never counts);

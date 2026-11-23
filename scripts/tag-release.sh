@@ -18,6 +18,8 @@ main() {
     printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{40}' || die "$sha is not a full commit SHA"
     case $fpr in SHA256:*) ;; *) die "expected fingerprint $fpr is not SHA256:..." ;; esac
 
+    # The ledger is a regular file: bash would open a path like /dev/tcp/host/port as a socket.
+    [ -f "$ledger" ] || die "the ledger $ledger is not a regular file"
     # One reader decides: the last line starting "Candidate passed: " is exactly the wanted one.
     # The shell opens the ledger: an awk operand like "want=" would be an assignment, not a file.
     awk -v want="Candidate passed: $sha" '/^Candidate passed: / { l = $0 } END { exit !(l == want) }' < "$ledger" ||

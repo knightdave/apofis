@@ -172,6 +172,10 @@ refused "tag-release refuses a Candidate passed line with a NUL after the SHA"
 fresh
 check "tag-release refuses a missing ledger file named want=" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "want=")" 1
 check "  pushes nothing and creates no local tag" "$(origin_tag) $(local_tag)" "none none"
+fresh
+check "tag-release refuses a ledger that is not a regular file" "$(st tagrel 0.1.0 "$main_sha" "$good_fpr" "$tmp")" 1
+check "  because it is not a regular file" "$(said "is not a regular file")" 1
+check "  pushes nothing and creates no local tag" "$(origin_tag) $(local_tag)" "none none"
 fresh; printf 'Candidate passed: %s\n' "$c1" > "$tmp/ledger"; runs "$(run "$c1" main push success)"; printf '%s\n' "$c1" > "$tmp/commit"
 refused "tag-release refuses when main on origin is not the SHA" "$c1"
 # main moved on origin while this clone's fetch refspec no longer updates its stale origin/main.
