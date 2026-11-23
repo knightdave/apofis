@@ -2307,5 +2307,9 @@ class RunFollowerTest {
         assertTrue("the follower's latch expired instead of being opened", opened)
         assertTrue("the cleanup did not wait for the follower", followerEnded)
         assertTrue("got $failure", failure is AssertionError && failure.message == "body sentinel")
+        assertTrue(
+            "the cleanup timed out instead of waiting",
+            failure!!.suppressed.none { it is AssertionError && it.message == "a follower did not end within 10 s after its test" },
+        )
     }
 }
