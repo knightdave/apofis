@@ -178,8 +178,9 @@ class DrawerUiTest {
         override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) {
             approvals += choice
         }
-        override fun onSendClick() {
+        override fun onSendClick(): Boolean {
             sends++
+            return true // a successful send
         }
     }
     private var shownChat by mutableStateOf(chat)

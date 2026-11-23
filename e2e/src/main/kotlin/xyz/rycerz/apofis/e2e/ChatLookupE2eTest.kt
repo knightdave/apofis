@@ -72,4 +72,23 @@ class ChatLookupE2eTest {
         if (!app.device.click(w * 9 / 10, y)) fail("Tapping the pushed chat failed") // the scrim over the pushed chat
         app.waitFor("the chat back after a tap on the scrim", 10_000) { chatShown() && !drawerRow() }
     }
+
+    /** Three typed lines show the expand button; expanding and collapsing keep the text. Nothing is sent. */
+    @Test
+    fun composerExpandAndCollapse() {
+        app.freshStart()
+        app.connect(app.url)
+        val text = "First line\nSecond line\nThird line"
+        app.setField(app.composerField() ?: fail("No composer.field"), text)
+        app.waitFor("the expand button after three lines", 10_000) { app.nodes { it.contentDescription?.toString() == app.str("composer_expand") }.isNotEmpty() }
+        app.click(app.str("composer_expand"))
+        app.waitFor("the collapse button", 10_000) { app.nodes { it.contentDescription?.toString() == app.str("composer_collapse") }.isNotEmpty() }
+        if (app.composerField()?.text?.toString() != text) fail("Expanding changed the text")
+        app.screenshot(name.methodName)
+        app.click(app.str("composer_collapse"))
+        app.waitFor("the expand button again", 10_000) { app.nodes { it.contentDescription?.toString() == app.str("composer_expand") }.isNotEmpty() }
+        if (app.composerField()?.text?.toString() != text) fail("Collapsing changed the text")
+        app.setField(app.composerField() ?: fail("No composer.field"), "")
+        app.waitFor("composer.send disabled again", 10_000) { sendButtons().singleOrNull()?.isEnabled == false }
+    }
 }

@@ -14,6 +14,9 @@ import androidx.compose.ui.platform.UriHandler
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performImeAction
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.onNodeWithTag
@@ -69,6 +72,8 @@ class ChromeInputsTest {
     private var currentState by mutableStateOf<(() -> ChatUiState)?>(null)
     private var dragArea by mutableStateOf<Modifier>(Modifier)
     private var covered by mutableStateOf(false)
+    private var enterToSend by mutableStateOf(false)
+    private var fontScale by mutableStateOf(1f)
 
     private class FakeClipboard : Clipboard {
         val writes = ArrayList<String?>()
@@ -84,8 +89,9 @@ class ChromeInputsTest {
     private fun show() {
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
-                CompositionLocalProvider(LocalBlur provides blur, LocalUriHandler provides uri, LocalClipboard provides clipboard) {
-                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState, dragArea = dragArea, covered = covered)
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                CompositionLocalProvider(LocalBlur provides blur, LocalUriHandler provides uri, LocalClipboard provides clipboard, androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(density.density, fontScale)) {
+                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, currentState = currentState, enterToSend = enterToSend, dragArea = dragArea, covered = covered)
                 }
             }
         }
@@ -134,9 +140,11 @@ class ChromeInputsTest {
         rule.waitForIdle()
         val on = ChromeProbe.bodyBackdropId
         assertTrue("the transcript still uses the backdrop without a layer", on != off && ChromeProbe.bodyBackdropHasLayer)
+        assertEquals("the composer's glass samples another backdrop than the transcript records", on, ChromeProbe.composerBackdropId)
         blur = false
         rule.waitForIdle()
         assertTrue("the transcript keeps the recording backdrop after blur was switched off", ChromeProbe.bodyBackdropId != on && !ChromeProbe.bodyBackdropHasLayer)
+        assertEquals(ChromeProbe.bodyBackdropId, ChromeProbe.composerBackdropId)
     }
 
     @Test
@@ -259,5 +267,48 @@ class ChromeInputsTest {
         link.performClick()
         rule.waitForIdle()
         assertEquals(listOf("https://example.com/docs"), opened)
+    }
+
+    /** The Enter to send setting reaches the composer after first composition: the IME action becomes Send and sends. */
+    @Test
+    fun replacedEnterToSendReachesTheComposer() {
+        ui = chat().copy(composer = ComposerMode.SEND, draft = "hi")
+        var sends = 0
+        actions = object : ChatActions {
+            override fun onSendClick(): Boolean {
+                sends++
+                return true
+            }
+        }
+        show()
+        val field = rule.onNodeWithTag(FIELD_TAG)
+        assertEquals(androidx.compose.ui.text.input.ImeAction.Default, field.fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsProperties.ImeAction])
+        enterToSend = true
+        rule.waitForIdle()
+        assertEquals(androidx.compose.ui.text.input.ImeAction.Send, field.fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsProperties.ImeAction])
+        field.performImeAction()
+        rule.waitForIdle()
+        assertEquals(1, sends)
+        enterToSend = false
+        rule.waitForIdle()
+        assertEquals(androidx.compose.ui.text.input.ImeAction.Default, field.fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsProperties.ImeAction])
+    }
+
+    /** What expanding leaves free follows the bar: after the bar grows (larger text), the expanded field still starts below it. */
+    @Test
+    fun replacedBarHeightReachesTheExpandedComposer() {
+        ui = chat().copy(composer = ComposerMode.SEND, draft = "one\ntwo\nthree")
+        show()
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        rule.waitForIdle()
+        fun gap(): Float {
+            val bar = rule.onNodeWithTag("chat.topbar", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot.bottom
+            return rule.onNodeWithTag(FIELD_TAG).fetchSemanticsNode().boundsInRoot.top - bar
+        }
+        val card = with(rule.density) { (64 + 16).dp.toPx() } // the transcript's 64 dp, then the card's 8 dp margin and 8 dp padding
+        assertEquals(card, gap(), 1.5f)
+        fontScale = 2f
+        rule.waitForIdle()
+        assertEquals("the expanded field ignores the taller bar", card, gap(), 1.5f)
     }
 }

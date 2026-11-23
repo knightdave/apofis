@@ -15,6 +15,7 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.performClick
 import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
@@ -126,5 +127,26 @@ class E2eTagsTest {
         assertEquals(1, rule.onAllNodes(hasTestTag("chat.title") and hasText("New chat"), useUnmergedTree = true).fetchSemanticsNodes().size)
         assertEquals(1, count("status.line"))
         assertEquals(1, rule.onAllNodes(hasContentDescription("Open chat list"), useUnmergedTree = true).fetchSemanticsNodes().size)
+    }
+
+    /** The end-to-end driver types into the editable node tagged composer.field; expanding keeps it the one tagged node. */
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test
+    fun composerTags() {
+        val state = ChatUiState("apofis-1", "", StatusLine.IDLE, emptyList(), ComposerMode.SEND, "one\ntwo\nthree", "hermes.example")
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                Box(Modifier.semantics { testTagsAsResourceId = true }) {
+                    ChatScreen(state, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+                }
+            }
+        }
+        fun field() = rule.onAllNodes(hasTestTag(FIELD_TAG), useUnmergedTree = true).fetchSemanticsNodes().single()
+        assertTrue("composer.field is not the editable node", field().config.contains(SemanticsProperties.EditableText))
+        assertEquals(1, count(SEND_TAG))
+        rule.onNodeWithContentDescription("Expand the editor").performClick()
+        rule.waitForIdle()
+        assertTrue(field().config.contains(SemanticsProperties.EditableText))
+        assertEquals("one\ntwo\nthree", field().config[SemanticsProperties.EditableText].text)
     }
 }

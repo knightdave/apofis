@@ -245,7 +245,7 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
                         container.chatShown(conn.generation, sessionKey, true)
                         onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
                     }
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, dragArea = dragArea, covered = drawerState.covered, coveredNow = { drawerState.covered })
+                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, enterToSend = prefs.enterToSend.collectAsState().value, dragArea = dragArea, covered = drawerState.covered, coveredNow = { drawerState.covered })
                 }
             }
         }
