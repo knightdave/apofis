@@ -590,6 +590,11 @@ check "selection: --full is model-capable; smoke, push and their methods are not
   'sel full && [ -n "$model_capable" ] && sel smoke && [ -z "$model_capable" ] && sel push && [ -z "$model_capable" ] && sel test SmokeE2eTest#connectViaLoopback && [ -z "$model_capable" ] && sel test PushE2eTest#hostilePushes && [ -z "$model_capable" ] && sel test HarnessSelfTest && [ -z "$model_capable" ]'
 check "selection: gate 2 (--test PushE2eTest#pushWakesKilledApp) reserves 1, provisions push, and runs only that method" \
   'sel test PushE2eTest#pushWakesKilledApp && [ "${models[*]}" = PushE2eTest#pushWakesKilledApp ] && [ "${MODEL_BOUND[${models[0]}]}" = 1 ] && [ "${push[*]}" = pushWakesKilledApp ] && [ -n "$model_capable" ] && [ "$(instrument_filter "$tests")" = "-e class $PKG.PushE2eTest#pushWakesKilledApp" ]'
+check "selection: a multi-line scenario with one valid line is refused, selecting nothing" '! sel scenario "$(printf "connectAndChat\nbogus")" && [ -z "$tests" ] && ! sel test "$(printf "SurvivalE2eTest#connectAndChat\nX")"'
+# shellcheck disable=SC2329 # the class lookup accepts anything here: the token check alone must refuse
+check "selection: the strict token check refuses a multi-line name even past the class lookup" '! (known_test() { return 0; }; sel test "$(printf "SurvivalE2eTest\nX")")'
+rc=0; o=$( (no_core_dumps() { echo "PASSED THE CHECKS"; return 1; }; main --scenario "$(printf 'connectAndChat\nconnectAndChat x')") 2>&1) || rc=$?
+check "main: a multi-line scenario is refused before the lock" '[ "$rc" != 0 ] && lacks "$o" "PASSED THE CHECKS"'
 for a in "--test push-model" "--push extra" "--test" "--test SurvivalE2eTest#connectAndChat extra" "--scenario bogus"; do
   read -ra words <<<"$a"
   # The first step after the checks is stubbed to stop: a refusal that failed ends there, before any lock or the key.
@@ -612,10 +617,14 @@ L=$t/ledger/model-budget
 R1=20261123-120000-aaaa R2=20261123-130000-bbbb R3=20261123-140000-cccc
 check "ledger: a first reservation creates the ledger and records it" \
   'ledger_reserve "$L" 8 $R1 PushE2eTest#pushWakesKilledApp=1 SurvivalE2eTest#connectAndChat=1 SurvivalE2eTest#replySurvivesProcessDeath=1 && [ "$(grep -c "^reserve $R1 " "$L")" = 3 ] && [ "$(ledger_total "$L")" = 3 ]'
-check "ledger: observed starts are recorded apart from the reservation and replace its bound" \
-  'ledger_observe "$L" $R1 SurvivalE2eTest#connectAndChat 0 && grep -qx "reserve $R1 SurvivalE2eTest#connectAndChat 1" "$L" && grep -qx "observed $R1 SurvivalE2eTest#connectAndChat 0" "$L" && [ "$(ledger_total "$L")" = 2 ]'
-check "ledger: an observation is recorded once per reservation, never without one" \
-  '! ledger_observe "$L" $R1 SurvivalE2eTest#connectAndChat 1 && ! ledger_observe "$L" $R2 SurvivalE2eTest#connectAndChat 1 && [ "$(ledger_total "$L")" = 2 ]'
+check "ledger: a release is recorded apart from the reservation and ends its count" \
+  'ledger_release "$L" $R1 SurvivalE2eTest#connectAndChat && grep -qx "reserve $R1 SurvivalE2eTest#connectAndChat 1" "$L" && grep -qx "observed $R1 SurvivalE2eTest#connectAndChat 0" "$L" && [ "$(ledger_total "$L")" = 2 ]'
+check "ledger: a reservation is released once, never one that does not exist" \
+  '! ledger_release "$L" $R1 SurvivalE2eTest#connectAndChat && ! ledger_release "$L" $R2 SurvivalE2eTest#connectAndChat && [ "$(ledger_total "$L")" = 2 ]'
+cp "$L" "$t/ledger.tab"
+printf 'reserve\t%s\tX#y\t1\n' $R3 >>"$t/ledger.tab" # parseable by a whitespace parser, not one of the two forms
+check "ledger: an entry with tab separators is refused alike by the total and by a proposal collision check" \
+  '! ledger_total "$t/ledger.tab" >/dev/null && ! ledger_reserve "$t/ledger.tab" 8 $R3 X#y=1 && ! ledger_reserve "$t/ledger.tab" 8 $R2 X#z=1'
 cp "$L" "$t/ledger.before"
 check "ledger: a reservation that would pass 8 is refused and appends nothing" \
   'ledger_reserve "$L" 8 $R2 PushE2eTest#pushWakesKilledApp=6 && ! ledger_reserve "$L" 8 $R3 SurvivalE2eTest#connectAndChat=1 && [ "$(ledger_total "$L")" = 8 ] && ! grep -q $R3 "$L"'
@@ -788,68 +797,62 @@ unset -f hermes
 rm -f "$E2E_OUT/sess/results.txt" "$E2E_OUT/sess/instrument.txt"
 rmdir "$E2E_OUT/sess"
 
-# A lost send line: check_sessions fails completeness, observe_starts keeps the bound, and the cap holds.
-mkdir -p "$E2E_OUT/sess"
-printf 'SurvivalE2eTest.connectAndChat PASS\n' >"$E2E_OUT/sess/results.txt"
-instrument_for <"$E2E_OUT/sess/results.txt" >"$E2E_OUT/sess/instrument.txt"
-LEDGER=$t/ledger-cap models=(SurvivalE2eTest#connectAndChat) mode=test key_sent_local=1 sessions_state=ok published=1 run_id=sess journal=() journal_complete='' starts=()
+# The ledger after a run: a reservation belongs to the invocation that made it; once the key was handed to the device
+# it stays at its bound whatever was observed; it is released only when the key never left this host.
+mkdir -p "$E2E_OUT/$R1"
+printf 'SurvivalE2eTest.connectAndChat FAIL\n' >"$E2E_OUT/$R1/results.txt"
+instrument_for <"$E2E_OUT/$R1/results.txt" >"$E2E_OUT/$R1/instrument.txt"
+LEDGER=$t/ledger-cap models=(SurvivalE2eTest#connectAndChat) mode=test key_sent_local=1 sessions_state=ok published=1 run_id=$R1 journal=()
 ledger_reserve "$LEDGER" 8 20261123-100000-0000 X#y=7
-ledger_reserve "$LEDGER" 8 $R1 SurvivalE2eTest#connectAndChat=1
-run_id=$R1
+ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1 && owned=("${models[@]}")
 # shellcheck disable=SC2329
 hermes() { echo "$1 $2" >>"$t/server-calls"; echo 404; }
-(check_sessions; observe_starts) >"$t/i4.out" 2>&1 || true
-check "observed: after a failed completeness check nothing lowers the reservation, and the cap still refuses" \
-  'has "$(cat "$t/i4.out")" "may remain" && ! grep -q "^observed" "$LEDGER" && [ "$(ledger_total "$LEDGER")" = 8 ] && ! ledger_reserve "$LEDGER" 8 $R2 SurvivalE2eTest#connectAndChat=1'
+(check_sessions; observe_starts) >"$t/ledger-run.out" 2>&1 || true
+check "ledger: a method that failed after the hand-over, its journal without send lines, keeps its place; the cap then refuses" \
+  'has "$(cat "$t/ledger-run.out")" "stays at its reserved 1" && ! grep -q "^observed" "$LEDGER" && [ "$(ledger_total "$LEDGER")" = 8 ] && ! ledger_reserve "$LEDGER" 8 $R2 SurvivalE2eTest#connectAndChat=1'
 unset -f hermes
-rm -f "$E2E_OUT/sess/results.txt" "$E2E_OUT/sess/instrument.txt"
-rmdir "$E2E_OUT/sess"
-# The count: only a complete, matching record with the one sent turn counts.
-mkdir -p "$E2E_OUT/sess"
-printf 'SurvivalE2eTest.connectAndChat PASS\n' >"$E2E_OUT/sess/results.txt"
-instrument_for <"$E2E_OUT/sess/results.txt" >"$E2E_OUT/sess/instrument.txt"
-count_case() { # <messages answer as jq program on $id>
-  LEDGER=$t/ledger-count-$RANDOM models=(SurvivalE2eTest#connectAndChat) mode=test key_sent_local=1 sessions_state=ok published=1 run_id=sess
-  journal=("send $K1 connectAndChat" "chat connectAndChat $K1 $K1") journal_complete='' starts=()
-  ledger_reserve "$LEDGER" 8 $R1 SurvivalE2eTest#connectAndChat=1
-  MSG=$1
-  (run_id=sess; check_sessions; run_id=$R1; observe_starts) >"$t/count.out" 2>&1 || true
-}
-# shellcheck disable=SC2329 # the server for count_case: the session proves this run's identity, messages as asked
-hermes() {
-  case "$1 $2" in
-    GET\ api/sessions/*/messages*) jq -n --arg id "$K1" "$MSG" >"$3"; echo 200 ;;
-    GET\ api/sessions/*) if [ -e "$t/gone" ]; then rm -f "$t/gone"; echo 404; else printf '{"session":{"id":"%s","title":"Test %s-1"}}' "$K1" "$nonce" >"$3"; echo 200; fi ;;
-    DELETE*) printf '{"id":"%s","deleted":true}' "$K1" >"$3"; : >"$t/gone"; echo 200 ;;
-  esac
-}
-OK_MSG='{object: "list", session_id: $id, data: [{role: "user"}, {role: "assistant"}], pagination: {limit: 500, returned: 2}}'
-count_case "$OK_MSG"
-check "observed: a complete record with the sent turn counts its user turns (1)" 'grep -qx "observed $R1 SurvivalE2eTest#connectAndChat 1" "$LEDGER"'
-count_case '{object: "list", session_id: $id, data: [{role: "user"}], pagination: {limit: 500, returned: 2}}'
-check "observed: a page that does not match its own count keeps the bound" '! grep -q "^observed" "$LEDGER"'
-count_case '{object: "list", session_id: $id, data: [{role: "assistant"}], pagination: {limit: 500, returned: 1}}'
-check "observed: a record without the sent turn (still materializing) keeps the bound" '! grep -q "^observed" "$LEDGER"'
-count_case '{object: "list", session_id: "apofis-other", data: [{role: "user"}], pagination: {limit: 500, returned: 1}}'
-check "observed: an answer for another session keeps the bound" '! grep -q "^observed" "$LEDGER"'
-unset -f hermes
-rm -f "$E2E_OUT/sess/results.txt" "$E2E_OUT/sess/instrument.txt"
-rmdir "$E2E_OUT/sess"
-mode=smoke journal_complete=''
+rm -f "$E2E_OUT/$R1/results.txt" "$E2E_OUT/$R1/instrument.txt"
+rmdir "$E2E_OUT/$R1"
+# A refused collision: the run id and method are already reserved (by another invocation). Nothing is owned, so the real
+# cleanup path changes nothing, byte for byte.
+LEDGER=$t/ledger-collide owned=() key_sent_local='' run_id=$R1
+ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1
+cp "$LEDGER" "$t/collide.before"
+if ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1; then owned=("${models[@]}"); fi
+observe_starts >"$t/collide.out" 2>&1
+check "ledger: a refused collision followed by the cleanup leaves the ledger byte for byte unchanged" '[ "${#owned[@]}" = 0 ] && cmp -s "$LEDGER" "$t/collide.before"'
+# The key never handed off: the invocation's own reservation is released.
+LEDGER=$t/ledger-release owned=() key_sent_local=''
+ledger_reserve "$LEDGER" 8 "$R1" SurvivalE2eTest#connectAndChat=1 PushE2eTest#pushWakesKilledApp=1 &&
+  owned=(SurvivalE2eTest#connectAndChat PushE2eTest#pushWakesKilledApp)
+observe_starts >/dev/null 2>&1
+check "ledger: with the key never handed off, each reservation of this invocation is released" \
+  '[ "$(grep -c "^observed $R1 .* 0$" "$LEDGER")" = 2 ] && [ "$(ledger_total "$LEDGER")" = 0 ]'
+LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m3 models=() owned=() key_sent_local='' sessions_state='' journal=() mode=smoke
 
-# Observed starts after the run.
-LEDGER=$t/ledger2 models=(SurvivalE2eTest#connectAndChat PushE2eTest#pushWakesKilledApp) run_id=$R1
-ledger_reserve "$LEDGER" 8 $R1 SurvivalE2eTest#connectAndChat=1 PushE2eTest#pushWakesKilledApp=1
-key_sent_local='' starts=()
-observe_starts >/dev/null 2>&1
-check "observed: no app ran (key never sent): 0 for each reserved method" '[ "$(grep -c "^observed $R1 .* 0$" "$LEDGER")" = 2 ]'
-LEDGER=$t/ledger3
-ledger_reserve "$LEDGER" 8 $R1 SurvivalE2eTest#connectAndChat=1 PushE2eTest#pushWakesKilledApp=1
-key_sent_local=1 sessions_state=ok journal_complete=1 journal=("send $K1 pushWakesKilledApp") starts=([connectAndChat]=1)
-observe_starts >/dev/null 2>&1
-check "observed: a counted method is recorded; one that sent but was not counted keeps its reservation" \
-  'grep -qx "observed $R1 SurvivalE2eTest#connectAndChat 1" "$LEDGER" && ! grep -q "^observed $R1 PushE2eTest#pushWakesKilledApp" "$LEDGER" && [ "$(ledger_total "$LEDGER")" = 2 ]'
-LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m3 models=() key_sent_local='' sessions_state='' journal=() starts=()
+# A push check with nothing minted or no private directory touches no path (a recording seam for every file operation).
+# shellcheck disable=SC2329,SC2032 # the recorders replace the real commands inside the subshells below
+seam_case() { # <push_dir> <installs: "" or one>
+  (
+    mktemp() { echo "mktemp $*" >>"$t/fileops"; command mktemp "$@"; }
+    rm() { echo "rm $*" >>"$t/fileops"; command rm "$@"; }
+    push_listing() { :; }
+    push=(connectorLifecycle) push_dir=$1 key_sent_local='' sessions_state=ok journal=()
+    if [ -n "$2" ]; then install_of=([connectorLifecycle]=$2); else install_of=(); fi
+    check_push
+  ) >/dev/null 2>&1 && echo 0 >"$t/seam-rc" || echo 1 >"$t/seam-rc"
+}
+: >"$t/fileops"
+seam_case '' ''
+check "push check: nothing minted and no private directory (a refused reservation): passes, no file operation at all" '[ ! -s "$t/fileops" ] && [ "$(cat "$t/seam-rc")" = 0 ]'
+: >"$t/fileops"
+seam_case '' "$IA"
+check "push check: installs but no private directory: refused, still no file operation" '[ ! -s "$t/fileops" ]'
+mkdir -p "$t/owned-push"
+: >"$t/fileops"
+seam_case "$t/owned-push" "$IA"
+check "push check: the response file is made inside the owned private directory and only that file is removed" \
+  '[ "$(grep -c "^mktemp $t/owned-push/body\.XXXXXX$" "$t/fileops")" = 1 ] && [ "$(grep -c "^rm " "$t/fileops")" = 1 ] && grep -qE "^rm -f -- $t/owned-push/body\.[A-Za-z0-9]{6}$" "$t/fileops" && [ -z "$(ls -A "$t/owned-push")" ]'
 
 # The fake ntfy as the harness starts and stops it: listening, then its port closed.
 push=(connectorLifecycle) install_of=([connectorLifecycle]=$IA) push_dir=$t/fakerun push_topic=upAbC123xyz09q
@@ -862,17 +865,27 @@ check "fake: started by the harness, listening on its port" '[ -n "$fake_pid" ] 
 stop_fake >"$t/stop.out" 2>&1 && rc=0 || rc=$? # in this shell: the fake is its child
 o=$(cat "$t/stop.out")
 check "fake: stopped, every child accounted for, its port closed" '[ "$rc" = 0 ] && has "$o" "port $push_port closed" && [ -z "$(ss -Hltn "sport = :$push_port")" ] && [ -z "$fake_pid" ]'
-# The harness dying without its cleanup: the pipe it holds closes, and the fake stops by itself.
-cd "$here/../.."
-start_fake || true
-cd - >/dev/null
+# The harness dying without its cleanup: the fake it started stops when reparented, even while another child that
+# inherited the harness's descriptors (as the tunnel's ssh does) stays alive.
+(
+  cd "$here/../.."
+  start_fake >/dev/null 2>&1
+  echo "$fake_pid" >"$t/owner.fake"
+  sleep 300 &
+  echo $! >"$t/owner.sibling"
+  exec sleep 300
+) &
+owner=$!
+wait_gone 20 eval '[ ! -s "$t/owner.sibling" ]'
 # shellcheck disable=SC2034 # read by check
-gone_pid=$fake_pid
-exec {fake_fd}>&-
-check "fake: when the pipe the harness holds closes (the harness died), the fake stops and closes its port" \
-  'wait_gone 30 alive "$gone_pid" && [ -z "$(ss -Hltn "sport = :$push_port")" ] && grep -qx "stopped: child released, owner gone" "$push_dir/fake.log"'
+gone_pid=$(cat "$t/owner.fake") sibling=$(cat "$t/owner.sibling")
+kill -KILL "$owner"
+wait "$owner" 2>/dev/null || true
+check "fake: when the harness that started it dies, it stops and closes its port though another child holds the harness's descriptors" \
+  'wait_gone 10 alive "$gone_pid" && alive "$sibling" && [ -z "$(ss -Hltn "sport = :$push_port")" ] && grep -qx "stopped: child released, owner gone" "$push_dir/fake.log"'
 stop_pid "$gone_pid" # only if that check failed: never leave a fake behind
-fake_pid='' fake_fd=''
+kill -KILL "$sibling" 2>/dev/null || true
+fake_pid=''
 python3 -I -c 'import socket, time; s = socket.socket(); s.bind(("127.0.0.1", int(__import__("sys").argv[1]))); s.listen(); time.sleep(30)' "$push_port" &
 squatter=$!
 wait_gone 10 eval '[ -z "$(ss -Hltn "sport = :$push_port")" ]' # until it listens

@@ -13,7 +13,7 @@ runs in D/home with HERMES_HOME=D/home, so its slot locks and log stay in D, wit
 answers once the detached child the script starts has released its slot (past CHILD_WAIT it kills the child's process
 group), and answers 200 only with proof that this invocation's child posted exactly once to this fake: one new hook
 log line "matched regs=1 <this origin>=200", exactly one message received meanwhile, and that message the fixed
-anonymous body. On SIGTERM, SIGINT, SIGHUP, or (with --owner-stdin) end of stdin when its owner dies, the fake admits
+anonymous body. On SIGTERM, SIGINT, SIGHUP, or (with --stop-with-parent) when its parent process is gone, the fake admits
 no further trigger, waits for a hook still starting, stops serving, kills any child still holding a slot, checks it
 is gone and exits 0 (1 if one could not be accounted for); after an owner's death it also removes the files it
 created when every child is accounted for. Python 3.9+ standard library.
@@ -92,6 +92,8 @@ class Fake:
         self.home = os.path.join(self.run_dir, "home")
         self.runner = runner or run_hook
         self.child_wait = CHILD_WAIT
+        self.join_wait = 10.0  # how long stop waits for admitted triggers to answer
+        self.kill = os.killpg  # test seam
         self.before_queue = lambda body: None  # test seam: runs in the handler before a message is queued
         self.queue: collections.deque = collections.deque()
         self.lock = threading.Lock()
@@ -144,18 +146,22 @@ class Fake:
             held = self.held()
         if not held:
             return "released" if self.children_exited(5) else "unaccounted"
-        killed = False
+        signalled = []
         for pid in held:
             if pid is not None:
                 try:
-                    os.killpg(pid, signal.SIGKILL)  # the child runs in its own session: its group id is its pid
-                    killed = True
+                    self.kill(pid, signal.SIGKILL)  # the child runs in its own session: its group id is its pid
+                    signalled.append(pid)
                 except OSError:
                     pass
+
+        def remaining():  # a slot still held, or a signalled child not yet exited (a signal sent is not an exit)
+            return self.held() or any(self.is_child(p) for p in signalled)
         end = time.monotonic() + 5
-        while self.held() and time.monotonic() < end:
+        while remaining() and time.monotonic() < end:
             time.sleep(0.05)
-        return "unaccounted" if self.held() or not killed else "killed"
+        gone = signalled and None not in held and not remaining() and self.children_exited(0)
+        return "killed" if gone else "unaccounted"
 
     def children_exited(self, wait: float) -> bool:
         """Every child pid published in a slot file that is still this fixture's child has exited (a child releases
@@ -205,7 +211,7 @@ class Fake:
             with open("/proc/%d/cmdline" % pid, "rb") as f:
                 argv = f.read().split(b"\0")
             return (os.getpgid(pid) == pid and self.script.encode() in argv and b"send" in argv
-                    and (self.fixture or "").encode() in argv)  # this fake's own fixture: its own child
+                    and self.fixture is not None and self.fixture.encode() in argv)  # this fake's own fixture
         except OSError:
             return False
 
@@ -267,10 +273,10 @@ class Fake:
             self.thread = None
         self.server.server_close()
         child = self.account(0)
-        end = time.monotonic() + 10
+        end = time.monotonic() + self.join_wait
         while self.in_flight and time.monotonic() < end:
             time.sleep(0.05)
-        return "unaccounted" if late else child
+        return "unaccounted" if late or self.in_flight else child  # a join that timed out proves nothing
 
     def remove_private(self) -> None:
         """The files this fake and its hook children created in the run directory (named files, then empty dirs)."""
@@ -375,7 +381,7 @@ def main(argv: list) -> int:
     for a in ("--run-dir", "--port", "--topic", "--script"):
         p.add_argument(a, required=True)
     p.add_argument("--wake-install")
-    p.add_argument("--owner-stdin", action="store_true")  # the owner holds our stdin: its end means the owner died
+    p.add_argument("--stop-with-parent", action="store_true")  # the owner started us: a changed parent pid means it died
     try:
         o = p.parse_args(argv)
     except SystemExit:
@@ -395,17 +401,13 @@ def main(argv: list) -> int:
         signal.signal(s, lambda *_: stop.set())
     fake = Fake(o.run_dir, int(o.port), o.topic, o.script, o.wake_install)
     orphaned = threading.Event()
-    if o.owner_stdin:
-        def watch_owner():
-            while os.read(0, 4096):  # the raw descriptor: a buffered read would block interpreter shutdown
-                pass
-            orphaned.set()
-            stop.set()
-        threading.Thread(target=watch_owner, daemon=True).start()
+    parent = os.getppid()  # read before anything else could let the owner die unnoticed
     fake.start()
     say("READY")
-    while not stop.wait(1):
-        pass
+    while not stop.wait(0.5):
+        if o.stop_with_parent and os.getppid() != parent:  # reparented: the owner is gone, whoever holds its descriptors
+            orphaned.set()
+            break
     child = fake.stop()
     if orphaned.is_set() and child != "unaccounted":
         fake.remove_private()  # nobody is left to clean up after us; kept as evidence when a child is unaccounted

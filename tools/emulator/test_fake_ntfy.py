@@ -458,35 +458,95 @@ class RealTrigger(Base):
                 self.assertNotEqual(0, s.connect_ex(("127.0.0.1", port)))
 
 
-    def test_owner_loss_stops_the_fake_and_removes_its_files(self):
+    def test_owner_loss_stops_the_fake_even_while_another_child_holds_its_descriptors(self):
         with tempfile.TemporaryDirectory() as root:
             run = os.path.join(root, "run")
             os.mkdir(run)
             with socket.socket() as s:
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
-            r, w = os.pipe()
-            owner = subprocess.Popen(["sleep", "60"], pass_fds=(w,))  # a dummy owner holding the pipe's write end
-            p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "fake_ntfy.py"), "--run-dir", run, "--port",
-                                  str(port), "--topic", TOPIC, "--script", SCRIPT, "--wake-install", INSTALL,
-                                  "--owner-stdin"], stdin=r, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            os.close(r)
-            os.close(w)
+            out = os.path.join(root, "fake.out")
+            # A dummy owner like the harness: it starts the fake, then a long-lived child that inherits every descriptor
+            # it has (as the tunnel's ssh does), then waits; it dies abruptly, the other child stays alive.
+            owner = subprocess.Popen(["bash", "-c", 'exec 5>"$1.held"; "$2" -I "$3" --run-dir "$4" --port "$5" --topic "$6" '
+                                      '--script "$7" --wake-install "$8" --stop-with-parent >"$1" 2>&1 </dev/null & '
+                                      'echo $! >"$1.pid"; sleep 300 & echo $! >"$1.sibling"; wait',
+                                      "_", out, sys.executable, os.path.join(HERE, "fake_ntfy.py"), run, str(port), TOPIC,
+                                      SCRIPT, INSTALL])
+            sibling = fake = None
             try:
-                self.assertEqual(b"READY\n", p.stdout.readline())
+                wait_until("the fake ready", lambda: os.path.exists(out) and open(out).read().startswith("READY"))
+                wait_until("the sibling started", lambda: os.path.exists(out + ".sibling") and open(out + ".sibling").read().strip())
+                fake, sibling = int(open(out + ".pid").read()), int(open(out + ".sibling").read())
                 self.assertEqual(200, request(port, "POST", "/trigger")[0])  # a real child ran and left its files
-                self.assertTrue(os.path.exists(os.path.join(run, "home", "agent-hooks", "apofis-push.log")))
-                owner.kill()  # the owner dies abruptly; nothing signals the fake
+                owner.kill()
                 owner.wait(WATCHDOG)
-                self.assertEqual(0, p.wait(WATCHDOG))
-                self.assertEqual(b"stopped: child released, owner gone", p.stdout.read().splitlines()[-1])
+                wait_until("the fake gone after its owner died", lambda: not alive(fake), timeout=10)
+                self.assertTrue(alive(sibling), "the other child, holding the owner's descriptors, still lives")
+                self.assertEqual("stopped: child released, owner gone", open(out).read().splitlines()[-1])
             finally:
-                if p.poll() is None:
-                    p.kill()
-                p.stdout.close()
+                if owner.poll() is None:
+                    owner.kill()
+                for pid in (sibling, fake):  # never leave either behind, also when the check failed
+                    if pid and alive(pid):
+                        os.kill(pid, signal.SIGKILL)
             self.assertEqual([], os.listdir(run))
             with socket.socket() as s:
                 self.assertNotEqual(0, s.connect_ex(("127.0.0.1", port)))
+
+    def stand_in_child(self, linger):
+        """A process the fake takes for its hook child (this script's send, this fixture, its own session) holding slot 0;
+        on SIGUSR1 it releases the slot and lives [linger] seconds more."""
+        path = os.path.join(self.home(), "agent-hooks", fake_ntfy.SLOTS[0])
+        code = ("import fcntl, os, signal, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "os.ftruncate(fd, 0); os.pwrite(fd, str(os.getpid()).encode(), 0)\n"
+                "signal.signal(signal.SIGUSR1, lambda *_: (os.close(fd), time.sleep(float(sys.argv[2])), os._exit(0)))\n"
+                "print('held', flush=True)\n"
+                "time.sleep(60)\n")
+        child = subprocess.Popen([sys.executable, "-I", "-c", code, path, str(linger), SCRIPT, "send", "--state-db",
+                                  os.path.join(self.run_dir, "fixture.db")], start_new_session=True, stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()))
+        self.assertEqual(b"held\n", child.stdout.readline())
+        return child
+
+    def test_a_killed_child_counts_only_once_it_has_exited(self):
+        f = self.fake()
+        f.kill = lambda pid, sig: os.kill(pid, signal.SIGUSR1)  # a kill that only freed the slot: the child lives on
+        child = self.stand_in_child(linger=60)
+        self.assertEqual("unaccounted", f.account(0))
+        self.assertIsNone(child.poll())
+
+    def test_a_killed_child_that_exits_after_its_unlock_is_killed(self):
+        f = self.fake()
+        f.kill = lambda pid, sig: os.kill(pid, signal.SIGUSR1)
+        child = self.stand_in_child(linger=1)
+        self.assertEqual("killed", f.account(0))
+        self.assertEqual(0, child.wait(WATCHDOG))
+
+    def test_a_join_that_times_out_is_unaccounted(self):
+        f = self.fake()
+        f.join_wait = 0.5
+        with f.lock:
+            f.in_flight += 1  # an admitted trigger that never answers
+        self.assertEqual("unaccounted", f.stop())
+
+    def test_without_a_fixture_no_process_counts_as_a_child(self):
+        f = self.fake(wake_install=None)
+        dummy = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)", SCRIPT, "send"], start_new_session=True)
+        self.addCleanup(dummy.kill)
+        path = os.path.join(self.home(), "agent-hooks", fake_ntfy.SLOTS[0])
+        with open(path, "w") as slot:
+            slot.write(str(dummy.pid))
+        fd = os.open(path, os.O_RDONLY)
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            self.assertEqual("unaccounted", f.account(0))  # an empty argument field is no fixture: never signalled
+            self.assertIsNone(dummy.poll())
+        finally:
+            os.close(fd)
 
     def test_length_header_of_ascii_digits_only(self):
         f = self.fake()
@@ -505,7 +565,7 @@ class RealTrigger(Base):
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
             p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "fake_ntfy.py"), "--run-dir", root, "--port",
-                                  str(port), "--topic", TOPIC, "--script", SCRIPT, "--owner-stdin"],
+                                  str(port), "--topic", TOPIC, "--script", SCRIPT, "--stop-with-parent"],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 self.assertEqual(b"READY\n", p.stdout.readline())

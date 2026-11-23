@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.e2e
 
+import android.graphics.Rect
 import android.os.SystemClock
 import android.util.Xml
 import android.view.accessibility.AccessibilityNodeInfo
@@ -206,24 +207,30 @@ class PushE2eTest {
         if (app.runStatus(runId, session) != "completed") fail("Not proved: the run ended ${app.runStatus(runId, session)}")
         app.waitFor("the final answer with $marker on the server", 30_000) { finals(app.serverMessages(session)).any { marker in it } }
 
-        val since = app.deviceTime() // the log cursor, before the precondition read
-        if (app.notificationsTagged(session).isNotEmpty()) fail("Not proved: a notification for the chat was already posted")
-        assertPrecondition(runId)
+        val since = app.deviceTime() // the log cursor, before every read it bounds
         if (push.poll() != null) fail("Not proved: the fake topic held a message before the trigger")
         push.trigger() // 200 only when this invocation's child posted exactly once to the fake
         val body = pollFor()
         if (!body.contentEquals(WAKE_BODY) || push.poll() != null) fail("Not proved: the topic did not hold exactly the hook's one wake")
-        assertPrecondition(runId) // again, immediately before the delivery
-        val before = app.wakeLines(since)
-        if (before.any { (wakeLine(it)?.settled ?: 1) > 0 }) fail("Not proved: a check settled (or logged unreadably) before the delivery: $before")
-        val delivered = SystemClock.uptimeMillis()
-        push.deliver(body)
-        val left = { (60_000 - (SystemClock.uptimeMillis() - delivered)).coerceAtLeast(1) }
-        app.waitFor("one new notification of this chat", left()) { app.notificationsTagged(session).size == 1 }
         val title = app.serverTitle(session)
+        // Right before the delivery: every slow read first, then as the last step the process found gone, then the
+        // broadcast with nothing in between.
+        val out = app.query(WAKE_PRECONDITION_SQL(session)) ?: fail("Not proved: the precondition query failed")
+        if (wakePrecondition(out) != runId) fail("Not proved: the precondition does not hold (stored run, no queued send, empty outbox)")
+        val before = app.wakeLines(since)
+        if (before.any { (wakeLine(it)?.settled ?: 1) > 0 }) fail("Not proved: a check settled (or logged unreadably) before the delivery")
+        if (app.notificationsTagged(session).isNotEmpty()) fail("Not proved: a notification for the chat was already posted")
+        val (rc, pids) = app.pidof()
+        if (rc != 1 || pids.isNotEmpty()) fail("Not proved: the app process is not gone at the delivery")
+        val deadline = SystemClock.uptimeMillis() + 60_000 // absolute: an observation completing after it does not count
+        push.deliver(body)
+        val within = { what: String, condition: () -> Boolean ->
+            if (!observedBy(deadline, SystemClock::uptimeMillis, { SystemClock.sleep(500) }, condition)) fail("Not proved: not seen within 60 s of the delivery: $what")
+        }
+        within("one new notification of this chat") { app.notificationsTagged(session).size == 1 }
         app.device.openNotification()
         var row: AccessibilityNodeInfo? = null
-        app.waitFor("that notification in the shade with the chat title and \"${app.str("notif_reply_finished")}\"", left()) {
+        within("that notification in the shade with the chat title and \"${app.str("notif_reply_finished")}\"") {
             notificationRows(title).singleOrNull()?.also { row = it } != null
         }
         if (app.notificationsTagged(session).size != 1) fail("Not proved: not exactly one notification of this chat")
@@ -232,18 +239,11 @@ class PushE2eTest {
         val lines = app.wakeLines(since)
         if (lines.take(before.size) != before || !provedByPush(before, lines.drop(before.size))) fail("Not proved: the settling check was not the push's alone: $lines")
         if (row?.performAction(AccessibilityNodeInfo.ACTION_CLICK) != true) fail("Tapping the notification failed")
-        app.waitFor("the chat with the marker reply", 30_000) { app.snapshot().replyWith(prompt, marker) != null }
+        app.waitFor("this chat (its key) with the marker reply", 30_000) { app.snapshot().let { t -> t.chatKey() == session && t.replyWith(prompt, marker) != null } }
         app.screenshot(name.methodName)
     }
 
     // ---- helpers
-
-    /** The wake precondition, read once and validated, with the process gone; anything else is "not proved". */
-    private fun assertPrecondition(runId: String) {
-        if (app.pidof().first != 1) fail("Not proved: the app process is not gone before the delivery")
-        val out = app.query(WAKE_PRECONDITION_SQL(session)) ?: fail("Not proved: the precondition query failed")
-        if (wakePrecondition(out) != runId) fail("Not proved: the precondition does not hold (stored run, no queued send, empty outbox)")
-    }
 
     /** The shade's notification rows that show both [title] and "Reply finished" in their own texts. */
     private fun notificationRows(title: String): List<AccessibilityNodeInfo> {
@@ -332,9 +332,6 @@ class PushE2eTest {
             app.click(app.str("settings_title"))
             app.waitFor("Settings", 15_000) { onSettings() }
         }
-        reveal("the Notifications section", ::settingsList) {
-            app.nodes { it.isHeading && it.text?.toString() == app.str("settings_notifications") }.singleOrNull()
-        }
     }
 
     /** The Settings screen's own scrolling container: a visible scrollable holding its section headings (the sheet has none). */
@@ -349,8 +346,14 @@ class PushE2eTest {
     private fun rowNode(): AccessibilityNodeInfo? =
         app.nodes { it.isClickable && segments(it.texts()).firstOrNull() == app.str("settings_notifications") }.singleOrNull()
 
-    /** The row, visible: found by scrolling the Settings list (bounded, both ways, stopping when a scroll moves nothing). */
-    private fun row(): AccessibilityNodeInfo = reveal("the Notifications row", ::settingsList) { rowNode() }
+    /** The row's own title (clickable or not yet: a row still loading shows its title only), never the section heading. */
+    private fun rowTitle(): AccessibilityNodeInfo? =
+        app.nodes { n ->
+            !n.isHeading && (n.text?.toString() == app.str("settings_notifications") || (n.isClickable && segments(n.texts()).firstOrNull() == app.str("settings_notifications")))
+        }.firstOrNull()
+
+    /** Discovers the row by the bounded scroll first (it may not exist until the list has scrolled to it). */
+    private fun showRow() = reveal("the Notifications row", settingsList() ?: fail("No Settings list")) { rowTitle() }
 
     /** The row's value, by the app's own string names (reading needs no scrolling: the value is its own node text). */
     private fun rowValue(): String? {
@@ -358,11 +361,15 @@ class PushE2eTest {
         return VALUES.firstOrNull { app.str(it) in shown.drop(1) }
     }
 
-    private fun awaitRow(value: String) = app.waitFor("Notifications showing \"${app.str(value)}\"", 60_000) { rowNode() != null && rowValue() == value }
+    private fun awaitRow(value: String) {
+        showRow()
+        app.waitFor("Notifications showing \"${app.str(value)}\"", 60_000) { rowValue() == value }
+    }
 
     private fun tapRow() {
+        showRow()
         app.waitFor("the Notifications row available", 30_000) { rowNode()?.isEnabled == true }
-        if (!row().performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping the Notifications row failed")
+        if (rowNode()?.performAction(AccessibilityNodeInfo.ACTION_CLICK) != true) fail("Tapping the Notifications row failed")
     }
 
     /**
@@ -378,45 +385,47 @@ class PushE2eTest {
         return scrollable(root) ?: root
     }
 
-    private fun inSheet(label: String): AccessibilityNodeInfo? {
-        fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? = if (n.isClickable) n else n.parent?.let(::clickableOf)
-        val s = sheet() ?: return null
+    /** The node labelled [label] inside [root] (the kept sheet root), clickable or not. */
+    private fun labelIn(root: AccessibilityNodeInfo, label: String): AccessibilityNodeInfo? {
         fun find(n: AccessibilityNodeInfo): AccessibilityNodeInfo? =
             if ((n.text ?: n.contentDescription)?.toString() == label) n else (0 until n.childCount).mapNotNull(n::getChild).firstNotNullOfOrNull(::find)
-        return find(s)?.let(::clickableOf)
+        root.refresh()
+        return find(root)
     }
 
-    /** A sheet action by its string, scrolled into view inside the sheet and enabled. */
+    private fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? = if (n.isClickable) n else n.parent?.let(::clickableOf)
+
+    private fun inSheet(label: String): AccessibilityNodeInfo? = sheet()?.let { labelIn(it, label) }?.let(::clickableOf)
+
+    /** A sheet action by its string: discovered by the bounded scroll in the sheet (its root kept), then enabled. */
     private fun sheetAction(stringName: String): AccessibilityNodeInfo {
         val label = app.str(stringName)
-        app.waitFor("the sheet", 10_000) { sheet() != null }
-        app.waitFor("an enabled \"$label\" in the sheet", 30_000) { inSheet(label)?.isEnabled == true }
-        return reveal("\"$label\" in the sheet", ::sheet) { inSheet(label) }
+        var root: AccessibilityNodeInfo? = null
+        app.waitFor("the sheet", 10_000) { sheet().also { root = it } != null }
+        val found = reveal("\"$label\" in the sheet", root!!) { labelIn(root!!, label) }
+        app.waitFor("an enabled \"$label\" in the sheet", 30_000) { found.refresh() && clickableOf(found)?.isEnabled == true }
+        return clickableOf(found) ?: fail("\"$label\" in the sheet is not a control")
     }
 
     /**
-     * Finds [what] and brings it on screen by scrolling [container] forward, then backward, a bounded number of times,
-     * stopping in a direction as soon as a scroll is refused or moves nothing; logs how many scrolls it took.
+     * Finds [what] and brings it on screen by scrolling [container] (kept for the whole search) with [revealIn];
+     * progress is what is visible in it, texts and bounds. Logs how many scrolls it took.
      */
-    private fun reveal(what: String, container: () -> AccessibilityNodeInfo?, find: () -> AccessibilityNodeInfo?): AccessibilityNodeInfo {
-        var scrolls = 0
-        for (action in listOf(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD, AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) {
-            var steps = 0
-            while (steps++ < 15) {
-                find()?.takeIf { it.isVisibleToUser }?.let {
-                    app.log("$what found after $scrolls scroll(s)")
-                    return it
-                }
-                val c = container() ?: fail("No scrolling container for $what")
-                val before = c.texts()
-                if (!c.performAction(action)) break // refused: the end in this direction
+    private fun reveal(what: String, container: AccessibilityNodeInfo, finder: () -> AccessibilityNodeInfo?): AccessibilityNodeInfo {
+        fun visible(n: AccessibilityNodeInfo): List<String> = (if (n.isVisibleToUser) listOf("${n.text}@" + Rect().also(n::getBoundsInScreen)) else emptyList()) +
+            (0 until n.childCount).mapNotNull(n::getChild).flatMap(::visible)
+        val (found, scrolls) = revealIn(object : ScrollList<AccessibilityNodeInfo> {
+            override fun find() = finder()
+            override fun visible(n: AccessibilityNodeInfo) = n.isVisibleToUser
+            override fun scroll(forward: Boolean): Boolean {
+                val ok = container.performAction(if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
                 app.device.waitForIdle()
-                scrolls++
-                if ((container()?.texts() ?: before) == before) break // moved nothing
+                return ok
             }
-        }
-        find()?.takeIf { it.isVisibleToUser }?.let { return it }
-        fail("Not found on screen after $scrolls scroll(s): $what. Screen: ${app.screen()}")
+            override fun shown(): Any = container.also { it.refresh() }.let(::visible)
+        })
+        app.log("$what ${if (found != null) "found" else "not found"} after $scrolls scroll(s)")
+        return found ?: fail("Not found on screen after $scrolls scroll(s): $what. Screen: ${app.screen()}")
     }
 
     /** Turns push on from the row (Off: one tap enables) and waits for On. */
@@ -464,6 +473,46 @@ fun wakePrecondition(rows: List<String>): String? =
 /** The run once the app has stored exactly one for the chat (whatever else the row says): to wait for before killing. */
 fun storedRun(rows: List<String>): String? =
     rows.singleOrNull()?.let { Regex("1\\|(run_[0-9a-f]{32})\\|\\d+\\|\\d+").matchEntire(it) }?.groupValues?.get(1)
+
+/** A scrolling list as [revealIn] sees it: the target (null until it exists), its visibility, a scroll, what is shown. */
+interface ScrollList<N> {
+    fun find(): N?
+    fun visible(n: N): Boolean
+    fun scroll(forward: Boolean): Boolean
+    fun shown(): Any
+}
+
+/**
+ * The target, visible, and the scrolls it took: looked for first, then after each scroll forward and then backward, at
+ * most [cap] each way; a direction ends when a scroll is refused or nothing shown changed (texts or bounds).
+ */
+fun <N> revealIn(list: ScrollList<N>, cap: Int = 15): Pair<N?, Int> {
+    var scrolls = 0
+    for (forward in listOf(true, false)) {
+        var steps = 0
+        while (steps++ < cap) {
+            list.find()?.takeIf(list::visible)?.let { return it to scrolls }
+            val before = list.shown()
+            if (!list.scroll(forward)) break
+            scrolls++
+            if (list.shown() == before) break
+        }
+    }
+    return list.find()?.takeIf(list::visible) to scrolls
+}
+
+/**
+ * Polls [condition] until the absolute [deadline] of [now]: true only for an observation that completed by it (the
+ * time is read after the probe too, so one that finished late does not count).
+ */
+fun observedBy(deadline: Long, now: () -> Long, pause: () -> Unit, condition: () -> Boolean): Boolean {
+    while (now() <= deadline) {
+        val seen = runCatching(condition).getOrDefault(false)
+        if (seen) return now() <= deadline
+        pause()
+    }
+    return false
+}
 
 /** Accessibility texts as the separate lines and merged parts a person reads. */
 fun segments(texts: List<String>) = texts.flatMap { it.split("\n", ", ") }.map(String::trim).filter(String::isNotEmpty)

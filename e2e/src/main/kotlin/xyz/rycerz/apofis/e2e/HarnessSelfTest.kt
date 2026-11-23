@@ -329,6 +329,58 @@ class HarnessSelfTest {
         assertFalse("not the current record", recordMatches(prefsXml("test_intents" to "$id\t$title", "record" to "apofis-push-$install-2", "endpoint" to endpoint), server(), id, endpoint, current = true))
     }
 
+    /** A list of [size] rows shown [window] at a time; [appearsAt]: the target row exists only from that scroll on. */
+    private class FakeList(val target: Int, val appearsAt: Int, val size: Int = 10, val window: Int = 3, val boundsOnly: Boolean = false) : ScrollList<Int> {
+        var offset = 0
+        var scrolls = 0
+        override fun find() = target.takeIf { scrolls >= appearsAt }
+        override fun visible(n: Int) = n in offset until offset + window
+        override fun scroll(forward: Boolean): Boolean {
+            val next = if (forward) offset + 1 else offset - 1
+            if (next < 0 || next + window > size) return false
+            offset = next
+            scrolls++
+            return true
+        }
+        // What is shown: the rows' texts and bounds; with boundsOnly every row reads the same and only the bounds move.
+        override fun shown(): Any = (offset until offset + window).map { (if (boundsOnly) "row" else "row $it") to it * 100 }
+    }
+
+    @Test
+    fun revealScrollsFirstAndJudgesProgressByWhatIsShown() {
+        // The section heading (row 2) is visible at once, but the row (5) does not exist until the second scroll.
+        val settings = FakeList(target = 5, appearsAt = 2)
+        assertEquals(5 to 3, revealIn(settings))
+        // The same for a sheet action that exists only once the sheet has scrolled twice.
+        assertEquals(4 to 2, revealIn(FakeList(target = 4, appearsAt = 2, size = 6)))
+        // Only bounds move (every row reads the same): still progress.
+        assertEquals(7 to 5, revealIn(FakeList(target = 7, appearsAt = 0, boundsOnly = true)))
+        // Nothing shown changes although the scroll was accepted: that direction stops at once.
+        val stuck = object : ScrollList<Int> {
+            var asked = 0
+            override fun find(): Int? = null
+            override fun visible(n: Int) = false
+            override fun scroll(forward: Boolean) = true.also { asked++ }
+            override fun shown(): Any = "same"
+        }
+        assertEquals(null to 2, revealIn(stuck))
+        assertEquals(2, stuck.asked)
+        // Not found anywhere: bounded both ways.
+        assertNull(revealIn(FakeList(target = 99, appearsAt = 99)).first)
+    }
+
+    @Test
+    fun anObservationFinishingAfterTheDeadlineDoesNotCount() {
+        var clock = 0L
+        assertTrue("seen in time", observedBy(1_000, { clock }, { clock += 100 }) { clock >= 500 })
+        clock = 0L
+        assertFalse("seen, but the probe ended after the deadline", observedBy(1_000, { clock }, { clock += 100 }) { (clock >= 900).also { if (it) clock += 300 } })
+        clock = 0L
+        assertFalse("never seen", observedBy(1_000, { clock }, { clock += 100 }) { false })
+        clock = 2_000L
+        assertFalse("past the deadline before the first probe", observedBy(1_000, { clock }, { clock += 100 }) { true })
+    }
+
     @Test
     fun settingsRowValueIsAWholeSegment() {
         val off = segments(listOf("Notifications, Off\nWithout push, the app checks about every 15 minutes while a reply is running"))

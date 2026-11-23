@@ -53,7 +53,8 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   pushIdentityCountsOnlyWhenReadBackWhole pushIntentsAreJournaledOrMissingForEveryInstall pushDiagnosticsNeverCarryTheBytesRead
   distributorLogsOnlyKnownActionsFromTheApp
   quietDeliveriesNeedANewPushCheckThatTookNoRun wakePreconditionPassesTheStoredRunsSendingRowOnly
-  pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly settingsRowValueIsAWholeSegment)
+  pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly revealScrollsFirstAndJudgesProgressByWhatIsShown
+  anObservationFinishingAfterTheDeadlineDoesNotCount settingsRowValueIsAWholeSegment)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
 # Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
 # tunnel. Gate 1's start no model run.
@@ -606,8 +607,8 @@ key='' nonce='' run_id='' tmp='' interrupted='' key_sent_local='' mode='' arg=''
 tun_fd='' tunnel_pid='' tunnel_port='' rin='' rout='' remote_pid='' remote_shell_pid='' last_line=''
 sessions_state='' journal=() published='' export_files=() export_state='' lock_tried='' locked='' released='' ports_before=''
 incoming='' wd_pid='' orig_out='' orig_err=''
-push=() models=() model_capable='' journal_complete='' keep_push='' fake_fd='' push_port='' push_topic='' push_installs='' push_dir='' fake_pid=''
-declare -A install_of=() starts=()
+push=() models=() owned=() model_capable='' keep_push='' push_port='' push_topic='' push_installs='' push_dir='' fake_pid=''
+declare -A install_of=()
 
 # Every SSH call: output captured by the caller (never printed), stderr discarded by the caller.
 rsh() { bounded "${RSH_TIMEOUT:-60}" ssh -o BatchMode=yes "$HOST" "$@"; }
@@ -704,9 +705,8 @@ check_sessions() {
   if [ -n "$bad" ]; then
     log "FAILED: the session journal is missing a line, or a line is incomplete or unmatched; sessions this run created may remain on the server (only complete entries are checked and deleted)"
     ok=1
-  else
-    journal_complete=1 # positive evidence of what ran: the only state in which observed starts may lower a reservation
-    [ "${#journal[@]}" != 0 ] || log "sessions: the journal is complete and empty (nothing was sent)"
+  elif [ "${#journal[@]}" = 0 ]; then
+    log "sessions: the journal is complete and empty (nothing was sent)"
   fi
   body=$(mktemp)
   for l in "${entries[@]}"; do
@@ -723,18 +723,6 @@ check_sessions() {
         continue
       fi
       verified+=("$id")
-      if [ "$id" = "${ids%%,*}" ] && grep -qx "[A-Za-z0-9]*#$scen" <<<"$(printf '%s\n' "${models[@]}")"; then
-        # The model starts of a reserved method: the user turns in the server's whole record of its chat (the current
-        # id answers with its lineage). Only a complete, matching answer with at least the one turn it sent counts.
-        code=$(hermes GET "api/sessions/$id/messages?order=oldest&include_compacted=true" "$body") || code=error
-        if [ "$code" = 200 ] && n=$(jq -e --arg id "$id" 'select(.object == "list" and .session_id == $id
-            and (.data | type) == "array" and .pagination.returned == (.data | length) and .pagination.returned < .pagination.limit)
-            | [.data[] | select(.role == "user")] | length' "$body" 2>/dev/null) && [ "$n" -ge 1 ]; then
-          starts[$scen]=$n
-        else
-          starts[$scen]=unknown
-        fi
-      fi
       if [ "$scen" = steerDuringRun ]; then
         code=$(hermes GET "api/sessions/$id/messages?order=oldest&include_compacted=true" "$body") || code=error
         if [ "$code" = 200 ] && steer_ok_json "$id" "$(steering_text)" "$body"; then
@@ -804,12 +792,14 @@ known_test() {
 # --smoke, --full, --scenario and --test of the other tests keep their behaviour; --full never selects a push test; a
 # suite name is never a --test argument. Fails for anything else, before any side effect.
 select_tests() {
-  local m=$1 a=${2:-}
-  push=() models=() model_capable=1
+  local m=$1 a=${2:-} t
+  push=() models=() model_capable=1 tests=
   case $m in
     smoke) tests=smoke model_capable='' ;;
     full) tests=all ;;
-    scenario) printf '%s\n' "${SCENARIOS[@]}" | grep -qxF -- "$a" || return 1; tests=SurvivalE2eTest#$a ;;
+    scenario)
+      for t in "${SCENARIOS[@]}"; do [ "$a" != "$t" ] || tests=SurvivalE2eTest#$a; done # literal equality only
+      [ -n "$tests" ] || return 1 ;;
     push) tests=push push=("${PUSH_TESTS[@]}") model_capable='' ;;
     push-model) tests=push-model push=(pushWakesKilledApp) models=("${PUSH_MODEL[@]}") ;;
     test)
@@ -824,6 +814,7 @@ select_tests() {
         PushE2eTest#hostilePushes | PushE2eTest#permissionAndTestPush) model_capable='' ;; esac ;;
     *) return 1 ;;
   esac
+  [[ $tests =~ ^[A-Za-z0-9_#-]+$ ]] # the strict token check, before any remote command is built from it
 }
 
 # <n> random letters and digits.
@@ -834,21 +825,36 @@ rand_alnum() {
 }
 
 # The model-start ledger, one per milestone (path and limit are arguments; Milestone 4 has its own). Lines:
-# "reserve <run id> <method> <bound>" before a run's instrumentation, "observed <run id> <method> <n>" after it, n
-# counted on the server. A reservation counts its bound until its run observed, then the observed count.
-# ledger_total <ledger>: prints the starts it counts; fails on an unreadable or ambiguous ledger (a line of another
-# form, a second reservation or observation of one run's method, an observation without its reservation).
-ledger_total() {
-  if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo 0; return 0; fi
-  [ -f "$1" ] && [ -r "$1" ] || return 1
-  [ ! -s "$1" ] || [ "$(tail -c1 "$1" | od -An -tx1 | tr -d ' ')" = 0a ] || return 1 # a torn last line
-  awk -v run="^$RUNID_RE\$" '
-    NF != 4 || $2 !~ run || $3 !~ /^[A-Za-z0-9]+#[A-Za-z0-9]+$/ || $4 !~ /^[0-9]{1,3}$/ { bad = 1; exit }
+# "reserve <run id> <method> <bound>" before a run's instrumentation, and "observed <run id> <method> 0" only to release
+# a reservation of an invocation that never handed the key to the device. A reservation counts its bound until
+# released.
+# ledger_check <ledger> [<run id> <method>...]: the one parser of the ledger. Every line must be exactly one of the two
+# forms (single spaces, a line break at the end of the file), no run and method reserved twice, no observation without
+# its reservation or twice; with a proposal, none of its run and methods may repeat or already be reserved. Prints the
+# starts the ledger counts; fails on anything else.
+ledger_check() {
+  local f=$1
+  shift
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    [ -f "$f" ] && [ -r "$f" ] || return 1
+    [ ! -s "$f" ] || [ "$(tail -c1 "$f" | od -An -tx1 | tr -d ' ')" = 0a ] || return 1 # a torn last line
+  else
+    f=/dev/null
+  fi
+  awk -v line="^(reserve|observed) ${RUNID_RE} [A-Za-z0-9]+#[A-Za-z0-9]+ [0-9]{1,3}\$" -v proposal="$*" '
+    $0 !~ line { bad = 1; exit }
     $1 == "reserve" { k = $2 " " $3; if (k in r) { bad = 1; exit } r[k] = $4; next }
-    $1 == "observed" { k = $2 " " $3; if (!(k in r) || (k in o)) { bad = 1; exit } o[k] = $4; next }
-    { bad = 1; exit }
-    END { if (bad) exit 1; for (k in r) t += (k in o) ? o[k] : r[k]; print t + 0 }' "$1"
+    { k = $2 " " $3; if (!(k in r) || (k in o)) { bad = 1; exit } o[k] = $4 }
+    END {
+      if (bad) exit 1
+      n = split(proposal, p, " ")
+      for (i = 2; i <= n; i++) { k = p[1] " " p[i]; if ((k in r) || (k in seen)) exit 1; seen[k] = 1 }
+      for (k in r) t += (k in o) ? o[k] : r[k]
+      print t + 0
+    }' "$f"
 }
+
+ledger_total() { ledger_check "$1"; }
 
 # ledger_reserve <ledger> <limit> <run id> <method>=<bound>...: under flock, appends one reservation per method only when
 # the ledger reads and its count plus these bounds stays within <limit>; fails (appending nothing) otherwise.
@@ -859,23 +865,20 @@ ledger_reserve() {
   mkdir -p -- "${f%/*}" || return 1
   (
     flock -w 30 9 || exit 1
-    t=$(ledger_total "$f") && [ $((t + add)) -le "$limit" ] || exit 1
-    # No proposed run and method twice, nor one the ledger already holds.
-    [ "$(printf '%s\n' "${@%=*}" | sort | uniq -d)" = '' ] || exit 1
-    for p; do ! grep -qE "^reserve $run ${p%=*} " "$f" 2>/dev/null || exit 1; done
+    t=$(ledger_check "$f" "$run" "${@%=*}") && [ $((t + add)) -le "$limit" ] || exit 1
     for p; do printf 'reserve %s %s %s\n' "$run" "${p%=*}" "${p#*=}"; done >>"$f"
   ) 9>>"$f.lock"
 }
 
-# ledger_observe <ledger> <run id> <method> <n>: under flock, appends the observed starts of that reservation.
-ledger_observe() {
+# ledger_release <ledger> <run id> <method>: under flock, releases that reservation ("observed ... 0"); only while it
+# is reserved and not yet released, by the same parser.
+ledger_release() {
   local f=$1
-  [[ $4 =~ ^[0-9]{1,3}$ ]] || return 1
   (
     flock -w 30 9 || exit 1
-    ledger_total "$f" >/dev/null || exit 1
-    awk -v k="$2 $3" '$1 == "reserve" && $2 " " $3 == k { r = 1 } $1 == "observed" && $2 " " $3 == k { o = 1 } END { exit !(r && !o) }' "$f" || exit 1
-    printf 'observed %s %s %s\n' "$2" "$3" "$4" >>"$f"
+    ledger_check "$f" >/dev/null && ! ledger_check "$f" "$2" "$3" >/dev/null || exit 1 # valid, and that one is reserved
+    ! grep -qxF "observed $2 $3 0" "$f" || exit 1
+    printf 'observed %s %s 0\n' "$2" "$3" >>"$f"
   ) 9>>"$f.lock"
 }
 
@@ -929,10 +932,11 @@ provision_push() {
 start_fake() {
   local wake='' i
   [[ " ${push[*]} " == *" pushWakesKilledApp "* ]] && wake=${install_of[pushWakesKilledApp]}
-  # Its stdin is a pipe this script holds: when this script dies for any reason, the fake sees the end and stops.
-  exec {fake_fd}> >(exec setsid env -i PATH="$PATH" python3 -I tools/emulator/fake_ntfy.py --run-dir "$push_dir/fake" \
-    --port "$push_port" --topic "$push_topic" --script "$PUSH_SCRIPT" ${wake:+--wake-install "$wake"} --owner-stdin \
-    >"$push_dir/fake.log" 2>&1 7>&-)
+  # Started directly by this script (setsid does not fork here: a background job of a non-interactive shell leads no
+  # group), so this script is its parent: when this script dies for any reason, the fake is reparented and stops.
+  setsid env -i PATH="$PATH" python3 -I tools/emulator/fake_ntfy.py --run-dir "$push_dir/fake" --port "$push_port" \
+    --topic "$push_topic" --script "$PUSH_SCRIPT" ${wake:+--wake-install "$wake"} --stop-with-parent \
+    </dev/null >"$push_dir/fake.log" 2>&1 7>&- &
   fake_pid=$!
   for i in $(seq 40); do
     [ "$(head -n1 "$push_dir/fake.log" 2>/dev/null)" = READY ] && return 0
@@ -949,8 +953,6 @@ stop_fake() {
   kill -TERM "$fake_pid" 2>/dev/null
   wait_gone 40 alive "$fake_pid" || { kill -KILL "$fake_pid" 2>/dev/null; rc=1; }
   wait "$fake_pid" 2>/dev/null || rc=1
-  [ -z "$fake_fd" ] || exec {fake_fd}>&-
-  fake_fd=''
   alive "$fake_pid" || fake_pid=''
   grep -qxE 'stopped: child (released|killed)' "$push_dir/fake.log" 2>/dev/null || rc=1
   o=$(ss -Hltn "sport = :$push_port") && [ -z "$o" ] || rc=1
@@ -968,7 +970,14 @@ stop_fake() {
 # not be read is not cleaned at all. Then every install is listed again: any record left fails the run, unremoved.
 check_push() {
   local ok=0 l id title inst m code gone body refused=' ' left
-  [ "${#push[@]}" -gt 0 ] || return 0
+  # Nothing minted: nothing of this run can exist on the server, and no path is touched.
+  [ "${#push[@]}" -gt 0 ] && [ "${#install_of[@]}" -gt 0 ] || return 0
+  # Every file of this check lives in the run's own private directory, created by this run.
+  if [ -z "$push_dir" ] || [ ! -d "$push_dir" ] || [ -L "$push_dir" ] || [ ! -O "$push_dir" ] ||
+    ! body=$(mktemp "$push_dir/body.XXXXXX"); then
+    log "FAILED: push: no private directory to work in; push records may remain under the installs ${install_of[*]}"
+    return 1
+  fi
   if [ -n "$key_sent_local" ] && [ "$sessions_state" != ok ]; then
     log "FAILED: push: the journal is missing or unreadable, so no create intent is known; no push record is deleted"
     ok=1
@@ -981,7 +990,6 @@ check_push() {
     refused+="${install_of[$m]:-?} "
     ok=1
   done
-  body=$push_dir/body
   for l in "${journal[@]}"; do
     [[ $l == pushintent\ * ]] || continue
     read -r _ id title <<<"$l"
@@ -1010,7 +1018,7 @@ check_push() {
       ok=1
     fi
   done
-  rm -f "$body"
+  rm -f -- "$body" # the file mktemp made above, nothing else
   for m in "${push[@]}"; do
     [ -n "${install_of[$m]:-}" ] || continue # never minted (the run stopped before): nothing of it can exist
     if ! left=$(push_listing "${install_of[$m]}"); then
@@ -1026,23 +1034,17 @@ check_push() {
   return "$ok"
 }
 
-# After the run, only on positive proof, the observed starts of every reserved method: 0 when the key never left this
-# host; with a journal check_sessions found complete, the user turns of the method's journaled chat in the server's
-# whole record (check_sessions), or 0 when that journal has no send for it. Anything else writes nothing and the
-# reservation's bound stands.
+# After the run: a reservation belongs to the invocation that made it (owned, filled only after a successful
+# reservation) and only it may change one. Released only when the key was never handed to the device; once it was,
+# the reservation stays at its bound whatever was observed.
 observe_starts() {
-  local m s n
-  for m in "${models[@]}"; do
-    s=${m#*#} n=''
-    if [ -z "$key_sent_local" ]; then n=0 # the key never left this host: no app ran
-    elif [ -z "$journal_complete" ]; then : # an incomplete or unverified journal proves nothing: the bound stands
-    elif [[ ${starts[$s]:-} =~ ^[0-9]+$ ]]; then n=${starts[$s]}
-    elif [ -z "${starts[$s]:-}" ] && ! grep -q "^send [^ ]* $s$" <<<"$(printf '%s\n' "${journal[@]}")"; then n=0; fi
-    if [ -z "$n" ]; then log "ledger: observed starts of $m unknown; its reservation of ${MODEL_BOUND[$m]} stands"; continue; fi
-    if ledger_observe "$LEDGER" "$run_id" "$m" "$n"; then log "ledger: $m reserved ${MODEL_BOUND[$m]}, observed $n"
-    else log "FAILED: ledger: could not record the observed starts of $m"; return 1; fi
+  local m
+  for m in "${owned[@]}"; do
+    if [ -n "$key_sent_local" ]; then log "ledger: $m stays at its reserved ${MODEL_BOUND[$m]} (the key was handed to the device)"
+    elif ledger_release "$LEDGER" "$run_id" "$m"; then log "ledger: $m released (the key never left this host)"
+    else log "FAILED: ledger: could not release the reservation of $m"; return 1; fi
   done
-  [ "${#models[@]}" = 0 ] || log "ledger: $(ledger_total "$LEDGER" || echo unknown) of $LEDGER_LIMIT model starts counted for Milestone 3"
+  [ "${#owned[@]}" = 0 ] || log "ledger: $(ledger_total "$LEDGER" || echo unknown) of $LEDGER_LIMIT model starts counted for Milestone 3"
 }
 
 # Lists the user's home and config entries and /tmp entries owned by the user on the emulator host (never printed).
@@ -1491,6 +1493,7 @@ main() {
     for m in "${models[@]}"; do bounds+=("$m=${MODEL_BOUND[$m]}"); done
     ledger_reserve "$LEDGER" "$LEDGER_LIMIT" "$run_id" "${bounds[@]}" ||
       die "ledger: reserving ${bounds[*]} would pass $LEDGER_LIMIT model starts, or $LEDGER is unreadable or ambiguous; nothing started"
+    owned=("${models[@]}") # only now: the cleanup may change only what this invocation reserved
     log "ledger: reserved ${bounds[*]} ($(ledger_total "$LEDGER") of $LEDGER_LIMIT counted)"
   fi
   [ "${#push[@]}" = 0 ] || provision_push
