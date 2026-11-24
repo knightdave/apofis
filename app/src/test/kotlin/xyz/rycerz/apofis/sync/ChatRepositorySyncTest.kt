@@ -5,14 +5,20 @@ import androidx.room.Room
 import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -37,12 +43,17 @@ import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.HoldingQueue
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.TOOL_RESULT_DISPLAY_LIMIT
 import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
+import xyz.rycerz.apofis.chat.buildTranscript
+import xyz.rycerz.apofis.chat.storedToolCalls
 import xyz.rycerz.apofis.db.AppDatabase
+import xyz.rycerz.apofis.db.ImageBindingEntity
+import xyz.rycerz.apofis.db.MessageEntity
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.ReplyOutcomeEntity
 import xyz.rycerz.apofis.db.SessionEntity
@@ -815,5 +826,350 @@ class ChatRepositorySyncTest {
 
         assertEquals(before, db.sessionDao().all())
         assertEquals(0, server.requestCount)
+    }
+
+    // Issue 16 row 4: a stored row is bounded, the cut is shown, and the cut never decides delivery.
+
+    private val cutD1 = "a1".repeat(32)
+    private val cutD2 = "b2".repeat(32)
+
+    private fun cutRow(id: Long, role: String, content: String, reasoning: String? = null, calls: String? = null, kind: String? = null) = buildJsonObject {
+        put("id", id); put("role", role); put("content", content); put("timestamp", 1.0)
+        if (kind != null) put("display_kind", kind)
+        if (reasoning != null) put("reasoning", reasoning)
+        if (calls != null) put("tool_calls", calls)
+    }.toString()
+
+    /** Calls as (id, name, arguments). */
+    private fun cutCalls(vararg calls: Triple<String, String, String>) = buildJsonArray {
+        for ((id, name, args) in calls) addJsonObject {
+            put("id", id)
+            put("type", "function")
+            putJsonObject("function") {
+                put("name", name)
+                put("arguments", args)
+            }
+        }
+    }.toString()
+
+    private fun cutHint(digest: String) = "[Image attached at: /home/h/.hermes/cache/native-inputs/api_${digest.take(32)}.jpg]"
+
+    private fun cutBlock(vararg digests: String) =
+        "\n\n" + digests.joinToString("\n") { cutHint(it) } + "\n" + digests.joinToString("\n") { "[screenshot]" }
+
+    private fun storedChars(r: MessageEntity) = r.content.length.toLong() + (r.reasoning?.length ?: 0) + (r.toolCallsJson?.length ?: 0)
+
+    private suspend fun assertWithinBound(db: AppDatabase) {
+        val rows = db.messageDao().rows("apofis-a")
+        assertTrue(rows.isNotEmpty())
+        for (r in rows) assertTrue("row ${r.id} stores ${storedChars(r)}", storedChars(r) <= 400_000)
+    }
+
+    private fun cutFile(name: String) =
+        Room.databaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java, name).allowMainThreadQueries().build()
+
+    /** Syncs [rows] into a fresh file database [name] with [sync], then gives [check] that file opened again (a new process). */
+    private suspend fun syncAndReopen(
+        name: String,
+        rows: List<String>,
+        seed: suspend (AppDatabase) -> Unit = {},
+        sync: suspend ChatRepository.(AppDatabase) -> Boolean = { syncMessages("apofis-a") },
+        check: suspend (AppDatabase, ChatRepository) -> Unit,
+    ) {
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        app.deleteDatabase(name)
+        try {
+            val first = cutFile(name)
+            try {
+                first.sessionDao().upsert(session("apofis-a"))
+                seed(first)
+                respond(rawMessages("apofis-a", rows))
+                assertTrue(ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), first, now = { 1_000L }).sync(first))
+            } finally {
+                first.close()
+            }
+            val reopened = cutFile(name)
+            try {
+                check(reopened, ChatRepository(HermesApi(server.url("/").toString(), "secret-key"), reopened, now = { 1_000L }))
+            } finally {
+                reopened.close()
+            }
+        } finally {
+            app.deleteDatabase(name) // also after a failure in the first half
+        }
+    }
+
+    @Test
+    fun manyLargeToolCallsReadBack() = runTest {
+        val calls = cutCalls(*Array(106) { Triple("c$it", "write_file", "y".repeat(25_000)) })
+        syncAndReopen("cut-calls.db", listOf(cutRow(1, "user", "go"), cutRow(2, "assistant", "done", calls = calls))) { db, repo ->
+            assertWithinBound(db)
+            val row = db.messageDao().rows("apofis-a").single { it.role == "assistant" }
+            val reply = repo.transcript("apofis-a").first().filterIsInstance<AssistantReply>().single()
+            assertTrue(row.droppedToolCalls > 0)
+            assertEquals(106, reply.steps.size + row.droppedToolCalls)
+            assertEquals(row.droppedToolCalls, reply.droppedToolCalls)
+            // The kept calls are the first ones, in order, and as many as fit: the next one would pass the bound.
+            val kept = reply.steps.map { (it as ToolStep).callId }
+            assertTrue(kept.isNotEmpty())
+            assertEquals(List(kept.size) { "c$it" }, kept)
+            val next = (Json.parseToJsonElement(storedToolCalls(calls)!!) as JsonArray)[kept.size].toString()
+            assertTrue(storedChars(row) + next.length + 1 > 400_000)
+            assertEquals("done", reply.text)
+            assertFalse(reply.shortened)
+        }
+    }
+
+    @Test
+    fun independentlyLargeFieldsCut() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        val small = cutCalls(Triple("c1", "terminal", "{}"))
+        respond(
+            rawMessages(
+                "apofis-a",
+                listOf(
+                    cutRow(1, "user", "go"),
+                    cutRow(2, "assistant", "a".repeat(300_000), reasoning = "r".repeat(300_000), calls = small),
+                    cutRow(3, "assistant", "b".repeat(399_999) + "😀" + "tail", reasoning = "lost"), // the cut falls inside a pair
+                    cutRow(4, "assistant", "c".repeat(100_000), reasoning = "s".repeat(100_000), calls = small), // within the bound
+                ),
+            ),
+        )
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertWithinBound(db)
+        val rows = db.messageDao().rows("apofis-a")
+        // Content first, then reasoning, then whole calls.
+        assertEquals("a".repeat(300_000), rows[1].content)
+        assertEquals("r".repeat(100_000), rows[1].reasoning)
+        assertNull(rows[1].toolCallsJson)
+        assertEquals(1, rows[1].droppedToolCalls)
+        assertTrue(rows[1].shortened)
+        // Never a lone high surrogate: the pair is dropped whole and the one character left goes to the reasoning.
+        assertEquals("b".repeat(399_999), rows[2].content)
+        assertEquals("l", rows[2].reasoning)
+        assertEquals(0, rows[2].droppedToolCalls)
+        assertTrue(rows[2].shortened)
+        // A row within the bound is stored as fetched.
+        assertEquals("c".repeat(100_000), rows[3].content)
+        assertEquals("s".repeat(100_000), rows[3].reasoning)
+        assertEquals(small, rows[3].toolCallsJson)
+        assertEquals(0, rows[3].droppedToolCalls)
+        assertFalse(rows[3].shortened)
+        // One reply folds the three rows: the counts add up and the flag is set by any of them.
+        val reply = repo.transcript("apofis-a").first().filterIsInstance<AssistantReply>().single()
+        assertEquals(1, reply.droppedToolCalls)
+        assertTrue(reply.shortened)
+    }
+
+    @Test
+    fun singleOversizedCallDropped() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        // Arguments are cut before storage; only an unbounded name (or id) can carry one call past the bound.
+        // The list ends at the first call that does not fit: the small call after it is dropped too.
+        val calls = cutCalls(Triple("c1", "terminal", "{}"), Triple("c2", "n".repeat(450_000), "{}"), Triple("c3", "terminal", "{}"))
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", "go"), cutRow(2, "assistant", "ran", calls = calls))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertWithinBound(db)
+        val row = db.messageDao().rows("apofis-a")[1]
+        assertEquals("ran", row.content)
+        assertEquals(2, row.droppedToolCalls)
+        assertFalse(row.shortened)
+        val reply = repo.transcript("apofis-a").first().filterIsInstance<AssistantReply>().single()
+        assertEquals("c1", (reply.steps.single() as ToolStep).callId)
+        assertEquals(2, reply.droppedToolCalls)
+        assertFalse(reply.shortened)
+    }
+
+    @Test
+    fun cutMarkersShownAfterReopen() = runTest {
+        val literal = "b".repeat(399_990) + cutBlock(cutD1) // typed text that ends like a marker block, with no binding
+        syncAndReopen(
+            "cut-markers.db",
+            listOf(
+                cutRow(1, "user", "a".repeat(450_000)),
+                cutRow(2, "assistant", "d".repeat(450_000), calls = cutCalls(Triple("c1", "terminal", "{}"))),
+                cutRow(3, "user", literal),
+                cutRow(4, "user", "[OUT-OF-BAND USER MESSAGE]\n" + "s".repeat(450_000) + "\n[/OUT-OF-BAND USER MESSAGE]", kind = "steer"),
+            ),
+        ) { db, repo ->
+            assertWithinBound(db)
+            val items = repo.transcript("apofis-a").first()
+            val users = items.filterIsInstance<UserMessage>()
+            assertEquals("a".repeat(400_000), users[0].text)
+            assertTrue(users[0].shortened)
+            // An unbound row is cut from its tail like any text: shown as stored, never parsed, no placeholder.
+            assertEquals(literal.take(400_000), users[1].text)
+            assertEquals(literal.take(400_000), users[1].raw)
+            assertEquals(emptyList<String?>(), users[1].images)
+            assertTrue(users[1].shortened)
+            // A cut steer row is cut from its tail too and keeps the mark (its wrapper line shows: a recorded limit).
+            assertTrue(users[2].steered)
+            assertTrue(users[2].shortened)
+            assertEquals(400_000, users[2].raw.length)
+            val reply = items.filterIsInstance<AssistantReply>().single()
+            assertEquals("d".repeat(400_000), reply.text)
+            assertEquals(1, reply.droppedToolCalls)
+            assertTrue(reply.shortened)
+        }
+    }
+
+    @Test
+    fun storedBytesWithinWindow() = runTest {
+        val euro = "€" // three bytes in UTF-8
+        syncAndReopen(
+            "cut-bytes.db",
+            listOf(
+                cutRow(1, "user", euro.repeat(450_000)),
+                cutRow(2, "assistant", euro.repeat(300_000), reasoning = euro.repeat(300_000), calls = cutCalls(Triple("c1", euro, euro))),
+            ),
+        ) { db, repo ->
+            assertWithinBound(db)
+            for (r in db.messageDao().rows("apofis-a")) {
+                val bytes = (r.content + (r.reasoning ?: "") + (r.toolCallsJson ?: "")).toByteArray(Charsets.UTF_8).size
+                assertTrue("row ${r.id} stores $bytes bytes", bytes <= 1_200_000) // below the 2 MB cursor window
+            }
+            assertEquals(euro.repeat(400_000), repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single().text)
+        }
+    }
+
+    @Test
+    fun oversizedUserRowStillConfirmed() = runTest {
+        val text = "t".repeat(450_000)
+        val bigCaption = "p".repeat(450_000) // the caption alone passes the bound
+        val caption = "q".repeat(399_990) // the caption fits; its marker block pushes the row past the bound
+        val confirmed = mutableSetOf<String>()
+        syncAndReopen(
+            "cut-users.db",
+            listOf(cutRow(1, "user", text), cutRow(2, "user", bigCaption + cutBlock(cutD1)), cutRow(3, "user", caption + cutBlock(cutD2))),
+            seed = { db ->
+                val dao = db.pendingSendDao()
+                dao.upsert(PendingSendEntity("k1", "apofis-a", text, "{}", 1_000L, "sending", "run_1", null))
+                dao.upsert(PendingSendEntity("k2", "apofis-a", bigCaption, "{}", 1_000L, "sending", "run_1", null, images = cutD1))
+                dao.upsert(PendingSendEntity("k3", "apofis-a", caption, "{}", 1_000L, "sending", "run_1", null, images = cutD2))
+            },
+            // Settlement's own decision (RunFollower.write) on what the transaction hands it.
+            sync = { db ->
+                syncMessages("apofis-a") { rows ->
+                    val shown = buildTranscript(rows).filterIsInstance<UserMessage>()
+                    val used = HashSet<String>()
+                    for (p in db.pendingSendDao().rows("apofis-a")) if (deliveredIn(p, shown, used)) confirmed += p.idempotencyKey
+                }
+            },
+        ) { db, repo ->
+            assertEquals(setOf("k1", "k2", "k3"), confirmed) // none would be marked unconfirmed
+            assertWithinBound(db)
+            val stored = db.messageDao().rows("apofis-a")
+            assertTrue(stored.all { it.shortened })
+            assertEquals(text.take(400_000), stored[0].content)
+            assertEquals(bigCaption.take(400_000), stored[1].content) // the block dropped whole, never split
+            assertEquals(caption, stored[2].content)
+            assertFalse(stored[2].content.contains("[Image attached"))
+            // The photos stay bound through the cut and the restart, and are shown through the binding.
+            assertEquals(mapOf(2L to cutD1, 3L to cutD2), db.imageBindingDao().forSession("apofis-a").associate { it.messageId to it.digests })
+            val users = repo.transcript("apofis-a").first().filterIsInstance<UserMessage>()
+            assertEquals(listOf(emptyList(), listOf(cutD1), listOf(cutD2)), users.map { it.images })
+            assertTrue(users.all { it.shortened })
+        }
+    }
+
+    @Test
+    fun oversizedCaptionLiveSyncShowsOneBubble() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        val caption = "p".repeat(450_000)
+        db.pendingSendDao().upsert(PendingSendEntity("k", "apofis-a", caption, "{}", 1_000L, "sending", "run_1", null, images = cutD1))
+        val seen = CopyOnWriteArrayList<List<ChatItem>>()
+        val latest = MutableStateFlow<List<ChatItem>?>(null)
+        backgroundScope.launch(Dispatchers.IO) { repo.transcript("apofis-a").collect { seen += it; latest.value = it } }
+        suspend fun awaitShown(condition: (List<ChatItem>) -> Boolean) =
+            withContext(Dispatchers.IO) { withTimeout(10_000) { latest.filterNotNull().first(condition) } }
+
+        awaitShown { items -> items.any { it.key == "pk" } }
+        // The live sync during the run: no settlement, so the pending row stays sending beside its cut stored row.
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", caption + cutBlock(cutD1)), cutRow(2, "assistant", "Looking"))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        val last = awaitShown { items -> items.any { it is AssistantReply } }
+
+        assertEquals("sending", db.pendingSendDao().get("k")?.state)
+        for (items in seen) items.filterIsInstance<UserMessage>().single() // never two bubbles
+        val bubble = last.filterIsInstance<UserMessage>().single()
+        assertEquals("u1", bubble.key)
+        assertEquals(listOf(cutD1), bubble.images)
+        assertTrue(bubble.shortened)
+        assertEquals("run_1", bubble.runId)
+    }
+
+    @Test
+    fun blankCutRowMatchesNothing() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        db.pendingSendDao().upsert(PendingSendEntity("k", "apofis-a", "hello", "{}", 1_000L, "sending", "run_1", null))
+        // Kept text all blank: the stored prefix of anything, so it must confirm nothing.
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", " ".repeat(400_000) + "elsewhere"))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        val users = repo.transcript("apofis-a").first().filterIsInstance<UserMessage>()
+        assertTrue(users[0].shortened)
+        assertEquals(listOf("u1", "pk"), users.map { it.key }) // the pending bubble stays
+    }
+
+    @Test
+    fun droppedCountCountsOnlyCalls() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        // Under the per-field limit the array is stored as sent, with elements the transcript never shows as calls.
+        val calls = """[1,"x",{"name":"no id"},{"id":"c1","function":{"name":"a","arguments":"{}"}},{"call_id":"c2","name":"b"}]"""
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", "go"), cutRow(2, "assistant", "a".repeat(399_990), calls = calls))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertWithinBound(db)
+        val row = db.messageDao().rows("apofis-a")[1]
+        assertNull(row.toolCallsJson)
+        assertEquals(2, row.droppedToolCalls)
+    }
+
+    @Test
+    fun cutChecksTheRowsOwnHints() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        db.imageBindingDao().upsert(ImageBindingEntity("apofis-a", 2, cutD1))
+        // Two rows with one id: the short one supports the binding, the long one names another photo.
+        val long = "p".repeat(399_990) + cutBlock(cutD2)
+        respond(rawMessages("apofis-a", listOf(cutRow(2, "user", "x" + cutBlock(cutD1)), cutRow(2, "user", long))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertEquals(long.take(400_000), db.messageDao().rows("apofis-a")[1].content) // cut from its tail, not parsed
+        assertEquals(mapOf(2L to cutD1), db.imageBindingDao().forSession("apofis-a").associate { it.messageId to it.digests })
+    }
+
+    @Test
+    fun rowRecutWhenItsBindingAppears() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        val caption = "q".repeat(399_990)
+        val raw = caption + cutBlock(cutD1)
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", raw))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertEquals(raw.take(400_000), db.messageDao().rows("apofis-a").single().content) // no binding yet: the tail cut
+
+        db.imageBindingDao().upsert(ImageBindingEntity("apofis-a", 1, cutD1))
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", raw))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertEquals(caption, db.messageDao().rows("apofis-a").single().content) // the next sync stores the caption
+        assertEquals(listOf(cutD1), repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single().images)
+    }
+
+    @Test
+    fun callThatFitsExactlyIsKept() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        val calls = """[{"id":"a"},{"id":"b"},{"id":"c"}]""" // 34 units; each call costs 10 plus a comma or bracket
+        respond(
+            rawMessages(
+                "apofis-a",
+                listOf(
+                    cutRow(1, "assistant", "a".repeat(400_000 - 23), calls = calls), // 23 left: exactly two calls
+                    cutRow(2, "assistant", "a".repeat(400_000 - 22), calls = calls), // one unit less: one call
+                ),
+            ),
+        )
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertWithinBound(db)
+        val rows = db.messageDao().rows("apofis-a")
+        assertEquals("""[{"id":"a"},{"id":"b"}]""", rows[0].toolCallsJson)
+        assertEquals(1, rows[0].droppedToolCalls)
+        assertEquals("""[{"id":"a"}]""", rows[1].toolCallsJson)
+        assertEquals(2, rows[1].droppedToolCalls)
     }
 }

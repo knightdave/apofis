@@ -121,6 +121,7 @@ internal fun UserBubble(
                 if (!expanded) SmallTextButton(R.string.chat_show_more, { expanded = true })
             }
         }
+        if (message.shortened) Caption(R.string.chat_reply_shortened)
         if (message.steered && message.state == SendState.SENT) Caption(R.string.chat_steered) // delivered
         // Before the early return: ordinary stored bubbles have no idempotency key. Offset so the icons end at the bubble's edge.
         if (message.state == SendState.SENT) MessageActionRow(message, actions, Modifier.offset(x = 16.dp), alignEnd = true)

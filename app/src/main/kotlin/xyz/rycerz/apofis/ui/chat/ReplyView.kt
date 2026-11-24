@@ -143,7 +143,7 @@ internal fun CodeSurface(modifier: Modifier = Modifier, content: @Composable () 
  * shown only while the chat has no live or unsettled run ([active], see [unsettled]). A CHANGED note shows inside the
  * block of the request that replaced the answered one, and only while that request is drawn (GONE notes: [GoneRow]).
  */
-@NonSkippableComposable // comparing two replies would compare their steps one by one; it reads only text and outcome
+@NonSkippableComposable // comparing two replies would compare their steps one by one; it reads only text, outcome and cut marks
 @Composable
 internal fun ReplyFooter(
     reply: AssistantReply,
@@ -188,6 +188,8 @@ internal fun ReplyFooter(
             ReplyOutcome.INTERRUPTED -> Notice(R.string.chat_outcome_interrupted, error = true)
             null -> Unit
         }
+        if (reply.droppedToolCalls > 0) Notice(R.string.chat_tool_calls_not_stored, count = reply.droppedToolCalls)
+        if (reply.shortened) Notice(R.string.chat_reply_shortened)
         // The first icon lines up with the 20 dp text inset (a 16 dp icon centred in its 48 dp target).
         if (rowActions != null && !reply.live && !active && hasText(reply.text)) { // the tap check's own bounded rule
             MessageActionRow(reply, rowActions, Modifier.padding(start = 4.dp))
@@ -243,7 +245,7 @@ private fun Label(@StringRes text: Int) {
 
 /** An info line under a reply, optionally with one action; [error]: the alert icon and the error color. */
 @Composable
-internal fun Notice(@StringRes text: Int, @StringRes action: Int? = null, onAction: () -> Unit = {}, error: Boolean = false) {
+internal fun Notice(@StringRes text: Int, @StringRes action: Int? = null, onAction: () -> Unit = {}, error: Boolean = false, count: Int? = null) {
     val tint = if (error) MaterialTheme.colorScheme.error else ApofisTheme.colors.muted
     Row(
         Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },
@@ -252,7 +254,7 @@ internal fun Notice(@StringRes text: Int, @StringRes action: Int? = null, onActi
         Icon(painterResource(if (error) R.drawable.lucide_triangle_exclamation_point else R.drawable.lucide_info), null, Modifier.size(15.dp), tint = tint)
         Box(Modifier.width(6.dp))
         Text(
-            stringResource(text),
+            if (count == null) stringResource(text) else stringResource(text, count),
             Modifier.weight(1f).padding(vertical = 14.dp),
             style = MaterialTheme.typography.labelMedium,
             color = tint,
