@@ -21,7 +21,7 @@ class ImageStoreTest {
     private val store = ImageStore(dir, clock = { now })
 
     // SHA-256 of the three ASCII bytes "abc" (FIPS 180-2, appendix B.1): an independent check of the name.
-    private val abc = "abc".toByteArray()
+    private val abc = bytes("abc")
     private val abcSha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
     private fun names() = dir.list()!!.sorted()

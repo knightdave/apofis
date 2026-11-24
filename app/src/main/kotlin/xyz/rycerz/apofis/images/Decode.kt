@@ -57,8 +57,9 @@ sealed interface Encoded {
 }
 
 /**
- * A `Bytes` array must not change until the call returns. A `Stored` file is a file of the app's private
- * directories, trusted to be a regular file that does not change while it is read.
+ * Treat an array passed to ImageInput.Bytes as immutable; after cancellation or timeout a detached decoder may
+ * still read it, so do not reuse or mutate that array. A `Stored` file is a file of the app's private directories,
+ * trusted to be a regular file that does not change while it is read.
  */
 sealed interface ImageInput {
     data class Content(val uri: Uri) : ImageInput
@@ -125,9 +126,9 @@ private class Request<T : Any>(private val dispose: (T) -> Unit) {
         abandoned.set(true)
         worker?.cancel() // wakes a worker waiting for the gate; no effect on blocking code
         decodeWork.launch {
-            signal.cancel()
+            runCatching { signal.cancel() }
             runCatching { descriptor.getAndSet(null)?.close() }
-            disposeUnclaimed()
+            runCatching { disposeUnclaimed() }
         }
     }
 }
@@ -198,10 +199,13 @@ private suspend fun <T : Any> admit(
     if (longestSide <= 0) throw Fail(ImageFailure.UNREADABLE)
     if (input is ImageInput.Bytes && input.bytes.size > limits.maxSourceBytes) throw Fail(ImageFailure.TOO_LARGE)
     val content = input is ImageInput.Content
-    if (content && !copySlots.tryAcquire()) throw Fail(ImageFailure.BUSY)
-    var slotHeld = content // by this caller until the worker starts
+    // Everything that allocates comes before the slot, so only the launch sits between taking it and the worker.
     val request = Request(dispose)
     var worker: Job? = null
+    var delivered = false
+    var slotHeld = false // by this caller from tryAcquire until the worker starts
+    if (content && !copySlots.tryAcquire()) throw Fail(ImageFailure.BUSY)
+    slotHeld = content
     fun start() {
         slotHeld = false
         worker = try {
@@ -218,18 +222,18 @@ private suspend fun <T : Any> admit(
     try {
         val copied = if (content) withTimeoutOrNull(limits.sourceDeadlineMs) { start(); request.copied.await() } else start()
         if (copied == null || withTimeoutOrNull(ImageLimits.GATE_WAIT_MS) { request.admitted.await() } == null) {
-            request.abandon(worker)
             throw Fail(ImageFailure.UNREADABLE)
         }
         request.done.await()
-    } catch (e: CancellationException) {
-        request.abandon(worker)
-        throw e
+        request.failure?.let { throw Fail(it) }
+        val value = request.take() ?: throw Fail(ImageFailure.UNREADABLE)
+        delivered = true
+        return value
     } finally {
+        // Every exit that did not deliver abandons: timeout, cancellation, failure or any other throw.
+        if (!delivered) request.abandon(worker)
         if (slotHeld) copySlots.release()
     }
-    request.failure?.let { throw Fail(it) }
-    return request.take() ?: throw Fail(ImageFailure.UNREADABLE)
 }
 
 /** The worker: copy, gate, decode, use; then everything given back, then the result reported. */
@@ -246,6 +250,7 @@ private suspend fun <T : Any> Request<T>.work(
     var produced: T? = null
     var failed: ImageFailure? = null
     try {
+        checkWanted() // a caller that left before this worker's first step gets no provider call
         val source = if (input is ImageInput.Content) {
             if (!contentAllowed(context, input.uri)) throw Fail(ImageFailure.NOT_AN_IMAGE)
             checkWanted()
@@ -263,23 +268,36 @@ private suspend fun <T : Any> Request<T>.work(
         produced = gate.withLock {
             checkWanted() // an abandoned request starts no decode
             admitted.complete(Unit)
-            use(decodeGated(source, longestSide, software, limits, decode))
+            val bitmap = decodeGated(source, longestSide, software, limits, decode)
+            // The use step borrows the bitmap; it is recycled here unless it is the result itself (a plain decode).
+            var result: T? = null
+            try {
+                checkWanted() // a caller that left during the decode gets no encode
+                result = use(bitmap)
+            } finally {
+                if (result !== bitmap) bitmap.recycle()
+            }
+            result
         }
     } catch (e: Fail) {
         failed = e.reason
     } catch (e: Throwable) {
         failed = ImageFailure.UNREADABLE
     } finally {
+        // Each step runs even when an earlier one throws; the slot and the report never depend on close or delete.
         runCatching { descriptor.getAndSet(null)?.close() }
-        temp?.delete() // shortcut: a failed delete still returns the slot; clearDecodeTemps removes the file at the next start
-        if (input is ImageInput.Content) copySlots.release()
+        runCatching { temp?.delete() } // shortcut: a failed delete still returns the slot; clearDecodeTemps removes the file at the next start
+        try {
+            if (input is ImageInput.Content) copySlots.release()
+        } finally {
+            value = produced
+            failure = failed
+            done.complete(Unit)
+            copied.complete(Unit)
+            admitted.complete(Unit)
+            if (abandoned.get()) disposeUnclaimed() // value published first, then checked: see Request.abandon
+        }
     }
-    value = produced
-    failure = failed
-    done.complete(Unit)
-    copied.complete(Unit)
-    admitted.complete(Unit)
-    if (abandoned.get()) disposeUnclaimed() // value published first, then checked: see Request.abandon
 }
 
 /** Scheme content only, a provider of another package, no user info in the authority. */
@@ -310,7 +328,7 @@ private fun copyCapped(input: InputStream, file: File, max: Long, abandoned: Ato
 }
 
 /** Runs on the worker while it holds the gate. The bitmap is checked against the target the header set. */
-private fun decodeGated(
+private fun Request<*>.decodeGated(
     input: ImageInput,
     longestSide: Int,
     software: Boolean,
@@ -337,6 +355,7 @@ private fun decodeGated(
         else -> ImageDecoder.createSource((input as ImageInput.Stored).file)
     }
     var target: Pair<Int, Int>? = null
+    checkWanted() // a caller that left during the sniff gets no codec
     val bitmap = decode(source) { decoder, info, _ ->
         val width = info.size.width.toLong()
         val height = info.size.height.toLong()
@@ -371,8 +390,8 @@ internal fun targetSize(width: Long, height: Long, side: Int): Pair<Int, Int>? {
     return maxOf(1L, width * side / longest).toInt() to maxOf(1L, height * side / longest).toInt()
 }
 
-/** White canvas, JPEG at quality 85; both bitmaps recycled. */
-internal fun flatJpeg(bitmap: Bitmap): ByteArray = try {
+/** White canvas, JPEG at quality 85. Borrows [bitmap]; recycles only its own white copy. */
+internal fun flatJpeg(bitmap: Bitmap): ByteArray {
     val flat = createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
     try {
         Canvas(flat).apply {
@@ -381,12 +400,10 @@ internal fun flatJpeg(bitmap: Bitmap): ByteArray = try {
         }
         val out = ByteArrayOutputStream()
         if (!flat.compress(Bitmap.CompressFormat.JPEG, ImageLimits.JPEG_QUALITY, out)) throw Fail(ImageFailure.UNREADABLE)
-        out.toByteArray()
+        return out.toByteArray()
     } finally {
         flat.recycle()
     }
-} finally {
-    bitmap.recycle()
 }
 
 private val LABELS = mapOf(

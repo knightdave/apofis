@@ -3,6 +3,8 @@ package xyz.rycerz.apofis.images
 import android.app.Application
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.ContextWrapper
+import android.content.pm.PackageManager
 import android.content.pm.ProviderInfo
 import android.content.res.AssetFileDescriptor
 import android.database.Cursor
@@ -28,8 +30,6 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.concurrent.thread
 import java.util.zip.CRC32
 import java.util.zip.Deflater
 import kotlinx.coroutines.CompletableDeferred
@@ -135,9 +135,13 @@ class DecodeTest {
 
     @After
     fun tearDown() = runBlocking {
-        releases.forEach { it() }
-        withTimeout(10_000) { workers().joinAll() }
-        disposals.forEach { it() }
+        try {
+            releases.forEach { it() }
+            withTimeout(10_000) { workers().joinAll() }
+        } finally {
+            // A failed release or join cannot skip closing both FIFO ends and unlinking them.
+            disposals.forEach { runCatching { it() } }
+        }
         assertFalse("a 10 s hold expired: the test did not release it", holdExpired.get())
         // Every success, failure, timeout and cancellation above has deleted its temp file.
         assertEquals(emptyList<String>(), temps())
@@ -174,6 +178,12 @@ class DecodeTest {
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
             throw AssertionError("not reached within 10 s: $what")
         }
+    }
+
+    /** True when some thread is inside the copy loop's file read: a FileInputStream read frame above copyCapped. */
+    private fun copyBlockedInRead() = Thread.getAllStackTraces().values.any { stack ->
+        val read = stack.indexOfFirst { it.className == "java.io.FileInputStream" && it.methodName.startsWith("read") }
+        read >= 0 && stack.drop(read + 1).any { it.className.startsWith("xyz.rycerz.apofis.images.") && it.methodName.startsWith("copyCapped") }
     }
 
     /** A 10 s hold released by the test; expiry marks the test failed and never lets the fixture go on. */
@@ -227,23 +237,6 @@ class DecodeTest {
 
         /** Bytes written and not yet read by anyone (FIONREAD); never consumes them. */
         fun unread() = FileInputStream(writer.fd).available()
-
-        /** Reads off what nobody else reads, until [finished]; a read only when bytes wait, so it never blocks. */
-        fun drain(finished: () -> Boolean) {
-            val buffer = ByteArray(64 * 1024)
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-            while (true) {
-                val waiting = unread()
-                when {
-                    waiting > 0 -> writer.read(buffer, 0, minOf(waiting, buffer.size))
-                    finished() -> return
-                    else -> {
-                        check(System.nanoTime() < deadline) { "drain not finished within 10 s" }
-                        Thread.yield()
-                    }
-                }
-            }
-        }
 
         fun end() { runCatching { writer.close() } }
     }
@@ -569,38 +562,30 @@ class DecodeTest {
         val exact = decode(ImageInput.Content(uri("img")), limits = DecodeLimits(maxSourceBytes = n), decoder = counting(calls)).bitmap()
         assertEquals(20 to 20, exact.width to exact.height)
         assertEquals(1, calls.get())
-        assertEquals(TOO_LARGE, decode(ImageInput.Content(uri("img")), limits = DecodeLimits(maxSourceBytes = n - 1), decoder = counting(calls)).reason())
+        // One byte too many, with the writer still open and no end of file: the copy itself stops, not a later check.
+        assertTrue(n < 64 * 1024) // fits the pipe's buffer, so filling it cannot block
+        Stall("over", bytes)
+        assertEquals(TOO_LARGE, within10s { decode(ImageInput.Content(uri("over")), limits = DecodeLimits(maxSourceBytes = n - 1), decoder = counting(calls)) }.reason())
         assertEquals(emptyList<String>(), temps())
         route("empty") { fileAfd(ByteArray(0)) }
         assertEquals(NOT_AN_IMAGE, decode(ImageInput.Content(uri("empty")), limits = DecodeLimits(maxSourceBytes = 0), decoder = counting(calls)).reason())
-        route("one") { fileAfd(ByteArray(1)) }
-        assertEquals(TOO_LARGE, decode(ImageInput.Content(uri("one")), limits = DecodeLimits(maxSourceBytes = 0), decoder = counting(calls)).reason())
+        Stall("one", ByteArray(1))
+        assertEquals(TOO_LARGE, within10s { decode(ImageInput.Content(uri("one")), limits = DecodeLimits(maxSourceBytes = 0), decoder = counting(calls)) }.reason())
         assertEquals(1, calls.get())
         assertEquals(emptyList<String>(), temps())
     }
 
     @Test
     fun endlessStream() = runBlocking {
-        val cap = 1L shl 20
-        val total = 4 * cap
-        val stall = Stall("long")
-        val written = AtomicLong()
-        val feeder = thread {
-            val chunk = ByteArray(16 * 1024)
-            // Blocks while the pipe is full; ends when all is written or the writer is closed.
-            runCatching { while (written.get() < total) { stall.feed(chunk); written.addAndGet(chunk.size.toLong()) } }
-        }
+        // The cap plus one byte, then nothing: the writer stays open, so no end of file ever comes.
+        val cap = 16L * 1024
+        assertTrue(cap + 1 < 64 * 1024) // fits the pipe's buffer, so filling it cannot block
+        Stall("long", ByteArray((cap + 1).toInt()))
         val calls = AtomicInteger()
         val result = within10s { decode(ImageInput.Content(uri("long")), limits = DecodeLimits(maxSourceBytes = cap), decoder = counting(calls)) }
-        val writtenAtStop = written.get()
         assertEquals(TOO_LARGE, result.reason())
         assertEquals(0, calls.get())
         assertEquals(emptyList<String>(), temps())
-        // The copy stopped at the cap: at most one 64 KiB read past it, plus the pipe's 64 KiB buffer, was written.
-        assertTrue("written $writtenAtStop", writtenAtStop <= cap + 256 * 1024)
-        stall.drain { !feeder.isAlive }
-        feeder.join(10_000)
-        assertEquals(total, written.get())
     }
 
     @Test
@@ -634,8 +619,7 @@ class DecodeTest {
         val stall = Stall("stall")
         val result = onClock(ImageInput.Content(uri("stall")))
         within10s { stall.opened.await() }
-        stall.feed(byteArrayOf(0x42))
-        until("the copy is in its read loop") { tempLengths() == listOf(1L) }
+        until("the copy is blocked in its read") { copyBlockedInRead() }
         step(19_999)
         assertFalse(result.isCompleted)
         val before = workers().toSet()
@@ -812,8 +796,7 @@ class DecodeTest {
         val one = Stall("one")
         val caller = launch(Dispatchers.Default) { decode(ImageInput.Content(uri("one"))) }
         within10s { one.opened.await() }
-        one.feed(byteArrayOf(0x42))
-        until("the copy is in its read loop") { tempLengths() == listOf(1L) }
+        until("the copy is blocked in its read") { copyBlockedInRead() }
         val worker: Job = workers().single()
         within10s { caller.cancelAndJoin() } // gives up at once, the read still blocks
         assertFalse(worker.isCompleted)
@@ -848,6 +831,59 @@ class DecodeTest {
         val delivered = decode(ImageInput.Bytes(png(10, 10))).bitmap()
         within10s { workers().joinAll() }
         assertFalse(delivered.isRecycled)
+    }
+
+    @Test
+    fun cancelledUploadStartsNoEncode() = runBlocking {
+        val held = Held()
+        val encodes = AtomicInteger()
+        val caller = launch(Dispatchers.Default) {
+            toUploadJpeg(ctx, ImageInput.Bytes(png(20, 10)), DecodeLimits(), held.decoder) { b -> encodes.incrementAndGet(); flatJpeg(b) }
+        }
+        within10s { held.entered.await() }
+        within10s { caller.cancelAndJoin() }
+        held.release()
+        within10s { workers().joinAll() }
+        // The caller left during the decode: no white copy and no encode start, and the decoded bitmap is recycled.
+        assertEquals(0, encodes.get())
+        assertTrue(held.bitmap!!.isRecycled)
+        assertTrue(within10s { decode(ImageInput.Bytes(png(10, 10))) } is Decoded.Ok)
+    }
+
+    @Test
+    fun callerGoneBeforeFirstStepMakesNoProviderCall() = runBlocking {
+        val lookups = AtomicInteger()
+        val counted = object : ContextWrapper(ctx) {
+            override fun getPackageManager(): PackageManager {
+                lookups.incrementAndGet()
+                return super.getPackageManager()
+            }
+        }
+        route("x") { fileAfd(png(4, 4)) }
+        // Every IO thread is held, so the worker cannot take its first step until its caller has left.
+        assertNull(System.getProperty("kotlinx.coroutines.io.parallelism"))
+        val threads = maxOf(64, Runtime.getRuntime().availableProcessors())
+        val started = CountDownLatch(threads)
+        val free = CountDownLatch(1)
+        releases += { free.countDown() }
+        val blockers = List(threads) {
+            CoroutineScope(Dispatchers.IO).launch {
+                started.countDown()
+                free.await(10, TimeUnit.SECONDS)
+            }
+        }
+        try {
+            assertTrue(started.await(10, TimeUnit.SECONDS))
+            val result = async(virtual) { decodeBounded(counted, ImageInput.Content(uri("x")), ImageLimits.VIEW_SIDE, true, DecodeLimits(), real) }
+            step(20_000)
+            assertEquals(UNREADABLE, within10s { result.await() }.reason())
+        } finally {
+            free.countDown()
+        }
+        within10s { blockers.joinAll() }
+        within10s { workers().joinAll() }
+        assertEquals(0, lookups.get())
+        assertEquals(0, opens("x"))
     }
 
     // Step 2: sizes, failures, formats.
