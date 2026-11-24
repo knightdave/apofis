@@ -76,6 +76,10 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         }
     }
 
+    /** The models of the server's configured providers, for the model sheet; never stored. */
+    suspend fun modelOptions(): ModelOptions =
+        get<ModelOptionsDto>(url("api/model/options") { addQueryParameter("include_unconfigured", "false") }).options()
+
     suspend fun messages(sessionId: String, limit: Int = 500, offset: Int = 0): MessagePage = get(
         url("api/sessions", sessionId, "messages") {
             addQueryParameter("limit", "$limit").addQueryParameter("offset", "$offset")
