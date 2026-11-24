@@ -739,8 +739,14 @@ class TemporaryLeaveTest : TemporaryFixture() {
         vm.selected.await { it == T }
         val caller = StandardTestDispatcher(TestCoroutineScheduler()) // runs only when the test says so
         val share = side.launch(caller) { vm.openFreshChatIf(T, { false }) {} }
-        caller.scheduler.runCurrent() // inserts the fresh row; its return waits on the caller
-        until { db.sessionDao().all().size == 2 }
+        // Driven step by step until the fresh row is inserted, checked before each step: its return then waits on the
+        // caller, and the cancellation lands before it.
+        until {
+            db.sessionDao().all().size == 2 || run {
+                caller.scheduler.runCurrent()
+                false
+            }
+        }
         share.cancel()
         until {
             caller.scheduler.runCurrent()
