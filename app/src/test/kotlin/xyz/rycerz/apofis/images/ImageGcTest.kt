@@ -13,7 +13,10 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
@@ -130,6 +133,18 @@ class ImageGcTest {
         routes["GET /api/sessions/$key/messages"] = 200 to """{"object":"list","session_id":"$key","data":[$data]}"""
     }
 
+    /**
+     * Deletes [key] and waits until the collection that Delete started has finished, without running one itself: the
+     * pass signals from inside the store's lock, so taking the lock afterwards waits for that pass to end.
+     */
+    private fun deleteAndAwaitItsCollection(key: String) {
+        val started = CompletableDeferred<Unit>()
+        c.beforeImageRows = { c.beforeImageRows = {}; started.complete(Unit) }
+        wait { c.connected()!!.repo.delete(key) }
+        wait { started.await() } // fails on the watchdog when the Delete starts no collection
+        wait { c.imageStore.lock.withLock { } }
+    }
+
     private fun readyDraft(key: String, d: String) = c.composer.setImage(c.composer.addImages(key, 1).single(), d)
 
     @Test
@@ -225,16 +240,12 @@ class ImageGcTest {
         val young = file(2, ageMs = MINUTE)
         bind("apofis-x", 1, old, young)
         deleteAnswers("apofis-x")
-        val started = CompletableDeferred<Unit>()
-        c.beforeImageRows = { c.beforeImageRows = {}; started.complete(Unit) }
-        wait { c.connected()!!.repo.delete("apofis-x") }
-        wait { started.await() } // the collection the Delete started
-        wait { c.collectImages() } // waits behind it under the store's lock
+        deleteAndAwaitItsCollection("apofis-x")
         assertEquals(emptyList<Any>(), bindings("apofis-x"))
         assertFalse(exists(old))
         assertTrue(exists(young))
         age(young)
-        wait { c.collectImages() }
+        wait { c.collectImages() } // a later pass, once the young file is old enough
         assertFalse(exists(young))
     }
 
@@ -247,11 +258,9 @@ class ImageGcTest {
         bind("apofis-2", 5, d)
         deleteAnswers("apofis-1")
         deleteAnswers("apofis-2")
-        wait { c.connected()!!.repo.delete("apofis-1") }
-        wait { c.collectImages() } // behind the one the Delete started
+        deleteAndAwaitItsCollection("apofis-1")
         assertTrue(exists(d))
-        wait { c.connected()!!.repo.delete("apofis-2") }
-        wait { c.collectImages() }
+        deleteAndAwaitItsCollection("apofis-2")
         assertFalse(exists(d))
     }
 
@@ -370,16 +379,27 @@ class ImageGcTest {
         val gate = CompletableDeferred<Unit>()
         c.beforeImageRows = { entered.complete(Unit); gate.await() }
         var after = false
-        wait {
-            c.connected()!!.repo.delete("apofis-x") // the watchdog fails if this waits for the held collection
-            after = true // the drawer's cleanup after a Delete
+        val repo = c.connected()!!.repo
+        runBlocking {
+            val deleting = launch(Dispatchers.Default) {
+                repo.delete("apofis-x")
+                after = true // the drawer's cleanup after a Delete
+            }
+            try {
+                // The watchdog fails the test if the Delete waits for the held collection, also uncancellably: the gate
+                // opens in the finally, so the child always ends before this scope is left.
+                withTimeout(10_000) {
+                    entered.await()
+                    deleting.join()
+                }
+            } finally {
+                c.beforeImageRows = {}
+                gate.complete(Unit)
+            }
         }
         assertTrue(after)
         assertNull(wait { db.sessionDao().get("apofis-x") })
-        wait { entered.await() } // the collection it started is still held
-        c.beforeImageRows = {}
-        gate.complete(Unit)
-        wait { c.collectImages() } // behind the released one
+        wait { c.imageStore.lock.withLock { } } // the released pass has ended
     }
 
     @Test
