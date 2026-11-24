@@ -898,7 +898,7 @@ class SendQueueTest {
         addSession("apofis-a")
         running("apofis-a")
         val refused = holding.hold(MockResponse.Builder().code(400).body("{}").build())
-        respond(fixture("session_delete.json"))
+        respond("""{"object":"hermes.session.deleted","id":"apofis-a","deleted":true}""")
         val repo = ChatRepository(api, db, { clock }, queue)
         val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
         take()
