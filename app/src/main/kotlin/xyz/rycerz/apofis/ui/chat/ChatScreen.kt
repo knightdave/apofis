@@ -334,39 +334,51 @@ fun ChatScreen(
                         )
                     }
                     Uncovered(barHeight, bottomArea, fullScreen = true, dragArea) {
-                        CompositionLocalProvider(LocalChatFontScale provides fontScale.value) {
-                            MessageList(
-                                state.items,
-                                state.live,
-                                state.notes,
-                                state.answering,
-                                c.actions,
-                                onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
-                                onStep = { step -> gate.pass { detail = step } },
-                                listState = listState,
-                                contentPadding = padding,
-                                zone = c.zone,
-                                today = c.today,
-                                modifier = Modifier
-                                    .backdropSource(backdrop, surface)
-                                    .drawWithContent {
-                                        drawContent()
-                                        // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
-                                        // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom
-                                        // edge (above the insets and the card's outer margin, Composer.kt) and below it: text
-                                        // and controls at the bottom are never washed out, text passing behind the composer fades.
-                                        val rest = size.height - bottomArea - 8.dp.toPx()
-                                        val edge = size.height - (bottomArea - bottomContent) - COMPOSER_MARGIN.toPx()
-                                        if (edge > rest) {
-                                            drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
-                                        }
-                                        drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
-                                    },
-                                onLink = { url -> gate.pass { linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure } },
-                                onSelect = { key -> gate.pass { selectKey = key } },
-                                current = current.value?.let { now -> { now().items } },
-                                onRevealGrew = follow::onGrew, // the follower read through the objects holder above
-                            )
+                        Box(propagateMinConstraints = true) { // the list keeps the whole screen; the skeleton lies over it
+                            CompositionLocalProvider(LocalChatFontScale provides fontScale.value) {
+                                MessageList(
+                                    state.items,
+                                    state.live,
+                                    state.notes,
+                                    state.answering,
+                                    c.actions,
+                                    onCancel = { it.idempotencyKey?.let(c.actions::onCancel) },
+                                    onStep = { step -> gate.pass { detail = step } },
+                                    listState = listState,
+                                    contentPadding = padding,
+                                    zone = c.zone,
+                                    today = c.today,
+                                    modifier = Modifier
+                                        .backdropSource(backdrop, surface)
+                                        .drawWithContent {
+                                            drawContent()
+                                            // Inside the source, so the sharp list and any blurred sample of it both fade. Clear where
+                                            // the last row rests (8 dp above the bottom area), opaque at the composer card's bottom
+                                            // edge (above the insets and the card's outer margin, Composer.kt) and below it: text
+                                            // and controls at the bottom are never washed out, text passing behind the composer fades.
+                                            val rest = size.height - bottomArea - 8.dp.toPx()
+                                            val edge = size.height - (bottomArea - bottomContent) - COMPOSER_MARGIN.toPx()
+                                            if (edge > rest) {
+                                                drawRect(Brush.verticalGradient(0f to surface.transparent(), 1f to surface, startY = rest, endY = edge), Offset(0f, rest), Size(size.width, edge - rest))
+                                            }
+                                            drawRect(surface, Offset(0f, edge), Size(size.width, size.height - edge))
+                                        },
+                                    onLink = { url -> gate.pass { linkFailed = runCatching { objects.value.uri.openUri(url) }.isFailure } },
+                                    onSelect = { key -> gate.pass { selectKey = key } },
+                                    current = current.value?.let { now -> { now().items } },
+                                    onRevealGrew = follow::onGrew, // the follower read through the objects holder above
+                                )
+                            }
+                            // The first fetch of a chat with no stored rows, over the still empty list (decision 27: no delay).
+                            if (state.firstLoad && state.items.isEmpty()) {
+                                ChatSkeleton(
+                                    Modifier.padding(
+                                        start = padding.calculateStartPadding(direction) + 16.dp,
+                                        end = padding.calculateEndPadding(direction) + 16.dp,
+                                        top = with(density) { barHeight.toDp() } + 24.dp,
+                                    ),
+                                )
+                            }
                         }
                     }
                     // Only where its 48 dp target fits in the uncovered band: otherwise not composed at all, so a button

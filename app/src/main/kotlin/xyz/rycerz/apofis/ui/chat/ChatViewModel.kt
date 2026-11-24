@@ -66,6 +66,7 @@ data class ChatUiState(
     val loaded: Boolean = true, // false only before the stored transcript first arrives (items empty but not known empty)
     val choice: ChatModel = ChatModel(), // the chat's model choice, stored on this phone only
     val sheet: ChoiceSheet? = null, // the model or reasoning sheet while it is open
+    val firstLoad: Boolean = false, // the history of a chat with no stored rows is being fetched for the first time
 )
 
 /** The reasoning sheet's levels: null is the server's default, "none" is Off; five of the server's eight (decision 19). */
@@ -159,6 +160,7 @@ private data class Local(
     val confirmCancel: String? = null,
     val confirmDiscard: Long? = null,
     val sheet: ChoiceSheet? = null,
+    val firstLoad: Boolean = false,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean, val choice: ChatModel)
@@ -223,6 +225,7 @@ class ChatViewModel(
             draftRevision = c.revision,
             choice = e.choice,
             sheet = l.sheet,
+            firstLoad = l.firstLoad,
         )
     }.stateIn(
         viewModelScope,
@@ -247,14 +250,21 @@ class ChatViewModel(
     /**
      * The chat was opened, now or again (a tap on its row while it is shown): fetches its history when it needs it.
      * Decided by the session row alone; unsent bubbles say nothing about the cache. A local-only chat makes no request.
-     * A failure shows on the status line.
+     * A failure shows on the status line. The first fetch of a chat with no stored rows sets [ChatUiState.firstLoad]
+     * (the skeleton) until it ends: success, failure or cancellation; a stale chat with stored rows is fetched without it.
      */
     fun onOpened() {
         if (opening?.isActive == true) return // one load at a time: the one running reads the newest state anyway
         opening = launchRequest {
             val session = repo.session(sessionKey).first()
-            if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
+            if (session == null || !session.existsOnServer) return@launchRequest
+            val first = !repo.hasCachedMessages(sessionKey)
+            if (!first && !session.stale) return@launchRequest
+            local.update { it.copy(firstLoad = first) }
+            try {
                 repo.syncMessages(sessionKey)
+            } finally {
+                local.update { it.copy(firstLoad = false) } // single flight: no other open can have set it meanwhile
             }
         }
     }
