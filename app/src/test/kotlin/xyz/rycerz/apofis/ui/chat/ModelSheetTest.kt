@@ -315,6 +315,7 @@ class ModelSheetTest {
         val release = CountDownLatch(1).also { latches += it }
         routes[OPTIONS] = { release.await(10, TimeUnit.SECONDS); json(minimal)(it) }
         val vm = vm()
+        rule.waitUntil(10_000) { vm.state.value.loaded } // the state follows the sheet only once every source has spoken
         val fetching = vm.launchedBy { vm.openModelSheet() } // with any history check the chat's first state started
         rule.waitUntil(10_000) { optionRequests() == 1 }
         open.set(false) // a server or key switch closed this connection: its generation is over
@@ -333,10 +334,12 @@ class ModelSheetTest {
         val release = CountDownLatch(1).also { latches += it }
         routes[OPTIONS] = { release.await(10, TimeUnit.SECONDS); json(minimal)(it) }
         val a = vm()
+        rule.waitUntil(10_000) { a.state.value.loaded }
         val fetching = a.launchedBy { a.openModelSheet() } // with any history check the chat's first state started
         rule.waitUntil(10_000) { optionRequests() == 1 }
         stores.single().clear() // another chat opened: AppNav clears the view model of the chat it leaves
         val b = vm("apofis-b")
+        rule.waitUntil(10_000) { b.state.value.loaded }
         release.countDown()
         runBlocking { withTimeout(10_000) { fetching.joinAll() } }
         assertTrue("the request ended with its chat", fetching.any { it.isCancelled })
