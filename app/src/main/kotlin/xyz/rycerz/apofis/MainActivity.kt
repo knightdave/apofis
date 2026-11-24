@@ -10,6 +10,7 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -22,6 +23,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.ui.AppNav
+import xyz.rycerz.apofis.ui.image.LocalImageStore
+import xyz.rycerz.apofis.ui.image.LocalThumbCache
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.isDarkTheme
 
@@ -58,6 +61,7 @@ class MainActivity : ComponentActivity() {
             val dynamicColor by prefs.dynamicColor.collectAsState()
             val pureBlack by prefs.pureBlack.collectAsState()
             val blur by prefs.blur.collectAsState()
+            val connection by container.connection.collectAsState()
             val dark = isDarkTheme(mode)
             // System bar icons follow the app theme, which may differ from the system one.
             DisposableEffect(dark) {
@@ -68,7 +72,10 @@ class MainActivity : ComponentActivity() {
             // Frosted glass is the user's switch (off by default): its cost is judged on a phone, not measured here.
             ApofisTheme(mode, dynamicColor, pureBlack, hapticsEnabled = { prefs.haptics.value }, blur = blur) {
                 // Test tags become resource ids, so the end-to-end tests find chat items by their opaque keys.
-                Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
+                // The image store is the container's; the thumbnails belong to the current connection.
+                CompositionLocalProvider(LocalImageStore provides container.imageStore, LocalThumbCache provides connection?.thumbs) {
+                    Box(Modifier.semantics { testTagsAsResourceId = true }) { AppNav(container) }
+                }
             }
         }
     }
