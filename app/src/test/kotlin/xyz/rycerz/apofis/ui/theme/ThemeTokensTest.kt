@@ -101,6 +101,9 @@ class ThemeTokensTest {
             floor("onSurfaceVariant on timelineFill", scheme.onSurfaceVariant, c.timelineFill, 4.5) // control card text
             floor("slider unfilled track (outline) on cardFill", scheme.outline, c.cardFill, 3.0) // the chat text size slider
             floor("clarify field idle border on timelineFill", c.timelineOutline, c.timelineFill, 3.0)
+            floor("image placeholder glyph and failure caption (muted text) on thumbPlaceholder", c.muted, c.thumbPlaceholder, 4.5)
+            floor("thumbChipGlyph on thumbChip", c.thumbChipGlyph, c.thumbChip, 3.0)
+            floor("onViewer on viewerBackdrop", c.onViewer, c.viewerBackdrop, 4.5)
         }
         assertEquals(emptyList<String>(), failures)
     }

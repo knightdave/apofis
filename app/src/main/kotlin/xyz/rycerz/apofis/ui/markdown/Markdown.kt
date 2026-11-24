@@ -29,6 +29,7 @@ import org.commonmark.node.StrongEmphasis
 import org.commonmark.node.Text
 import org.commonmark.node.ThematicBreak
 import java.net.URI
+import java.util.Base64
 import java.net.URISyntaxException
 import org.commonmark.parser.Parser
 
@@ -48,8 +49,12 @@ sealed interface MdBlock {
     data class ListBlock(val ordered: Boolean, val start: Int, val items: List<MdListItem>, val tight: Boolean = true) : MdBlock
     data class Table(val header: List<MdText>, val align: List<Align>, val rows: List<List<MdText>>) : MdBlock
 
-    /** A paragraph that is only an image; [url] is empty unless [safeUrl] accepts it. Nothing is ever fetched. */
-    data class Image(val alt: String, val url: String) : MdBlock
+    /**
+     * A paragraph that is only an image; [url] is empty unless [safeUrl] accepts it. Nothing is ever fetched. [data] is
+     * the destination when it is an inline image ([dataImage]), else empty: decoded on the phone, never handed to [url]'s
+     * browser path.
+     */
+    data class Image(val alt: String, val url: String, val data: String = "") : MdBlock
     data object Rule : MdBlock
 }
 
@@ -107,6 +112,17 @@ fun safeUrl(url: String): String? {
     return scheme.lowercase() + url.substring(scheme.length)
 }
 
+private val DATA_IMAGE = Regex("data:image/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}")
+
+/** [url] when it is a base64 `data:` URL of a PNG, JPEG, GIF or WebP image (lower case, as written); else null. */
+internal fun dataImage(url: String): String? = url.takeIf { DATA_IMAGE.matches(it) }
+
+/** The MIME type of a URL [dataImage] accepted, in the form the decoder's label check takes. */
+internal fun dataImageType(url: String): String = url.substring("data:".length, url.indexOf(';'))
+
+/** The bytes of a URL [dataImage] accepted, in a fresh array; null when its padding is malformed. */
+internal fun dataImageBytes(url: String): ByteArray? = runCatching { Base64.getDecoder().decode(url.substring(url.indexOf(',') + 1)) }.getOrNull()
+
 /** The blocks under [parent], which sits [depth] containers deep. */
 private fun blocks(parent: Node, depth: Int): List<MdBlock> {
     val out = ArrayList<MdBlock>()
@@ -157,7 +173,7 @@ private fun listItem(item: ListItem, depth: Int): MdListItem {
 private fun paragraph(node: Paragraph): MdBlock {
     val only = node.firstChild
     if (only is Image && only.next == null) {
-        return MdBlock.Image(inline(only).text, safeUrl(only.destination) ?: "")
+        return MdBlock.Image(inline(only).text, safeUrl(only.destination) ?: "", dataImage(only.destination) ?: "")
     }
     return MdBlock.Paragraph(inline(node))
 }

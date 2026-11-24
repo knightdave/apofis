@@ -44,6 +44,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -95,6 +97,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             }
             if (command.length > ONE_LINE_MAX) SmallTextButton(R.string.chat_approval_full_command, { chatGate { reading = true } })
             if (reading) {
+                OverChat(gate.overlays)
                 Dialog(onDismissRequest = { reading = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
                     SelectTextScreen(command, onBack = { reading = false })
                 }
@@ -115,6 +118,8 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                     ApofisIconButton(onClick = { chatGate { menu = true } }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
                         Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
                     }
+                    // Marked once per showing, on the frame it shows, also one with no click (restored, or after answering).
+                    if (menu && !answering) OverChat(gate.overlays)
                     DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
                         val session = remember { MutableInteractionSource() }
                         val sessionPress = remember { Press() }
@@ -251,7 +256,7 @@ private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerG
  * that pointer's down, one from a key release uses that key's down; an activation with no press of its own (an
  * accessibility action) uses none and is judged when it arrives. Nothing else blocks an answer.
  */
-internal class AnswerGate(private val clock: () -> Long, private val settle: Long) {
+internal class AnswerGate(private val clock: () -> Long, private val settle: Long, val overlays: Overlays = Overlays()) {
     private val shownAt = clock()
 
     /** Called by an answer control's click with that control's press record: consumes the press it came from. */
@@ -262,7 +267,36 @@ internal class AnswerGate(private val clock: () -> Long, private val settle: Lon
             else -> null // no press of its own
         }
         if (begun != null && begun.second !== this) return false // begun on another request
+        if (begun != null && begun.first <= overlays.openedAt) return false // it began before a window opened over the chat
         return (begun?.first ?: clock()) - shownAt >= settle
+    }
+}
+
+/**
+ * When a window last opened over the chat (a viewer, sheet, dialog or menu; [OverChat]), on the answer clock: the
+ * uptime domain of a press's own down event. A press whose down is not later answers nothing; closing a window
+ * changes nothing. Main thread.
+ */
+internal class Overlays {
+    var openedAt = Long.MIN_VALUE
+}
+
+/**
+ * The [Overlays] of the chat and every window over it, provided once above them (AppNav). None: the chat screen and
+ * an answer block each keep their own, so nothing is shared between roots or tests.
+ */
+internal val LocalOverlays = staticCompositionLocalOf<Overlays?> { null }
+
+/**
+ * Placed in the composition of a window that opens over the chat: marks [overlays] with the answer clock when it
+ * enters, and again when [showing] changes (another kind of prompt is another showing). See [Overlays].
+ */
+@Composable
+internal fun OverChat(overlays: Overlays?, showing: Any? = null) {
+    val clock = LocalAnswerClock.current
+    DisposableEffect(overlays, showing) {
+        overlays?.openedAt = clock()
+        onDispose {}
     }
 }
 

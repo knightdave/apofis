@@ -53,6 +53,27 @@ import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import androidx.compose.runtime.remember
+import xyz.rycerz.apofis.ui.PromptOverChat
+import xyz.rycerz.apofis.ui.drawer.Prompt
+import xyz.rycerz.apofis.ui.drawer.PromptActions
+import xyz.rycerz.apofis.ui.drawer.PromptKind
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
+import androidx.compose.ui.test.isRoot
+import androidx.compose.ui.test.click
+import androidx.test.espresso.Espresso
+import java.time.ZoneOffset
+import xyz.rycerz.apofis.chat.SendState
+import xyz.rycerz.apofis.chat.ToolStep
+import xyz.rycerz.apofis.chat.UserMessage
+import xyz.rycerz.apofis.ui.FIXED_NOW
+import xyz.rycerz.apofis.ui.FIXED_TODAY
+import xyz.rycerz.apofis.ui.markdown.dataUrl
+import xyz.rycerz.apofis.ui.markdown.pngBytes
 
 /**
  * The answer guard: a request accepts an answer only from a press that began at least the double-tap interval
@@ -207,6 +228,7 @@ class AnswerGuardTest {
         tick(300)
         rule.onNodeWithContentDescription("More approval options").performClick()
         settle()
+        tick(1) // the answer clock moves on before the tap: no real tap shares the menu's millisecond
         rule.onNodeWithText("Allow for this chat").performClick()
         assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.SESSION)), approvals)
     }
@@ -360,5 +382,310 @@ class AnswerGuardTest {
         assertEquals(1, approvals.size)
         rule.onNodeWithText("Deny").performClick() // a fresh pointer press, in time
         assertEquals(2, approvals.size)
+    }
+
+    // ---- a press begun before a window opened over the chat answers nothing (Task 3; nothing restarts on close) ----
+
+    private var ui by mutableStateOf<ChatUiState?>(null)
+    private val tile = hasContentDescription("A dot") and hasClickAction()
+    private val step = hasText("terminal") and hasClickAction()
+
+    /** The chat screen with a stored reply (a tool step and a data image) above the live approval. */
+    private fun hostChat() {
+        val items = listOf(
+            UserMessage("u1", "Look", steered = false, timestamp = FIXED_NOW, state = SendState.QUEUED, idempotencyKey = "q1"),
+            AssistantReply("r0", listOf(ToolStep("c1", "terminal", "command=ls", "ok", resultTruncated = false, error = false, running = false)), "![A dot](${dataUrl(pngBytes(4, 3))})", FIXED_NOW),
+        )
+        val live = live(approval)
+        ui = ChatUiState("k", "Chat", StatusLine.WORKING, withLive(items, live) { FIXED_NOW }, ComposerMode.STOP, "", "hermes.example", live)
+        rule.setContent { Themed { ui?.let { now -> ChatScreen(now, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, currentState = { now }) } } }
+        rule.waitUntil(10_000) { tick(16); exists(tile) } // the image decodes off the main thread; the interval passes meanwhile
+        tick(1_000)
+    }
+
+    private fun exists(m: SemanticsMatcher) = rule.onAllNodes(m).fetchSemanticsNodes().isNotEmpty()
+
+    private fun windows() = rule.onAllNodes(isDialog()).fetchSemanticsNodes().size
+
+    private fun openViewer() {
+        rule.onNode(tile).performSemanticsAction(SemanticsActions.OnClick)
+        rule.waitUntil(10_000) { tick(16); exists(hasContentDescription("Close image")) }
+    }
+
+    private fun closeViewer() {
+        rule.onNodeWithContentDescription("Close image").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(0, windows())
+    }
+
+    @Test
+    fun viewerBlocksApprovalGuard() {
+        hostChat()
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) } // well after the interval
+        tick(50)
+        openViewer()
+        closeViewer()
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+    }
+
+    @Test
+    fun answerRightAfterViewerClosesGoesThrough() {
+        hostChat()
+        openViewer()
+        closeViewer()
+        rule.onNodeWithText("Allow once").performClick() // at once: closing restarts nothing
+        assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.ONCE)), approvals)
+    }
+
+    @Test
+    fun aConfirmDialogBlocksAPressBegunBeforeIt() {
+        hostChat()
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        ui = ui!!.copy(confirmCancel = "q1")
+        tick(48)
+        assertEquals(1, windows())
+        ui = ui!!.copy(confirmCancel = null)
+        tick(48)
+        assertEquals(0, windows())
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun theToolSheetBlocksAPressBegunBeforeIt() {
+        hostChat()
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        rule.onNode(step).performSemanticsAction(SemanticsActions.OnClick)
+        tick(1_000)
+        assertEquals(1, windows())
+        rule.mainClock.autoAdvance = true // the sheet's own hide animation needs frames
+        val roots = rule.onAllNodes(isRoot())
+        roots[roots.fetchSemanticsNodes().size - 1].performTouchInput { click(Offset(centerX, 10f)) } // a tap on its scrim
+        rule.waitForIdle()
+        rule.mainClock.autoAdvance = false
+        assertEquals(0, windows())
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun theBlocksOwnReaderBlocksAPressBegunBeforeIt() {
+        rule.setContent { Themed { Footer(approval.copy(command = "x".repeat(ONE_LINE_MAX + 1))) } }
+        tick(1_000)
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        rule.onNodeWithText("Show full command").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(1, windows())
+        rule.onNodeWithContentDescription("Back").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(0, windows())
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    // ---- fix round 1: the mark is the answer clock when a window opened; a press dated before it answers nothing ----
+
+    private val longCommand get() = approval.copy(command = "x".repeat(ONE_LINE_MAX + 1))
+
+    private fun openAndCloseTheReader() {
+        rule.onNodeWithText("Show full command").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(1, windows())
+        rule.onNodeWithContentDescription("Back").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(0, windows())
+    }
+
+    @Test
+    fun aPointerDownDatedBeforeTheWindowIsRefusedThoughHandledAfter() {
+        rule.setContent { Themed { Footer(longCommand) } }
+        tick(1_000)
+        lag = 200 // the main thread runs 200 ms behind the events it handles
+        openAndCloseTheReader() // marked at the clock: 200 ms past the events of that moment
+        rule.onNodeWithText("Allow once").performTouchInput { down(center); up() } // dated before the mark, handled after it
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        lag = 0
+        tick(300)
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun aKeyDownDatedBeforeTheWindowIsRefusedThoughHandledAfter() {
+        rule.setContent { Themed { Footer(longCommand) } }
+        tick(1_000)
+        lag = 200
+        openAndCloseTheReader()
+        keyboard()
+        rule.onNodeWithText("Allow once").requestFocus()
+        settle()
+        rule.onNodeWithText("Allow once").performKeyInput { keyDown(Key.Enter); keyUp(Key.Enter) }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        lag = 0
+        tick(300)
+        rule.onNodeWithText("Allow once").performKeyInput { keyDown(Key.Enter); keyUp(Key.Enter) }
+        settle()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun aKeyHeldWhileAWindowOpensAnswersNothing() {
+        rule.setContent { Themed { Footer(longCommand) } }
+        tick(1_000)
+        keyboard()
+        rule.onNodeWithText("Allow once").requestFocus()
+        settle()
+        rule.onNodeWithText("Allow once").performKeyInput { keyDown(Key.Enter) }
+        tick(50)
+        openAndCloseTheReader()
+        rule.onNodeWithText("Allow once").performKeyInput { keyUp(Key.Enter) }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performKeyInput { keyDown(Key.Enter); keyUp(Key.Enter) }
+        settle()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun aPressHeldWhileTheBlocksMenuOpensAnswersNothing() {
+        rule.setContent { Themed { Footer(approval) } }
+        tick(1_000)
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        rule.onNodeWithContentDescription("More approval options").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertTrue(exists(hasText("Always allow")))
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    /** The drawer's session actions sheet over the chat (AppNav's prompt host); another kind of prompt is another showing. */
+    @Test
+    fun aPressHeldAcrossTheSessionActionsSheetAnswersNothing() {
+        lateinit var drawer: PushDrawerState
+        lateinit var scope: CoroutineScope
+        var prompt by mutableStateOf<Prompt?>(null)
+        rule.setContent {
+            Themed {
+                CompositionLocalProvider(LocalOverlays provides remember { Overlays() }) {
+                    drawer = rememberPushDrawerState()
+                    scope = rememberCoroutineScope()
+                    PushDrawer(drawer, drawerContent = { Text("Drawer") }) { drag -> Box(drag) { Footer(approval) } }
+                    prompt?.let { PromptOverChat(it, object : PromptActions {}) }
+                }
+            }
+        }
+        val actions = Prompt(PromptKind.ACTIONS, "k", "Chat", pinned = false, archived = false, running = false, token = 1)
+        tick(1_000)
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        rule.runOnIdle { scope.launch { drawer.open() } }
+        tick(48)
+        prompt = actions
+        tick(48)
+        prompt = null
+        tick(48)
+        rule.runOnIdle { scope.launch { drawer.close() } }
+        tick(48)
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick() // at once
+        assertEquals(1, approvals.size)
+        // A press begun while the sheet shows, released after the prompt turned into the Rename dialog: another showing.
+        prompt = actions
+        tick(48)
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        prompt = actions.copy(kind = PromptKind.RENAME)
+        tick(48)
+        prompt = null
+        tick(48)
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertEquals(1, approvals.size)
+    }
+
+    // ---- closing commit: the menu is marked when it shows; a prompt by its kind ----
+
+    /** More asked at t, another answer's down at t + 5, the menu shows at t + 16: that press answers nothing. */
+    @Test
+    fun aDownBetweenMoreAndTheMenuShowingAnswersNothing() {
+        val overlays = Overlays()
+        rule.setContent { Themed { CompositionLocalProvider(LocalOverlays provides overlays) { Footer(approval) } } }
+        tick(1_000)
+        rule.onNodeWithContentDescription("More approval options").performSemanticsAction(SemanticsActions.OnClick) // asked
+        rule.mainClock.advanceTimeBy(5)
+        val down = rule.mainClock.currentTime
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(16)
+        assertTrue(exists(hasText("Always allow")))
+        assertTrue("shown at ${overlays.openedAt}, after the down at $down", overlays.openedAt > down)
+        rule.mainClock.autoAdvance = true // the popup's own dismissal needs frames
+        Espresso.pressBack()
+        rule.waitForIdle()
+        rule.mainClock.autoAdvance = false
+        assertTrue("the menu closed", !exists(hasText("Always allow")))
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+    }
+
+    @Test
+    fun aMenuItemPressedAfterTheMenuShowedAnswers() {
+        rule.setContent { Themed { Footer(approval) } }
+        tick(1_000)
+        rule.onNodeWithContentDescription("More approval options").performSemanticsAction(SemanticsActions.OnClick)
+        tick(16) // shows
+        tick(16)
+        rule.onNodeWithText("Always allow").performClick()
+        assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.ALWAYS)), approvals)
+    }
+
+    /** A drawer prompt marks when it shows and when its kind changes; a new token for the same dialog does not. */
+    @Test
+    fun aPromptIsMarkedByItsKindNotItsToken() {
+        val overlays = Overlays()
+        val actions = Prompt(PromptKind.ACTIONS, "k", "Chat", pinned = false, archived = false, running = false, token = 1)
+        var prompt by mutableStateOf<Prompt?>(actions)
+        rule.setContent { Themed { CompositionLocalProvider(LocalOverlays provides overlays) { prompt?.let { PromptOverChat(it, object : PromptActions {}) } } } }
+        tick(48)
+        val shown = overlays.openedAt
+        assertTrue(shown > Long.MIN_VALUE)
+        tick(100)
+        prompt = actions.copy(kind = PromptKind.DELETE, token = 2)
+        tick(48)
+        val delete = overlays.openedAt
+        assertTrue("a kind change moves it", delete > shown)
+        tick(100)
+        prompt = actions.copy(kind = PromptKind.DELETE, token = 3, running = true) // the reworded confirmation
+        tick(48)
+        prompt = prompt!!.copy(busy = true) // a plain update
+        tick(48)
+        assertEquals("the same dialog: no move", delete, overlays.openedAt)
+        prompt = null
+        tick(48)
+        prompt = actions.copy(kind = PromptKind.DELETE, token = 4) // shown again after it was gone
+        tick(48)
+        assertTrue(overlays.openedAt > delete)
     }
 }

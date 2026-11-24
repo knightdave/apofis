@@ -219,6 +219,7 @@ class ControlBlockTest {
         advance(1000)
         rule.onNodeWithContentDescription("More approval options").performClick()
         advance(16)
+        advance(1) // the answer clock moves on before the tap: no real tap shares the popup's millisecond
         rule.onNodeWithText("Always allow").performClick()
         advance(16)
         assertEquals(listOf(Triple("ctl_a", 2L, ApprovalChoice.ALWAYS)), choices)

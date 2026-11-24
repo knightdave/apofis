@@ -88,6 +88,25 @@ import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.scaled
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import xyz.rycerz.apofis.images.Decoded
+import xyz.rycerz.apofis.images.ImageFailure
+import xyz.rycerz.apofis.images.ImageInput
+import xyz.rycerz.apofis.images.decodeBounded
+import xyz.rycerz.apofis.ui.image.ImagePlaceholder
+import xyz.rycerz.apofis.ui.image.LocalImageOpen
+import xyz.rycerz.apofis.ui.image.ReplyLimits
+import xyz.rycerz.apofis.ui.image.ViewerImage
+import xyz.rycerz.apofis.ui.image.rememberDecoded
+import xyz.rycerz.apofis.ui.image.fitSize
+import xyz.rycerz.apofis.ui.chat.Work
+import xyz.rycerz.apofis.BuildConfig
+import androidx.compose.ui.unit.DpSize
 
 /**
  * One display chunk of a reply. Links open only through [onLink], on a tap; nothing is fetched. [tableScroll] is
@@ -299,6 +318,7 @@ private fun TaskBox(checked: Boolean, modifier: Modifier) {
 
 @Composable
 private fun ImageTile(image: MdBlock.Image, onLink: (String) -> Unit) {
+    if (image.data.isNotEmpty()) return DataImageTile(image.data, image.alt)
     val colors = ApofisTheme.colors
     val shape = RoundedCornerShape(12.dp)
     Row(
@@ -316,6 +336,55 @@ private fun ImageTile(image: MdBlock.Image, onLink: (String) -> Unit) {
         Text(image.alt.ifEmpty { stringResource(R.string.md_image) }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
     }
 }
+
+/**
+ * A reply's `data:` image: 240 dp tall at the text column's width before and after decoding, the picture fitted
+ * inside. Decoded off the main thread within the reply limits, memoised by its URL in [LocalThumbCache]; a tap opens
+ * the viewer ([LocalImageOpen]). A failure shows the image-off glyph and is not clickable. The URL never reaches the
+ * link handler, and only `clickable` is used, so a sideways drag stays the drawer's.
+ */
+@Composable
+private fun DataImageTile(url: String, alt: String) {
+    val colors = ApofisTheme.colors
+    val context = LocalContext.current
+    val decoded = rememberDecoded(url) {
+        if (BuildConfig.DEBUG) Work.imageDecodes++
+        val bytes = withContext(Dispatchers.Default) { dataImageBytes(url) }
+        if (bytes == null) Decoded.Failed(ImageFailure.NOT_AN_IMAGE) else decodeBounded(context, ImageInput.Bytes(bytes, dataImageType(url)), REPLY_SIDE, limits = ReplyLimits)
+    }
+    val open = LocalImageOpen.current
+    val scope = rememberCoroutineScope()
+    val label = alt.ifEmpty { stringResource(R.string.md_image) }
+    val tile = Modifier.fillMaxWidth().height(240.dp).clip(MaterialTheme.shapes.medium)
+    val failed = stringResource(R.string.md_image_failed)
+    if (decoded !is Decoded.Ok) return ImagePlaceholder(tile, if (decoded == null) label else "$label, $failed", glyph = decoded != null, glyphSize = 20.dp) {
+        Text(failed, style = MaterialTheme.typography.bodyMedium, color = colors.muted)
+    }
+    val bitmap = decoded.bitmap
+    BoxWithConstraints(
+        tile
+            .background(colors.thumbPlaceholder)
+            .then(
+                if (open == null) {
+                    Modifier
+                } else {
+                    // A fresh array for the viewer, decoded off the main thread; the decoder's own array is never shared.
+                    Modifier.clickable(role = Role.Button) { scope.launch { withContext(Dispatchers.Default) { dataImageBytes(url) }?.let { open(ViewerImage.Data(it, dataImageType(url))) } } }
+                },
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        val fitted = fitSize(bitmap.width, bitmap.height, Size(constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat()))
+        Image(
+            remember(bitmap) { bitmap.asImageBitmap() },
+            label,
+            Modifier.size(with(LocalDensity.current) { DpSize(fitted.width.toDp(), fitted.height.toDp()) }),
+            contentScale = ContentScale.FillBounds,
+        )
+    }
+}
+
+private const val REPLY_SIDE = 1024
 
 private val TableRadius = 12.dp
 private val CellPadX = 12.dp

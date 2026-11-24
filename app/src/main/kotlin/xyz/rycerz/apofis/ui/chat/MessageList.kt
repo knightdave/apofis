@@ -62,6 +62,9 @@ import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_CHARS
 import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_COLUMNS
 import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_ROWS
 import xyz.rycerz.apofis.ui.markdown.displayChunks
+import xyz.rycerz.apofis.ui.markdown.MdBlock
+import xyz.rycerz.apofis.ui.markdown.PARSE_MAX_BRACKETS
+import xyz.rycerz.apofis.ui.markdown.PARSE_MAX_CHARS
 import xyz.rycerz.apofis.ui.markdown.highlighted
 import xyz.rycerz.apofis.ui.markdown.infoWord
 import xyz.rycerz.apofis.ui.markdown.rawChunk
@@ -474,6 +477,7 @@ internal object Work {
     var timelineRows = 0L // timeline step rows composed
     var pageEnds = 0L // text pages measured
     var smoothFrames = 0L // frames the text smoother's loop woke for
+    var imageDecodes = 0L // reply data images whose decode started
 }
 
 /**
@@ -523,20 +527,40 @@ private fun textRow(key: String, b: LogicalBlock, c: Int, chunk: DisplayChunk, l
     return TextRow("$key/b${b.index}/c$c", chunk, b.kind, b.lang, first = c == 0, joinBelow = !last, fenceClosed = b.fenceClosed && last)
 }
 
-private fun blockRows(key: String, b: LogicalBlock, text: CharSequence): List<TextRow> {
-    val chunks = displayChunks(text, b)
-    return chunks.mapIndexed { c, chunk -> textRow(key, b, c, chunk, c == chunks.size - 1) }
+private fun blockRows(key: String, b: LogicalBlock, text: CharSequence, chunks: List<DisplayChunk> = displayChunks(text, b)): List<TextRow> =
+    chunks.mapIndexed { c, chunk -> textRow(key, b, c, chunk, c == chunks.size - 1) }
+
+/**
+ * The chunks of [b], a finished reply's last TEXT block that the live rule left literal, when the parser makes it
+ * exactly one `data:` image; else null (it stays literal). The parser's bounds are checked on the source range first,
+ * so an oversized block is neither copied nor parsed.
+ */
+internal fun finalImage(text: CharSequence, b: LogicalBlock): List<DisplayChunk>? {
+    if (b.end - b.start > PARSE_MAX_CHARS) return null
+    var brackets = 0
+    for (k in b.start until b.end) if (text[k] == '[' && ++brackets > PARSE_MAX_BRACKETS) return null
+    val chunks = displayChunks(text, b.copy(mode = BlockMode.PARSED))
+    val image = (chunks.singleOrNull() as? DisplayChunk.Blocks)?.blocks?.singleOrNull() as? MdBlock.Image
+    return chunks.takeIf { image != null && image.data.isNotEmpty() }
 }
 
 /** [text] with CRLF and bare CR as LF: done once where text comes in, so every later stage sees one line ending. */
 internal fun lf(text: String): String = if (text.indexOf('\r') < 0) text else text.replace("\r\n", "\n").replace('\r', '\n')
 
 /**
- * Every text row of a reply, parsed from scratch. [closeFences]: the reply is no longer live, so an unclosed fence is
- * shown closed (highlighted, with its bottom edge); a live reply's open fence stays plain until it closes.
+ * Every text row of a reply, parsed from scratch. [closeFences]: the reply is no longer live, so nothing can be appended:
+ * an unclosed fence is shown closed (highlighted, with its bottom edge), and a last text block the live cutoff
+ * ([OPEN_PARSE_LIMIT]) left literal shows as its image when the parser makes it exactly one `data:` image ([finalImage]).
+ * Any other open text keeps the live rows. A live reply's open blocks stay as they are.
  */
 internal fun replyRows(key: String, text: String, closeFences: Boolean = false): List<TextRow> = lf(text).let { t ->
-    parseBlocks(t).flatMap { b -> blockRows(key, if (closeFences && b.kind == BlockKind.CODE) b.copy(fenceClosed = true) else b, t) }
+    parseBlocks(t).flatMap { b ->
+        when {
+            closeFences && b.kind == BlockKind.CODE -> blockRows(key, b.copy(fenceClosed = true), t)
+            closeFences && b.kind == BlockKind.TEXT && !b.stable && b.mode == BlockMode.LITERAL -> blockRows(key, b, t, finalImage(t, b) ?: displayChunks(t, b))
+            else -> blockRows(key, b, t)
+        }
+    }
 }
 
 /** The raw source (line endings LF) of logical block [blockIndex] of [replyText], from a fresh parse; null if none. */

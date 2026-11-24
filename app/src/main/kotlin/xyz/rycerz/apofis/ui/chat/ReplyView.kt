@@ -165,10 +165,12 @@ internal fun ReplyFooter(
                 val changed = showsChanged(notes, pending)
                 // Double-tap protection (see [AnswerGate]): the interval counts from when this block first showed this
                 // request, or the request changed. Accepted limit: a request that waited behind a sheet or out of view
-                // accepts an answer as soon as it is revealed.
+                // accepts an answer as soon as it is revealed. A press begun before a window opened over the chat
+                // answers nothing ([Overlays]).
                 val clock = LocalAnswerClock.current
                 val settle = LocalViewConfiguration.current.doubleTapTimeoutMillis
-                val gate = remember(pending.requestId, pending.executionGeneration) { AnswerGate(clock, settle) }
+                val overlays = LocalOverlays.current ?: remember { Overlays() }
+                val gate = remember(pending.requestId, pending.executionGeneration) { AnswerGate(clock, settle, overlays) }
                 // A request with another id or generation is a new block: an open menu or typed answer never carries over.
                 key(pending.requestId, pending.executionGeneration) {
                     when (pending.kind) {
