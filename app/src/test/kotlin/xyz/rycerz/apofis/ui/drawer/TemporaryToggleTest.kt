@@ -249,8 +249,8 @@ class TemporaryToggleTest : TemporaryFixture() {
         composer.edit(old, "first", composer.current(old).revision)
         val shown = vm.shown(NewChatState.TEMPORARY_OFF)
         val lock = heldLock()
-        // Started here, it runs until it waits for the repository lock (nothing before that suspends).
-        val toggle = side.async(start = CoroutineStart.UNDISPATCHED) { vm.toggleTemporary(shown) }
+        // Started alone, it takes the selection lock at once and runs until it waits for the repository lock.
+        val toggle = vm.startAlone { vm.toggleTemporary(shown) }
         composer.edit(old, "first second", composer.current(old).revision) // the field still shows the old key's draft
         lock.release()
         val new = withTimeout(60_000) { toggle.await() }!!
@@ -265,7 +265,7 @@ class TemporaryToggleTest : TemporaryFixture() {
         composer.edit(old, "first", composer.current(old).revision)
         val shown = vm.shown(NewChatState.TEMPORARY_OFF)
         val lock = heldLock()
-        val toggle = side.async(start = CoroutineStart.UNDISPATCHED) { vm.toggleTemporary(shown) }
+        val toggle = vm.startAlone { vm.toggleTemporary(shown) }
         composer.edit(old, "first second", composer.current(old).revision)
         pending(old) // a message stored while the replacement waits
         lock.release()
@@ -311,7 +311,7 @@ class TemporaryToggleTest : TemporaryFixture() {
         composer.edit(old, "hello", composer.current(old).revision)
         val shown = vm.shown(NewChatState.TEMPORARY_OFF)
         val lock = heldLock()
-        val toggle = side.async(start = CoroutineStart.UNDISPATCHED) { vm.toggleTemporary(shown) }
+        val toggle = vm.startAlone { vm.toggleTemporary(shown) }
         val storing = CompletableDeferred<Unit>()
         composer.sendWithImages(old) { text, _ -> storing.await(); connected.repo.send(old, text) }!! // claimed now
         lock.release()
@@ -339,7 +339,7 @@ class TemporaryToggleTest : TemporaryFixture() {
             composer.edit(old, "hello", composer.current(old).revision)
             val shown = vm.shown(NewChatState.TEMPORARY_OFF)
             val lock = heldLock()
-            val toggle = side.async(start = CoroutineStart.UNDISPATCHED) { vm.toggleTemporary(shown) }
+            val toggle = vm.startAlone { vm.toggleTemporary(shown) }
             val storing = CompletableDeferred<Unit>()
             composer.sendWithImages(old) { text, _ -> storing.await(); connected.repo.send(old, text) }!! // claimed now
             lock.release()
@@ -416,7 +416,7 @@ class TemporaryToggleTest : TemporaryFixture() {
         composer.edit(old, "half", composer.current(old).revision)
         val shown = vm.shown(NewChatState.TEMPORARY_OFF)
         var lock = heldLock()
-        val toggle = side.async(start = CoroutineStart.UNDISPATCHED) { runCatching { vm.toggleTemporary(shown) } }
+        val toggle = vm.startAlone { runCatching { vm.toggleTemporary(shown) } }
         connected.close() // a server switch while the toggle waits
         lock.release()
         assertTrue(withTimeout(60_000) { toggle.await() }.isFailure)
@@ -426,7 +426,7 @@ class TemporaryToggleTest : TemporaryFixture() {
 
         lock = heldLock()
         var filled = false
-        val share = side.async(start = CoroutineStart.UNDISPATCHED) { vm.openFreshChatIf(old, { true }) { filled = true } }
+        val share = vm.startAlone { vm.openFreshChatIf(old, { true }) { filled = true } }
         lock.release()
         assertNull(withTimeout(60_000) { share.await() })
         assertFalse(filled)
