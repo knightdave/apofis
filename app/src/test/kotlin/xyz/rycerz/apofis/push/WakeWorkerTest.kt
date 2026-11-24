@@ -613,6 +613,10 @@ class WakeWorkerTest {
     @Test
     fun aFailedInstallIsTriedOnceMoreThenTheMarkStays() = runTest {
         stored("run_a")
+        // The stored row's reconcile installs the timer before any failure is armed; later emissions repeat its decision
+        // and the lane skips them without an install, so the failures below meet only the pushes' installs.
+        awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
         on("run_a", A, "completed")
         var failures = 1
         Wake.beforeInstall = { if (failures-- > 0) throw IllegalStateException("database full") }
