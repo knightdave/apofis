@@ -359,8 +359,9 @@ class ChatRepository(
      * Steers the session's running run, else queues [text] and tries to start it at once; with [images] (digests) it is
      * always queued. The message is stored before any request; [onStored] runs once it is (before any request). A hidden
      * chat fails locally; an unknown one throws IllegalArgumentException; see [SendQueue.submit] for the other refusals.
-     * It first waits for every choice change started before it ([changeChoice]), in any chat of this connection, so the
-     * choice it freezes into the message is the one picked before the tap.
+     * Every choice change started before this call ([changeChoice]), in any chat of this connection, finishes before the
+     * message is handed to the queue. The queue freezes the choice stored at the moment it stores the message, which can
+     * include a change made after the call.
      */
     suspend fun send(sessionKey: String, text: String, images: List<String> = emptyList(), onStored: () -> Unit = {}) {
         requireAppKey(sessionKey)
@@ -368,8 +369,15 @@ class ChatRepository(
         queue().submit(sessionKey, text, onStored, images)
     }
 
-    /** Stores the chat's model choice on this phone only; see [changeChoice], whose order and refusals it shares. */
-    suspend fun setChoice(sessionKey: String, choice: ChatModel) = changeChoice(sessionKey) { choice }
+    /**
+     * Stores the chat's model choice on this phone only; see [changeChoice], whose order it shares. A name over
+     * [MAX_CHOICE_CHARS] is refused (IllegalArgumentException) before any lock, whether or not the chat exists.
+     */
+    suspend fun setChoice(sessionKey: String, choice: ChatModel) {
+        requireAppKey(sessionKey)
+        requireShortNames(choice)
+        changeChoice(sessionKey) { choice }
+    }
 
     /**
      * Applies [change] to the chat's stored model choice on this phone only (no server call); sends stored from now on
@@ -385,7 +393,7 @@ class ChatRepository(
                 ensureOpen()
                 val session = sessionDao.get(sessionKey) ?: return
                 val choice = change(session.choice())
-                require(listOfNotNull(choice.model, choice.provider, choice.reasoning).all { it.length <= MAX_CHOICE_CHARS }) { "choice too long" }
+                requireShortNames(choice)
                 sessionDao.upsert(session.copy(model = choice.model, provider = choice.provider, reasoning = choice.reasoning, fast = choice.fast))
             }
         }
@@ -445,6 +453,9 @@ class ChatRepository(
     }
 
     private fun ensureOpen() = check(active()) { "closed" }
+
+    private fun requireShortNames(choice: ChatModel) =
+        require(listOfNotNull(choice.model, choice.provider, choice.reasoning).all { it.length <= MAX_CHOICE_CHARS }) { "choice too long" }
 }
 
 private const val DELIVERY_WINDOW_S = 60.0

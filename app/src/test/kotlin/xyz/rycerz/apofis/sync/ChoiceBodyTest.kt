@@ -52,6 +52,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -329,6 +330,16 @@ class ChoiceBodyTest {
         release.countDown()
         writes.joined()
         assertEquals(ChatModel("model-b", "p", "high"), choice())
+    }
+
+    @Test
+    fun setChoiceRefusesALongNameBeforeLookingForTheChat() = runTest {
+        try {
+            repo.setChoice("apofis-none", ChatModel(model = "x".repeat(257))) // no such row
+            fail("a name over 256 characters was accepted")
+        } catch (_: IllegalArgumentException) {
+        }
+        assertTrue(requests.isEmpty())
     }
 
     @Test

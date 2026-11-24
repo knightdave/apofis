@@ -572,7 +572,6 @@ class ModelSheetTest {
 
     // ---- the screen on a plain state ----
 
-    private fun hasTagStarting(prefix: String) = SemanticsMatcher("tag starts with $prefix") { it.config.getOrElse(SemanticsProperties.TestTag) { "" }.startsWith(prefix) }
 
     /** Each matching node's label: its text, else its content description. */
     private fun labels(m: SemanticsMatcher) = rule.onAllNodes(m).fetchSemanticsNodes().map {
@@ -587,14 +586,13 @@ class ModelSheetTest {
             AssistantReply("r1", emptyList(), "", FIXED_NOW, outcome = ReplyOutcome.FAILED),
             UserMessage("p1", "refused", false, FIXED_NOW, SendState.FAILED, "k1", error = SendError.HTTP_ERROR, attempted = false),
         )
-        val noOutcome = listOf(items[0], (items[1] as AssistantReply).copy(outcome = null))
-        var shown by mutableStateOf(noOutcome) // the same run without its outcome, then failed, then the refused send alone
+        var shown by mutableStateOf(items.take(1)) // the delivered message alone, then with the failed reply, then the refused send alone
         rule.setContent { Themed { ChatScreen(ChatUiState("k", "Chat", StatusLine.IDLE, shown, ComposerMode.SEND_DISABLED, ""), object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
         val before = labels(hasClickAction()).sorted()
         shown = items.take(2)
         rule.waitForIdle()
         rule.onNodeWithText("The reply failed").assertExists()
-        assertEquals("the failed outcome adds no control", before, labels(hasClickAction()).sorted())
+        assertEquals("the failed, empty reply adds its notice and no control", before, labels(hasClickAction()).sorted())
         shown = items.drop(2)
         rule.waitForIdle()
         assertEquals("the refused send offers exactly Retry and Remove", listOf("Remove message", "Retry"), labels(hasClickAction() and hasAnyAncestor(hasTestTag("user:p1"))).sorted())
