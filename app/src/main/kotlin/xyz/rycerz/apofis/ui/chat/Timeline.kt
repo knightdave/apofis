@@ -29,7 +29,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.graphics.Color
-import android.icu.text.BreakIterator
+import xyz.rycerz.apofis.ui.text.graphemeCut
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -421,11 +421,12 @@ private class TextPages {
 /**
  * The end of the page of [text] that starts at [start] (a grapheme boundary): at most [TEXT_PAGE_CHARS] characters
  * and [TEXT_PAGE_LINES] line breaks (CR, LF and CRLF each count once), after the last line break in reach, else at
- * [cutAt]. Reads at most the page and one code point past it.
+ * the last grapheme boundary at or before the cap ([graphemeCut] down). Reads at most the page and one code point
+ * past it.
  */
 internal fun pageEnd(text: CharSequence, start: Int): Int {
     if (BuildConfig.DEBUG) Work.pageEnds++
-    val cap = start + TEXT_PAGE_CHARS
+    val cap = start + minOf(TEXT_PAGE_CHARS, text.length - start) // never past Int range
     val limit = minOf(text.length, cap)
     var i = start
     var lines = 0
@@ -443,28 +444,11 @@ internal fun pageEnd(text: CharSequence, start: Int): Int {
         i++
     }
     if (i == text.length) return text.length
-    return if (afterBreak > start) afterBreak else cutAt(text, start, cap)
-}
-
-/**
- * The one cut for every cap in this task: the last grapheme boundary of [text] at or before [cap], so a cap is never
- * exceeded. [from] must be a grapheme boundary (0 or an earlier cut): ICU's character BreakIterator reads only from
- * [from] to one code point past [cap], so flags, ZWJ sequences, combining marks and CRLF stay whole. When no boundary
- * lies after [from] (one cluster longer than the window), the cut is the last code point boundary at or before [cap].
- */
-internal fun cutAt(text: CharSequence, from: Int, cap: Int): Int {
-    if (cap >= text.length) return text.length
-    if (cap <= from) return from
-    val after = cap + if (Character.isHighSurrogate(text[cap]) && cap + 1 < text.length) 2 else 1 // what follows the cap
-    val graphemes = BreakIterator.getCharacterInstance()
-    graphemes.setText(text.subSequence(from, after).toString())
-    val boundary = graphemes.preceding(cap - from + 1)
-    if (boundary != BreakIterator.DONE && boundary > 0) return from + boundary
-    return if (Character.isLowSurrogate(text[cap]) && Character.isHighSurrogate(text[cap - 1])) cap - 1 else cap
+    return if (afterBreak > start) afterBreak else graphemeCut(text, start, cap, up = false)
 }
 
 /** [text] cut to at most [limit] characters at the last grapheme boundary (the live tool previews' display cap). */
-internal fun displayPrefix(text: String, limit: Int): String = if (text.length <= limit) text else text.substring(0, cutAt(text, 0, limit))
+internal fun displayPrefix(text: String, limit: Int): String = if (text.length <= limit) text else text.substring(0, graphemeCut(text, 0, limit, up = false))
 
 /** At most [ONE_LINE_MAX] characters, never ending on half a surrogate pair. */
 internal fun oneLine(text: String): String {
