@@ -144,10 +144,10 @@ class SendQueue(
      * locally; an unknown session or a missing image file throws IllegalArgumentException; a body too large to send
      * throws [SendTooLarge].
      */
-    internal suspend fun submit(sessionKey: String, text: String, onStored: () -> Unit = {}, images: List<String> = emptyList()) {
+    internal suspend fun submit(sessionKey: String, text: String, onStored: (String) -> Unit = {}, images: List<String> = emptyList()) {
         // Contract: a throw here means nothing was stored, so the caller may offer the text again.
         val row = store(sessionKey, text, steer = true, images)
-        onStored() // committed with its worker armed: from here the row is the message
+        onStored(row.idempotencyKey) // committed with its worker armed: from here the row is the message
         if (row.state == PendingState.FAILED) return
         try {
             val queued = drainLock.withLock { withRepositoryLock { deliverStored(row.idempotencyKey) } }

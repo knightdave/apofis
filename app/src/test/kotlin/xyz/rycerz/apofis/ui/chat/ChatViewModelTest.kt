@@ -55,6 +55,8 @@ import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ComposeError
+import xyz.rycerz.apofis.chat.ComposerNote
+import xyz.rycerz.apofis.chat.NoteKind
 import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Notice
@@ -435,7 +437,7 @@ class ChatViewModelTest {
     @Test
     fun discardAsksOnceAndRemovesOnlyTheTextShown() = runTest {
         connected.composer.edit(KEY, "first")
-        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        connected.composer.sendWithImages(KEY) { _, _ -> throw IllegalStateException("not stored") }!!.join()
         val vm = vm()
         assertEquals("first", vm.state.value.unsent?.text) // the first frame already shows it
         vm.onDiscardUnsent()
@@ -453,7 +455,7 @@ class ChatViewModelTest {
     @Test
     fun aStaleDiscardConfirmationNeverOpensForANewEntryWithTheSameText() = runTest {
         connected.composer.edit(KEY, "same")
-        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        connected.composer.sendWithImages(KEY) { _, _ -> throw IllegalStateException("not stored") }!!.join()
         val vm = vm()
         vm.onDiscardUnsent()
         vm.await { it.confirmDiscard != null }
@@ -471,7 +473,7 @@ class ChatViewModelTest {
         addSession()
         db.pendingSendDao().upsert(PendingSendEntity("q1", KEY, "later", "{}", System.currentTimeMillis(), "queued", null, null, attempted = true))
         connected.composer.edit(KEY, "first")
-        connected.composer.send(KEY) { throw IllegalStateException("not stored") }!!.join()
+        connected.composer.sendWithImages(KEY) { _, _ -> throw IllegalStateException("not stored") }!!.join()
         val vm = vm()
         vm.await { it.items.isNotEmpty() }
         vm.onCancel("q1")
@@ -482,7 +484,7 @@ class ChatViewModelTest {
 
         vm.onConfirmCancel("q1", mayHaveSentShown = true)
         val done = vm.await { it.composerNote != null }
-        assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, done.composerNote)
+        assertEquals(ComposerNote(NoteKind.REMOVED_MAY_HAVE_SENT), done.composerNote)
         assertEquals("first", done.unsent?.text)
     }
 
@@ -527,7 +529,7 @@ class ChatViewModelTest {
         vm.onCancel("q1")
         assertEquals("q1", vm.await { it.confirmCancel != null }.confirmCancel)
         vm.onConfirmCancel("q1", mayHaveSentShown = true)
-        assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, vm.await { it.composerNote != null }.composerNote)
+        assertEquals(ComposerNote(NoteKind.REMOVED_MAY_HAVE_SENT), vm.await { it.composerNote != null }.composerNote)
         assertTrue(vm.await { it.items.isEmpty() }.items.isEmpty())
     }
 
@@ -734,7 +736,7 @@ class ChatViewModelTest {
 
         vm.onConfirmCancel("q1", mayHaveSentShown = true)
         val done = vm.await { it.items.isEmpty() && it.confirmCancel == null }
-        assertEquals(ComposerNote.REMOVED_MAY_HAVE_SENT, done.composerNote)
+        assertEquals(ComposerNote(NoteKind.REMOVED_MAY_HAVE_SENT), done.composerNote)
     }
 
     private fun tool(callId: String?, name: String, result: String) = ToolStep(callId ?: "", name, "", result, false, error = false, running = false)

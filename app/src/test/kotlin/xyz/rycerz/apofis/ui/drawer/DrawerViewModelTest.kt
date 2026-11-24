@@ -387,7 +387,7 @@ class DrawerViewModelTest {
         val composer = connected.composer
         composer.edit("apofis-a", "hello")
         val stored = CompletableDeferred<Unit>()
-        val send = composer.send("apofis-a") { stored.await(); connected.repo.send("apofis-a", it) }!!
+        val send = composer.sendWithImages("apofis-a") { t, _ -> stored.await(); connected.repo.send("apofis-a", t) }!!
         vm.onDeleteRequest("apofis-a")
         vm.confirmDelete(vm.prompt.value!!.token)
         vm.prompt.await { it == null }
@@ -406,7 +406,7 @@ class DrawerViewModelTest {
         val composer = connected.composer
         gone.forEach { composer.current(it) } // each was drawn once: it has an idle record
         composer.edit("apofis-r0", "not stored")
-        composer.send("apofis-r0") { throw IllegalStateException("not stored") }!!.join()
+        composer.sendWithImages("apofis-r0") { _, _ -> throw IllegalStateException("not stored") }!!.join()
         routes["GET /api/sessions"] = listing("apofis-kept")
         val vm = vm()
         vm.selected.await { it == "apofis-kept" }

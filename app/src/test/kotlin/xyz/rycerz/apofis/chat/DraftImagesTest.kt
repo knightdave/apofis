@@ -165,8 +165,6 @@ class DraftImagesTest {
     @Test
     fun blankTextWithImageSends() {
         ready(K, D1)
-        // The entry for drafts without images starts nothing while the draft holds one.
-        assertNull(composer.send(K) { error("not for images") })
         val stores = mutableListOf<Pair<String, List<String>>>()
         wait { composer.sendWithImages(K) { t, i -> stores += t to i }!!.join() }
         assertEquals(listOf("" to listOf(D1)), stores)
@@ -547,7 +545,7 @@ class DraftImagesTest {
         val repo = repo()
         val text = "x".repeat(800_000)
         type(K, text)
-        wait { composer.send(K) { repo.send(K, it, onStored = { stored() }) }!!.join() }
+        wait { composer.sendWithImages(K) { t, _ -> repo.send(K, t, onStored = { stored() }) }!!.join() }
         val s = composer.current(K)
         assertEquals(text, s.draft)
         assertNull(s.unsent)

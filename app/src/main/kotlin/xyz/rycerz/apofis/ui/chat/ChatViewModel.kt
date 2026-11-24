@@ -3,6 +3,7 @@ package xyz.rycerz.apofis.ui.chat
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
@@ -36,6 +37,9 @@ import xyz.rycerz.apofis.api.ChatModel
 import xyz.rycerz.apofis.api.ModelOptions
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.ComposerNote
+import xyz.rycerz.apofis.chat.DraftImage
+import xyz.rycerz.apofis.chat.NoteKind
 import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.db.choice
@@ -57,7 +61,7 @@ data class ChatUiState(
     val notes: Map<RequestRef, AnswerNote> = emptyMap(), // by the answered request, kept until the next message is sent
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null, // the failed send whose retry waits for the user's consent
-    val composerNote: ComposerNote? = null, // one line above the composer about the last send or cancel
+    val composerNote: ComposerNote? = null, // the composer's one note (the holder's): about the last send, cancel or photo
     val sending: Boolean = false, // a send is being stored; the send button is disabled meanwhile
     val confirmCancel: String? = null, // the idempotency key of the unsent message the user asked to remove
     val unsent: UnsentText? = null, // text a send could not store, in its own notice above the composer
@@ -69,6 +73,9 @@ data class ChatUiState(
     // From the moment an open decides to fetch the history of a chat with no stored rows until that fetch ends, the wait
     // for the repository's lock included (another request may hold it meanwhile).
     val firstLoad: Boolean = false,
+    val images: List<DraftImage> = emptyList(), // the draft's photos, in pick order
+    val storedSends: Long = 0, // sends of this view model whose row was stored: the screen pins the list on each
+    val storedKey: String? = null, // the idempotency key of the latest of them: the pin waits until the transcript shows it
 )
 
 /** The reasoning sheet's levels: null is the server's default, "none" is Off; five of the server's eight (decision 19). */
@@ -95,12 +102,8 @@ data class AnswerNote(val result: AnswerResult, val successor: RequestRef? = nul
 
 enum class StatusLine { IDLE, WORKING, QUEUED, OFFLINE, UNREACHABLE, KEY_REJECTED, SERVER_ERROR, CHAT_GONE, LOAD_FAILED }
 
-enum class ComposerMode { SEND_DISABLED, SEND, STEER, STOP }
-
-enum class ComposerNote {
-    REMOVED_MAY_HAVE_SENT, // cancelled on this phone, but it may already have reached the server
-    CANCEL_TOO_LATE, // it started sending before the cancel: nothing was removed
-}
+/** SEND_AFTER: a run is live and the draft holds a ready photo; it is sent after the reply (a photo never steers). */
+enum class ComposerMode { SEND_DISABLED, SEND, STEER, STOP, SEND_AFTER }
 
 /** Everything the chat screen can ask for; no-ops by default so previews and screenshots need no view model. */
 interface ChatActions {
@@ -149,6 +152,13 @@ interface ChatActions {
 
     /** Flips this chat's stored fast mode on this phone (unset counts as off). */
     fun toggleFast() {}
+
+    /** The photo picker's result: adds the photos to the draft (on the connection current when it arrives). */
+    fun onImagesPicked(uris: List<Uri>) {}
+    fun onRemoveImage(id: Long) {}
+
+    /** Plus with ten photos attached: the limit note instead of a picker. */
+    fun onImagesLimit() {}
 }
 
 private enum class Failure { NETWORK, UNAUTHORIZED, SERVER, GONE }
@@ -158,11 +168,12 @@ private data class Local(
     val notes: Map<RequestRef, AnswerNote> = emptyMap(),
     val answering: Boolean = false,
     val confirmRetry: UserMessage? = null,
-    val composerNote: ComposerNote? = null,
     val confirmCancel: String? = null,
     val confirmDiscard: Long? = null,
     val sheet: ChoiceSheet? = null,
     val firstLoad: Boolean = false,
+    val storedSends: Long = 0,
+    val storedKey: String? = null,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean, val choice: ChatModel)
@@ -193,6 +204,9 @@ class ChatViewModel(
 
     val state: StateFlow<ChatUiState> = combine(content, composer.state(sessionKey), env, local) { (items, live), c, e, l ->
         val d = c.draft
+        // What sendWithImages would send: nothing while a photo is processing; text or a ready photo otherwise.
+        val sendable = c.images.none { it.processing } && (d.isNotBlank() || c.images.any { it.digest != null })
+        val photos = c.images.any { !it.failed }
         ChatUiState(
             sessionKey = sessionKey,
             title = e.title,
@@ -208,10 +222,10 @@ class ChatViewModel(
             },
             items = items,
             composer = when {
-                live == null && d.isBlank() -> ComposerMode.SEND_DISABLED
-                live == null -> ComposerMode.SEND
+                live == null -> if (sendable) ComposerMode.SEND else ComposerMode.SEND_DISABLED
+                photos -> if (sendable) ComposerMode.SEND_AFTER else ComposerMode.STOP
                 d.isBlank() -> ComposerMode.STOP
-                else -> ComposerMode.STEER
+                else -> ComposerMode.STEER // a draft of text and only failed photos: the failed ones leave with it
             },
             draft = d,
             host = host,
@@ -219,7 +233,7 @@ class ChatViewModel(
             notes = l.notes,
             answering = l.answering,
             confirmRetry = l.confirmRetry,
-            composerNote = l.composerNote,
+            composerNote = c.note,
             sending = c.sending,
             confirmCancel = l.confirmCancel,
             unsent = c.unsent,
@@ -228,12 +242,15 @@ class ChatViewModel(
             choice = e.choice,
             sheet = l.sheet,
             firstLoad = l.firstLoad,
+            images = c.images,
+            storedSends = l.storedSends,
+            storedKey = l.storedKey,
         )
     }.stateIn(
         viewModelScope,
         SharingStarted.Eagerly,
         composer.current(sessionKey).let {
-            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision, loaded = false)
+            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision, loaded = false, images = it.images)
         },
     )
 
@@ -279,20 +296,20 @@ class ChatViewModel(
 
     override fun onDraftChange(text: String, basedOnRevision: Long) {
         composer.edit(sessionKey, text, basedOnRevision)
-        if (local.value.composerNote != null) local.update { it.copy(composerNote = null) }
+        if (composer.current(sessionKey).note != null) composer.setNote(sessionKey, null) // any keystroke clears the note
     }
 
     override fun onSendClick(): Boolean {
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
-        val started = composer.send(sessionKey) { text ->
-            // The field empties only once the text is stored; delivery problems after that show on the bubble.
-            repo.send(sessionKey, text, onStored = ::stored)
-            local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
+        val started = composer.sendWithImages(sessionKey) { text, images ->
+            // The field empties only once the text is stored; delivery problems after that show on the bubble. The
+            // counter tells the screen a row was stored, with the row's key, at the commit: the screen pins once the
+            // transcript shows it. Harmless once this view model was cleared. Published before stored() releases the
+            // claim: the next send of this chat cannot be claimed, so cannot publish its key, before this one has.
+            repo.send(sessionKey, text, images, onStored = { key -> local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) }; stored() })
+            local.update { it.copy(notes = emptyMap()) }
         }
-        if (started != null) {
-            local.update { it.copy(composerNote = null) }
-            accepted.tryEmit(Unit)
-        }
+        if (started != null) accepted.tryEmit(Unit)
         return started != null
     }
 
@@ -314,6 +331,14 @@ class ChatViewModel(
     /** Closes the confirmation only if it is still the one for [idempotencyKey]. */
     override fun onDismissRetry(idempotencyKey: String) =
         local.update { if (it.confirmRetry?.idempotencyKey == idempotencyKey) it.copy(confirmRetry = null) else it }
+
+    override fun onImagesPicked(uris: List<Uri>) {
+        if (uris.isNotEmpty()) connected.attachImages(sessionKey, uris)
+    }
+
+    override fun onRemoveImage(id: Long) = composer.removeImage(sessionKey, id)
+
+    override fun onImagesLimit() = composer.setNote(sessionKey, ComposerNote(NoteKind.IMAGES_LIMIT))
 
     override fun onPutBack() = composer.putBack(sessionKey)
 
@@ -338,11 +363,12 @@ class ChatViewModel(
         val note = when (repo.cancelSend(idempotencyKey, mayHaveSentShown)) {
             // Tried since the dialog said it was not: the dialog stays open and rewords as the row redraws.
             CancelResult.NOW_ATTEMPTED -> return@request
-            CancelResult.REMOVED_MAY_HAVE_SENT -> ComposerNote.REMOVED_MAY_HAVE_SENT
-            CancelResult.STARTED -> ComposerNote.CANCEL_TOO_LATE
+            CancelResult.REMOVED_MAY_HAVE_SENT -> ComposerNote(NoteKind.REMOVED_MAY_HAVE_SENT)
+            CancelResult.STARTED -> ComposerNote(NoteKind.CANCEL_TOO_LATE)
             CancelResult.REMOVED, CancelResult.NOT_FOUND -> null
         }
-        local.update { it.copy(composerNote = note, confirmCancel = it.confirmCancel.takeIf { k -> k != idempotencyKey }) }
+        composer.setNote(sessionKey, note) // before the dialog closes: the note is in the state when it is gone
+        local.update { it.copy(confirmCancel = it.confirmCancel.takeIf { k -> k != idempotencyKey }) }
     }
 
     override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) =

@@ -399,7 +399,7 @@ class ComposerViewTest {
         val holder = DraftHolder(scope)
         holder.edit("k", "hello", holder.current("k").revision)
         var stores = 0
-        onSendHook = { holder.send("k") { stores++; awaitCancellation() } != null }
+        onSendHook = { holder.sendWithImages("k") { _, _ -> stores++; awaitCancellation() } != null }
         draft = "hello"
         subject = "chat-1"
         show()
@@ -723,7 +723,7 @@ class ComposerViewTest {
         val holder = DraftHolder(scope)
         holder.edit("k", "hello", holder.current("k").revision)
         var stores = 0
-        onSendHook = { holder.send("k") { stores++; awaitCancellation() } != null }
+        onSendHook = { holder.sendWithImages("k") { _, _ -> stores++; awaitCancellation() } != null }
         draft = "hello"
         enter = true
         show()
@@ -818,12 +818,15 @@ class ComposerViewTest {
         for (desc in listOf("Rozwiń edytor", "Zatrzymaj", "Wyślij do trwającej odpowiedzi")) rule.onNodeWithContentDescription(desc).assertExists()
         val layout = layoutOf(FIELD_TAG)
         val f = bounds(FIELD_TAG)
-        assertEquals(3, layout.lineCount)
-        assertTrue("all three lines at 2.0 show: ${f.height}", f.height >= layout.getLineBottom(2) + px(8f) - 1) // at 2.0 the padding shrinks to about 4 dp
+        assertEquals(4, layout.lineCount) // Plus takes 48 dp of the field: the first line wraps
+        assertFalse("nothing cut off", layout.didOverflowHeight)
+        assertTrue("all four lines at 2.0 show: ${f.height}", f.height >= layout.getLineBottom(layout.lineCount - 1) + px(8f) - 1) // at 2.0 the padding shrinks to about 4 dp
         // The buttons stay inside the card's column, below and beside each other, never over the field.
         assertFalse(described("Rozwiń edytor").overlaps(bounds(SEND_TAG)))
         assertFalse(described("Rozwiń edytor").overlaps(f))
         assertFalse(bounds(SEND_TAG).overlaps(f))
+        assertFalse(described("Dodaj zdjęcia").overlaps(f))
+        assertFalse(described("Dodaj zdjęcia").overlaps(bounds(SEND_TAG)))
     }
 
     @Test
@@ -833,6 +836,23 @@ class ComposerViewTest {
         val f = bounds(FIELD_TAG)
         assertTrue(bounds(SEND_TAG).right <= f.left + 1)
         assertTrue(described("Expand the editor").right <= f.left + 1)
+        assertPlusAtTheRowStart(rtl = true)
+    }
+
+    @Test
+    fun leftToRightPutsPlusAtTheStart() {
+        draft = "one\ntwo\nthree"
+        show()
+        assertPlusAtTheRowStart(rtl = false)
+    }
+
+    /** Plus sits at the row's start edge (the card's inner edge, 20 dp in) and overlaps neither the field nor Send. */
+    private fun assertPlusAtTheRowStart(rtl: Boolean) {
+        val plus = described("Add photos")
+        val width = rule.onNodeWithTag("root").fetchSemanticsNode().boundsInRoot.width
+        if (rtl) assertEquals(width - px(20f), plus.right, 1f) else assertEquals(px(20f), plus.left, 1f)
+        assertFalse(plus.overlaps(bounds(FIELD_TAG)))
+        assertFalse(plus.overlaps(bounds(SEND_TAG)))
     }
 
     /**
@@ -941,7 +961,7 @@ class ComposerViewTest {
         ui = ui.copy(draft = s.draft, draftRevision = s.revision, composer = if (s.draft.isBlank()) ComposerMode.SEND_DISABLED else ComposerMode.SEND)
         val actions = object : ChatActions {
             override fun onDraftChange(text: String, basedOnRevision: Long) = holder.edit(k, text, basedOnRevision)
-            override fun onSendClick(): Boolean = holder.send(k) { stores += it; awaitCancellation() } != null
+            override fun onSendClick(): Boolean = holder.sendWithImages(k) { t, _ -> stores += t; awaitCancellation() } != null
         }
         showChat(actions = actions, enterToSend = true)
     }
@@ -1107,7 +1127,7 @@ class ComposerViewTest {
         val body = ChromeProbe.bodyCompositions
         val bottom = ChromeProbe.bottomCompositions
         val root = ChromeProbe.rootMeasures
-        for (i in 1..30) { // one line: the bottom area keeps its height
+        for (i in 1..20) { // one line (Plus takes 48 dp of the field): the bottom area keeps its height
             ui = ui.copy(draft = "x".repeat(i), composer = ComposerMode.SEND)
             frames(1)
         }
