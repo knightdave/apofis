@@ -64,6 +64,30 @@ class ModelOptionsTest {
     }
 
     @Test
+    fun unauthenticatedProviderDropped() = runTest {
+        respond("""{"providers":[{"slug":"a","models":["m"],"authenticated":false},{"slug":"b","models":["m"],"authenticated":true},{"slug":"c","models":["m"]}]}""")
+        assertEquals(listOf("b", "c"), api.modelOptions().providers.map { it.slug }) // missing counts as usable
+    }
+
+    @Test
+    fun blankNamesDropped() = runTest {
+        respond("""{"providers":[{"slug":"a","models":["   ","\t","ok"]},{"slug":"  ","models":["m"]}],"model":" ","provider":"\n"}""")
+        assertEquals(ModelOptions(null, null, listOf(ProviderModels("a", listOf("ok")))), api.modelOptions())
+    }
+
+    @Test
+    fun repeatedModelAppearsOnce() = runTest {
+        respond("""{"providers":[{"slug":"a","models":["m","n","m"]},{"slug":"b","models":["m"]}]}""")
+        assertEquals(listOf(ProviderModels("a", listOf("m", "n")), ProviderModels("b", listOf("m"))), api.modelOptions().providers)
+    }
+
+    @Test
+    fun repeatedSlugKeepsTheFirst() = runTest {
+        respond("""{"providers":[{"slug":"a","models":["first"]},{"slug":"b","models":["m"]},{"slug":"a","models":["second"]}]}""")
+        assertEquals(listOf(ProviderModels("a", listOf("first")), ProviderModels("b", listOf("m"))), api.modelOptions().providers)
+    }
+
+    @Test
     fun usageNeverParsed() = runTest {
         // A usage object, a warning, an env var name, pricing and featured models: none can change or enter the result.
         respond(

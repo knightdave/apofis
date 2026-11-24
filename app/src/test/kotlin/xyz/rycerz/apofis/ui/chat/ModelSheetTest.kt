@@ -2,6 +2,17 @@ package xyz.rycerz.apofis.ui.chat
 
 import android.content.Context
 import androidx.compose.runtime.Composable
+import xyz.rycerz.apofis.sync.SendError
+import xyz.rycerz.apofis.chat.ReplyOutcome
+import xyz.rycerz.apofis.chat.SendState
+import xyz.rycerz.apofis.chat.UserMessage
+import mockwebserver3.SocketEffect
+import org.junit.Assert.assertFalse
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.test.click
+import androidx.compose.ui.test.isRoot
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -140,15 +151,45 @@ class ModelSheetTest {
 
     @After
     fun tearDown() {
-        latches.forEach { it.countDown() }
-        val jobs = vms.map { it.viewModelScope.coroutineContext.job }
-        stores.forEach { it.clear() }
-        runBlocking { withTimeout(60_000) { jobs.joinAll() } }
-        runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
-        db.close()
-        server.close()
-        Dispatchers.resetMain()
+        try {
+            latches.forEach { it.countDown() }
+            val jobs = vms.map { it.viewModelScope.coroutineContext.job }
+            stores.forEach { it.clear() }
+            runBlocking { withTimeout(60_000) { jobs.joinAll() } }
+            runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
+            db.close()
+            server.close()
+            assertFalse("a held answer was never released by its test", expired.get())
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
+
+    private val expired = AtomicBoolean(false)
+
+    /** Answers [body] once [release] opens; a gate that expires answers nothing (the connection drops) and fails the test. */
+    private fun held(release: CountDownLatch, body: String): (RecordedRequest) -> MockResponse = {
+        if (release.await(10, TimeUnit.SECONDS)) {
+            json(body)(it)
+        } else {
+            expired.set(true)
+            MockResponse.Builder().onResponseStart(SocketEffect.CloseSocket()).build()
+        }
+    }
+
+    private fun gate() = CountDownLatch(1).also { latches += it }
+
+    /** One more state emission, written straight to the row, so a later assert reads a state built after everything before. */
+    private fun ChatViewModel.settle(key: String = KEY) {
+        val title = "settled ${System.nanoTime()}"
+        runBlocking { db.sessionDao().upsert(db.sessionDao().get(key)!!.copy(title = title)) }
+        rule.waitUntil(10_000) { state.value.title == title }
+    }
+
+    private fun ChatViewModel.loading() = (state.value.sheet as? ChoiceSheet.Model)?.let { it.options == null && !it.failed } == true
+
+    /** Runs [action] and waits for the view model coroutines it started (a pick's write, a request). */
+    private fun ChatViewModel.andWait(action: () -> Unit) = runBlocking { withTimeout(10_000) { launchedBy(action).joinAll() } }
 
     private fun json(body: String, code: Int = 200) =
         { _: RecordedRequest -> MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build() }
@@ -219,12 +260,16 @@ class ModelSheetTest {
         rule.waitUntil(10_000) { vm.state.value.choice.model == "alpha-small" }
         vm.openModelSheet()
         waitFor(hasText("beta-1"))
-        assertEquals(listOf("Server default", "alpha", "alpha-large", "alpha-small", "beta", "beta-1"), listed())
+        assertEquals(
+            listOf("Model for this chat", "The server may use another model", "Server default", "alpha", "alpha-large", "alpha-small", "beta", "beta-1"),
+            listed(),
+        )
         assertEquals(listOf("alpha-small"), selected())
         assertTrue(exists(hasText("alpha") and SemanticsMatcher.keyIsDefined(SemanticsProperties.Heading)))
         vm.closeSheet()
         waitGone(hasText("beta-1"))
         runBlocking { connected.repo.setChoice(KEY, ChatModel()) }
+        rule.waitUntil(10_000) { vm.state.value.choice == ChatModel() } // the check reads the state, not the row
         vm.openModelSheet()
         waitFor(hasText("beta-1"))
         assertEquals(listOf("Server default"), selected())
@@ -238,9 +283,9 @@ class ModelSheetTest {
         host(vm)
         vm.openModelSheet()
         waitFor(hasText("beta-1"))
-        rule.onNodeWithText("beta-1").performClick()
+        vm.andWait { rule.onNodeWithText("beta-1").performClick() } // the write has ended: a request it made would be recorded
         waitGone(hasText("beta-1")) // the sheet closes on a pick
-        rule.waitUntil(10_000) { stored() == ChatModel("beta-1", "beta", "high", true) }
+        assertEquals(ChatModel("beta-1", "beta", "high", true), stored())
         assertNull(vm.state.value.sheet)
         assertEquals(listOf(OPTIONS), requests.map { it.target.substringBefore('?') }) // the list, and nothing for the pick
     }
@@ -264,8 +309,8 @@ class ModelSheetTest {
         rule.waitUntil(10_000) { stored().reasoning == "none" }
         vm.openReasoningSheet()
         waitFor(hasText("Medium"))
-        rule.onNodeWithText("Server default").performClick()
-        rule.waitUntil(10_000) { stored() == ChatModel("alpha-large", "alpha") }
+        vm.andWait { rule.onNodeWithText("Server default").performClick() }
+        assertEquals(ChatModel("alpha-large", "alpha"), stored())
         assertTrue(requests.isEmpty())
     }
 
@@ -273,16 +318,23 @@ class ModelSheetTest {
     fun fastToggles() {
         addSession(ChatModel("alpha-large", "alpha"))
         val vm = vm()
-        rule.waitUntil(10_000) { vm.state.value.choice.model == "alpha-large" }
-        assertTrue(vm.toggleFast()) // unset counts as off
-        rule.waitUntil(10_000) { vm.state.value.choice.fast == true }
+        vm.andWait { vm.toggleFast() } // unset counts as off
         assertEquals(ChatModel("alpha-large", "alpha", fast = true), stored())
-        assertEquals(false, vm.toggleFast())
-        rule.waitUntil(10_000) { vm.state.value.choice.fast == false }
+        vm.andWait { vm.toggleFast() }
         assertEquals(ChatModel("alpha-large", "alpha", fast = false), stored())
-        assertTrue(vm.toggleFast())
-        rule.waitUntil(10_000) { stored().fast == true }
+        vm.toggleFast()
+        vm.andWait { vm.toggleFast() } // two at once cancel out: each flips the row the one before wrote
+        assertEquals(ChatModel("alpha-large", "alpha", fast = false), stored())
         assertTrue(requests.isEmpty())
+    }
+
+    @Test
+    fun toggleFlipsTheStoredRowBeforeTheStateLoads() {
+        addSession(ChatModel(fast = true))
+        val vm = vm()
+        assertEquals("the state has not loaded the row yet", ChatModel(), vm.state.value.choice)
+        vm.andWait { vm.toggleFast() }
+        assertEquals(ChatModel(fast = false), stored())
     }
 
     @Test
@@ -312,41 +364,70 @@ class ModelSheetTest {
     @Test
     fun lateOptionsAfterSwitchDropped() {
         addSession()
-        val release = CountDownLatch(1).also { latches += it }
-        routes[OPTIONS] = { release.await(10, TimeUnit.SECONDS); json(minimal)(it) }
+        val release = gate()
+        routes[OPTIONS] = held(release, minimal)
         val vm = vm()
-        rule.waitUntil(10_000) { vm.state.value.loaded } // the state follows the sheet only once every source has spoken
-        val fetching = vm.launchedBy { vm.openModelSheet() } // with any history check the chat's first state started
-        rule.waitUntil(10_000) { optionRequests() == 1 }
+        val fetch = heldFetch(vm)
         open.set(false) // a server or key switch closed this connection: its generation is over
         release.countDown()
-        runBlocking { withTimeout(10_000) { fetching.joinAll() } }
-        assertEquals(ChoiceSheet.Model(), vm.state.value.sheet) // still waiting: the old generation's list never shows
-        val picking = vm.launchedBy { vm.pickModel("alpha", "alpha-large") } // a pick in the old generation stores nothing
-        runBlocking { withTimeout(10_000) { picking.joinAll() } }
+        runBlocking { withTimeout(10_000) { fetch.join() } }
+        vm.settle()
+        assertTrue("the old generation's list never shows: ${vm.state.value.sheet}", vm.loading())
+        vm.andWait { vm.pickModel("alpha", "alpha-large") } // a pick in the old generation stores nothing
         assertEquals(ChatModel(), stored())
+    }
+
+    /** Opens the model sheet with its request held: returns the request's coroutine once the loading sheet shows and the GET arrived. */
+    private fun heldFetch(vm: ChatViewModel): Job {
+        rule.waitUntil(10_000) { vm.state.value.loaded } // the state follows the sheet only once every source has spoken
+        val launched = vm.launchedBy { vm.openModelSheet() }
+        rule.waitUntil(10_000) { optionRequests() == 1 && vm.loading() }
+        return launched.single { it.isActive } // the chat's own history check (if one started meanwhile) ends at once
+    }
+
+    @Test
+    fun lateOptionsAfterCloseDropped() {
+        addSession()
+        val release = gate()
+        routes[OPTIONS] = held(release, minimal)
+        val vm = vm()
+        val fetch = heldFetch(vm)
+        vm.closeSheet()
+        release.countDown()
+        runBlocking { withTimeout(10_000) { fetch.join() } }
+        vm.settle()
+        assertNull(vm.state.value.sheet)
+    }
+
+    @Test
+    fun aSecondOpenWhileLoadingShowsItsOwnList() {
+        addSession()
+        val release = gate()
+        val calls = AtomicInteger()
+        val a = held(release, """{"providers":[{"slug":"p","models":["from-a"]}]}""")
+        routes[OPTIONS] = { if (calls.getAndIncrement() == 0) a(it) else json("""{"providers":[{"slug":"p","models":["from-b"]}]}""")(it) }
+        val vm = vm()
+        host(vm)
+        heldFetch(vm)
+        vm.openModelSheet() // again, while the first is loading
+        waitFor(hasText("from-b"))
+        release.countDown() // the first answer, released afterwards, changes nothing
+        vm.settle()
+        assertTrue(exists(hasText("from-b")))
+        assertTrue(!exists(hasText("from-a")))
     }
 
     @Test
     fun lateOptionsAfterChatChangeDropped() {
         addSession()
-        addSession(key = "apofis-b")
-        val release = CountDownLatch(1).also { latches += it }
-        routes[OPTIONS] = { release.await(10, TimeUnit.SECONDS); json(minimal)(it) }
+        val release = gate()
+        routes[OPTIONS] = held(release, minimal)
         val a = vm()
-        rule.waitUntil(10_000) { a.state.value.loaded }
-        val fetching = a.launchedBy { a.openModelSheet() } // with any history check the chat's first state started
-        rule.waitUntil(10_000) { optionRequests() == 1 }
+        val fetch = heldFetch(a)
         stores.single().clear() // another chat opened: AppNav clears the view model of the chat it leaves
-        val b = vm("apofis-b")
-        rule.waitUntil(10_000) { b.state.value.loaded }
         release.countDown()
-        runBlocking { withTimeout(10_000) { fetching.joinAll() } }
-        assertTrue("the request ended with its chat", fetching.any { it.isCancelled })
-        assertEquals(ChoiceSheet.Model(), a.state.value.sheet)
-        assertNull(b.state.value.sheet)
-        assertEquals(ChatModel(), stored())
-        assertEquals(ChatModel(), stored("apofis-b"))
+        runBlocking { withTimeout(10_000) { fetch.join() } }
+        assertTrue("the request ended with its chat", fetch.isCancelled)
     }
 
     @Test
@@ -417,7 +498,78 @@ class ModelSheetTest {
         assertTrue(!exists(hasText("The server may use another model")))
     }
 
+    @Test
+    fun aRepeatedModelIsSelectedOnce() {
+        addSession(ChatModel("m", "p"))
+        routes[OPTIONS] = json("""{"providers":[{"slug":"p","models":["m","m","n"]},{"slug":"p","models":["m"]}]}""")
+        val vm = vm()
+        host(vm)
+        rule.waitUntil(10_000) { vm.state.value.choice.model == "m" }
+        vm.openModelSheet()
+        waitFor(hasText("n"))
+        assertEquals(listOf("Server default", "p", "m", "n"), listed().drop(2))
+        assertEquals(listOf("m"), selected())
+    }
+
+    @Test
+    fun theMarkFollowsTheProvider() {
+        addSession(ChatModel("shared", "beta"))
+        routes[OPTIONS] = json("""{"providers":[{"slug":"alpha","models":["shared"]},{"slug":"beta","models":["shared"]}]}""")
+        val vm = vm()
+        host(vm)
+        rule.waitUntil(10_000) { vm.state.value.choice.provider == "beta" }
+        vm.openModelSheet()
+        waitFor(hasText("beta"))
+        val rows = rule.onNode(hasTestTag("model.list")).onChildren().fetchSemanticsNodes()
+        val marked = rows.indices.filter { rows[it].config.getOrElse(SemanticsProperties.Selected) { false } }
+        val beta = rows.indexOfFirst { it.config.getOrElse(SemanticsProperties.Text) { emptyList() }.joinToString() == "beta" }
+        assertEquals("one row, the one under beta", listOf(beta + 1), marked)
+    }
+
+    @Test
+    fun dismissingWhileCoveredClosesTheSheet() {
+        addSession()
+        routes[OPTIONS] = json(minimal)
+        val vm = vm()
+        var covered by mutableStateOf(false)
+        rule.setContent {
+            Themed {
+                val state by vm.state.collectAsState()
+                ChatScreen(state, vm, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, covered = covered, coveredNow = { covered })
+            }
+        }
+        vm.openModelSheet()
+        waitFor(hasText("beta-1"))
+        covered = true // the drawer came out over the chat with the sheet already showing
+        rule.waitForIdle()
+        val roots = rule.onAllNodes(isRoot())
+        roots[roots.fetchSemanticsNodes().size - 1].performTouchInput { click(Offset(centerX, 10f)) } // a tap on its scrim
+        rule.waitUntil(10_000) { vm.state.value.sheet == null }
+        covered = false
+        rule.waitForIdle()
+        assertTrue(!exists(hasText("beta-1")))
+        assertNull(vm.state.value.sheet)
+    }
+
     // ---- the screen on a plain state ----
+
+    /** M3: what the screen offers for a run that failed after its message was delivered, and for a refused send. */
+    @Test
+    fun aFailedRunOffersNothingAndARefusedSendOffersRetryAndRemove() {
+        val items = listOf(
+            UserMessage("u1", "hi", false, FIXED_NOW),
+            AssistantReply("r1", emptyList(), "", FIXED_NOW, outcome = ReplyOutcome.FAILED),
+            UserMessage("p1", "refused", false, FIXED_NOW, SendState.FAILED, "k1", error = SendError.HTTP_ERROR, attempted = false),
+        )
+        rule.setContent { Themed { ChatScreen(ChatUiState("k", "Chat", StatusLine.IDLE, items, ComposerMode.SEND_DISABLED, ""), object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
+        rule.onNodeWithText("The reply failed").assertExists()
+        assertEquals("one Retry, on the refused send only", 1, rule.onAllNodes(hasText("Retry")).fetchSemanticsNodes().size)
+        assertEquals(1, rule.onAllNodes(hasContentDescription("Remove message")).fetchSemanticsNodes().size)
+        val actions = rule.onAllNodes(hasClickAction()).fetchSemanticsNodes().map {
+            it.config.getOrElse(SemanticsProperties.Text) { emptyList() }.joinToString() + it.config.getOrElse(SemanticsProperties.ContentDescription) { emptyList() }.joinToString()
+        }
+        assertTrue("no other action on the two: $actions", actions.none { it.contains("again", ignoreCase = true) || it.contains("model", ignoreCase = true) })
+    }
 
     private val approval = PendingControl("approval", "ctl_1", 1, "rm -rf ~/old", null)
     private val live = LiveReply("run_1", "running", "Checking.", emptyList(), approval, Connection.LIVE)
@@ -433,7 +585,12 @@ class ModelSheetTest {
     }
 
     @Test
-    fun aPressBegunBeforeTheModelSheetAnswersNothing() {
+    fun aPressBegunBeforeTheModelSheetAnswersNothing() = pressAcross(ChoiceSheet.Model())
+
+    @Test
+    fun aPressBegunBeforeTheReasoningSheetAnswersNothing() = pressAcross(ChoiceSheet.Reasoning)
+
+    private fun pressAcross(sheet: ChoiceSheet) {
         val approvals = ArrayList<ApprovalChoice>()
         val actions = object : ChatActions {
             override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) {
@@ -452,7 +609,7 @@ class ModelSheetTest {
         tick(1_000)
         rule.onNodeWithText("Allow once").performTouchInput { down(center) } // well after the interval
         tick(50)
-        ui = ui.copy(sheet = ChoiceSheet.Model())
+        ui = ui.copy(sheet = sheet)
         tick(48)
         assertEquals(1, rule.onAllNodes(isDialog()).fetchSemanticsNodes().size)
         ui = ui.copy(sheet = null)

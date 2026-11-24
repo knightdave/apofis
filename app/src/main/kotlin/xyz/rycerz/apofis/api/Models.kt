@@ -121,23 +121,29 @@ data class ProviderModels(val slug: String, val models: List<String>)
 /** The server's default model and provider, and the usable models by provider. Nothing else of the response is kept. */
 data class ModelOptions(val defaultModel: String?, val defaultProvider: String?, val providers: List<ProviderModels>)
 
-/** The four keys the model sheet reads; `usage`, `warning`, `key_env`, `capabilities` and every other key are skipped. */
+/**
+ * The keys the model sheet reads: `model`, `provider`, and each provider's `slug`, `models` and `authenticated`;
+ * `usage`, `warning`, `key_env`, `capabilities` and every other key are skipped.
+ */
 @Serializable
 internal data class ModelOptionsDto(val model: String? = null, val provider: String? = null, val providers: List<ProviderDto>? = null) {
     @Serializable
-    data class ProviderDto(val slug: String? = null, val models: List<String>? = null)
+    data class ProviderDto(val slug: String? = null, val models: List<String>? = null, val authenticated: Boolean? = null)
 
-    /** Drops every name that is empty or that setChoice would refuse, and a provider left with no models. */
+    /**
+     * Drops a provider marked not authenticated, every name that is blank or that setChoice would refuse, a model listed
+     * twice in one provider and a slug listed twice (the first wins, order kept), and a provider left with no models.
+     */
     fun options() = ModelOptions(
         model.usable(),
         provider.usable(),
-        providers.orEmpty().mapNotNull { p ->
-            val models = p.models.orEmpty().filter { it.usable() != null }
+        providers.orEmpty().filter { it.authenticated != false }.mapNotNull { p ->
+            val models = p.models.orEmpty().filter { it.usable() != null }.distinct()
             p.slug.usable()?.takeIf { models.isNotEmpty() }?.let { ProviderModels(it, models) }
-        },
+        }.distinctBy { it.slug },
     )
 }
 
 private const val MAX_NAME = 256 // ChatRepository.setChoice refuses a longer model or provider name
 
-private fun String?.usable() = this?.takeIf { it.isNotEmpty() && it.length <= MAX_NAME }
+private fun String?.usable() = this?.takeIf { it.isNotBlank() && it.length <= MAX_NAME }

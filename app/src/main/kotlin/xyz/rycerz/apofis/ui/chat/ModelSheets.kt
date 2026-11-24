@@ -1,7 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -38,8 +37,8 @@ import xyz.rycerz.apofis.ui.theme.SheetRow
 @Composable
 internal fun ModelSheet(sheet: ChoiceSheet.Model, choice: ChatModel, onPick: (provider: String?, model: String?) -> Unit, onRetry: () -> Unit, onDismiss: () -> Unit) {
     ApofisSheet(onDismiss) {
-        SheetTitle(R.string.model_title, R.string.model_note)
         LazyColumn(Modifier.testTag("model.list")) {
+            item { SheetTitle(R.string.model_title, R.string.model_note) } // scrolls with the rows: a short window still reaches them
             item { ChoiceRow(stringResource(R.string.model_default), choice.model == null && choice.provider == null) { onPick(null, null) } }
             if (sheet.failed) {
                 item {
@@ -64,8 +63,8 @@ internal fun ModelSheet(sheet: ChoiceSheet.Model, choice: ChatModel, onPick: (pr
 @Composable
 internal fun ReasoningSheet(choice: ChatModel, onPick: (String?) -> Unit, onDismiss: () -> Unit) {
     ApofisSheet(onDismiss) {
-        SheetTitle(R.string.reasoning_title, R.string.reasoning_note)
         Column(Modifier.verticalScroll(rememberScrollState())) { // a short window still reaches every level
+            SheetTitle(R.string.reasoning_title, R.string.reasoning_note)
             for (level in REASONING_LEVELS) ChoiceRow(stringResource(reasoningLabel(level)), choice.reasoning == level) { onPick(level) }
         }
     }
@@ -81,7 +80,7 @@ private fun reasoningLabel(level: String?) = when (level) {
 
 /** The sheet's title and one muted line under it, lined up with the rows' labels. */
 @Composable
-private fun ColumnScope.SheetTitle(title: Int, note: Int) {
+private fun SheetTitle(title: Int, note: Int) = Column {
     Text(
         stringResource(title),
         Modifier.padding(horizontal = 14.dp).semantics { heading() },

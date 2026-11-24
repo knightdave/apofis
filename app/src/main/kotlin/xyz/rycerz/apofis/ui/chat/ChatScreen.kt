@@ -662,7 +662,8 @@ internal class Gate(private val covered: () -> Boolean) {
 
 /**
  * [actions] through [gate]. Exempt, and passed straight on: typing ([onDraftChange]), which dropping could lose, and
- * the six confirm and dismiss callbacks of the confirmation dialogs, which are their own windows above the drawer.
+ * the six confirm and dismiss callbacks of the confirmation dialogs and the choice sheets' dismissal, each its own window
+ * above the drawer.
  */
 internal class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
     override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
@@ -683,10 +684,10 @@ internal class CoveredActions(private val actions: () -> ChatActions, private va
     override fun onResolveUnknown() = gate.pass { actions().onResolveUnknown() }
     override fun openModelSheet() = gate.pass { actions().openModelSheet() }
     override fun openReasoningSheet() = gate.pass { actions().openReasoningSheet() }
-    override fun closeSheet() = gate.pass { actions().closeSheet() }
+    override fun closeSheet() = actions().closeSheet()
     override fun pickModel(provider: String?, model: String?) = gate.pass { actions().pickModel(provider, model) }
     override fun pickReasoning(level: String?) = gate.pass { actions().pickReasoning(level) }
-    override fun toggleFast(): Boolean = gate.passOr(false) { actions().toggleFast() } // covered: nothing stored, nothing on
+    override fun toggleFast() = gate.pass { actions().toggleFast() }
 }
 
 /** The body lambda for the last pair of bar heights. */

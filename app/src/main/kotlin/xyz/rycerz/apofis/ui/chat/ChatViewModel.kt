@@ -5,7 +5,10 @@ import android.net.ConnectivityManager
 import android.net.Network
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -23,6 +26,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -70,8 +74,11 @@ val REASONING_LEVELS = listOf(null, "none", "low", "medium", "high")
 
 /** An open choice sheet. */
 sealed interface ChoiceSheet {
-    /** [options]: the server's models once fetched, held only here and never stored; [failed]: the fetch failed. */
-    data class Model(val options: ModelOptions? = null, val failed: Boolean = false) : ChoiceSheet
+    /**
+     * [options]: the server's models once fetched, held only here and never stored; [failed]: the fetch failed. Not a
+     * data class: each open is its own sheet, so a second open while the first is loading replaces it.
+     */
+    class Model(val options: ModelOptions? = null, val failed: Boolean = false) : ChoiceSheet
     data object Reasoning : ChoiceSheet
 }
 
@@ -138,8 +145,8 @@ interface ChatActions {
     fun pickModel(provider: String?, model: String?) {}
     fun pickReasoning(level: String?) {}
 
-    /** Flips fast mode for this chat on this phone (unset counts as off); returns the new state. */
-    fun toggleFast(): Boolean = false
+    /** Flips this chat's stored fast mode on this phone (unset counts as off). */
+    fun toggleFast() {}
 }
 
 private enum class Failure { NETWORK, UNAUTHORIZED, SERVER, GONE }
@@ -262,6 +269,7 @@ class ChatViewModel(
     override fun onSendClick(): Boolean {
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.send(sessionKey) { text ->
+            choosing.withLock {} // every pick made before the tap is stored first, so this send carries it
             // The field empties only once the text is stored; delivery problems after that show on the bubble.
             repo.send(sessionKey, text, onStored = ::stored)
             local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
@@ -363,23 +371,27 @@ class ChatViewModel(
 
     override fun pickReasoning(level: String?) = choose { it.copy(reasoning = level) }
 
-    override fun toggleFast(): Boolean {
-        val on = state.value.choice.fast != true
-        choose(close = false) { it.copy(fast = on) }
-        return on
-    }
+    override fun toggleFast() = choose(close = false) { it.copy(fast = it.fast != true) }
 
-    /** Changes this chat's stored choice on this phone, in this connection only; makes no request. */
+    /**
+     * Changes this chat's stored choice on this phone, in this connection only; makes no request. The change takes its
+     * place in [choosing] before this returns (so a send tapped next waits for it) and is not cancelled with the view
+     * model; a closed connection or a failed write drops it and the old choice stays.
+     */
     private fun choose(close: Boolean = true, change: (ChatModel) -> ChatModel) {
         if (close) closeSheet()
-        viewModelScope.launch {
-            try {
-                choosing.withLock { // one read and write at a time, so quick picks never undo each other
-                    val repo = connected.repo // throws once the connection is closed: a pick belongs to its generation
-                    val session = repo.session(sessionKey).first() ?: return@withLock
-                    repo.setChoice(sessionKey, change(session.choice()))
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable) {
+                try {
+                    choosing.withLock { // one read and write at a time, so quick picks never undo each other
+                        val repo = connected.repo // throws once the connection is closed: a pick belongs to its generation
+                        val session = repo.session(sessionKey).first() ?: return@withLock
+                        repo.setChoice(sessionKey, change(session.choice()))
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
                 }
-            } catch (_: IllegalStateException) {
             }
         }
     }

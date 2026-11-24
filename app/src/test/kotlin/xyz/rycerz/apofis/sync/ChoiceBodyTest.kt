@@ -20,6 +20,14 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import mockwebserver3.SocketEffect
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.CountDownLatch
+import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
@@ -98,6 +106,7 @@ class ChoiceBodyTest {
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 requests += request
+                requested.value = requests.size
                 return routes[request.target.substringBefore('?')]?.invoke(request) ?: MockResponse.Builder().code(500).build()
             }
         }
@@ -122,14 +131,62 @@ class ChoiceBodyTest {
 
     @After
     fun tearDown() {
-        val jobs = vms.map { it.viewModelScope.coroutineContext.job }
-        store.clear()
-        runBlocking { withTimeout(60_000) { jobs.joinAll() } }
-        follower.pauseAll()
-        runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
-        db.close()
-        server.close()
-        Dispatchers.resetMain()
+        try {
+            latches.forEach { it.countDown() }
+            val jobs = vms.map { it.viewModelScope.coroutineContext.job }
+            store.clear()
+            runBlocking { withTimeout(60_000) { jobs.joinAll() } }
+            follower.pauseAll()
+            runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
+            db.close()
+            server.close()
+            assertFalse("a held answer was never released by its test", expired.get())
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    private val requested = MutableStateFlow(0)
+    private val latches = CopyOnWriteArrayList<CountDownLatch>()
+    private val expired = AtomicBoolean(false)
+
+    /** Answers [body] once [release] opens; a gate that expires answers nothing (the connection drops) and fails the test. */
+    private fun held(release: CountDownLatch, body: String): (RecordedRequest) -> MockResponse = {
+        if (release.await(10, TimeUnit.SECONDS)) {
+            json(body)(it)
+        } else {
+            expired.set(true)
+            MockResponse.Builder().onResponseStart(SocketEffect.CloseSocket()).build()
+        }
+    }
+
+    private fun gate() = CountDownLatch(1).also { latches += it }
+
+    private fun newVm() = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected) } })[ChatViewModel::class].also { vms += it }
+
+    /** Runs [action] and returns the view model coroutines it started (a pick's write) that are still running. */
+    private fun ChatViewModel.launchedBy(action: () -> Unit): List<Job> {
+        val before = viewModelScope.coroutineContext.job.children.toSet()
+        action()
+        return viewModelScope.coroutineContext.job.children.filter { it !in before }.toList()
+    }
+
+    private suspend fun List<Job>.joined() = withContext(Dispatchers.Default) { withTimeout(10_000) { joinAll() } }
+
+    /** A session list naming this chat, so a refresh rewrites its row (and keeps its choice). */
+    private val listingThisChat = """{"object":"list","data":[{"id":"$KEY","source":"api_server","title":"Plans","pinned":false,""" +
+        """"archived":false,"hidden":false,"started_at":1.0,"last_active":1.0,"message_count":0,"preview":""}],"has_more":false}"""
+
+    /**
+     * A session refresh holding the repository lock at its HTTP response, as production holds it; returns the gate that
+     * lets it finish. A choice write waits for this lock; storing a send does not.
+     */
+    private suspend fun heldRefresh(): CountDownLatch {
+        val release = gate()
+        routes[SESSIONS] = held(release, listingThisChat)
+        scope.launch { repo.refreshSessions() }
+        awaitTrue { requests.any { it.target.startsWith("$SESSIONS?") } }
+        return release
     }
 
     private fun json(body: String, code: Int = 200) =
@@ -161,12 +218,12 @@ class ChoiceBodyTest {
         ),
     )
 
-    private suspend fun awaitTrue(condition: suspend () -> Boolean) = withContext(Dispatchers.IO) {
-        repeat(2000) {
-            if (condition()) return@withContext
-            Thread.sleep(5)
+    /** Checks [condition] now and after every request and every change of the chat tables, for at most 10 s. */
+    private suspend fun awaitTrue(condition: suspend () -> Boolean) = withContext(Dispatchers.Default) {
+        withTimeout(10_000) {
+            merge(requested, db.invalidationTracker.createFlow("SessionEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity", "MessageEntity"))
+                .first { condition() }
         }
-        throw AssertionError("condition not met within 10 s")
     }
 
     private fun runBodies() = requests.filter { it.target == RUNS }.map { it.body!!.utf8() }
@@ -180,16 +237,67 @@ class ChoiceBodyTest {
     @Test
     fun pickedChoiceInNextBody() = runTest {
         addSession()
-        val vm = ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(KEY, connected) } })[ChatViewModel::class].also { vms += it }
-        vm.pickModel("alpha", "alpha-large")
-        vm.pickReasoning("low")
-        assertTrue(vm.toggleFast())
-        awaitTrue { choice() == CHOICE }
+        val vm = newVm()
+        vm.launchedBy {
+            vm.pickModel("alpha", "alpha-large")
+            vm.pickReasoning("low")
+            vm.toggleFast()
+        }.joined() // the writes have ended: a request one of them made would be recorded by now
+        assertEquals(CHOICE, choice())
         assertTrue("a pick makes no request", requests.none { !it.target.startsWith(MESSAGES) }) // the chat's own history load only
         repo.send(KEY, "hi")
         assertEquals(listOf(buildRunBody(KEY, "hi", choice = CHOICE)), runBodies())
         assertTrue(keysOf(runBodies().single()).containsAll(MODEL_KEYS))
         settled()
+    }
+
+    @Test
+    fun aSendTappedAfterAPickCarriesIt() = runTest {
+        addSession(ChatModel("model-a", "p"))
+        val vm = newVm()
+        val release = heldRefresh()
+        vm.pickModel("p", "model-b") // its write waits for the refresh's lock
+        vm.onDraftChange("hi", connected.composer.current(KEY).revision)
+        assertTrue(vm.onSendClick())
+        release.countDown()
+        awaitTrue { runBodies().isNotEmpty() }
+        assertEquals(listOf(buildRunBody(KEY, "hi", choice = ChatModel("model-b", "p"))), runBodies())
+        settled()
+    }
+
+    @Test
+    fun aPickSurvivesLeavingTheChat() = runTest {
+        addSession(ChatModel("model-a", "p"))
+        val vm = newVm()
+        val release = heldRefresh()
+        vm.pickModel("p", "model-b")
+        store.clear() // the chat was left: AppNav clears its view model
+        release.countDown()
+        awaitTrue { choice() == ChatModel("model-b", "p") }
+    }
+
+    @Test
+    fun picksWaitingForTheLockKeepEachOther() = runTest {
+        addSession()
+        val vm = newVm()
+        val release = heldRefresh()
+        val writes = vm.launchedBy {
+            vm.pickModel("p", "model-b")
+            vm.pickReasoning("high")
+        }
+        release.countDown()
+        writes.joined()
+        assertEquals(ChatModel("model-b", "p", "high"), choice())
+    }
+
+    @Test
+    fun aWriteTheRepositoryRefusesIsDropped() = runTest {
+        addSession(ChatModel("model-a", "p"))
+        val vm = newVm()
+        vm.launchedBy { vm.pickModel("p", "x".repeat(257)) }.joined() // setChoice refuses a name over 256 characters
+        assertEquals(ChatModel("model-a", "p"), choice())
+        vm.launchedBy { vm.pickModel("p", "model-b") }.joined()
+        assertEquals(ChatModel("model-b", "p"), choice())
     }
 
     @Test
@@ -331,9 +439,13 @@ class ChoiceBodyTest {
         addSession(CHOICE)
         // The server ran another model than the one asked for and says so in the run's runtime metadata (H7).
         routes[STATUS] = status("completed", extra = ""","runtime":{"model":"served-model","provider":"served"}""")
+        val attaches = AtomicInteger()
+        // The stream drops before its end, so the follower reads the run's status (with the served runtime) to finish it.
+        routes[EVENTS] = { if (attaches.getAndIncrement() == 0) sse() else sse(terminal(9, "completed")) }
         routes[MESSAGES] = json(rows("hi"))
         repo.send(KEY, "hi")
         settled()
+        assertTrue("the status naming the served model was read", requests.any { it.target == STATUS })
         assertTrue(db.pendingSendDao().rows(KEY).isEmpty())
         assertEquals(CHOICE, choice())
         routes[MESSAGES] = json(rows("hi", "again"))
