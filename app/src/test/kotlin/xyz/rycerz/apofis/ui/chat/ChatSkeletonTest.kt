@@ -9,10 +9,18 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasContentDescription
@@ -32,6 +40,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -205,6 +214,17 @@ class ChatSkeletonTest {
         rule.waitForIdle()
     }
 
+    /** Waits for the view model's current open (started at creation or by the last [ChatViewModel.onOpened]) to end. */
+    private fun ChatViewModel.openEnded() {
+        rule.waitUntil(10_000) { opening != null }
+        runBlocking { withTimeout(10_000) { opening!!.join() } }
+    }
+
+    private val context = ApplicationProvider.getApplicationContext<Context>()
+
+    /** The header's status line, merged as TalkBack reads it, shows [text]. */
+    private fun statusShows(text: String) = rule.onAllNodes(hasTestTag("status.line") and hasText(text)).fetchSemanticsNodes().isNotEmpty()
+
     /** The coroutines [action] launched in the view model that are still running. */
     private fun ChatViewModel.launchedBy(action: () -> Unit): List<Job> {
         val before = viewModelScope.coroutineContext.job.children.toSet()
@@ -241,6 +261,7 @@ class ChatSkeletonTest {
         val vm = vm()
         host(vm)
         vm.waitState { it.items.isNotEmpty() && !it.firstLoad } // stored now
+        vm.openEnded()
         val release = gate()
         val arrived = gate()
         routes[HISTORY] = held(release, arrived)
@@ -263,8 +284,9 @@ class ChatSkeletonTest {
         addSession(onServer = false)
         val vm = vm()
         host(vm)
-        vm.settle()
+        vm.openEnded() // the check at creation ended
         vm.onOpened()
+        vm.openEnded()
         vm.settle()
         assertEquals(0, history())
         assertFalse(vm.state.value.firstLoad)
@@ -289,6 +311,21 @@ class ChatSkeletonTest {
         assertFalse(vm.state.value.firstLoad)
         assertTrue(vm.state.value.items.isEmpty())
         waitGone(loading)
+        val serverError = context.getString(R.string.chat_status_server_error)
+        rule.waitUntil(10_000) { statusShows(serverError) }
+        // A retry retires the old error while its skeleton shows; failing again, it shows the error again.
+        vm.openEnded()
+        val again = gate()
+        val arrivedAgain = gate()
+        routes[HISTORY] = held(again, arrivedAgain, json("""{"error":{"code":"boom"}}""", 500))
+        vm.onOpened()
+        arrivedAgain.reached()
+        waitFor(loading)
+        assertFalse("the old error shows over the retry's skeleton", statusShows(serverError))
+        again.countDown()
+        waitGone(loading)
+        rule.waitUntil(10_000) { statusShows(serverError) }
+        assertEquals(2, history())
     }
 
     @Test
@@ -296,7 +333,7 @@ class ChatSkeletonTest {
         addSession(onServer = false) // the first check fetches nothing
         val vm = vm()
         host(vm)
-        vm.settle()
+        vm.openEnded() // the check at creation ended before the row changes
         addSession(onServer = true) // created on the server since; still nothing stored
         val release = gate()
         val arrived = gate()
@@ -347,7 +384,8 @@ class ChatSkeletonTest {
         routes[HISTORY] = json(serverRows)
         val vm = vm()
         host(vm)
-        vm.waitState { it.items.isNotEmpty() && !it.firstLoad } // the first open ended
+        vm.waitState { it.items.isNotEmpty() && !it.firstLoad }
+        vm.openEnded() // the first open ended
         val release = gate()
         val arrived = gate()
         routes[HISTORY] = held(release, arrived)
@@ -372,11 +410,13 @@ class ChatSkeletonTest {
     private var ui by mutableStateOf(chat)
     private var dragArea: Modifier by mutableStateOf(Modifier)
     private var skeletonColor = Color.Unspecified
+    private var pageColor = Color.Unspecified
 
     private fun show(reduceMotion: Boolean = true) {
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = reduceMotion, blur = false) {
                 skeletonColor = ApofisTheme.colors.skeleton
+                pageColor = MaterialTheme.colorScheme.surface
                 ChatScreen(ui, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, dragArea = dragArea)
             }
         }
@@ -388,6 +428,16 @@ class ChatSkeletonTest {
         rule.mainClock.advanceTimeByFrame()
     }
 
+    /** The middle of the first bar (start aligned, 44 dp tall, so 44 px down at xhdpi), as drawn now. */
+    private fun firstBar(): Int {
+        val pixels = rule.onNode(loading, useUnmergedTree = true).drawnPixels()
+        return pixels[pixels.width / 10, 44].toArgb()
+    }
+
+    private fun near(expected: Color, actual: Int, levels: Int = 2) = listOf(16, 8, 0).all {
+        kotlin.math.abs((expected.toArgb() shr it and 0xFF) - (actual shr it and 0xFF)) <= levels
+    }
+
     @Test
     fun oneNodeLabelled() {
         show()
@@ -397,19 +447,32 @@ class ChatSkeletonTest {
         val node = nodes.single()
         assertTrue("the four bars are separate nodes", node.children.isEmpty())
         assertFalse(node.config.contains(SemanticsActions.OnClick))
+        assertEquals(LiveRegionMode.Polite, node.config.getOrElseNullable(SemanticsProperties.LiveRegion) { null })
     }
 
     /** It takes no touches: a tap and a drag that start on it reach the drawer's drag area under it, not consumed. */
     @Test
     fun touchesReachTheDragArea() {
         var hits = 0
-        dragArea = Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) { if (awaitPointerEvent().changes.any { !it.isConsumed }) hits++ } } }
+        var moves = 0
+        dragArea = Modifier.pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    val event = awaitPointerEvent()
+                    if (event.changes.any { !it.isConsumed }) {
+                        hits++
+                        if (event.type == PointerEventType.Move) moves++
+                    }
+                }
+            }
+        }
         show()
         rule.onNode(loading, useUnmergedTree = true).performTouchInput { click(Offset(width * 0.3f, 20f)) }
-        val tapped = hits
-        assertTrue("a tap on the skeleton did not reach the drag area", tapped > 0)
+        assertTrue("a tap on the skeleton did not reach the drag area", hits > 0)
+        val before = moves
         rule.onNode(loading, useUnmergedTree = true).performTouchInput { swipeRight() }
-        assertTrue("a drag on the skeleton did not reach the drag area", hits > tapped)
+        // The moves themselves, past the touch slop, not only the down: a drawer drag needs them unconsumed.
+        assertTrue("the drag's moves did not reach the drag area (${moves - before})", moves - before >= 5)
     }
 
     /** Only over an empty list and never in place of the load-failed page. */
@@ -440,12 +503,53 @@ class ChatSkeletonTest {
         val loops = PulseProbe.frames
         frames(60)
         assertEquals("a frame loop runs under reduced motion", loops, PulseProbe.frames)
+        assertEquals("the bar changed over 60 frames", skeletonColor.toArgb(), firstBar())
+    }
+
+    /**
+     * The bars' edges at the goldens' size (360 dp wide, xhdpi): the first bar ends at 62 % of the 328 dp between the
+     * 16 dp margins, the second (end aligned, 48 %) starts at 52 % of it. A drift of 2 dp fails, which the goldens' 1 %
+     * tolerance would let through.
+     */
+    @Test
+    fun barEdgesAtTheGoldenSize() {
+        show()
+        val pixels = rule.onRoot().drawnPixels()
+        val top = rule.onNode(loading, useUnmergedTree = true).fetchSemanticsNode().boundsInWindow.top.toInt()
+        fun px(dp: Double) = (dp * 2).roundToInt() // xhdpi
+        val firstEnd = px(16 + 0.62 * 328)
+        val secondStart = px(16 + 0.52 * 328)
+        val first = top + px(22.0) // the first bar's middle row
+        val second = top + px(44.0 + 14 + 22) // the second bar's middle row
+        assertEquals("inside the first bar", skeletonColor.toArgb(), pixels[firstEnd - 4, first].toArgb())
+        assertEquals("after the first bar", pageColor.toArgb(), pixels[firstEnd + 4, first].toArgb())
+        assertEquals("before the second bar", pageColor.toArgb(), pixels[secondStart - 4, second].toArgb())
+        assertEquals("inside the second bar", skeletonColor.toArgb(), pixels[secondStart + 4, second].toArgb())
+    }
+
+    /**
+     * A short window (a phone in landscape): the bars that do not fit are clipped above the line where the list's last row
+     * rests, so none shows in the composer's margins or below its card.
+     */
+    @Test
+    @Config(qualifiers = "w760dp-h360dp-xhdpi")
+    fun skeletonStaysAboveTheComposer() {
+        show()
+        val pixels = rule.onNodeWithTag("chat.bottom").drawnPixels()
+        val strip = 14 // px: inside the 8 dp margins above and below the card, clear of its border
+        val margins = (0 until pixels.width).flatMap { x -> (0 until strip).flatMap { y -> listOf(x to y, x to pixels.height - 1 - y) } } +
+            (0 until pixels.height).flatMap { y -> (0 until strip).flatMap { x -> listOf(x to y, pixels.width - 1 - x to y) } }
+        val bar = skeletonColor.toArgb()
+        assertEquals("skeleton pixels in the composer's margins", 0, margins.count { (x, y) -> pixels[x, y].toArgb() == bar })
+        // Clipped, not squeezed: the group keeps its four 44 dp bars and three 14 dp gaps (218 dp, 436 px).
+        assertEquals(436, rule.onNode(loading, useUnmergedTree = true).fetchSemanticsNode().size.height) // its own size, not the clipped bounds
     }
 
     @Test
     fun chromeStableWithSkeleton() {
         rule.mainClock.autoAdvance = false
         show(reduceMotion = false)
+        val dim = firstBar() // time 0: the dimmest phase, the group at 0.45
         frames(5)
         assertTrue(exists(loading))
         val bar = ChromeProbe.barCompositions
@@ -454,8 +558,13 @@ class ChatSkeletonTest {
         val root = ChromeProbe.rootMeasures
         val skeleton = ChromeProbe.skeletonCompositions
         val loops = PulseProbe.frames
+        frames(51) // 56 frames of 16 ms in all: about half of Motion.PULSE_PERIOD, the brightest phase
+        val bright = firstBar()
+        assertTrue("the bars do not pulse", dim != bright)
+        assertTrue("the dim phase is not the token at 0.45", near(skeletonColor.copy(alpha = 0.45f).compositeOver(pageColor), dim))
+        assertTrue("the bright phase is not the token", near(skeletonColor, bright))
         frames(60) // the pulse runs: it is read in a graphics layer, so it recomposes and measures nothing
-        assertTrue("the pulse did not run", PulseProbe.frames >= loops + 60)
+        assertTrue("the pulse did not run", PulseProbe.frames >= loops + 111)
         assertEquals("header recomposed by the pulse", bar, ChromeProbe.barCompositions)
         assertEquals("composer recomposed by the pulse", bottom, ChromeProbe.bottomCompositions)
         assertEquals("transcript recomposed by the pulse", body, ChromeProbe.bodyCompositions)
@@ -467,5 +576,8 @@ class ChatSkeletonTest {
         assertEquals("header recomposed by the end of the load", bar, ChromeProbe.barCompositions)
         assertEquals("composer recomposed by the end of the load", bottom, ChromeProbe.bottomCompositions)
         assertEquals("root measured by the end of the load", root, ChromeProbe.rootMeasures)
+        val stopped = PulseProbe.frames
+        frames(30)
+        assertEquals("the frame loop outlived the skeleton", stopped, PulseProbe.frames)
     }
 }

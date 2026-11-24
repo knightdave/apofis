@@ -15,7 +15,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.BuildConfig
 import xyz.rycerz.apofis.R
@@ -30,7 +32,7 @@ private val WIDTHS = listOf(0.62f, 0.48f, 0.70f, 0.55f)
  * Four placeholder bars while a chat's history loads for the first time (UI map: the loading skeleton), start and end
  * aligned in turn, at the top of the space [modifier] leaves. The group pulses 0.45 to 1 over [Motion.PULSE_PERIOD], read
  * in its graphics layer so a frame recomposes nothing; static at full alpha under reduced motion. One accessibility node
- * ("Loading messages"); no pointer input, so a drag that starts on it reaches the drawer's drag area under it.
+ * ("Loading messages", a polite live region); no pointer input, so a drag that starts on it reaches the drawer's drag area under it.
  */
 @Composable
 fun ChatSkeleton(modifier: Modifier = Modifier) {
@@ -42,8 +44,11 @@ fun ChatSkeleton(modifier: Modifier = Modifier) {
     if (BuildConfig.DEBUG) SideEffect { ChromeProbe.skeletonCompositions++ }
     Column(
         modifier
-            .wrapContentHeight(Alignment.Top)
-            .clearAndSetSemantics { contentDescription = label }
+            .wrapContentHeight(Alignment.Top, unbounded = true) // the bars keep their 44 dp; the caller clips what does not fit
+            .clearAndSetSemantics {
+                contentDescription = label
+                liveRegion = LiveRegionMode.Polite // announced once when it appears, not on every frame
+            }
             .graphicsLayer { alpha = if (reduce) 1f else pulseAlpha(time.value, Motion.PULSE_PERIOD, 0.45f, 1f) },
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {

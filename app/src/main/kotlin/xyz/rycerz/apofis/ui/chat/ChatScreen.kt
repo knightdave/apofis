@@ -50,6 +50,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.runtime.snapshotFlow
 import xyz.rycerz.apofis.BuildConfig
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -371,12 +372,17 @@ fun ChatScreen(
                             }
                             // The first fetch of a chat with no stored rows, over the still empty list (decision 27: no delay).
                             if (state.firstLoad && state.items.isEmpty()) {
+                                // Clipped above the line where the list's last row rests: in a short window (landscape, the
+                                // keyboard, the expanded editor) no bar draws under or around the composer.
                                 ChatSkeleton(
-                                    Modifier.padding(
-                                        start = padding.calculateStartPadding(direction) + 16.dp,
-                                        end = padding.calculateEndPadding(direction) + 16.dp,
-                                        top = with(density) { barHeight.toDp() } + 24.dp,
-                                    ),
+                                    Modifier
+                                        .padding(
+                                            start = padding.calculateStartPadding(direction) + 16.dp,
+                                            end = padding.calculateEndPadding(direction) + 16.dp,
+                                            top = with(density) { barHeight.toDp() } + 24.dp,
+                                            bottom = padding.calculateBottomPadding(),
+                                        )
+                                        .clipToBounds(),
                                 )
                             }
                         }
