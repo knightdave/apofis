@@ -101,6 +101,7 @@ import androidx.compose.ui.window.DialogProperties
 import xyz.rycerz.apofis.chat.ChatItem
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.api.ChatModel
 import xyz.rycerz.apofis.chat.ComposeError
 import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
@@ -512,6 +513,17 @@ fun ChatScreen(
         OverChat(overlays)
         ImageViewer(image, onClose = { viewer = null })
     }
+    when (val sheet = state.sheet) {
+        is ChoiceSheet.Model -> {
+            OverChat(overlays) // once per showing: the list arriving is the same window
+            ModelSheet(sheet, state.choice, gated::pickModel, gated::openModelSheet, gated::closeSheet)
+        }
+        ChoiceSheet.Reasoning -> {
+            OverChat(overlays)
+            ReasoningSheet(state.choice, gated::pickReasoning, gated::closeSheet)
+        }
+        null -> {}
+    }
 }
 
 @Composable
@@ -618,9 +630,9 @@ private data class BottomInput(
     val loadFailed: Boolean,
 )
 
-/** What the transcript reads: without the composer's fields, so typing does not recompose it. */
+/** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it. */
 private fun ChatUiState.forTranscript() =
-    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0)
+    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null)
 
 private data class BarCallbacks(
     val onOpenConnection: () -> Unit,
@@ -650,7 +662,8 @@ internal class Gate(private val covered: () -> Boolean) {
 
 /**
  * [actions] through [gate]. Exempt, and passed straight on: typing ([onDraftChange]), which dropping could lose, and
- * the six confirm and dismiss callbacks of the confirmation dialogs, which are their own windows above the drawer.
+ * the six confirm and dismiss callbacks of the confirmation dialogs and the choice sheets' dismissal, each its own window
+ * above the drawer.
  */
 internal class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
     override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
@@ -669,6 +682,12 @@ internal class CoveredActions(private val actions: () -> ChatActions, private va
     override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) = gate.pass { actions().onApproval(requestId, executionGeneration, choice) }
     override fun onClarify(requestId: String, executionGeneration: Long, answer: String) = gate.pass { actions().onClarify(requestId, executionGeneration, answer) }
     override fun onResolveUnknown() = gate.pass { actions().onResolveUnknown() }
+    override fun openModelSheet() = gate.pass { actions().openModelSheet() }
+    override fun openReasoningSheet() = gate.pass { actions().openReasoningSheet() }
+    override fun closeSheet() = actions().closeSheet()
+    override fun pickModel(provider: String?, model: String?) = gate.pass { actions().pickModel(provider, model) }
+    override fun pickReasoning(level: String?) = gate.pass { actions().pickReasoning(level) }
+    override fun toggleFast() = gate.pass { actions().toggleFast() }
 }
 
 /** The body lambda for the last pair of bar heights. */
