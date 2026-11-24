@@ -63,7 +63,8 @@ class ImageStore(private val dir: File, private val clock: () -> Long, internal 
         if (NAME.matches(sha256)) File(dir, "$sha256.jpg").takeIf { it.isFile } else null
 
     /**
-     * Deletes every file that is not a referenced `<digest>.jpg` and is at least [minAgeMs] old. The references
+     * Deletes every file that is not a referenced `<digest>.jpg` and is at least [minAgeMs] old; with [minAgeMs] at
+     * most 0 the age is not read, so a file dated in the future goes too. The references
      * are read under the store lock, so no put lands between reading them and deleting. [referenced] must not
      * call back into this store.
      */
@@ -74,7 +75,7 @@ class ImageStore(private val dir: File, private val clock: () -> Long, internal 
             dir.listFiles()?.forEach { file ->
                 val sha = file.name.removeSuffix(".jpg")
                 val wanted = file.name.endsWith(".jpg") && NAME.matches(sha) && sha in keep
-                if (!wanted && now - file.lastModified() >= minAgeMs) file.delete()
+                if (!wanted && (minAgeMs <= 0 || now - file.lastModified() >= minAgeMs)) file.delete()
             }
         }
     }

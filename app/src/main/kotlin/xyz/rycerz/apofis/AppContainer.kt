@@ -42,6 +42,7 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.openAppDatabase
 import xyz.rycerz.apofis.images.Encoded
 import xyz.rycerz.apofis.images.ImageInput
+import xyz.rycerz.apofis.images.ImageLimits
 import xyz.rycerz.apofis.images.ImageStore
 import xyz.rycerz.apofis.images.clearDecodeTemps
 import xyz.rycerz.apofis.images.toUploadJpeg
@@ -129,8 +130,8 @@ class Connected internal constructor(
 
     private fun checkOpen() = check(isOpen) { "closed" }
 
-    // Picked photos are converted one at a time, in pick order (the lock is fair), in this connection's scope: closing
-    // it cancels them without waiting, and nothing a cancelled job finishes later is stored or set.
+    // Picked photos are converted one at a time, in order within a pick (two picks may convert in either order), in this
+    // connection's scope: closing it cancels them without waiting, and nothing a cancelled job finishes later is stored.
     private val converting = Mutex()
 
     /**
@@ -140,10 +141,10 @@ class Connected internal constructor(
      */
     fun attachImages(sessionKey: String, uris: List<Uri>): Job? {
         val store = checkNotNull(imageStore) { "no image store" }
-        val picked = uris.toList() // counted on a snapshot
-        val ids = composer.addImages(sessionKey, picked.size)
+        val picked = uris.take(ImageLimits.MAX_IMAGES + 1) // a bounded snapshot; the extra one tells an overflow
+        val ids = composer.addImages(sessionKey, picked.size) { open.get() }
         if (ids.isEmpty()) return null
-        // ATOMIC: the body runs even on a closed connection, so its finally always settles the placeholders.
+        // ATOMIC: a close between the admission and here still runs the body, so its finally settles the placeholders.
         return scope.launch(start = CoroutineStart.ATOMIC) {
             val job = coroutineContext.job
             try {
@@ -334,7 +335,8 @@ class AppContainer(
      * once it is ten minutes old. The composer is read first (so a send that stores its row and then empties the draft
      * is seen in one of the two), then, in one transaction, orphaned bindings go and pending rows and bindings are read
      * (so a confirmation moving digests from one to the other hides nothing). Under the store's lock: a second call
-     * waits for the first, then makes its own full pass. Failures are logged, never thrown.
+     * waits for the first, then makes its own full pass. A failure to read the references is logged and skips the run;
+     * a file that cannot be listed or deleted is skipped silently and tried again by the next run. Never throws.
      */
     suspend fun collectImages() {
         try {
@@ -577,7 +579,10 @@ class AppContainer(
         }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, ended ->
             notifier.clearNeedsAnswer(key, run, generation, ended)
         }, generation = { generation })
-        return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation, imageStore, { convertImage(it) })
+        return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation, imageStore, {
+            startup.join() // the start-up sweep of decode temps finishes before the first conversion makes one
+            convertImage(it)
+        })
     }
 }
 

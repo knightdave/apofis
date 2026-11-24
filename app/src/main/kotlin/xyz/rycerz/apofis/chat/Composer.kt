@@ -143,6 +143,10 @@ class Composer(private val scope: CoroutineScope) {
             if (sessionKey in b.gone) return@update b
             b.with(sessionKey) { s, tick ->
                 claimed = s.images
+                // More photos than one message may carry (put back onto a draft): refused until some are removed.
+                if (!s.sending && allowed(s) && s.images.count { it.digest != null } > ImageLimits.MAX_IMAGES) {
+                    return@with s.copy(note = ComposerNote(NoteKind.IMAGES_LIMIT))
+                }
                 text = s.draft.takeIf { !s.sending && allowed(s) && (it.isNotBlank() || s.images.any { i -> i.digest != null }) }
                 if (text == null) s else s.copy(sending = true, revision = tick) // the field drawn before takes no edit
             }
@@ -159,8 +163,8 @@ class Composer(private val scope: CoroutineScope) {
                 else -> b.with(sessionKey) { s, tick ->
                     if (tooLarge) return@with s.copy(sending = false, revision = tick, note = ComposerNote(NoteKind.IMAGES_TOO_LARGE))
                     val unsent = if (!failed) s.unsent else UnsentText(
-                        tick, s.unsent?.let { it.text + "\n\n" + claimedText } ?: claimedText, ComposeError.NOT_STORED,
-                        s.unsent?.images.orEmpty() + digests,
+                        tick, listOfNotNull(s.unsent?.text, claimedText).filter { it.isNotBlank() }.joinToString("\n\n"),
+                        ComposeError.NOT_STORED, s.unsent?.images.orEmpty() + digests,
                     )
                     // Photos added while it was stored stay in the draft.
                     s.copy(draft = "", sending = false, unsent = unsent, revision = tick, images = s.images.filterNot { it.id in ids })
@@ -186,13 +190,14 @@ class Composer(private val scope: CoroutineScope) {
 
     /**
      * Adds [count] processing photos to the draft, as many as fit under [ImageLimits.MAX_IMAGES]; returns their ids in
-     * order. When some did not fit, the note [NoteKind.IMAGES_LIMIT] is set.
+     * order. When some did not fit, the note [NoteKind.IMAGES_LIMIT] is set. Nothing is added once [live] is false.
      */
-    fun addImages(sessionKey: String, count: Int): List<Long> {
+    fun addImages(sessionKey: String, count: Int, live: () -> Boolean = { true }): List<Long> {
         var ids: List<Long> = emptyList()
         book.update { b ->
             ids = emptyList()
-            if (sessionKey in b.gone || count <= 0) return@update b
+            // [live] is read inside the update: a clear that lands first makes it retry and see the closed connection.
+            if (sessionKey in b.gone || count <= 0 || !live()) return@update b
             val fits = (ImageLimits.MAX_IMAGES - (b.of(sessionKey)?.images?.size ?: 0)).coerceIn(0, count)
             ids = List(fits) { b.counter + 1 + it }
             b.copy(counter = b.counter + fits).with(sessionKey) { s, _ ->
@@ -216,7 +221,9 @@ class Composer(private val scope: CoroutineScope) {
         }
     }
 
-    fun removeImage(sessionKey: String, id: Long) = change(sessionKey) { s, _ -> s.copy(images = s.images.filterNot { it.id == id }) }
+    /** Ignored while a send is in flight: its photos stay referenced until it is stored or fails, like the field. */
+    fun removeImage(sessionKey: String, id: Long) =
+        change(sessionKey) { s, _ -> if (s.sending) s else s.copy(images = s.images.filterNot { it.id == id }) }
 
     fun setNote(sessionKey: String, note: ComposerNote?) = change(sessionKey) { s, _ -> s.copy(note = note) }
 
@@ -226,15 +233,20 @@ class Composer(private val scope: CoroutineScope) {
     }
 
     /**
-     * Puts the unsent text back: the unsent text, then a newline and the draft when the draft is not blank; its photos
-     * go before the draft's.
+     * Puts the unsent text back: the unsent text, then a newline and the draft when neither is blank; its photos go
+     * before the draft's.
      */
     fun putBack(sessionKey: String) = book.update { b ->
         val s = b.entries[sessionKey]
         val unsent = s?.unsent?.takeIf { !s.sending && sessionKey !in b.gone } ?: return@update b // the field holds a send in flight
         val images = unsent.images.mapIndexed { i, d -> DraftImage(b.counter + 1 + i, d) }
         b.copy(counter = b.counter + images.size).with(sessionKey) { _, tick ->
-            s.copy(draft = if (s.draft.isBlank()) unsent.text else unsent.text + "\n" + s.draft, unsent = null, revision = tick, images = images + s.images)
+            val draft = when {
+                unsent.text.isBlank() -> s.draft
+                s.draft.isBlank() -> unsent.text
+                else -> unsent.text + "\n" + s.draft
+            }
+            s.copy(draft = draft, unsent = null, revision = tick, images = images + s.images)
         }
     }
 

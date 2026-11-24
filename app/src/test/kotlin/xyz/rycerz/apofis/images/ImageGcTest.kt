@@ -8,8 +8,14 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
 import java.io.File
 import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import javax.crypto.KeyGenerator
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import mockwebserver3.Dispatcher
@@ -49,6 +55,7 @@ class ImageGcTest {
     private val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
     private val server = MockWebServer()
     private val routes = ConcurrentHashMap<String, Pair<Int, String>>() // "METHOD /path" to code and body
+    private val requests = CopyOnWriteArrayList<Pair<String, String>>() // "METHOD /path" and body, as served
     private lateinit var a: Credentials
     private lateinit var c: AppContainer
 
@@ -56,7 +63,9 @@ class ImageGcTest {
     fun setUp() {
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
-                val (code, body) = routes["${request.method} ${request.target.substringBefore('?')}"] ?: (500 to "")
+                val target = "${request.method} ${request.target.substringBefore('?')}"
+                requests += target to (request.body?.utf8() ?: "")
+                val (code, body) = routes[target] ?: (500 to "")
                 return MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build()
             }
         }
@@ -154,14 +163,15 @@ class ImageGcTest {
     }
 
     @Test
-    fun gcDuringConfirmationKeepsImage() {
+    fun confirmationBeforeRowReadKeepsImage() {
         session("apofis-s")
         val d = file(1)
         pending("apofis-s", "k", "sending", d, runId = "run_1")
         serveRows("apofis-s", 1L to "cap\n\n${hint(d)}\n[screenshot]")
         val repo = c.connected()!!.repo
         // The confirmation runs between the composer's read and the database's: the run end's sync writes the binding
-        // and removes the pending row in one transaction.
+        // and removes the pending row in one transaction, and the collection then finds the digest in the binding.
+        // This does not pin that the collection reads both tables in one transaction.
         c.beforeImageRows = {
             c.beforeImageRows = {}
             assertTrue(repo.syncMessages("apofis-s", afterReplace = { _ -> db.pendingSendDao().delete("k") }))
@@ -225,21 +235,6 @@ class ImageGcTest {
         age(young)
         wait { c.collectImages() }
         assertFalse(exists(young))
-    }
-
-    @Test
-    fun jobResultBetweenPutAndDraftKept() {
-        val d = file(1)
-        val bytes = File(dir, "$d.jpg").readBytes()
-        // The steps of a processing job, with a collection between its put and its setImage.
-        val id = c.composer.addImages("apofis-s", 1).single()
-        assertEquals(d, wait { c.imageStore.put(bytes) })
-        wait { c.collectImages() }
-        assertTrue(exists(d))
-        c.composer.setImage(id, d)
-        age(d)
-        wait { c.collectImages() }
-        assertTrue(exists(d)) // now the draft names it
     }
 
     @Test
@@ -340,5 +335,99 @@ class ImageGcTest {
         c.composer.removeImage("apofis-s", image.id) // unreferenced again, but its put made it young
         wait { c.collectImages() }
         assertTrue(exists(d))
+    }
+
+    @Test
+    fun removeDuringSendKeepsPhoto() {
+        session("apofis-s")
+        val d = file(1) // eleven minutes old
+        c.composer.edit("apofis-s", "look", c.composer.current("apofis-s").revision)
+        val id = c.composer.addImages("apofis-s", 1).single().also { c.composer.setImage(it, d) }
+        val repo = c.connected()!!.repo
+        val gate = CompletableDeferred<Unit>()
+        val send = c.composer.sendWithImages("apofis-s") { t, i ->
+            gate.await() // before its row commits
+            repo.send("apofis-s", t, i, onStored = { stored() })
+        }!!
+        c.composer.removeImage("apofis-s", id)
+        assertEquals(listOf(d), c.composer.current("apofis-s").images.map { it.digest })
+        wait { c.collectImages() }
+        assertTrue(exists(d))
+        gate.complete(Unit)
+        wait { send.join() }
+        assertEquals(listOf(d), wait { db.pendingSendDao().allImages() })
+        assertTrue(exists(d))
+    }
+
+    @Test
+    fun cancelledDeleteStillReturns() {
+        session("apofis-x")
+        deleteAnswers("apofis-x")
+        val entered = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
+        c.beforeImageRows = { entered.complete(Unit); gate.await() }
+        var after = false
+        val repo = c.connected()!!.repo
+        val caller = CoroutineScope(Dispatchers.Default).launch {
+            repo.delete("apofis-x")
+            after = true // the drawer's cleanup after a Delete
+        }
+        wait { entered.await() }
+        caller.cancel()
+        gate.complete(Unit)
+        wait { caller.join() }
+        c.beforeImageRows = {}
+        assertTrue(after)
+        assertNull(wait { db.sessionDao().get("apofis-x") })
+    }
+
+    @Test
+    fun purgeIgnoresAgeOrdinaryCollectionDoesNot() {
+        val young = file(1, ageMs = 0)
+        val future = file(2, ageMs = -60 * MINUTE) // dated an hour ahead
+        wait { c.collectImages() }
+        assertTrue(exists(young))
+        assertTrue(exists(future))
+        wait { c.connect(Credentials("https://b.example/", "key-b")) }
+        assertFalse(exists(young))
+        assertFalse(exists(future))
+        assertEquals(emptyList<String>(), dir.list().orEmpty().toList())
+    }
+
+    @Test
+    fun picturesReachTheRunInPickOrder() {
+        session("apofis-s")
+        routes["POST /v1/runs"] = 202 to """{"run_id":"run_1","status":"started","replayed":false}"""
+        val first = byteArrayOf(1, 2, 3)
+        val second = byteArrayOf(4, 5, 6)
+        c.convertImage = { Encoded.Ok(if (it.lastPathSegment == "1") first else second) }
+        val conn = c.connected()!!
+        wait { conn.attachImages("apofis-s", listOf(Uri.parse("content://picker/1"), Uri.parse("content://picker/2")))!!.join() }
+        c.composer.edit("apofis-s", "two", c.composer.current("apofis-s").revision)
+        wait { c.composer.sendWithImages("apofis-s") { t, i -> conn.repo.send("apofis-s", t, i, onStored = { stored() }) }!!.join() }
+        val runs = requests.filter { it.first == "POST /v1/runs" }
+        assertEquals(1, runs.size)
+        val body = runs.single().second
+        val a = body.indexOf(Base64.getEncoder().encodeToString(first))
+        val b = body.indexOf(Base64.getEncoder().encodeToString(second))
+        assertTrue("both pictures in the body", a >= 0 && b >= 0)
+        assertTrue("in pick order", a < b)
+    }
+
+    @Test
+    fun restartCollectsDraftOnlyFilesAndDecodeTemps() {
+        session("apofis-s")
+        val drafted = file(1)
+        val queued = file(2)
+        readyDraft("apofis-s", drafted)
+        pending("apofis-s", "k", "failed", queued)
+        val temp = File(app.cacheDir, "decode-x.tmp").apply { writeBytes(byteArrayOf(1)) }
+        wait { c.collectImages() }
+        assertTrue(exists(drafted)) // the draft still names it
+
+        c = container() // a process death: the draft is lost, the pending row is not
+        assertFalse(exists(drafted))
+        assertTrue(exists(queued))
+        assertFalse(temp.exists())
     }
 }

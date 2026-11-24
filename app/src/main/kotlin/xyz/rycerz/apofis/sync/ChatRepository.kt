@@ -348,7 +348,7 @@ class ChatRepository(
             ensureOpen()
             sessionDao.delete(sessionKey)
         }
-        afterDelete()
+        withContext(NonCancellable) { afterDelete() } // the rows are gone: the caller learns it even when cancelled now
     }
 
     /**

@@ -20,6 +20,12 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
+import java.util.concurrent.atomic.AtomicBoolean
+import xyz.rycerz.apofis.Connected
+import xyz.rycerz.apofis.images.ImageStore
+import xyz.rycerz.apofis.run.RunFollower
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -40,6 +46,7 @@ import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.images.Encoded
+import xyz.rycerz.apofis.images.ImageFailure
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.sync.ChatRepository
@@ -284,22 +291,6 @@ class DraftImagesTest {
     }
 
     @Test
-    fun processDeathLosesDraftOnly() {
-        addSession()
-        val repo = repo()
-        type(K, "stored")
-        ready(K, D1)
-        wait { sendVia(repo)!!.join() }
-        ready(K, D2) // a draft photo not sent yet
-        assertEquals(setOf(D2), composer.referencedImages())
-
-        val afterDeath = Composer(scope)
-        assertEquals(emptySet<String>(), afterDeath.referencedImages())
-        assertEquals(emptyList<DraftImage>(), afterDeath.current(K).images)
-        assertEquals(listOf(D1), wait { db.pendingSendDao().allImages() }) // the stored send keeps its photo
-    }
-
-    @Test
     fun hintTitleStoredAsUntitled() {
         fun session(id: String, title: String) =
             """{"id":"$id","source":"api_server","title":"$title","pinned":false,"archived":false,"hidden":false,""" +
@@ -352,6 +343,8 @@ class DraftImagesTest {
         wait { entered.await() }
         val second = conn.attachImages(K, listOf(uri(3)))!!
         assertEquals(3, c.composer.current(K).images.count { it.processing }) // all three placeholders wait
+        // The second pick does not reach the converter while the first holds it (a bounded wait that expects nothing).
+        assertNull(runBlocking { withTimeoutOrNull(500) { while (uri(3) !in order) yield() } })
         assertEquals(listOf(uri(1)), order.toList())
         gate.complete(Unit)
         wait { first.join(); second.join() }
@@ -397,10 +390,142 @@ class DraftImagesTest {
         val s = c.composer.current(K)
         assertEquals("caption", s.draft) // the draft is kept at the same server
         assertTrue(s.images.single().failed)
+        assertEquals(ComposerNote(NoteKind.IMAGE_FAILED), s.note)
         gate.complete(Unit)
         val stores = mutableListOf<List<String>>()
         wait { c.composer.sendWithImages(K) { _, i -> stores += i }!!.join() } // Send works again
         assertEquals(listOf(emptyList<String>()), stores)
         assertEquals(emptyList<String>(), imagesDir().list().orEmpty().toList())
+    }
+
+    @Test
+    fun moreThanTenPutBackRefused() {
+        val ten = (1..10).map { sha(byteArrayOf(it.toByte(), 9)) }
+        ready(K, *ten.toTypedArray())
+        wait { composer.sendWithImages(K) { _, _ -> throw IllegalStateException("not stored") }!!.join() }
+        val one = ready(K, D1).single()
+        composer.putBack(K)
+        assertNull(composer.current(K).unsent)
+        assertEquals(11, composer.current(K).images.size)
+        assertNull(composer.sendWithImages(K) { _, _ -> error("over the cap") })
+        val s = composer.current(K)
+        assertEquals(ComposerNote(NoteKind.IMAGES_LIMIT), s.note)
+        assertEquals(11, s.images.size)
+        assertFalse(s.sending)
+        composer.removeImage(K, one)
+        val stores = mutableListOf<List<String>>()
+        wait { composer.sendWithImages(K) { _, i -> stores += i }!!.join() }
+        assertEquals(listOf(ten), stores)
+    }
+
+    @Test
+    fun twentyJoinedInUnsentRefusedAndReferenced() {
+        val all = (1..20).map { sha(byteArrayOf(it.toByte(), 9)) }
+        for (part in all.chunked(10)) {
+            ready(K, *part.toTypedArray())
+            wait { composer.sendWithImages(K) { _, _ -> throw IllegalStateException("not stored") }!!.join() }
+        }
+        assertEquals(all, composer.current(K).unsent!!.images)
+        composer.putBack(K)
+        assertEquals(all, composer.current(K).images.map { it.digest })
+        assertNull(composer.sendWithImages(K) { _, _ -> error("over the cap") })
+        assertEquals(ComposerNote(NoteKind.IMAGES_LIMIT), composer.current(K).note)
+        assertEquals(all.toSet(), composer.referencedImages())
+    }
+
+    @Test
+    fun blankPartsNotJoined() {
+        fun fail(text: String, vararg digests: String) {
+            type(K, text)
+            ready(K, *digests)
+            wait { composer.sendWithImages(K) { _, _ -> throw IllegalStateException("not stored") }!!.join() }
+        }
+        // Put back: a blank unsent text leaves the draft as it is; a blank draft takes the unsent text.
+        fail("", D1)
+        type(K, "hello")
+        composer.putBack(K)
+        assertEquals("hello", composer.current(K).draft)
+        wait { composer.sendWithImages(K) { _, _ -> }!!.join() }
+        fail("caption", D1)
+        composer.putBack(K)
+        assertEquals("caption", composer.current(K).draft)
+        wait { composer.sendWithImages(K) { _, _ -> }!!.join() }
+
+        // The unsent join: blank on either side is left out; two captions join as before.
+        fail("", D1)
+        fail("second", D2)
+        assertEquals("second", composer.current(K).unsent!!.text)
+        fail("", D1)
+        assertEquals("second", composer.current(K).unsent!!.text)
+        fail("third", D2)
+        assertEquals("second\n\nthird", composer.current(K).unsent!!.text)
+    }
+
+    @Test
+    fun oldConnectionAddsNothingAfterSwitch() {
+        val c = container()
+        wait { c.connect(A) }
+        c.convertImage = { Encoded.Ok(bytesOf(it)) }
+        val beforeUrl = c.connected()!!
+        wait { c.connect(Credentials("https://b.example/", "key-b")) }
+        assertNull(beforeUrl.attachImages(K, listOf(uri(1))))
+        assertEquals(ComposerState(revision = c.composer.current(K).revision), c.composer.current(K))
+
+        val beforeKey = c.connected()!!
+        wait { c.connect(Credentials("https://b.example/", "key-2")) }
+        assertNull(beforeKey.attachImages(K, listOf(uri(1))))
+        assertEquals(ComposerState(revision = c.composer.current(K).revision), c.composer.current(K))
+    }
+
+    @Test
+    fun closeBetweenAdmissionAndLaunchStillSettles() {
+        // A connection whose scope is already cancelled while its open flag still reads true: the instant between the
+        // admission and the launch. The job must still run its finally, or the photo stays processing for good.
+        val api = HermesApi(server.url("/").toString(), "secret-key")
+        val queue = SendQueue(api, db, RunStarter { _, _ -> }, { 1_000L })
+        val repo = ChatRepository(api, db, { 1_000L }, queue)
+        val closed = CoroutineScope(SupervisorJob() + Dispatchers.Default).apply { cancel() }
+        val store = ImageStore(imagesDir(), System::currentTimeMillis)
+        val conn = Connected(
+            A, api, db, repo, queue, RunFollower(api, db, repo, closed), AtomicBoolean(true), closed, composer, 0, store,
+            { Encoded.Ok(bytesOf(it)) },
+        )
+        val job = conn.attachImages(K, listOf(uri(1)))!!
+        wait { job.join() }
+        assertTrue(composer.current(K).images.single().failed)
+    }
+
+    @Test
+    fun pickOfThreeFailuresContinue() {
+        val c = container()
+        wait { c.connect(A) }
+        val calls = Collections.synchronizedList(mutableListOf<Uri>())
+        c.convertImage = {
+            calls += it
+            when (it) {
+                uri(1) -> Encoded.Failed(ImageFailure.BUSY)
+                uri(2) -> throw IllegalStateException("decoder fault")
+                else -> Encoded.Ok(bytesOf(it))
+            }
+        }
+        wait { c.connected()!!.attachImages(K, listOf(uri(1), uri(2), uri(3)))!!.join() }
+        val s = c.composer.current(K)
+        assertEquals(listOf(true, true, false), s.images.map { it.failed })
+        assertEquals(sha(byteArrayOf(3)), s.images[2].digest)
+        assertEquals(ComposerNote(NoteKind.IMAGE_FAILED), s.note)
+        assertEquals(listOf(uri(1), uri(2), uri(3)), calls)
+    }
+
+    @Test
+    fun textOnlySendOverRowLimitKeepsDraft() {
+        addSession()
+        val repo = repo()
+        val text = "x".repeat(800_000)
+        type(K, text)
+        wait { composer.send(K) { repo.send(K, it, onStored = { stored() }) }!!.join() }
+        val s = composer.current(K)
+        assertEquals(text, s.draft)
+        assertNull(s.unsent)
+        assertEquals(ComposerNote(NoteKind.IMAGES_TOO_LARGE), s.note)
     }
 }
