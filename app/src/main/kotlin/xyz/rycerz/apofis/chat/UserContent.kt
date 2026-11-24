@@ -10,6 +10,7 @@ private const val FILE_NAME = "api_"
 private const val PREFIX_HEX = 32
 private val MARKERS = setOf("[screenshot]", "[screenshot detail=low]", "[screenshot detail=high]", "[screenshot detail=auto]")
 private val MAX_MARKER_LINE = MARKERS.maxOf { it.length }
+private const val OTHER_BREAKS = "\r\u0085\u2028\u2029" // line terminators besides LF: never inside a server line
 
 /**
  * Splits [content] into its text and the server's image block at its very end (H2): a blank line, k hint lines, then
@@ -19,10 +20,10 @@ private val MAX_MARKER_LINE = MARKERS.maxOf { it.length }
 fun parseUserContent(content: String): UserContent {
     val plain = UserContent(content, emptyList())
     var end = content.length
-    // The start of the line that ends at [end], or -1 when that line is longer than [max].
+    // The start of the line that ends at [end], or -1 when that line is longer than [max] or holds another line terminator.
     fun lineStart(end: Int, max: Int = Int.MAX_VALUE): Int {
         var i = end - 1
-        while (i >= 0 && content[i] != '\n') if (end - i > max) return -1 else i--
+        while (i >= 0 && content[i] != '\n') if (end - i > max || content[i] in OTHER_BREAKS) return -1 else i--
         return i + 1
     }
 
@@ -37,7 +38,7 @@ fun parseUserContent(content: String): UserContent {
     val images = arrayOfNulls<String>(markers)
     for (i in markers - 1 downTo 0) {
         val start = lineStart(end)
-        if (start == 0) return plain // no blank line can come before it
+        if (start <= 0) return plain // another line terminator inside it, or no blank line can come before it
         images[i] = (hintAt(content, start, end) ?: return plain).ifEmpty { null }
         end = start - 1
     }

@@ -229,6 +229,22 @@ class ImageBindingTest {
     }
 
     @Test
+    fun existingBindingWinsOverAnotherPhotoUnderItsId() = runTest {
+        seed("k1", "old", listOf(D1))
+        runEnd(row(7, "old" + block(D1)))
+        assertEquals(mapOf(7L to D1), bindings())
+
+        // Two rows under id 7 support different photos; B's send settles in this sync. The binding stays A.
+        seed("k2", "new", listOf(D2))
+        runEnd(row(7, "old" + block(D1)), row(7, "new" + block(D2)))
+        assertEquals(mapOf(7L to D1), bindings())
+        assertEquals(listOf(listOf(D1), listOf(null)), users().map { it.images })
+        sync(row(7, "old" + block(D1)), row(7, "new" + block(D2)))
+        assertEquals(mapOf(7L to D1), bindings())
+        assertEquals(listOf(listOf(D1), listOf(null)), users().map { it.images })
+    }
+
+    @Test
     fun parserRunsOnlyOnPlainUserRows() = runTest {
         seed("k", "cap", listOf(D1))
         val notification = "cap" + block(D1)

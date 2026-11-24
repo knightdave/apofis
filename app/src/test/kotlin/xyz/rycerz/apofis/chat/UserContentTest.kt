@@ -126,6 +126,17 @@ class UserContentTest {
     }
 
     @Test
+    fun lineTerminatorInsideAHintIsText() {
+        for (c in listOf("\r", "\u0085", "\u2028", "\u2029")) {
+            for (content in listOf("cap\n\n[Image attached: left${c}right]\n[screenshot]", "cap\n\n[Image attached at: /p${c}q/api_$a.jpg]\n[screenshot]")) {
+                assertEquals(plain(content), parseUserContent(content))
+                val items = buildTranscript(listOf(MessageDto(1, "user", null, content, null, null, null, null, 1.0, null)))
+                assertEquals(content, (items.single() as UserMessage).text)
+            }
+        }
+    }
+
+    @Test
     fun digestIsExactly32LowerCaseHex() {
         for (digest in listOf("a".repeat(31), "a".repeat(33), "A".repeat(32), "g".repeat(32))) {
             val content = "x\n\n[Image attached at: /p/api_$digest.jpg]\n[screenshot]"

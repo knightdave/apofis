@@ -201,6 +201,15 @@ class DeliveryMatchTest {
     }
 
     @Test
+    fun settlementRefusesALineTerminatorInsideAHint() = runTest {
+        runEndsWith("cap", listOf(D1), row(10, "cap\n\n[Image attached: left\rright]\n[screenshot]"), row(11, "Hm.", role = "assistant"))
+
+        val left = db.pendingSendDao().get("k")!! // the row is literal text, not an image block
+        assertEquals("failed", left.state)
+        assertEquals("unconfirmed", left.error)
+    }
+
+    @Test
     fun settlementOfATextOnlySendComparesItsWholeText() = runTest {
         val text = "hi\n\n${hint(D1)}\n[screenshot]"
         runEndsWith(text, emptyList(), row(10, text), row(11, "Hello.", role = "assistant"))
