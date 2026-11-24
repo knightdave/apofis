@@ -98,7 +98,7 @@ private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
         onConfirm = { actions.confirmRename(prompt.token, title) },
         dismissLabel = stringResource(R.string.cancel),
         onDismiss = { actions.dismiss(prompt.token) },
-        confirmEnabled = cleanTitle(title) != null && !prompt.busy && !prompt.gone,
+        confirmEnabled = title != prompt.title && cleanTitle(title) != null && !prompt.busy && !prompt.gone,
     ) {
         Column {
             OutlinedTextField(

@@ -217,5 +217,43 @@ class RenameTest {
         assertEquals(listOf("a" + FACE.repeat(TITLE_MAX - 1)), confirmed)
     }
 
+    /** Astra I3: an unchanged title, even one longer than TITLE_MAX, is not offered for Save; an edit is capped. */
+    @Test
+    fun unchangedTitleIsNotRewritten() {
+        val confirmed = CopyOnWriteArrayList<String>()
+        val actions = object : PromptActions {
+            override fun confirmRename(token: Long, title: String) {
+                confirmed += title
+            }
+        }
+        val stored = FACE.repeat(100) // valid on the server (100 code points), longer than this app gives
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                PromptHost(Prompt(PromptKind.RENAME, KEY, stored, pinned = false, archived = false, running = false, token = 1), actions)
+            }
+        }
+        rule.onNodeWithText("Save").assertIsNotEnabled().performClick()
+        assertEquals(emptyList<String>(), confirmed) // no rename, so no PATCH
+        rule.onNode(hasSetTextAction()).performTextReplacement(stored + "x") // one edit: the cap applies
+        rule.onNodeWithText("Save").assertIsEnabled().performClick()
+        assertEquals(listOf(FACE.repeat(TITLE_MAX)), confirmed)
+    }
+
+    /** Astra I4, I6, lens L2, L14: what Hermes' sanitize_title drops, the spaces it keeps, the cut, the bounded read. */
+    @Test
+    fun cleanTitleMirrorsTheServer() {
+        assertNull(cleanTitle("\uFFFC"))
+        assertEquals("ab", cleanTitle("a\uFFFCb"))
+        assertEquals("ab", cleanTitle("a\u2065b"))
+        assertEquals("ab", cleanTitle("a\u2028b")) // dropped by the server, not a space
+        assertEquals("ab", cleanTitle("a\u001Fb")) // whitespace to Java, a control the server drops
+        assertEquals("a b", cleanTitle("a\u00A0b"))
+        assertEquals("a b", cleanTitle("a\u0085b")) // whitespace to Python's \s
+        assertEquals("a b c", cleanTitle("a\tb\r\nc"))
+        assertEquals("a".repeat(95), cleanTitle("a".repeat(95) + " bc")) // trimmed again after the cut
+        assertEquals("x".repeat(TITLE_MAX), cleanTitle("x".repeat(2_000_000))) // a control: true before this round too
+        assertNull(cleanTitle("\u200B".repeat(4096) + "late")) // only the first 4,096 characters are read
+    }
+
     private fun json(code: Int, body: String) = MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build()
 }

@@ -32,6 +32,11 @@ class CommandsTest {
             "/title $long" to Parsed.Run(Command.TITLE, long),
             "/Steer  go on  " to Parsed.Run(Command.STEER, "go on"),
             "/-x" to Parsed.Message, // a word starts with a letter, digit or underscore
+            // Any Unicode space ends the word, the same on this JVM (ASCII-only \s) and on Android (Unicode \s).
+            "/new\u00A0more" to Parsed.Run(Command.NEW, "more"),
+            "/new\u2028x" to Parsed.Run(Command.NEW, "x"),
+            "/status\u3000now" to Parsed.Unknown("status"),
+            "/new\u0085x" to Parsed.Run(Command.NEW, "x"),
         )
         for ((draft, expected) in table) assertEquals(draft.take(40), expected, parseCommand(draft))
     }

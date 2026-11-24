@@ -9,6 +9,7 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.performClick
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewModelScope
@@ -30,7 +31,11 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
@@ -50,6 +55,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -62,6 +68,7 @@ import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.fixture
 import xyz.rycerz.apofis.chat.Command
+import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.chat.ComposerNote
 import xyz.rycerz.apofis.chat.DraftImage
 import xyz.rycerz.apofis.chat.NoteKind
@@ -73,6 +80,7 @@ import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.sync.ChatRepository
+import xyz.rycerz.apofis.sync.MAX_ROW_BYTES
 import xyz.rycerz.apofis.sync.PendingState
 import xyz.rycerz.apofis.sync.SendError
 import xyz.rycerz.apofis.sync.SendQueue
@@ -117,6 +125,9 @@ class CommandDispatchTest {
     /** When set, a store waits before its transaction (after the dispatch returned) until it completes. */
     @Volatile private var storeGate: CompletableDeferred<Unit>? = null
 
+    /** The thread the latest store ran on, read where it arms its worker (inside the store, before its transaction). */
+    @Volatile private var storeThread: Thread? = null
+
     @Before
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
@@ -132,13 +143,15 @@ class CommandDispatchTest {
         val api = HermesApi(server.url("/").toString(), "secret-key")
         lateinit var f: RunFollower
         val queue = SendQueue(
-            api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, schedule = { storeGate?.await() },
+            api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, schedule = { storeThread = Thread.currentThread(); storeGate?.await() },
             readImage = { ByteArray(10) }, imageSize = { 10L },
         )
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue)
         f = RunFollower(api, db, repo, scope, delayMs = { delay(minOf(it, 20L)) })
         follower = f
-        connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, f, AtomicBoolean(true), scope)
+        // The holder's own scope (a child of the fixture's): settling it waits for stores only, not for the follower.
+        val composer = Composer(CoroutineScope(SupervisorJob(scope.coroutineContext.job) + Dispatchers.IO))
+        connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, f, AtomicBoolean(true), scope, composer)
     }
 
     @After
@@ -163,9 +176,10 @@ class CommandDispatchTest {
         if (!await(10, TimeUnit.SECONDS)) timedOut.set(true)
     }
 
-    private fun vm(key: String = KEY, onNew: () -> Unit = {}): ChatViewModel {
+    /** [online]: a flow that never emits keeps the state at its first value (the shown choice never catches up). */
+    private fun vm(key: String = KEY, online: Flow<Boolean> = flowOf(true), onNew: () -> Unit = {}): ChatViewModel {
         val store = ViewModelStore().also { stores += it }
-        return ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(key, connected, onNew = onNew) } })[ChatViewModel::class]
+        return ViewModelProvider.create(store, viewModelFactory { initializer { ChatViewModel(key, connected, online, onNew) } })[ChatViewModel::class]
             .also { chats += it }
     }
 
@@ -187,11 +201,11 @@ class CommandDispatchTest {
         ),
     )
 
-    /** A live run of [KEY] whose stream stays open until the test ends. */
-    private suspend fun heldRun() {
+    /** A live run of [KEY] with [status] whose stream stays open until the test ends. */
+    private suspend fun heldRun(status: String = "running") {
         routes["GET /v1/runs/$RUN"] = json(
             200,
-            """{"object":"hermes.run","run_id":"$RUN","status":"running","session_id":"$KEY","admission_id":"adm_1","execution_generation":3,"output":"","pending_controls":[]}""",
+            """{"object":"hermes.run","run_id":"$RUN","status":"$status","session_id":"$KEY","admission_id":"adm_1","execution_generation":3,"output":"","pending_controls":[]}""",
         )
         val release = latch()
         routes["GET /v1/runs/$RUN/events"] = {
@@ -199,7 +213,7 @@ class CommandDispatchTest {
             MockResponse.Builder().body(": open\n\nid: 9\ndata: {\"event\":\"run.completed\",\"seq\":9}\n\n").addHeader("Content-Type", "text/event-stream").build()
         }
         follower.resumeAll()
-        db.activeRunDao().upsert(ActiveRunEntity(RUN, KEY, null, "running", 1L))
+        db.activeRunDao().upsert(ActiveRunEntity(RUN, KEY, null, status, 1L))
         follower.onRunStarted(KEY, RUN)
     }
 
@@ -224,6 +238,37 @@ class CommandDispatchTest {
     /** A watchdog only: waits in real time for work on other threads (the server, Room). */
     private suspend fun until(condition: suspend () -> Boolean) = withContext(Dispatchers.Default) { withTimeout(60_000) { while (!condition()) delay(5) } }
 
+    /** Every store the holder took has ended (stored, failed or refused): the composer's own completion, not a poll. */
+    private suspend fun settled() = withContext(Dispatchers.Default) { withTimeout(60_000) { connected.composer.settle() } }
+
+    /** The view model coroutines [action] started. */
+    private fun ViewModel.launchedBy(action: () -> Boolean): Pair<Boolean, List<Job>> {
+        val parent = viewModelScope.coroutineContext.job
+        val before = parent.children.toSet()
+        val result = action()
+        return result to parent.children.filter { it !in before }.toList()
+    }
+
+    /** Runs [action] and waits for its END: the coroutines it started joined and the holder's stores settled. */
+    private suspend fun ChatViewModel.ended(action: () -> Boolean): Boolean {
+        val (result, started) = launchedBy(action)
+        withContext(Dispatchers.Default) { withTimeout(60_000) { started.joinAll() } }
+        settled()
+        return result
+    }
+
+    /** Every state [ChatViewModel.state] shows from now on, in order. */
+    private fun ChatViewModel.states() = CopyOnWriteArrayList<ChatUiState>().also { seen -> scope.launch(Dispatchers.Unconfined) { state.collect { seen += it } } }
+
+    /** After the claim, no state shows the field released before the stored key was published. */
+    private fun List<ChatUiState>.publishedBeforeRelease(key: String) {
+        val claimed = indexOfFirst { it.sending }
+        assertTrue("the holder claimed it", claimed >= 0)
+        val released = drop(claimed).filter { !it.sending }
+        assertTrue("the claim was released", released.isNotEmpty())
+        assertTrue("released before the key was published: $released", released.all { it.storedSends == 1L && it.storedKey == key })
+    }
+
     private fun composer(key: String = KEY) = connected.composer.current(key)
     private suspend fun rows(key: String = KEY) = db.pendingSendDao().rows(key)
     private fun lines() = requests.map { "${it.method} ${it.target}" }
@@ -243,11 +288,11 @@ class CommandDispatchTest {
 
     @Test
     fun unknownCommandSendsNothing() = runBlocking<Unit> {
-        session(onServer = true)
+        session() // local only: opening it makes no request, so every request would be the command's
         val vm = vm()
         photo()
         vm.type("/status now")
-        assertFalse(vm.onSendClick())
+        assertFalse(vm.ended { vm.onSendClick() })
         assertEquals(ComposerNote(NoteKind.CMD_UNKNOWN, "/status"), composer().note)
         assertEquals("/status now", composer().draft)
         assertEquals(1, composer().images.size)
@@ -259,7 +304,8 @@ class CommandDispatchTest {
         vm.type("/" + "x".repeat(30) + LETTER.repeat(3))
         assertFalse(vm.onSendClick())
         assertEquals("/" + "x".repeat(30) + LETTER, composer().note!!.arg)
-        assertTrue(writes().isEmpty())
+        settled()
+        assertEquals(emptyList<String>(), lines()) // no request of any method
     }
 
     @Test
@@ -267,10 +313,9 @@ class CommandDispatchTest {
         session()
         val vm = vm()
         vm.type("/etc/hosts is broken")
-        assertTrue(vm.onSendClick())
-        until { rows().isNotEmpty() }
+        assertTrue(vm.ended { vm.onSendClick() })
         assertEquals("/etc/hosts is broken", rows().single().text)
-        vm.await { it.draft.isEmpty() }
+        assertEquals("", composer().draft)
     }
 
     @Test
@@ -317,9 +362,10 @@ class CommandDispatchTest {
         val empty = first.selected.await { it != null }!!
         val a = vm(empty) { first.newChat() }
         a.type("/new", empty)
-        assertTrue(a.onSendClick())
+        val (ran, newChat) = first.launchedBy { a.onSendClick() } // the drawer's New chat, started by the command
+        assertTrue(ran)
+        withContext(Dispatchers.Default) { withTimeout(60_000) { newChat.joinAll() } }
         assertEquals("", composer(empty).draft)
-        first.refreshJob?.join()
         assertEquals(empty, first.selected.value)
         assertEquals(listOf(empty), db.sessionDao().all().map { it.key })
 
@@ -354,10 +400,11 @@ class CommandDispatchTest {
         val vm = vm()
         val accepted = vm.accepts()
         vm.await { it.live?.status == "running" }
+        val states = vm.states()
         vm.type("/steer  go left ")
-        assertTrue(vm.onSendClick())
-        until { rows().singleOrNull()?.state == PendingState.STEERED }
+        assertTrue(vm.ended { vm.onSendClick() })
         val row = rows().single()
+        assertEquals(PendingState.STEERED, row.state) // delivered inside the store, before the holder settled
         assertEquals("go left", row.text)
         assertTrue(row.steerOnly)
         assertFalse(row.requestBody.contains("/steer"))
@@ -367,8 +414,24 @@ class CommandDispatchTest {
         assertEquals("", composer().draft)
         val done = vm.await { it.storedSends == 1L }
         assertEquals(row.idempotencyKey, done.storedKey) // pinned like a send (ruling 1)
+        states.publishedBeforeRelease(row.idempotencyKey)
         assertEquals(1, accepted.get())
         assertTrue(lines().none { it == "POST /v1/runs" })
+    }
+
+    /** The store, and with it the steer's request body, is built off the main thread, as a plain send's is. */
+    @Test
+    fun steerIsStoredOffTheMainThread() = runBlocking<Unit> {
+        session(onServer = true)
+        steerOk()
+        heldRun()
+        val vm = vm()
+        vm.await { it.live?.status == "running" }
+        vm.type("/steer go left")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(PendingState.STEERED, rows().single().state)
+        assertNotNull(storeThread)
+        assertNotEquals(android.os.Looper.getMainLooper().thread, storeThread)
     }
 
     @Test
@@ -382,12 +445,26 @@ class CommandDispatchTest {
         assertTrue(vm.onSendClick()) // the dispatch saw it running
         db.activeRunDao().delete(RUN) // it ends before the insert
         storeGate!!.complete(Unit)
-        until { composer().note != null }
-        assertEquals(ComposerNote(NoteKind.CMD_NOTHING_RUNNING), composer().note)
-        assertEquals("/steer go left", composer().draft)
+        settled()
+        assertEquals("/steer go left", composer().unsent?.text) // shown as not stored, with Put back
+        assertEquals("", composer().draft)
         assertTrue(rows().isEmpty())
         assertTrue(lines().none { it.startsWith("POST") })
         assertEquals(0L, vm.state.value.storedSends)
+    }
+
+    /** Lens L8: a live run that is not running takes no steer. */
+    @Test
+    fun steerOnARunNotRunningRefused() = runBlocking<Unit> {
+        session(onServer = true)
+        heldRun(status = "queued")
+        val vm = vm()
+        vm.await { it.live?.status == "queued" }
+        vm.type("/steer go")
+        assertFalse(vm.ended { vm.onSendClick() })
+        assertEquals(ComposerNote(NoteKind.CMD_NOTHING_RUNNING), composer().note)
+        assertEquals("/steer go", composer().draft)
+        assertTrue(rows().isEmpty())
     }
 
     @Test
@@ -405,6 +482,9 @@ class CommandDispatchTest {
             assertEquals("/steer look", composer().draft)
             assertEquals(1, composer().images.size)
         }
+        vm.type("/steer  ") // the refusal order: missing text first, photos or not (lens L16)
+        assertFalse(vm.onSendClick())
+        assertEquals(ComposerNote(NoteKind.CMD_NEEDS_TEXT), composer().note)
         assertTrue(rows().isEmpty())
         assertTrue(lines().none { it.startsWith("POST") })
     }
@@ -418,9 +498,9 @@ class CommandDispatchTest {
         val vm = vm()
         vm.await { it.live?.status == "running" }
         vm.type("/steer go left")
-        assertTrue(vm.onSendClick())
-        until { rows().singleOrNull()?.state == PendingState.FAILED }
+        assertTrue(vm.ended { vm.onSendClick() })
         val row = rows().single()
+        assertEquals(PendingState.FAILED, row.state)
         assertEquals(SendError.STEER_NOT_DELIVERED, row.error)
         assertFalse(row.attempted)
         db.activeRunDao().delete(RUN)
@@ -439,17 +519,76 @@ class CommandDispatchTest {
         val vm = vm()
         val accepted = vm.accepts()
         vm.await { it.live != null }
+        val states = vm.states()
         vm.type("/queue later please")
-        assertTrue(vm.onSendClick())
-        until { rows().isNotEmpty() }
+        assertTrue(vm.ended { vm.onSendClick() })
         val row = rows().single()
         assertEquals("later please", row.text)
         assertEquals(PendingState.QUEUED, row.state) // never a steer, though a run is running
         assertFalse(row.steerOnly)
         assertFalse(row.requestBody.contains("/queue"))
         vm.await { it.draft.isEmpty() && it.storedSends == 1L && it.storedKey == row.idempotencyKey }
+        states.publishedBeforeRelease(row.idempotencyKey)
         assertEquals(1, accepted.get())
-        assertTrue(lines().none { it.startsWith("POST") }) // it starts after the running reply
+        connected.sendQueue.drain() // a drain finds the chat busy: it starts after the running reply
+        assertEquals(PendingState.QUEUED, rows().single().state)
+        assertTrue(lines().none { it.startsWith("POST") })
+    }
+
+    /** Astra I1: while /queue is being stored, a second Enter, an edit and another send are refused; one row. */
+    @Test
+    fun queueBeingStoredRefusesEverySecondSend() = runBlocking<Unit> {
+        session(onServer = true)
+        heldRun()
+        val vm = vm()
+        vm.await { it.live != null }
+        storeGate = CompletableDeferred()
+        vm.type("/queue A")
+        assertTrue(vm.onSendClick())
+        assertFalse("a second Enter", vm.onSendClick())
+        vm.type("/queue B")
+        assertEquals("the field takes no edit while it stores", "/queue A", composer().draft)
+        assertFalse("another send", vm.onSendClick())
+        assertFalse("another command", vm.onCommand(Command.MODEL))
+        storeGate!!.complete(Unit)
+        settled()
+        assertEquals(listOf("A"), rows().map { it.text })
+        assertEquals("", composer().draft)
+    }
+
+    /** Astra I2: the photo of a /queue being stored cannot go out with a second send too. */
+    @Test
+    fun queuedPhotoGoesInOneRowOnly() = runBlocking<Unit> {
+        session(onServer = true)
+        heldRun()
+        val vm = vm()
+        vm.await { it.live != null }
+        photo(1)
+        storeGate = CompletableDeferred()
+        vm.type("/queue first")
+        assertTrue(vm.onSendClick())
+        vm.type("/queue second")
+        assertFalse(vm.onSendClick())
+        connected.composer.removeImage(KEY, composer().images.single().id)
+        assertEquals("the photo stays with the store", 1, composer().images.size)
+        storeGate!!.complete(Unit)
+        settled()
+        assertEquals(listOf(digest(1)), rows().map { it.images })
+        assertTrue(composer().images.isEmpty())
+    }
+
+    /** Lens L9: a /queue too large to send stores nothing and keeps the draft with the note. */
+    @Test
+    fun queueTooLargeKeepsTheDraft() = runBlocking<Unit> {
+        session(onServer = true)
+        val vm = vm()
+        val line = "/queue " + "a".repeat(MAX_ROW_BYTES + 1)
+        vm.type(line)
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(ComposerNote(NoteKind.IMAGES_TOO_LARGE), composer().note)
+        assertEquals(line, composer().draft)
+        assertNull(composer().unsent)
+        assertTrue(rows().isEmpty())
     }
 
     @Test
@@ -467,13 +606,13 @@ class CommandDispatchTest {
         assertNull(composer().note)
         connected.composer.removeImage(KEY, processing)
         vm.type("/queue look at these")
-        assertTrue(vm.onSendClick())
-        until { rows().isNotEmpty() }
+        assertTrue(vm.ended { vm.onSendClick() })
         val row = rows().single()
         assertEquals("look at these", row.text)
         assertEquals(listOf(digest(1), digest(2)).joinToString(","), row.images)
         assertEquals(PendingState.QUEUED, row.state)
-        vm.await { it.draft.isEmpty() && it.images.isEmpty() } // the failed photo leaves with it, as with a send
+        assertEquals("", composer().draft)
+        assertTrue(composer().images.isEmpty()) // the failed photo leaves with it, as with a send
     }
 
     @Test
@@ -482,8 +621,8 @@ class CommandDispatchTest {
         routes["POST /v1/runs"] = json(202, """{"run_id":"run_9","status":"started","replayed":false}""")
         val vm = vm()
         vm.type("/queue now please")
-        assertTrue(vm.onSendClick())
-        until { rows().singleOrNull()?.state == PendingState.SENDING }
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(PendingState.SENDING, rows().single().state)
         assertEquals(1, lines().count { it == "POST /v1/runs" })
         assertTrue(requests.single { it.target == "/v1/runs" }.body!!.utf8().contains("now please"))
     }
@@ -496,11 +635,37 @@ class CommandDispatchTest {
         routes["PATCH /api/sessions/$KEY"] = titled("Hello world")
         val vm = vm()
         vm.type("/title  Hello   world ")
-        assertTrue(vm.onSendClick())
-        vm.await { it.title == "Hello world" && it.draft.isEmpty() }
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals("", composer().draft)
         val patch = requests.single { it.method == "PATCH" }
         assertEquals("Hello world", JSONObject(patch.body!!.utf8()).getString("title"))
-        assertEquals(StatusLine.IDLE, vm.state.value.status)
+        vm.await { it.title == "Hello world" && it.status == StatusLine.IDLE }
+
+        // The guard ended with the command: the same line again (same text, same revision) renames again.
+        vm.type("/title  Hello   world ")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(2, requests.count { it.method == "PATCH" })
+    }
+
+    /** Lens L13: /stop and /title answered 500 keep the draft and show the status line, not the title note. */
+    @Test
+    fun serverErrorsKeepTheDraft() = runBlocking<Unit> {
+        session(onServer = true)
+        routes["POST /v1/runs/$RUN/stop"] = json(500, "{}")
+        routes["PATCH /api/sessions/$KEY"] = json(500, "{}")
+        heldRun()
+        val vm = vm()
+        vm.await { it.live != null }
+        vm.type("/stop")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals("/stop", composer().draft)
+        vm.await { it.status == StatusLine.SERVER_ERROR }
+        vm.type("/title Plans B")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals("/title Plans B", composer().draft)
+        assertNull(composer().note)
+        assertEquals(StatusLine.SERVER_ERROR, vm.state.value.status)
+        assertEquals("Plans", db.sessionDao().get(KEY)!!.title)
     }
 
     @Test
@@ -509,8 +674,7 @@ class CommandDispatchTest {
         routes["PATCH /api/sessions/$KEY"] = json(400, """{"error":{"code":"invalid_title","message":"Title is already in use"}}""")
         val vm = vm()
         vm.type("/title Taken")
-        assertTrue(vm.onSendClick())
-        until { composer().note != null }
+        assertTrue(vm.ended { vm.onSendClick() })
         assertEquals(ComposerNote(NoteKind.CMD_TITLE_REFUSED), composer().note)
         assertEquals("/title Taken", composer().draft)
         assertEquals("Plans", db.sessionDao().get(KEY)!!.title)
@@ -529,12 +693,14 @@ class CommandDispatchTest {
         }
         val vm = vm()
         vm.type("/title Hello")
-        assertTrue(vm.onSendClick())
+        val (ran, renaming) = vm.launchedBy { vm.onSendClick() }
+        assertTrue(ran)
         withContext(Dispatchers.IO) { assertTrue(arrived.await(10, TimeUnit.SECONDS)) }
         assertFalse("Enter again while it runs does nothing", vm.onSendClick())
         vm.type("/title Hello there") // edited while the rename is in flight
         release.countDown()
-        vm.await { it.title == "Hello" }
+        withContext(Dispatchers.Default) { withTimeout(60_000) { renaming.joinAll() } } // the command has ended
+        assertEquals("Hello", db.sessionDao().get(KEY)!!.title)
         assertEquals("/title Hello there", composer().draft)
         assertEquals(1, requests.count { it.method == "PATCH" })
     }
@@ -544,8 +710,9 @@ class CommandDispatchTest {
         session()
         val vm = vm()
         vm.type("/title " + "a".repeat(200))
-        assertTrue(vm.onSendClick())
-        vm.await { it.title == "a".repeat(TITLE_MAX) && it.draft.isEmpty() }
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals("a".repeat(TITLE_MAX), db.sessionDao().get(KEY)!!.title)
+        assertEquals("", composer().draft)
     }
 
     @Test
@@ -553,8 +720,7 @@ class CommandDispatchTest {
         session()
         val vm = vm()
         vm.type("/title Trip $FACE " + FACE.repeat(200))
-        assertTrue(vm.onSendClick())
-        until { db.sessionDao().get(KEY)!!.title != "Plans" }
+        assertTrue(vm.ended { vm.onSendClick() })
         val title = db.sessionDao().get(KEY)!!.title!!
         assertEquals("Trip $FACE " + FACE.repeat(TITLE_MAX - 7), title)
         assertEquals(TITLE_MAX, title.codePointCount(0, title.length))
@@ -564,19 +730,23 @@ class CommandDispatchTest {
     fun titleControlsRemoved() = runBlocking<Unit> {
         session()
         val vm = vm()
-        vm.type("/title Plans\u0007 for​ the week‮")
-        assertTrue(vm.onSendClick())
-        vm.await { it.title == "Plans for the week" }
+        // A bell, a zero-width space, a no-break space, a line separator and a bidi override. Hermes drops U+2028 (it
+        // does not turn it into a space), so "the" and "week" join, as on the server.
+        vm.type("/title Plans\u0007 for\u200B\u00A0the\u2028week\u202E")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals("Plans for theweek", db.sessionDao().get(KEY)!!.title)
     }
 
     @Test
     fun invisibleOnlyTitleRefusedLocally() = runBlocking<Unit> {
         session(onServer = true)
         val vm = vm()
-        vm.type("/title ​⁠\u0007")
-        assertFalse(vm.onSendClick())
-        assertEquals(ComposerNote(NoteKind.CMD_NEEDS_TEXT), composer().note)
-        assertEquals("/title ​⁠\u0007", composer().draft)
+        for (line in listOf("/title \u200B\u2060\u0007", "/title \uFFFC", "/title \u2065\uFFFC")) { // U+FFFC: what Hermes drops (Astra I4)
+            vm.type(line)
+            assertFalse(vm.ended { vm.onSendClick() })
+            assertEquals(ComposerNote(NoteKind.CMD_NEEDS_TEXT), composer().note)
+            assertEquals(line, composer().draft)
+        }
         assertTrue(writes().isEmpty())
         assertEquals("Plans", db.sessionDao().get(KEY)!!.title)
     }
@@ -590,8 +760,7 @@ class CommandDispatchTest {
         val vm = vm()
         vm.type("hello")
         vm.type("hello there")
-        assertTrue(vm.onSendClick())
-        until { rows().isNotEmpty() }
+        assertTrue(vm.ended { vm.onSendClick() })
         assertEquals("hello there", rows().single().text)
     }
 
@@ -626,9 +795,8 @@ class CommandDispatchTest {
         heldRun()
         vm.await { it.live != null }
         vm.type("/st")
-        assertTrue(vm.onCommand(Command.STOP))
-        until { lines().contains("POST /v1/runs/$RUN/stop") }
-        vm.await { it.draft.isEmpty() }
+        assertTrue(vm.ended { vm.onCommand(Command.STOP) })
+        assertEquals("", composer().draft)
         assertEquals(1, lines().count { it.endsWith("/stop") })
     }
 
@@ -641,17 +809,34 @@ class CommandDispatchTest {
         val vm = vm()
         val accepted = vm.accepts()
         vm.await { it.live != null }
-        for (line in listOf("/model", "/reasoning", "/fast", "/title Plans B", "/stop", "/status", "/new now", "/title", "/queue")) {
+        for (line in listOf("/model", "/reasoning", "/fast", "/title Plans B", "/stop", "/status", "/new now", "/title", "/queue", "/new")) {
             vm.type(line)
-            vm.onSendClick()
+            vm.ended { vm.onSendClick() } // each one has ENDED before the next: a pin or a signal at its end would show
         }
-        vm.await { it.title == "Plans B" && it.sheet is ChoiceSheet.Reasoning }
-        until { lines().any { it.endsWith("/stop") } && db.sessionDao().get(KEY)!!.fast == true }
-        vm.type("/new")
-        assertTrue(vm.onSendClick())
+        assertEquals("Plans B", db.sessionDao().get(KEY)!!.title)
+        assertEquals(true, db.sessionDao().get(KEY)!!.fast)
+        assertEquals(1, lines().count { it.endsWith("/stop") })
         assertEquals(0L, vm.state.value.storedSends)
         assertNull(vm.state.value.storedKey)
         assertEquals(0, accepted.get())
+        assertTrue(rows().isEmpty())
+    }
+
+    /** Lens L10: /model and /reasoning open their own sheets, clear the draft and store nothing. */
+    @Test
+    fun modelAndReasoningOpenTheirSheets() = runBlocking<Unit> {
+        session()
+        routes["GET /api/model/options"] = json(200, """{"providers":[],"model":null,"provider":null}""")
+        val vm = vm()
+        vm.type("/model")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertTrue(vm.await { it.sheet != null }.sheet is ChoiceSheet.Model)
+        assertEquals("", composer().draft)
+        vm.closeSheet()
+        vm.type("/reasoning")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(ChoiceSheet.Reasoning, vm.await { it.sheet != null }.sheet)
+        assertEquals("", composer().draft)
         assertTrue(rows().isEmpty())
     }
 
@@ -660,15 +845,57 @@ class CommandDispatchTest {
         session()
         val vm = vm()
         vm.type("/fast")
-        assertTrue(vm.onSendClick())
-        until { composer().note != null }
+        assertTrue(vm.ended { vm.onSendClick() })
         assertEquals(ComposerNote(NoteKind.FAST_ON), composer().note)
         assertEquals(true, db.sessionDao().get(KEY)!!.fast)
         assertEquals("", composer().draft)
         vm.type("/fast")
-        assertTrue(vm.onSendClick())
-        until { composer().note?.kind == NoteKind.FAST_OFF }
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(ComposerNote(NoteKind.FAST_OFF), composer().note)
         assertEquals(false, db.sessionDao().get(KEY)!!.fast)
+    }
+
+    /** Astra M1: the note follows the stored choice, also when the shown one differs (it has not caught up). */
+    @Test
+    fun fastShowsTheStoredValueNotTheShownOne() = runBlocking<Unit> {
+        session()
+        db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(fast = true))
+        val vm = vm(online = MutableSharedFlow()) // never emits: the shown state stays at its first value
+        assertNull(vm.state.value.choice.fast)
+        vm.type("/fast")
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(ComposerNote(NoteKind.FAST_OFF), composer().note)
+        assertEquals(false, db.sessionDao().get(KEY)!!.fast)
+        assertNull(vm.state.value.choice.fast)
+    }
+
+    /** Lens L11: with nothing stored (no row for the chat) /fast shows no note and keeps the draft. */
+    @Test
+    fun fastWithNothingStoredShowsNothing() = runBlocking<Unit> {
+        val key = "apofis-none"
+        val vm = vm(key)
+        vm.type("/fast", key)
+        assertTrue(vm.ended { vm.onSendClick() })
+        assertNull(composer(key).note)
+        assertEquals("/fast", composer(key).draft)
+        assertNull(db.sessionDao().get(key))
+    }
+
+    /** Astra M2: a cleared view model takes nothing: no claim, no store, no command. */
+    @Test
+    fun dispatchAfterClearedTakesNothing() = runBlocking<Unit> {
+        session()
+        val vm = vm()
+        stores.last().clear()
+        connected.composer.edit(KEY, "hello", composer().revision)
+        assertFalse(vm.onSendClick())
+        connected.composer.edit(KEY, "/queue later", composer().revision)
+        assertFalse(vm.onSendClick())
+        assertFalse(vm.onCommand(Command.NEW))
+        settled()
+        assertTrue(rows().isEmpty())
+        assertEquals("/queue later", composer().draft)
+        assertEquals(emptyList<String>(), lines())
     }
 
     // ---- the hosted editor ----
@@ -748,10 +975,16 @@ class CommandDispatchTest {
         val vm = vm()
         vm.await { it.live != null }
         vm.type("about the old reply")
-        assertTrue(vm.onSendClick("run_0")) // drawn for a run that has ended: queued, not steering run_1
-        until { rows().isNotEmpty() }
+        assertTrue(vm.ended { vm.onSendClick("run_0") }) // drawn for a run that has ended: queued, not steering run_1
         assertEquals(PendingState.QUEUED, rows().single().state)
+
+        // Lens L7: /steer goes to the drawn run too. run_0 has ended, so nothing is stored; run_1 is never steered.
+        vm.type("/steer x")
+        assertTrue(vm.ended { vm.onSendClick("run_0") })
+        assertEquals("/steer x", composer().unsent?.text)
+        assertEquals(1, rows().size)
         assertTrue(lines().none { it.endsWith("/steer") })
         assertNotEquals(null, vm.state.value.live)
     }
+
 }

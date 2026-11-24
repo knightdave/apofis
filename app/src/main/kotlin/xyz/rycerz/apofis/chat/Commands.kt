@@ -16,7 +16,8 @@ sealed interface Parsed {
 }
 
 // The server's command word (H14): a letter, digit or underscore, then those or hyphens, ended by whitespace or the end.
-private val COMMAND = Regex("""^/([\p{L}\p{N}_][\p{L}\p{N}_-]*)(\s|$)""")
+// The whitespace is spelled out: `\s` is ASCII only on the JVM and Unicode on Android; this class is the same on both.
+private val COMMAND = Regex("""^/([\p{L}\p{N}_][\p{L}\p{N}_-]*)([\t\n\x0B\f\r\x{85}\p{Z}]|$)""")
 private val PALETTE = Regex("""^/[\p{L}\p{N}_-]*$""")
 
 private fun command(word: String): Command? = word.lowercase(Locale.ROOT).let { w -> Command.entries.firstOrNull { it.word == w } }
