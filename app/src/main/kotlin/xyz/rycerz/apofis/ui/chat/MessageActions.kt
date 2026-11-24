@@ -38,7 +38,6 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import java.text.BreakIterator
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
@@ -59,29 +58,8 @@ import xyz.rycerz.apofis.ui.theme.wash
 /** The most characters one composable is given of a message (an expanded bubble, one piece of the Select view). */
 internal const val PAGE_CHARS = 8000
 
-/** How far past the cap a piece may run to finish the grapheme that straddles it. */
+/** How far past the cap a piece may run to finish the grapheme that straddles it ([graphemeCut] up). */
 internal const val GRAPHEME_SLACK = 1024
-
-/**
- * The one cutting function: the end of the piece of [text] starting at [start] (a grapheme boundary), at the first
- * grapheme boundary at or after [start] + [cap]. Segmentation runs over a window that begins at [start], so flag
- * pairs, ZWJ sequences, combining marks and CRLF stay together; it reads at most [cap] + [GRAPHEME_SLACK] characters.
- * The window ends on a code point boundary; its end counts as a boundary only at the end of [text]. Shortcut: when no
- * boundary is found in the window (a grapheme longer than [GRAPHEME_SLACK]), the cut is at the cap, on a code point
- * boundary.
- * Known limit: a grapheme spanning more than one window may also be cut at code point boundaries that are not
- * grapheme boundaries.
- */
-internal fun pieceEnd(text: CharSequence, start: Int, cap: Int = PAGE_CHARS): Int {
-    if (text.length - start <= cap) return text.length
-    var windowEnd = minOf(text.length, start + cap + GRAPHEME_SLACK)
-    if (windowEnd < text.length && text[windowEnd - 1].isHighSurrogate() && text[windowEnd].isLowSurrogate()) windowEnd++ // whole code points only
-    val bi = BreakIterator.getCharacterInstance().apply { setText(text.subSequence(start, windowEnd).toString()) }
-    val b = bi.following(cap - 1)
-    if (b != BreakIterator.DONE && (start + b < windowEnd || windowEnd == text.length)) return start + b
-    val end = start + cap
-    return if (text[end - 1].isHighSurrogate() && text[end].isLowSurrogate()) end + 1 else end
-}
 
 // ---- what an action may act on
 
