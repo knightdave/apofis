@@ -43,6 +43,7 @@ import xyz.rycerz.apofis.ui.theme.rememberTimeMs
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.rotate
 import xyz.rycerz.apofis.ui.theme.scaled
+import xyz.rycerz.apofis.ui.text.graphemeCut
 
 private val bubbleShape = RoundedCornerShape(16.dp)
 
@@ -55,12 +56,12 @@ internal const val USER_COLLAPSED_LINES = 9
 internal const val COLLAPSED_MAX_CHARS = 4000
 
 /**
- * What a collapsed bubble lays out: the first [pieceEnd] piece of at most [COLLAPSED_MAX_CHARS], ended before its
- * tenth line break (one line more than shown, so the layout sees the overflow). CR, LF and CRLF are one break each,
- * and a cut before a break is a grapheme boundary.
+ * What a collapsed bubble lays out: the first piece of at most [COLLAPSED_MAX_CHARS] ([graphemeCut] up), ended
+ * before its tenth line break (one line more than shown, so the layout sees the overflow). CR, LF and CRLF are one
+ * break each, and a cut before a break is a grapheme boundary.
  */
 internal fun collapsedPrefix(text: String): String {
-    val end = pieceEnd(text, 0, COLLAPSED_MAX_CHARS)
+    val end = graphemeCut(text, 0, COLLAPSED_MAX_CHARS, up = true)
     var lines = 0
     var i = 0
     while (i < end) {
@@ -76,7 +77,7 @@ internal fun collapsedPrefix(text: String): String {
 
 /**
  * Right aligned, at most 75 % wide, tinted with primary, collapsed to [USER_COLLAPSED_LINES] lines with Show more.
- * Expanded, it shows the first [pieceEnd] piece, which always holds the collapsed prefix; a longer message then
+ * Expanded, it shows the first [PAGE_CHARS] piece, which always holds the collapsed prefix; a longer message then
  * offers Show full message, which opens the whole text in the Select view. A sent message has Copy and Select below;
  * unsent messages show their state and controls instead.
  */
@@ -93,7 +94,7 @@ internal fun UserBubble(
         var expanded by rememberSaveable(message.key) { mutableStateOf(initiallyExpanded) }
         val text = message.text
         val prefix = remember(text) { collapsedPrefix(text) }
-        val page = if (expanded) remember(text) { text.substring(0, pieceEnd(text, 0)) } else ""
+        val page = if (expanded) remember(text) { text.substring(0, graphemeCut(text, 0, PAGE_CHARS, up = true)) } else ""
         val more = expanded && page.length < text.length
         // Decided by the latest layout, both ways (a wider window can make a long message fit).
         var long by remember(text) { mutableStateOf(prefix.length < text.length) }
