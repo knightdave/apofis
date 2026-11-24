@@ -72,13 +72,14 @@ class ThumbCache : LruCache<String, Decoded>(MAX_WEIGHT) {
 /**
  * The decode of [key], from [LocalThumbCache] when it holds it, else from [decode] in this composition's coroutine
  * (cancelled when the caller leaves, which hands an unclaimed bitmap back to the decoder); null until it is done.
- * A failure is shown, not retried, until the caller is composed anew.
+ * A failure is shown, not retried, until the caller is composed anew; one cached stays while resident, except BUSY.
  */
 @Composable
 internal fun rememberDecoded(key: String, decode: suspend () -> Decoded): Decoded? {
     val cache = LocalThumbCache.current
     val result = remember(key, cache) { mutableStateOf(cache?.get(key)) }
-    if (result.value == null) LaunchedEffect(key, cache) { result.value = decode().also { cache?.put(key, it) } }
+    // BUSY says nothing about the image: it is shown but not cached, so the next composition tries again.
+    if (result.value == null) LaunchedEffect(key, cache) { result.value = decode().also { if ((it as? Decoded.Failed)?.reason != ImageFailure.BUSY) cache?.put(key, it) } }
     return result.value
 }
 

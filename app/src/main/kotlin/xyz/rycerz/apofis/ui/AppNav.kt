@@ -15,6 +15,11 @@ import xyz.rycerz.apofis.ui.drawer.DrawerActions
 import xyz.rycerz.apofis.ui.drawer.DrawerContent
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
 import xyz.rycerz.apofis.ui.drawer.PromptHost
+import xyz.rycerz.apofis.ui.drawer.Prompt
+import xyz.rycerz.apofis.ui.drawer.PromptActions
+import xyz.rycerz.apofis.ui.chat.LocalOverlays
+import xyz.rycerz.apofis.ui.chat.OverChat
+import xyz.rycerz.apofis.ui.chat.Overlays
 import xyz.rycerz.apofis.ui.drawer.PushDrawer
 import xyz.rycerz.apofis.ui.drawer.PushDrawerState
 import kotlinx.coroutines.CoroutineScope
@@ -23,6 +28,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -187,66 +193,77 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
         DrawerButton(Modifier.focusRequester(drawerButtonFocus)) { scope.launch { drawerState.open() } }
     }
     val newChatButton: @Composable RowScope.() -> Unit = { NewChatButton(drawer::newChat) }
-    if (showArchived) {
-        BackHandler { showArchived = false }
-        ArchivedScreen(archived, open, onBack = { showArchived = false })
-    } else {
-        PushDrawer(
-            drawerState,
-            drawerContent = {
-                DrawerContent(
-                    rows,
-                    query,
-                    refreshFailed,
-                    hasArchived = archived.isNotEmpty(),
-                    actions = open,
-                    onQuery = drawer::onQuery,
-                    onNewChat = {
-                        drawer.newChat()
-                        scope.launch { drawerState.close() }
-                    },
-                    onArchived = { showArchived = true },
-                    onSettings = onSettings,
-                )
-            },
-            onOpening = drawer::onOpen,
-            restoreFocus = drawerButtonFocus,
-        ) { dragArea ->
-            val sessionKey = selected
-            if (sessionKey == null) {
-                ChatScreen(
-                    ChatUiState("", "", if (loadFailed) StatusLine.LOAD_FAILED else StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, ""),
-                    object : ChatActions {},
-                    onOpenConnection = onConnection,
-                    onRetryLoad = drawer::retryLoad,
-                    navigationIcon = drawerButton,
-                    appBarActions = newChatButton,
-                    dragArea = dragArea,
-                    covered = drawerState.covered,
-                    coveredNow = { drawerState.covered },
-                )
-            } else {
-                key(sessionKey) {
-                    // Scoped to this chat being on screen: leaving clears the view model, its collectors and its
-                    // connectivity subscription. Its draft lives in the connection's holder, not here.
-                    val chatOwner = rememberViewModelStoreOwner()
-                    val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
-                    // The first send the composer accepts asks for the notification permission, once ever, through the
-                    // launcher of the composition that is collecting (the view model holds none).
-                    LaunchedEffect(vm, askNotifications) { vm.sendAccepted.collect { askNotifications() } }
-                    LaunchedEffect(vm) { drawer.reopened.drop(1).filterNotNull().filter { it.key == sessionKey }.collect { vm.onOpened() } }
-                    val state by vm.state.collectAsState()
-                    // Its notification is never posted while it is on screen in a started activity.
-                    LifecycleStartEffect(conn, sessionKey) {
-                        container.chatShown(conn.generation, sessionKey, true)
-                        onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
+    // One mark for every window over the chat and its drawer (the answer guard, see [Overlays]).
+    val overlays = remember { Overlays() }
+    CompositionLocalProvider(LocalOverlays provides overlays) {
+        if (showArchived) {
+            BackHandler { showArchived = false }
+            ArchivedScreen(archived, open, onBack = { showArchived = false })
+        } else {
+            PushDrawer(
+                drawerState,
+                drawerContent = {
+                    DrawerContent(
+                        rows,
+                        query,
+                        refreshFailed,
+                        hasArchived = archived.isNotEmpty(),
+                        actions = open,
+                        onQuery = drawer::onQuery,
+                        onNewChat = {
+                            drawer.newChat()
+                            scope.launch { drawerState.close() }
+                        },
+                        onArchived = { showArchived = true },
+                        onSettings = onSettings,
+                    )
+                },
+                onOpening = drawer::onOpen,
+                restoreFocus = drawerButtonFocus,
+            ) { dragArea ->
+                val sessionKey = selected
+                if (sessionKey == null) {
+                    ChatScreen(
+                        ChatUiState("", "", if (loadFailed) StatusLine.LOAD_FAILED else StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, ""),
+                        object : ChatActions {},
+                        onOpenConnection = onConnection,
+                        onRetryLoad = drawer::retryLoad,
+                        navigationIcon = drawerButton,
+                        appBarActions = newChatButton,
+                        dragArea = dragArea,
+                        covered = drawerState.covered,
+                        coveredNow = { drawerState.covered },
+                    )
+                } else {
+                    key(sessionKey) {
+                        // Scoped to this chat being on screen: leaving clears the view model, its collectors and its
+                        // connectivity subscription. Its draft lives in the connection's holder, not here.
+                        val chatOwner = rememberViewModelStoreOwner()
+                        val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
+                        // The first send the composer accepts asks for the notification permission, once ever, through the
+                        // launcher of the composition that is collecting (the view model holds none).
+                        LaunchedEffect(vm, askNotifications) { vm.sendAccepted.collect { askNotifications() } }
+                        LaunchedEffect(vm) { drawer.reopened.drop(1).filterNotNull().filter { it.key == sessionKey }.collect { vm.onOpened() } }
+                        val state by vm.state.collectAsState()
+                        // Its notification is never posted while it is on screen in a started activity.
+                        LifecycleStartEffect(conn, sessionKey) {
+                            container.chatShown(conn.generation, sessionKey, true)
+                            onStopOrDispose { container.chatShown(conn.generation, sessionKey, false) }
+                        }
+                        ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, enterToSend = prefs.enterToSend.collectAsState().value, chatFontScale = prefs.chatFontScale.collectAsState().value, dragArea = dragArea, covered = drawerState.covered, coveredNow = { drawerState.covered })
                     }
-                    ChatScreen(state, vm, onOpenConnection = onConnection, navigationIcon = drawerButton, appBarActions = newChatButton, currentState = { vm.state.value }, enterToSend = prefs.enterToSend.collectAsState().value, chatFontScale = prefs.chatFontScale.collectAsState().value, dragArea = dragArea, covered = drawerState.covered, coveredNow = { drawerState.covered })
                 }
             }
         }
+        prompt?.let { PromptOverChat(it, drawer) }
     }
-    prompt?.let { PromptHost(it, drawer) }
+}
+
+/** A drawer prompt, a window over the chat: each showing marks the answer guard ([OverChat]), a new kind anew. */
+@Composable
+internal fun PromptOverChat(prompt: Prompt, actions: PromptActions) {
+    OverChat(LocalOverlays.current, prompt.kind to prompt.token)
+    PromptHost(prompt, actions)
 }
 
 /** The chat bar's drawer button: a 20 dp glyph in a 40 dp box, 48 dp target. */

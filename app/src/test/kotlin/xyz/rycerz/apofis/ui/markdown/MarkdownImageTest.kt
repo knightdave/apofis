@@ -64,6 +64,15 @@ import xyz.rycerz.apofis.ui.image.LocalThumbCache
 import xyz.rycerz.apofis.ui.image.ThumbCache
 import xyz.rycerz.apofis.ui.image.ViewerImage
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.test.captureToImage
+import java.util.concurrent.TimeUnit
+import org.junit.Assert.assertNull
+import xyz.rycerz.apofis.run.Connection
+import xyz.rycerz.apofis.run.LiveReply
+import xyz.rycerz.apofis.ui.chat.Work
+import xyz.rycerz.apofis.ui.chat.withLive
+import xyz.rycerz.apofis.ui.image.rememberDecoded
 
 /** An encoded PNG of one color, made by the platform encoder. */
 internal fun pngBytes(w: Int, h: Int, color: Int = Color.RED): ByteArray {
@@ -78,10 +87,10 @@ internal fun jpegBytes(w: Int, h: Int): ByteArray {
 }
 
 /**
- * A black 1-bit greyscale PNG written by hand, so a large image stays a few hundred bytes; [filler] adds a text chunk
- * of that many letters (ignored by decoders) to make the encoding longer.
+ * A black (or [white]) 1-bit greyscale PNG written by hand, so a large image stays a few hundred bytes; [filler] adds a
+ * text chunk of that many letters (ignored by decoders) to make the encoding longer.
  */
-internal fun onebitPng(w: Int, h: Int, filler: Int = 0, seed: Int = 0): ByteArray {
+internal fun onebitPng(w: Int, h: Int, filler: Int = 0, seed: Int = 0, white: Boolean = false): ByteArray {
     val out = ByteArrayOutputStream()
     val data = DataOutputStream(out)
     data.write(byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 0x0D, 0x0A, 0x1A, 0x0A))
@@ -93,7 +102,8 @@ internal fun onebitPng(w: Int, h: Int, filler: Int = 0, seed: Int = 0): ByteArra
     }
     chunk("IHDR", ByteBuffer.allocate(13).putInt(w).putInt(h).put(1).put(0).put(0).put(0).put(0).array())
     if (filler > 0) chunk("tEXt", "Comment".toByteArray() + 0 + "$seed".padEnd(filler, 'x').toByteArray())
-    val raw = ByteArray((1 + (w + 7) / 8) * h) // filter byte 0 and black pixels on every row
+    val row = 1 + (w + 7) / 8
+    val raw = ByteArray(row * h) { if (white && it % row != 0) -1 else 0 } // filter byte 0, then the pixels of each row
     val deflater = Deflater(9).apply { setInput(raw); finish() }
     val packed = ByteArrayOutputStream()
     val buffer = ByteArray(64 * 1024)
@@ -144,11 +154,23 @@ class MarkdownImageTest {
 
     private val failed = hasText("Image could not be shown")
 
-    private fun exists(m: SemanticsMatcher) = rule.onAllNodes(m, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+    private fun exists(m: SemanticsMatcher) =
+        rule.onAllNodes(m).fetchSemanticsNodes().isNotEmpty() || rule.onAllNodes(m, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
 
     private fun waitFor(m: SemanticsMatcher) = rule.waitUntil(10_000) { exists(m) }
 
     private val dot = dataUrl(pngBytes(4, 3))
+
+    /** The cache's weight by the brief's rule, from what it holds: max(64 KiB, the bitmap's bytes or 64 KiB) plus two per key character. */
+    private fun expectedWeight(cache: ThumbCache) = cache.snapshot().entries.sumOf { (key, value) ->
+        maxOf(64 * 1024, (value as? Decoded.Ok)?.bitmap?.allocationByteCount ?: 64 * 1024) + 2 * key.length
+    }
+
+    /** Whether the node's own drawing holds a pixel darker than a quarter grey (the black fixture on the light fill). */
+    private fun drawsDark(m: SemanticsMatcher): Boolean {
+        val bitmap = rule.onNode(m).captureToImage().asAndroidBitmap()
+        return (0 until bitmap.width).any { x -> (0 until bitmap.height).any { y -> android.graphics.Color.red(bitmap.getPixel(x, y)) < 64 } }
+    }
 
     @Test
     fun dataUrlBecomesImage() {
@@ -182,6 +204,7 @@ class MarkdownImageTest {
             rule.onNode(hasText("A diagram") and hasClickAction()).performClick()
             rule.waitForIdle()
             assertEquals(listOf(url), links)
+            assertNull(server.takeRequest(500, TimeUnit.MILLISECONDS)) // nor later
             assertEquals(0, server.requestCount)
             assertTrue(opened.isEmpty())
         } finally {
@@ -228,6 +251,12 @@ class MarkdownImageTest {
         assertFalse(exists(hasClickAction()))
         assertEquals(listOf(true, true), urls.map { cache.get(it) is Decoded.Failed })
         assertTrue(links.isEmpty() && opened.isEmpty())
+        // The merged node says the image failed (its alt, then why), offers no action and keeps the tile's height.
+        for (i in 0..1) {
+            val node = rule.onNode(hasContentDescription("broken $i, Image could not be shown")).fetchSemanticsNode()
+            assertFalse(node.config.contains(SemanticsActions.OnClick))
+            assertEquals(240f, node.size.height / 2f, 0.5f)
+        }
     }
 
     @Test
@@ -242,6 +271,7 @@ class MarkdownImageTest {
             assertEquals(1024, maxOf(bitmap.width, bitmap.height)) // the reply side
             assertEquals(1, minOf(bitmap.width, bitmap.height))
             assertEquals(240f, rule.onNode(hasContentDescription(name) and hasClickAction()).fetchSemanticsNode().size.height / 2f, 0.5f)
+            assertTrue("$name draws a pixel", drawsDark(hasContentDescription(name) and hasClickAction()))
         }
     }
 
@@ -299,12 +329,14 @@ class MarkdownImageTest {
     fun failuresCannotFillCache() {
         val cache = ThumbCache()
         repeat(1_000) { cache.put("data:image/png;base64,AAAA$it", Decoded.Failed(ImageFailure.NOT_AN_IMAGE)) }
-        assertTrue("weight ${cache.size()}", cache.size() <= ThumbCache.MAX_WEIGHT)
-        assertTrue("entries ${cache.snapshot().size}", cache.snapshot().size <= ThumbCache.MAX_ENTRIES)
-        // Long keys are charged too.
+        assertEquals(expectedWeight(cache), cache.size())
+        assertTrue("weight ${cache.size()}", cache.size() <= 16 * 1024 * 1024)
+        assertTrue("entries ${cache.snapshot().size}", cache.snapshot().size <= 256)
+        // Long keys are charged too: fewer of them fit.
         repeat(1_000) { cache.put("data:image/png;base64,$it" + "A".repeat(19_000), Decoded.Failed(ImageFailure.UNREADABLE)) }
-        assertTrue("weight ${cache.size()}", cache.size() <= ThumbCache.MAX_WEIGHT)
-        assertTrue("entries ${cache.snapshot().size}", cache.snapshot().size <= ThumbCache.MAX_ENTRIES)
+        assertEquals(expectedWeight(cache), cache.size())
+        assertTrue("weight ${cache.size()}", cache.size() <= 16 * 1024 * 1024)
+        assertTrue("entries ${cache.snapshot().size}", cache.snapshot().size < 256)
     }
 
     @Test
@@ -317,8 +349,9 @@ class MarkdownImageTest {
         assertEquals(1 to 1, decoded.bitmap.width to decoded.bitmap.height)
         val cache = ThumbCache()
         for (url in urls) cache.put(url, Decoded.Ok(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)))
-        assertTrue("weight ${cache.size()}", cache.size() <= ThumbCache.MAX_WEIGHT)
-        assertTrue("entries ${cache.snapshot().size}", cache.snapshot().size <= ThumbCache.MAX_ENTRIES)
+        assertEquals(expectedWeight(cache), cache.size())
+        assertTrue("weight ${cache.size()}", cache.size() <= 16 * 1024 * 1024)
+        assertTrue("entries ${cache.snapshot().size}", cache.snapshot().size < 256) // the keys' charge leaves room for fewer
         assertTrue(cache.get(urls.last()) != null && cache.get(urls.first()) == null) // the oldest went first
     }
 
@@ -365,13 +398,118 @@ class MarkdownImageTest {
     @Test
     fun noNetworkClassReferenced() {
         val root = File("src/main/kotlin/xyz/rycerz/apofis/ui")
-        val sources = listOf("image", "markdown").flatMap { File(root, it).walk().filter { f -> f.extension == "kt" }.toList() }
-        assertTrue(sources.size >= 4)
+        val sources = listOf("image", "markdown").flatMap { File(root, it).walk().filter { f -> f.extension == "kt" }.toList() } + File(root, "chat/ChatScreen.kt")
+        assertTrue(sources.size >= 5 && sources.all { it.isFile })
         for (file in sources) {
             val text = file.readText()
-            for (word in listOf("OkHttpClient", "URL(", "HttpURLConnection", "openConnection", "okhttp3")) {
-                assertFalse("${file.name} names $word", text.contains(word))
+            // As calls or types: ChatScreen's own "openConnection" callback (the Connection screen) is not a network call.
+            for (word in listOf("\\bOkHttpClient\\b", "\\bURL\\(", "HttpURLConnection", "\\.openConnection\\b", "\\bokhttp3\\b", "\\.toURL\\b", "\\.openStream\\b", "Socket\\b")) {
+                assertFalse("${file.name} names $word", Regex(word).containsMatchIn(text))
             }
         }
+    }
+
+    // ---- fix round 1 ----
+
+    /** The composition's own memo, with a decoder that never leaves the composition dispatcher: one decode while shown, hidden and shown. */
+    @Test
+    fun rememberDecodedDecodesOnceWhileResident() {
+        val cache = ThumbCache()
+        var decodes = 0
+        var shown by mutableStateOf(true)
+        rule.setContent {
+            CompositionLocalProvider(LocalThumbCache provides cache) {
+                if (shown) rememberDecoded("k") { decodes++; Decoded.Ok(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)) }
+            }
+        }
+        rule.waitForIdle()
+        shown = false
+        rule.waitForIdle()
+        shown = true
+        rule.waitForIdle()
+        assertEquals(1, decodes)
+    }
+
+    /** BUSY is shown and not cached: composed anew, the image decodes again; any other failure stays cached. */
+    @Test
+    fun busyIsNotCached() {
+        val cache = ThumbCache()
+        val decodes = HashMap<String, Int>()
+        val results = HashMap<String, Decoded?>()
+        var shown by mutableStateOf(true)
+        rule.setContent {
+            CompositionLocalProvider(LocalThumbCache provides cache) {
+                if (shown) {
+                    for ((key, reason) in listOf("busy" to ImageFailure.BUSY, "bad" to ImageFailure.NOT_AN_IMAGE)) {
+                        results[key] = rememberDecoded(key) { decodes.merge(key, 1, Int::plus); Decoded.Failed(reason) }
+                    }
+                }
+            }
+        }
+        rule.waitForIdle()
+        assertEquals(Decoded.Failed(ImageFailure.BUSY), results["busy"]) // shown as a failure
+        shown = false
+        rule.waitForIdle()
+        shown = true
+        rule.waitForIdle()
+        assertEquals(mapOf("busy" to 2, "bad" to 1), decodes)
+        assertNull(cache.get("busy"))
+    }
+
+    private fun tiles(text: String) = rows(text).map { row -> (row.chunk as? DisplayChunk.Blocks)?.blocks.orEmpty().sumOf(::dataTiles) }
+
+    private fun dataTiles(b: MdBlock): Int = when (b) {
+        is MdBlock.Image -> if (b.data.isNotEmpty()) 1 else 0
+        is MdBlock.Quote -> b.blocks.sumOf(::dataTiles)
+        is MdBlock.ListBlock -> b.items.sumOf { it.blocks.sumOf(::dataTiles) }
+        else -> 0
+    }
+
+    @Test
+    fun fiftyImageParagraphsAreFiftyRows() {
+        val tiles = tiles((1..50).joinToString("\n\n") { "![p$it]($dot)" })
+        assertEquals(List(50) { 1 }, tiles)
+    }
+
+    @Test
+    fun aTightListOfImagesHasOneTilePerRowAndKeepsItsNumbers() {
+        val rows = rows((1..24).joinToString("\n") { "$it. ![i$it]($dot)" })
+        assertEquals(List(24) { 1 }, rows.map { row -> (row.chunk as DisplayChunk.Blocks).blocks.sumOf(::dataTiles) })
+        assertEquals((1..24).toList(), rows.map { ((it.chunk as DisplayChunk.Blocks).blocks.single() as MdBlock.ListBlock).start })
+    }
+
+    @Test
+    fun aQuoteOfImagesIsCut() {
+        val tiles = tiles((1..6).joinToString("\n>\n") { "> ![q$it]($dot)" })
+        assertEquals(List(6) { 1 }, tiles)
+    }
+
+    @Test
+    fun oneListItemWithManyImagesIsLiteral() {
+        val parses = Work.imageDecodes
+        val rows = rows("- ![a]($dot)\n\n" + (1..6).joinToString("\n\n") { "  ![b$it]($dot)" })
+        assertTrue(rows.isNotEmpty() && rows.all { it.chunk is DisplayChunk.Literal })
+        show("- ![a]($dot)\n\n" + (1..6).joinToString("\n\n") { "  ![b$it]($dot)" })
+        rule.waitForIdle()
+        assertEquals("no decode at all", parses, Work.imageDecodes)
+    }
+
+    /** A finished reply has no open block: its last image paragraph over the live cutoff becomes a tile with nothing appended. */
+    @Test
+    fun aFinishedReplysLastImageIsParsed() {
+        val url = dataUrl(onebitPng(4, 4, filler = 8_000))
+        assertTrue("${url.length}", url.length in 10_000..19_000)
+        val text = "Here:\n\n![late]($url)" // no line break after it
+        val live = LiveReply("run_1", "running", text, emptyList(), null, Connection.LIVE)
+        val reply = AssistantReply("r1", emptyList(), text, FIXED_NOW)
+        val chat = ChatRows(ZoneOffset.UTC)
+        val streaming = chat.rows(withLive(emptyList(), live) { FIXED_NOW }).filterIsInstance<TextRow>()
+        assertTrue("literal while live", streaming.any { (it.chunk as? DisplayChunk.Literal)?.text?.contains("![late]") == true })
+        val stored = chat.rows(listOf(reply)).filterIsInstance<TextRow>()
+        assertEquals(1, stored.sumOf { (it.chunk as? DisplayChunk.Blocks)?.blocks.orEmpty().sumOf(::dataTiles) })
+        // Control: over the parser's own bound it stays literal when finished too.
+        val big = "Here:\n\n![big](data:image/png;base64," + "A".repeat(20_000) + ")"
+        val finished = ChatRows(ZoneOffset.UTC).rows(listOf(reply.copy(text = big))).filterIsInstance<TextRow>()
+        assertTrue(finished.none { (it.chunk as? DisplayChunk.Blocks)?.blocks.orEmpty().any { b -> b is MdBlock.Image } })
     }
 }

@@ -169,7 +169,7 @@ internal fun ReplyFooter(
                 // answers nothing ([Overlays]).
                 val clock = LocalAnswerClock.current
                 val settle = LocalViewConfiguration.current.doubleTapTimeoutMillis
-                val overlays = LocalOverlays.current
+                val overlays = LocalOverlays.current ?: remember { Overlays() }
                 val gate = remember(pending.requestId, pending.executionGeneration) { AnswerGate(clock, settle, overlays) }
                 // A request with another id or generation is a new block: an open menu or typed answer never carries over.
                 key(pending.requestId, pending.executionGeneration) {

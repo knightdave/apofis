@@ -33,6 +33,8 @@ import xyz.rycerz.apofis.ui.chat.ChromeProbe
 import xyz.rycerz.apofis.ui.chat.ComposerMode
 import xyz.rycerz.apofis.ui.chat.StatusLine
 import xyz.rycerz.apofis.ui.chat.withLive
+import androidx.compose.ui.test.junit4.StateRestorationTester
+import xyz.rycerz.apofis.ui.chat.Work
 import xyz.rycerz.apofis.ui.markdown.Themed
 import xyz.rycerz.apofis.ui.markdown.dataUrl
 import xyz.rycerz.apofis.ui.markdown.pngBytes
@@ -94,5 +96,34 @@ class ReplyImageChromeTest {
         stream(101)
         assertTrue(exists(tile))
         assertChromeAlone("by tokens after the viewer closed")
+    }
+
+    /** A real tile opens the viewer in the hosted chat; it survives recreation and then closes. */
+    @Test
+    fun theViewerSurvivesRecreationInTheChat() {
+        val tester = StateRestorationTester(rule)
+        tester.setContent { Themed { val now = state(1); ChatScreen(now, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, currentState = { now }) } }
+        rule.waitUntil(10_000) { exists(tile) }
+        rule.onNode(tile).performSemanticsAction(SemanticsActions.OnClick)
+        rule.waitUntil(10_000) { exists(hasContentDescription("Close image")) }
+        tester.emulateSavedInstanceStateRestore()
+        rule.waitUntil(10_000) { exists(hasContentDescription("Close image")) }
+        rule.onNodeWithContentDescription("Close image").performSemanticsAction(SemanticsActions.OnClick)
+        rule.waitForIdle()
+        assertTrue(!exists(hasContentDescription("Close image")))
+    }
+
+    /** In a short window, a reply of 24 listed images starts decodes only for the rows the list composes, not for all. */
+    @Test
+    @Config(qualifiers = "w360dp-h400dp-xhdpi")
+    fun decodesStartOnlyForComposedRows() {
+        val list = (1..24).joinToString("\n") { "$it. ![i$it](${dataUrl(pngBytes(4, 3, android.graphics.Color.rgb(it, 0, 0)))})" }
+        val reply = AssistantReply("r0", emptyList(), list, FIXED_NOW)
+        val now = ChatUiState("k", "Chat", StatusLine.IDLE, listOf(UserMessage("u1", "Draw", steered = false, timestamp = FIXED_NOW), reply), ComposerMode.SEND, "", "hermes.example")
+        val before = Work.imageDecodes
+        rule.setContent { Themed { ChatScreen(now, object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, currentState = { now }) } }
+        rule.waitForIdle()
+        val started = Work.imageDecodes - before
+        assertTrue("$started decodes started", started in 1..4)
     }
 }

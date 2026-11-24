@@ -103,6 +103,10 @@ import xyz.rycerz.apofis.ui.image.LocalImageOpen
 import xyz.rycerz.apofis.ui.image.ReplyLimits
 import xyz.rycerz.apofis.ui.image.ViewerImage
 import xyz.rycerz.apofis.ui.image.rememberDecoded
+import xyz.rycerz.apofis.ui.image.fitSize
+import xyz.rycerz.apofis.ui.chat.Work
+import xyz.rycerz.apofis.BuildConfig
+import androidx.compose.ui.unit.DpSize
 
 /**
  * One display chunk of a reply. Links open only through [onLink], on a tap; nothing is fetched. [tableScroll] is
@@ -344,6 +348,7 @@ private fun DataImageTile(url: String, alt: String) {
     val colors = ApofisTheme.colors
     val context = LocalContext.current
     val decoded = rememberDecoded(url) {
+        if (BuildConfig.DEBUG) Work.imageDecodes++
         val bytes = withContext(Dispatchers.Default) { dataImageBytes(url) }
         if (bytes == null) Decoded.Failed(ImageFailure.NOT_AN_IMAGE) else decodeBounded(context, ImageInput.Bytes(bytes, dataImageType(url)), REPLY_SIDE, limits = ReplyLimits)
     }
@@ -351,12 +356,12 @@ private fun DataImageTile(url: String, alt: String) {
     val scope = rememberCoroutineScope()
     val label = alt.ifEmpty { stringResource(R.string.md_image) }
     val tile = Modifier.fillMaxWidth().height(240.dp).clip(MaterialTheme.shapes.medium)
-    if (decoded !is Decoded.Ok) return ImagePlaceholder(tile, label, glyph = decoded != null, glyphSize = 20.dp) {
-        Text(stringResource(R.string.md_image_failed), style = MaterialTheme.typography.bodyMedium, color = colors.muted)
+    val failed = stringResource(R.string.md_image_failed)
+    if (decoded !is Decoded.Ok) return ImagePlaceholder(tile, if (decoded == null) label else "$label, $failed", glyph = decoded != null, glyphSize = 20.dp) {
+        Text(failed, style = MaterialTheme.typography.bodyMedium, color = colors.muted)
     }
-    Image(
-        remember(decoded.bitmap) { decoded.bitmap.asImageBitmap() },
-        label,
+    val bitmap = decoded.bitmap
+    BoxWithConstraints(
         tile
             .background(colors.thumbPlaceholder)
             .then(
@@ -367,8 +372,16 @@ private fun DataImageTile(url: String, alt: String) {
                     Modifier.clickable(role = Role.Button) { scope.launch { withContext(Dispatchers.Default) { dataImageBytes(url) }?.let { open(ViewerImage.Data(it, dataImageType(url))) } } }
                 },
             ),
-        contentScale = ContentScale.Fit,
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        val fitted = fitSize(bitmap.width, bitmap.height, Size(constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat()))
+        Image(
+            remember(bitmap) { bitmap.asImageBitmap() },
+            label,
+            Modifier.size(with(LocalDensity.current) { DpSize(fitted.width.toDp(), fitted.height.toDp()) }),
+            contentScale = ContentScale.FillBounds,
+        )
+    }
 }
 
 private const val REPLY_SIDE = 1024

@@ -45,7 +45,9 @@ import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.toSize
+import kotlin.math.roundToInt
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
@@ -104,9 +106,18 @@ internal fun clampTransform(scale: Float, offset: Offset, image: Size, viewport:
     return s to Offset(offset.x.coerceIn(-x, x), offset.y.coerceIn(-y, y))
 }
 
+/**
+ * A [width] x [height] picture fitted inside [box] (px), aspect kept and rounded as an image is drawn, each side at least
+ * one physical pixel, so a thin image never vanishes.
+ */
+internal fun fitSize(width: Int, height: Int, box: Size): IntSize {
+    val fit = minOf(box.width / width, box.height / height)
+    return IntSize(maxOf(1, (width * fit).roundToInt()), maxOf(1, (height * fit).roundToInt()))
+}
+
 internal typealias ViewerDecode = suspend (Context, ImageInput, DecodeLimits) -> Decoded
 
-private val decodeForViewer: ViewerDecode = { context, input, limits -> decodeBounded(context, input, ImageLimits.VIEW_SIDE, limits = limits) }
+internal val decodeForViewer: ViewerDecode = { context, input, limits -> decodeBounded(context, input, ImageLimits.VIEW_SIDE, limits = limits) }
 
 /**
  * One image full screen on black, decoded at [ImageLimits.VIEW_SIDE] when it opens and recycled when it closes; a
@@ -185,11 +196,8 @@ private fun Zoomable(bitmap: android.graphics.Bitmap) {
     var viewport by remember { mutableStateOf(Size.Zero) }
     var scale by remember(bitmap) { mutableStateOf(1f) }
     var offset by remember(bitmap) { mutableStateOf(Offset.Zero) }
-    val fitted = remember(bitmap, viewport) {
-        val fit = minOf(viewport.width / bitmap.width, viewport.height / bitmap.height)
-        Size(bitmap.width * fit, bitmap.height * fit)
-    }
-    fun apply(s: Float, o: Offset) = clampTransform(s, o, fitted, viewport).let { (cs, co) -> scale = cs; offset = co }
+    val fitted = remember(bitmap, viewport) { fitSize(bitmap.width, bitmap.height, viewport) }
+    fun apply(s: Float, o: Offset) = clampTransform(s, o, fitted.toSize(), viewport).let { (cs, co) -> scale = cs; offset = co }
     val transform = rememberTransformableState { zoom, pan, _ -> apply(scale * zoom, offset + pan) }
     Box(
         Modifier
@@ -210,7 +218,7 @@ private fun Zoomable(bitmap: android.graphics.Bitmap) {
             Modifier
                 .size(with(LocalDensity.current) { DpSize(fitted.width.toDp(), fitted.height.toDp()) })
                 .graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y },
-            contentScale = ContentScale.Fit,
+            contentScale = ContentScale.FillBounds,
         )
     }
 }

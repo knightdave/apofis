@@ -44,6 +44,9 @@ import xyz.rycerz.apofis.ui.markdown.Themed
 import xyz.rycerz.apofis.ui.markdown.jpegBytes
 import xyz.rycerz.apofis.ui.markdown.onebitPng
 import xyz.rycerz.apofis.ui.markdown.pngBytes
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.test.captureToImage
+import androidx.test.core.app.ApplicationProvider
 
 /** The full-screen viewer: bounded zoom and pan, close by Back or the button, one bitmap released on close. */
 @RunWith(RobolectricTestRunner::class)
@@ -209,5 +212,34 @@ class ImageViewerTest {
         assertTrue(small !== data.value) // restored from the saved state, not the same object
         assertEquals("image/png", (data.value as ViewerImage.Data).label)
         assertNull(big.value) // above 16 KiB: closed after recreation
+    }
+
+    /** A 3000 x 1 and a 1 x 3000 white strip, through the production decode: each still draws on the black page. */
+    @Test
+    fun aThinImageKeepsAPixel() {
+        rule.setContent {
+            Themed {
+                ImageViewer(ViewerImage.Data(onebitPng(3000, 1, white = true), "image/png")) {}
+                ImageViewer(ViewerImage.Data(onebitPng(1, 3000, white = true), "image/png")) {}
+            }
+        }
+        rule.waitUntil(10_000) { rule.onAllNodes(image).fetchSemanticsNodes().size == 2 }
+        for (i in 0..1) {
+            val node = rule.onAllNodes(image)[i]
+            val bounds = node.fetchSemanticsNode().size
+            assertTrue("$bounds", bounds.width >= 1 && bounds.height >= 1)
+            val bitmap = node.captureToImage().asAndroidBitmap()
+            assertTrue("image $i draws a pixel", (0 until bitmap.width).any { x -> (0 until bitmap.height).any { y -> android.graphics.Color.red(bitmap.getPixel(x, y)) > 192 } })
+        }
+    }
+
+    /** The production viewer decode asks for VIEW_SIDE: a picture wider than a reply tile's 1024 comes back as wide. */
+    @Test
+    fun productionViewerDecodeUsesViewSide() {
+        val ctx = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val decoded = runBlocking { decodeForViewer(ctx, ImageInput.Bytes(onebitPng(2000, 10), "image/png"), ReplyLimits) } as Decoded.Ok
+        assertEquals(2000, decoded.bitmap.width)
+        val wide = runBlocking { decodeForViewer(ctx, ImageInput.Bytes(onebitPng(3000, 10), "image/png"), ReplyLimits) } as Decoded.Ok
+        assertEquals(ImageLimits.VIEW_SIDE, wide.bitmap.width)
     }
 }

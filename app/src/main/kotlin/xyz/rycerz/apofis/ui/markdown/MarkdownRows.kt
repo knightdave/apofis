@@ -229,7 +229,7 @@ internal fun cost(b: MdBlock): Int = NODE_COST + when (b) {
     is MdBlock.Quote -> b.blocks.sumOf(::cost)
     is MdBlock.ListBlock -> b.items.sumOf(::cost)
     is MdBlock.Table -> b.header.sumOf { it.text.length } + b.rows.sumOf { r -> r.sumOf { it.text.length } }
-    is MdBlock.Image -> b.alt.length
+    is MdBlock.Image -> if (b.data.isEmpty()) b.alt.length else CHUNK // a decoded picture: a row of its own
     MdBlock.Rule -> 0
 }
 

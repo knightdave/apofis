@@ -73,9 +73,10 @@ class ImageScreenshotTest {
         rule.shot("image_thumbs") {
             CompositionLocalProvider(LocalThumbCache provides cache) {
                 Row(Modifier.background(MaterialTheme.colorScheme.surface).padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ImageThumb("a".repeat(64), 112.dp, "Image 1 of 3") {}
-                    ImageThumb("b".repeat(64), 112.dp, "Image 2 of 3") {}
-                    ImageThumb(null, 112.dp, "Image 3 of 3", null)
+                    // Three 96 dp squares and their gaps fit the 360 dp row.
+                    ImageThumb("a".repeat(64), 96.dp, "Image 1 of 3") {}
+                    ImageThumb("b".repeat(64), 96.dp, "Image 2 of 3") {}
+                    ImageThumb(null, 96.dp, "Image 3 of 3", null)
                 }
             }
         }

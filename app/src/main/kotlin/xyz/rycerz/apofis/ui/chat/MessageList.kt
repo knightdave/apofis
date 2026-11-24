@@ -62,6 +62,7 @@ import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_CHARS
 import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_COLUMNS
 import xyz.rycerz.apofis.ui.markdown.TABLE_MAX_ROWS
 import xyz.rycerz.apofis.ui.markdown.displayChunks
+import xyz.rycerz.apofis.ui.markdown.isDataImageParagraph
 import xyz.rycerz.apofis.ui.markdown.highlighted
 import xyz.rycerz.apofis.ui.markdown.infoWord
 import xyz.rycerz.apofis.ui.markdown.rawChunk
@@ -474,6 +475,7 @@ internal object Work {
     var timelineRows = 0L // timeline step rows composed
     var pageEnds = 0L // text pages measured
     var smoothFrames = 0L // frames the text smoother's loop woke for
+    var imageDecodes = 0L // reply data images whose decode started
 }
 
 /**
@@ -532,11 +534,21 @@ private fun blockRows(key: String, b: LogicalBlock, text: CharSequence): List<Te
 internal fun lf(text: String): String = if (text.indexOf('\r') < 0) text else text.replace("\r\n", "\n").replace('\r', '\n')
 
 /**
- * Every text row of a reply, parsed from scratch. [closeFences]: the reply is no longer live, so an unclosed fence is
- * shown closed (highlighted, with its bottom edge); a live reply's open fence stays plain until it closes.
+ * Every text row of a reply, parsed from scratch. [closeFences]: the reply is no longer live, so nothing can be appended:
+ * an unclosed fence is shown closed (highlighted, with its bottom edge), and a last block that is one `data:` image
+ * paragraph is final, parsed within the parser's own bounds rather than the live cutoff ([OPEN_PARSE_LIMIT]). Other open
+ * text keeps the live rule, so a finished reply's rows equal its streamed ones. A live reply's open blocks stay as they are.
  */
 internal fun replyRows(key: String, text: String, closeFences: Boolean = false): List<TextRow> = lf(text).let { t ->
-    parseBlocks(t).flatMap { b -> blockRows(key, if (closeFences && b.kind == BlockKind.CODE) b.copy(fenceClosed = true) else b, t) }
+    parseBlocks(t).flatMap { b ->
+        val final = when {
+            !closeFences -> b
+            b.kind == BlockKind.CODE -> b.copy(fenceClosed = true)
+            b.kind == BlockKind.TEXT && !b.stable && isDataImageParagraph(t.subSequence(b.start, b.end)) -> b.copy(mode = BlockMode.PARSED)
+            else -> b
+        }
+        blockRows(key, final, t)
+    }
 }
 
 /** The raw source (line endings LF) of logical block [blockIndex] of [replyText], from a fresh parse; null if none. */

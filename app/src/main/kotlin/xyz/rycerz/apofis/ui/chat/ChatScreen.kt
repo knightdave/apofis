@@ -176,6 +176,7 @@ fun ChatScreen(
     val gate = remember { Gate { coveredRead.value() } }
     val passGate: (() -> Unit) -> Unit = remember { gate::pass } // one instance: a new one would recompose the bar
     val openImage: (ViewerImage) -> Unit = remember { { image -> gate.pass { viewer = image } } } // one instance, as above
+    val overlays = LocalOverlays.current ?: remember { Overlays() } // the windows over this chat (AppNav provides one)
     val gated = remember { CoveredActions({ actionsNow.value }, gate) }
     val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
     val openConnection = remember { { gate.pass { barCallbacks.value.onOpenConnection() } } }
@@ -423,7 +424,7 @@ fun ChatScreen(
         measure
     }
     // Controls inside the layout (the bar slots' buttons, the approval's More) reach the same gate.
-    CompositionLocalProvider(LocalChatGate provides passGate, LocalImageOpen provides openImage) {
+    CompositionLocalProvider(LocalChatGate provides passGate, LocalImageOpen provides openImage, LocalOverlays provides overlays) {
         SubcomposeLayout(
             modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
             policy,
@@ -447,6 +448,7 @@ fun ChatScreen(
                     dismiss = R.string.chat_keep,
                     onConfirm = { actions.onConfirmCancel(id, mayHaveSentShown = attempted) },
                     onDismiss = { actions.onDismissCancel(id) },
+                    overlays = overlays,
                     destructive = true,
                 )
             }
@@ -462,6 +464,7 @@ fun ChatScreen(
                 dismiss = R.string.chat_keep,
                 onConfirm = { actions.onConfirmDiscard(unsent.id) },
                 onDismiss = actions::onDismissDiscard,
+                overlays = overlays,
                 destructive = true,
             )
         }
@@ -477,6 +480,7 @@ fun ChatScreen(
                 dismiss = R.string.cancel,
                 onConfirm = { actions.onConfirmRetry(key) },
                 onDismiss = { actions.onDismissRetry(key) },
+                overlays = overlays,
             )
         }
     }
@@ -485,7 +489,7 @@ fun ChatScreen(
         val found = steps.find(state.items, subject)
         LaunchedEffect(found == null) { if (found == null) detail = null }
         found?.let {
-            OverChat()
+            OverChat(overlays)
             ToolDetailSheet(it.step, it.live, onDismiss = { detail = null })
         }
     }
@@ -498,14 +502,14 @@ fun ChatScreen(
         // A restored view waits for the transcript to load; once loaded, a miss closes it for good.
         LaunchedEffect(text == null, state.loaded) { if (text == null && state.loaded) selectKey = null }
         if (text != null) {
-            OverChat()
+            OverChat(overlays)
             Dialog(onDismissRequest = { selectKey = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
                 CompositionLocalProvider(LocalChatFontScale provides chatFontScale) { SelectTextScreen(text, onBack = { selectKey = null }) }
             }
         }
     }
     viewer?.let { image ->
-        OverChat()
+        OverChat(overlays)
         ImageViewer(image, onClose = { viewer = null })
     }
 }
@@ -556,8 +560,8 @@ private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: (
 }
 
 @Composable
-private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, dismiss: Int, onConfirm: () -> Unit, onDismiss: () -> Unit, destructive: Boolean = false) {
-    OverChat()
+private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, dismiss: Int, onConfirm: () -> Unit, onDismiss: () -> Unit, overlays: Overlays, destructive: Boolean = false) {
+    OverChat(overlays)
     ApofisDialog(stringResource(title), stringResource(confirm), onConfirm, stringResource(dismiss), onDismiss, destructive) {
         Column {
             // The message itself, so a dialog for another message is visibly another dialog.
