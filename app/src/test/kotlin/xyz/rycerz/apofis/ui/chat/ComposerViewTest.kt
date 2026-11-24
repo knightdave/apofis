@@ -39,7 +39,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
-import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -51,7 +50,6 @@ import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
-import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.StateRestorationTester
@@ -95,6 +93,7 @@ import xyz.rycerz.apofis.ui.FIXED_NOW
 import xyz.rycerz.apofis.ui.FIXED_TODAY
 import xyz.rycerz.apofis.ui.GreenSeed
 import xyz.rycerz.apofis.ui.PurpleSeed
+import xyz.rycerz.apofis.ui.drawnPixels
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.Motion
 import xyz.rycerz.apofis.chat.Composer as DraftHolder
@@ -855,7 +854,7 @@ class ComposerViewTest {
         for (i in cases.indices) {
             case = i
             rule.waitForIdle()
-            val image = rule.onNodeWithTag("probe").captureToImage().toPixelMap()
+            val image = rule.onNodeWithTag("probe").drawnPixels()
             val probe = bounds("probe")
             val f = bounds(FIELD_TAG)
             var lo = 1f
