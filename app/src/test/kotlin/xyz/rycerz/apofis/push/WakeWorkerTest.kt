@@ -37,7 +37,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -154,7 +153,7 @@ class WakeWorkerTest {
             }
         }
         server.start()
-        container = newContainer()
+        container = observedContainer() // before connect: the table is empty and no publication has posted
         container.connect(Credentials(url(), "key"))
         Wake.idle()
     }
@@ -164,9 +163,10 @@ class WakeWorkerTest {
         wakeStep = {}
         Wake.laneStep = {}
         Wake.beforeInstall = {}
+        // Joined before the shared database closes, and before the drain: no collector posts into the next test's lane.
+        runBlocking { withTimeout(10_000) { containers.forEach { it.scope.coroutineContext[Job]!!.cancelAndJoin() } } }
         Wake.idle()
         wm.cancelAllWork().result.get()
-        containers.forEach { it.scope.cancel() } // before the shared database closes
         db.close()
         server.close()
     }
@@ -174,11 +174,21 @@ class WakeWorkerTest {
     private fun url() = server.url("/").toString()
     private fun newContainer() = AppContainer(app, store) { db }.also { containers += it }
 
-    /** A new process on the same disk: the old container's scope (its collector among it) ends first. */
-    private fun restart() {
+    /**
+     * A container whose collector's first request has reached the lane, so its first observation comes before every
+     * write that follows. A new container posts nothing else on its own (a cold load does not publish).
+     */
+    private suspend fun observedContainer(): AppContainer {
+        val first = Channel<Unit>(Channel.CONFLATED)
+        Wake.laneStep = { if (it is WakeRequest.Reconcile) first.trySend(Unit) }
+        return newContainer().also { real { first.receive() }; Wake.laneStep = {} }
+    }
+
+    /** A new process on the same disk: the old container's scope (its collector among it) ends, joined, first. */
+    private suspend fun restart() {
+        real { container.scope.coroutineContext[Job]!!.cancelAndJoin() }
         Wake.newProcess()
-        container.scope.cancel()
-        container = newContainer()
+        container = observedContainer()
     }
 
     private fun epoch() = connectionEpoch(app)
@@ -613,6 +623,10 @@ class WakeWorkerTest {
     @Test
     fun aFailedInstallIsTriedOnceMoreThenTheMarkStays() = runTest {
         stored("run_a")
+        // The stored row's reconcile installs the timer before any failure is armed. Until runJob() the row and the epoch
+        // stay unchanged, so a repeated reconcile is skipped without an install and cannot use an armed failure.
+        awaitWork(CHECK_WORK) { it.any { w -> !w.state.isFinished } }
+        Wake.idle()
         on("run_a", A, "completed")
         var failures = 1
         Wake.beforeInstall = { if (failures-- > 0) throw IllegalStateException("database full") }

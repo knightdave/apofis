@@ -25,27 +25,37 @@ fun userKey(id: Long) = "u$id"
 /**
  * Turns stored session rows (oldest first) into chat items. Linear in the number of rows. A plain user row shows its
  * parsed text and the digests [bindings] (message id to digests) holds for its id when its own hints are exactly
- * their first 32 hex, in order; otherwise one placeholder per parsed image. So a row never borrows another row's photo.
+ * their first 32 hex, in order; otherwise one placeholder per parsed image. So a row that is not shortened never borrows
+ * another row's photo. [cuts] holds each row's stored cut by index (dropped calls, shortened): a shortened plain user
+ * row shows its stored content unparsed with the photos bound to its id, even when another row with that id holds them.
  */
-fun buildTranscript(rows: List<MessageDto>, bindings: Map<Long, List<String>> = emptyMap()): List<ChatItem> {
+fun buildTranscript(
+    rows: List<MessageDto>,
+    bindings: Map<Long, List<String>> = emptyMap(),
+    cuts: List<Pair<Int, Boolean>> = emptyList(),
+): List<ChatItem> {
     val items = mutableListOf<Any>() // ChatItem, or a ReplyBuilder that may still receive tool results
     var reply: ReplyBuilder? = null
     // Calls waiting for a result, up to the next user bubble, even across notices.
     var waiting = HashMap<String, Pair<ReplyBuilder, Int>>()
-    for (row in rows) {
+    for ((i, row) in rows.withIndex()) {
         val kind = row.displayKind
+        val cut = cuts.getOrNull(i)
+        val shortened = cut?.second == true
         when {
             row.role == "session_meta" || kind == "hidden" -> Unit
             row.role == "user" && (kind == null || kind == "internal_notification" || kind == "steer") -> {
                 reply = null
                 waiting = HashMap() // fresh, since clear() keeps the peak capacity and costs that much per turn
                 val steered = kind == "steer"
-                items += if (kind == null) {
+                items += if (kind == null && shortened) {
+                    UserMessage(userKey(row.id), row.content, false, row.timestamp, images = bindings[row.id] ?: emptyList(), raw = row.content, shortened = true)
+                } else if (kind == null) {
                     val parsed = parseUserContent(row.content)
                     val images = bindings[row.id]?.takeIf { d -> d.map { it.take(32) } == parsed.images } ?: parsed.images.map { null }
                     UserMessage(userKey(row.id), parsed.text, false, row.timestamp, images = images, raw = row.content)
                 } else {
-                    UserMessage(userKey(row.id), if (steered) unwrapSteer(row.content) else row.content, steered, row.timestamp, raw = row.content)
+                    UserMessage(userKey(row.id), if (steered) unwrapSteer(row.content) else row.content, steered, row.timestamp, raw = row.content, shortened = shortened)
                 }
             }
             kind != null -> {
@@ -55,10 +65,12 @@ fun buildTranscript(rows: List<MessageDto>, bindings: Map<Long, List<String>> = 
             row.role == "tool" && waiting.containsKey(row.toolCallId) -> {
                 val (owner, index) = waiting.remove(row.toolCallId)!! // a second result for the same id becomes its own step
                 owner.setResult(index, row)
+                owner.mark(cut)
             }
             row.role == "assistant" || row.role == "tool" -> {
                 val current = reply ?: ReplyBuilder(row).also { reply = it; items += it }
                 if (row.role == "tool") current.addOrphan(row) else current.addAssistant(row, waiting)
+                current.mark(cut)
             }
             else -> Unit // e.g. a system row: nothing to show
         }
@@ -92,6 +104,8 @@ private class ReplyBuilder(first: MessageDto) {
     private val steps = mutableListOf<Step>()
     private val texts = mutableListOf<String>()
     private val rowIds = mutableListOf<Long>()
+    private var dropped = 0
+    private var shortened = false
 
     fun addAssistant(row: MessageDto, waiting: MutableMap<String, Pair<ReplyBuilder, Int>>) {
         rowIds += row.id
@@ -116,6 +130,13 @@ private class ReplyBuilder(first: MessageDto) {
         steps[index] = withResult(steps[index] as ToolStep, row)
     }
 
+    /** Adds the stored cut of a row folded into this reply. */
+    fun mark(cut: Pair<Int, Boolean>?) {
+        if (cut == null) return
+        dropped += cut.first
+        shortened = shortened || cut.second
+    }
+
     /** A result row whose call is unknown: shown once, as its own step. */
     fun addOrphan(row: MessageDto) {
         rowIds += row.id
@@ -133,7 +154,9 @@ private class ReplyBuilder(first: MessageDto) {
         )
     }
 
-    fun build() = AssistantReply(key, steps.toList(), texts.joinToString("\n\n"), timestamp, rowIds = rowIds.toList())
+    fun build() = AssistantReply(
+        key, steps.toList(), texts.joinToString("\n\n"), timestamp, rowIds = rowIds.toList(), droppedToolCalls = dropped, shortened = shortened,
+    )
 }
 
 private fun JsonObject.str(name: String) = (get(name) as? JsonPrimitive)?.takeIf { it.isString }?.content
@@ -196,6 +219,20 @@ fun storedToolCalls(text: String?): String? {
         }
     }
     return JsonArray(calls).toString()
+}
+
+/**
+ * The calls of [text] (as [storedToolCalls] returns it) that fit [budget] characters: whole calls in order while they
+ * fit, and how many were dropped. Elements that are no call the transcript shows (not an object, or without an id) are
+ * neither kept nor counted. Null when none is kept, or when the text is no array and does not fit (never shown).
+ */
+fun fittingToolCalls(text: String?, budget: Int): Pair<String?, Int> {
+    if (text == null || text.length <= budget) return text to 0
+    val array = parse(text) as? JsonArray ?: return null to 0
+    val calls = array.filter { call -> (call as? JsonObject)?.let { it.str("id") ?: it.str("call_id") } != null }
+    var left = budget - 1 // the opening bracket; each kept call then costs its length and one comma or the closing bracket
+    val kept = calls.takeWhile { left -= it.toString().length + 1; left >= 0 } // no overflow: left is at least -1 before each step
+    return (if (kept.isEmpty()) null else JsonArray(kept).toString()) to calls.size - kept.size
 }
 
 /**

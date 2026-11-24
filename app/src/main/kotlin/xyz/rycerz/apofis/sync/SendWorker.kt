@@ -17,7 +17,7 @@ interface SendQueueProvider {
     val sendQueue: SendQueue?
 }
 
-/** Drains the send queue in the background until nothing is left queued. */
+/** Drains the send queue in the background until nothing is left to send. */
 class SendWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val queue = (applicationContext as? SendQueueProvider)?.sendQueue ?: return Result.success()
@@ -32,8 +32,9 @@ class SendWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         fun ensureScheduled(context: Context) =
             WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request())
 
-        // REPLACE starts the drain at once with a fresh backoff. Cancelling a running drain is safe: an interrupted
-        // start stays queued and is retried with the same body and idempotency key. Returns once WorkManager stored it.
+        // REPLACE starts the drain at once with a fresh backoff. Cancelling a running drain is safe: a steer in flight
+        // is not cancelled and completes, and an interrupted start stays queued and is retried with the same body and
+        // idempotency key. Returns once WorkManager stored it.
         suspend fun schedule(context: Context) {
             WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request()).await()
         }

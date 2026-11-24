@@ -25,6 +25,7 @@ import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.chat.buildTranscript
 import xyz.rycerz.apofis.chat.parseUserContent
 import xyz.rycerz.apofis.chat.userKey
+import xyz.rycerz.apofis.chat.fittingToolCalls
 import xyz.rycerz.apofis.chat.storedToolCalls
 import xyz.rycerz.apofis.chat.storedToolResult
 import xyz.rycerz.apofis.db.AppDatabase
@@ -110,7 +111,8 @@ class ChatRepository(
                 if (rows to bindings != lastSource) {
                     lastSource = rows to bindings
                     val bound = bindings.associate { it.messageId to it.digests.digestList() }
-                    mapped = rows.withIndex().associate { (i, row) -> row.id to i } to buildTranscript(rows.map { it.toDto() }, bound)
+                    val cuts = rows.map { it.droppedToolCalls to it.shortened }
+                    mapped = rows.withIndex().associate { (i, row) -> row.id to i } to buildTranscript(rows.map { it.toDto() }, bound, cuts)
                     shown = mapped.second.filterIsInstance<UserMessage>()
                 }
                 // A started send the stored rows already show (synced while its run goes on) is not shown twice;
@@ -239,7 +241,8 @@ class ChatRepository(
         withContext(NonCancellable) {
             val written = try {
                 db.withTransaction {
-                    replaceRows(sessionKey, tip, rows).also { if (it) afterReplace(rows.map { r -> r.toDto() }) }
+                    // The fetched rows, uncut: a row stored cut to the bound never decides delivery.
+                    replaceRows(sessionKey, tip, rows).also { if (it) afterReplace(rows) }
                 }
             } finally {
                 lock.unlock()
@@ -249,21 +252,24 @@ class ChatRepository(
         return true
     }
 
-    /** Under the lock: the server transcript as rows, or null when the chat has no server copy (no request made). */
-    private suspend fun fetchRows(sessionKey: String, onResponse: () -> Unit): Pair<String, List<MessageEntity>>? {
+    /** Under the lock: the server transcript, or null when the chat has no server copy (no request made). */
+    private suspend fun fetchRows(sessionKey: String, onResponse: () -> Unit): Pair<String, List<MessageDto>>? {
         val session = sessionDao.get(sessionKey) ?: return null
         if (!session.existsOnServer || session.hidden || !active()) return null
-        val (tip, messages) = fetchMessages(session.currentId, onResponse) ?: return null
-        return tip to messages.mapIndexed { i, m -> m.toEntity(sessionKey, i) }
+        return fetchMessages(session.currentId, onResponse)
     }
 
-    /** In a transaction: false when the chat went away or got hidden since the fetch. */
-    private suspend fun replaceRows(sessionKey: String, tip: String, rows: List<MessageEntity>): Boolean {
+    /**
+     * In a transaction: false when the chat went away or got hidden since the fetch. Binds first, on the fetched rows,
+     * so each row is stored (cut to the bound if it must be) knowing the binding written in this same sync.
+     */
+    private suspend fun replaceRows(sessionKey: String, tip: String, messages: List<MessageDto>): Boolean {
         if (!active()) return false
         val current = sessionDao.get(sessionKey) ?: return false
         if (current.hidden) return false
-        db.messageDao().replaceSession(sessionKey, rows)
-        bindImages(sessionKey, rows)
+        bindImages(sessionKey, messages)
+        val bound = db.imageBindingDao().forSession(sessionKey).associate { it.messageId to it.digests.digestList() }
+        db.messageDao().replaceSession(sessionKey, messages.mapIndexed { i, m -> m.toEntity(sessionKey, i, bound[m.id]) })
         sessionDao.upsert(current.movedTo(tip).copy(stale = false))
         return true
     }
@@ -274,7 +280,7 @@ class ChatRepository(
      * first 32 hex); a repeated id keeps it while any of its rows does, whatever their order. Then binds each image send
      * the rows confirm to its row, only when that match is unambiguous. A binding is never rebuilt from anything else.
      */
-    private suspend fun bindImages(sessionKey: String, rows: List<MessageEntity>) {
+    private suspend fun bindImages(sessionKey: String, rows: List<MessageDto>) {
         val dao = db.imageBindingDao()
         val kept = dao.forSession(sessionKey)
         if (kept.isNotEmpty()) {
@@ -289,7 +295,7 @@ class ChatRepository(
         }
         val sending = db.pendingSendDao().rows(sessionKey).filter { it.state == PendingState.SENDING }
         if (sending.none { it.images.isNotEmpty() }) return
-        val shown = buildTranscript(rows.map { it.toDto() }).filterIsInstance<UserMessage>()
+        val shown = buildTranscript(rows).filterIsInstance<UserMessage>()
         val ids = rows.associateBy({ userKey(it.id) }, { it.id }) // a repeated id gives one key, so either row's key finds it
         val bound = dao.forSession(sessionKey).associate { it.messageId to it.digests }
         val used = HashSet<String>()
@@ -493,8 +499,10 @@ private const val DELIVERY_WINDOW_S = 60.0
  * never the shown text) equals its trimmed text, or for a send with images ends with a complete block of as many
  * images with equal trimmed text before it and every known hint a prefix of the digest at its place (contained in a
  * merged steer bubble for a steer), on a row from at most a minute before the send was created. Two equal messages
- * sent within a minute can therefore confirm each other; this match never grants a photo. [used] keeps one bubble
- * from confirming two run sends. Rows in any other state are never confirmed.
+ * sent within a minute can therefore confirm each other; this match never grants a photo. A [UserMessage.shortened]
+ * bubble (only [ChatRepository.transcript] shows stored cuts) matches when its stored content is a prefix of the
+ * trimmed text, with no image check; a blank one matches nothing. [used] keeps one bubble from confirming two run
+ * sends. Rows in any other state are never confirmed.
  */
 internal fun deliveredIn(p: PendingSendEntity, shown: List<UserMessage>, used: MutableSet<String>): Boolean = matchIn(p, shown, used) != null
 
@@ -511,6 +519,7 @@ internal fun matchIn(p: PendingSendEntity, shown: List<UserMessage>, used: Mutab
 /** The run send match of [matchIn] for one bubble, whether or not another send already took it. */
 private fun delivers(p: PendingSendEntity, m: UserMessage): Boolean {
     if (m.steered || m.timestamp < p.createdAt / 1000.0 - DELIVERY_WINDOW_S) return false
+    if (m.shortened) return m.raw.isNotBlank() && p.text.trim().startsWith(m.raw.trim())
     val digests = p.images.digestList()
     if (digests.isEmpty()) return m.raw.trim() == p.text.trim()
     if (m.images.size != digests.size) return false // also keeps out rows that never carry images (notifications)
@@ -551,12 +560,37 @@ private fun SessionDto.toEntity(cached: SessionEntity?): SessionEntity {
     )
 }
 
-private fun MessageDto.toEntity(sessionKey: String, position: Int) = MessageEntity(
-    sessionKey = sessionKey, position = position, id = id, role = role, displayKind = displayKind,
-    content = if (role == "tool") storedToolResult(content) else content,
-    reasoning = reasoning, toolCallsJson = storedToolCalls(toolCallsJson), toolCallId = toolCallId, toolName = toolName,
-    timestamp = timestamp, finishReason = finishReason,
-)
+private const val STORED_ROW_CHARS = 400_000 // content + reasoning + calls of one stored row, in UTF-16 characters
+
+/**
+ * The row as stored: per-field cuts first, then the bound on content, reasoning and calls together. Over it, content
+ * is kept first, then reasoning, then whole calls while they fit. A plain user row whose own hints are exactly its
+ * [bound] digests' first 32 hex stores its parsed text (the photos show through the binding); any other row is cut
+ * from its tail. The cut is recorded in [MessageEntity.shortened] and [MessageEntity.droppedToolCalls].
+ */
+private fun MessageDto.toEntity(sessionKey: String, position: Int, bound: List<String>?): MessageEntity {
+    val content = if (role == "tool") storedToolResult(content) else content
+    val calls = storedToolCalls(toolCallsJson)
+    val row = MessageEntity(
+        sessionKey = sessionKey, position = position, id = id, role = role, displayKind = displayKind,
+        content = content, reasoning = reasoning, toolCallsJson = calls, toolCallId = toolCallId, toolName = toolName,
+        timestamp = timestamp, finishReason = finishReason,
+    )
+    if (content.length.toLong() + (reasoning?.length ?: 0) + (calls?.length ?: 0) <= STORED_ROW_CHARS) return row
+    val parsed = if (role == "user" && displayKind == null && bound != null) parseUserContent(content) else null
+    val text = if (parsed != null && parsed.images == bound?.map { it.take(32) }) parsed.text else content
+    val keptContent = text.cutTo(STORED_ROW_CHARS)
+    val keptReasoning = reasoning?.cutTo(STORED_ROW_CHARS - keptContent.length)
+    val (keptCalls, dropped) = fittingToolCalls(calls, STORED_ROW_CHARS - keptContent.length - (keptReasoning?.length ?: 0))
+    return row.copy(
+        content = keptContent, reasoning = keptReasoning, toolCallsJson = keptCalls, droppedToolCalls = dropped,
+        shortened = keptContent.length < content.length || keptReasoning != reasoning,
+    )
+}
+
+/** At most [n] characters, never ending on a high surrogate, so the stored text stays valid UTF-16. */
+private fun String.cutTo(n: Int): String =
+    if (length <= n) this else substring(0, if (n > 0 && this[n - 1].isHighSurrogate()) n - 1 else n)
 
 private fun MessageEntity.toDto() = MessageDto(
     id = id, role = role, displayKind = displayKind, content = content, reasoning = reasoning,
