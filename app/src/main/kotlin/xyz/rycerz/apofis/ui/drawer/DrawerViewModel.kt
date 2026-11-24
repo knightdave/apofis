@@ -498,6 +498,9 @@ class DrawerViewModel(
     /** For tests: actions started and not yet applied. */
     internal fun busyActions(): Int = inFlight.get()
 
+    /** For tests: the selection lock is held now (a reconcile across its Room read, or a call that has taken it). */
+    internal val selectionLockHeld: Boolean get() = ops.isLocked
+
     /** For tests: returns once no leave is in flight, so after each one's note decision (the set empties on completion). */
     internal suspend fun leavesEnded() {
         leavingFlow.first { it.isEmpty() }

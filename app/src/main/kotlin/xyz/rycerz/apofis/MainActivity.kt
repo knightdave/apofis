@@ -22,6 +22,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.launch
+import xyz.rycerz.apofis.share.ShareIntent
+import xyz.rycerz.apofis.share.validateShare
 import xyz.rycerz.apofis.ui.AppNav
 import xyz.rycerz.apofis.ui.image.LocalImageStore
 import xyz.rycerz.apofis.ui.image.LocalThumbCache
@@ -85,11 +87,18 @@ class MainActivity : ComponentActivity() {
         handle(intent, fresh = true)
     }
 
-    /** The only reader of launch and new intents: a notification tap goes to the container, anything else changes nothing. */
+    /**
+     * The only reader of launch and new intents: a share and a notification tap go to the container, anything else
+     * changes nothing.
+     */
     private fun handle(intent: Intent, fresh: Boolean) {
-        if (!gate(intent, fresh, packageName)) return
         val container = (application as ApofisApp).container
-        lifecycleScope.launch { container.openChat(intent) } // which opens only a chat of the current connection
+        val share = shareGate(intent, fresh)
+        when {
+            share != null -> container.offerShare(share) // read now, while the grant lasts; shown in a sheet until accepted
+            gate(intent, fresh, packageName) -> lifecycleScope.launch { container.openChat(intent) } // only a chat of the current connection
+            else -> return
+        }
         setIntent(Intent(this, MainActivity::class.java)) // handed over once: a later reader sees a plain start
     }
 }
@@ -105,3 +114,10 @@ internal const val OPEN_CHAT = "xyz.rycerz.apofis.OpenChat"
 internal fun gate(intent: Intent, fresh: Boolean, packageName: String): Boolean =
     fresh && intent.action == Intent.ACTION_VIEW && intent.component == ComponentName(packageName, OPEN_CHAT) &&
         intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0
+
+/**
+ * The share gate, the third kind: a share [validateShare] accepts, under the same two conditions as a tap (fresh, not
+ * replayed from Recents), checked first so a recreated or replayed intent is not read at all.
+ */
+internal fun shareGate(intent: Intent, fresh: Boolean): ShareIntent? =
+    if (fresh && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) validateShare(intent) else null

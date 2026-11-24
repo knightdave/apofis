@@ -31,6 +31,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
@@ -175,6 +177,32 @@ abstract class TemporaryFixture {
      */
     protected suspend fun settled() {
         db.sessionDao().get("")
+    }
+
+    /**
+     * Starts [call] undispatched at a moment when nothing else can hold the drawer's selection lock: Room's thread is
+     * held, so no list can be delivered and no reconcile can start, and the lock is seen free (a reconcile already in
+     * flight holds it while it waits for its Room read behind that hold, so it is seen). [call] then takes the lock at
+     * once and runs to its first suspension before Room is released. Without this a reconcile in flight could make
+     * [call] wait for the lock while the test goes on.
+     */
+    protected suspend fun <V> DrawerViewModel.startAlone(call: suspend () -> V): Deferred<V> {
+        repeat(1_000) {
+            val roomHeld = gate()
+            val holding = CompletableDeferred<Unit>()
+            roomThread.execute {
+                holding.complete(Unit)
+                roomHeld.hold()
+            }
+            try {
+                withTimeout(60_000) { holding.await() }
+                if (!selectionLockHeld) return side.async(start = CoroutineStart.UNDISPATCHED) { call() }
+            } finally {
+                roomHeld.countDown()
+            }
+            settled() // the reconcile in flight reads and lets go of the lock
+        }
+        throw AssertionError("the selection lock never came free")
     }
 
     /** Exceptions that no coroutine handled, as the threads' default handler saw them while [block] ran. */
@@ -492,7 +520,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         assertEquals(1L, gate.count)
 
         // A new chat needs the repository lock, which the held DELETE keeps: it completes once that answers.
-        val fresh = side.async(start = CoroutineStart.UNDISPATCHED) { vm.onNewChat() } // runs until its first Room read
+        val fresh = vm.startAlone { vm.onNewChat() } // runs until its first Room read, the selection lock taken
         settled() // that read has answered, and its continuation, queued first, has reached the repository lock
         assertFalse(fresh.isCompleted)
         assertEquals(setOf(T, A, B), db.sessionDao().all().map { it.key }.toSet()) // no new row yet
@@ -886,21 +914,12 @@ class TemporaryLeaveTest : TemporaryFixture() {
         session(T)
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
-        val caller = StandardTestDispatcher(TestCoroutineScheduler()) // runs only when the test says so
-        val share = side.launch(caller) { vm.openFreshChatIf(T, { false }) {} }
-        // Driven step by step until the fresh row is inserted, checked before each step: its return then waits on the
-        // caller, and the cancellation lands before it.
-        until {
-            db.sessionDao().all().size == 2 || run {
-                caller.scheduler.runCurrent()
-                false
-            }
-        }
-        share.cancel()
-        until {
-            caller.scheduler.runCurrent()
-            share.isCompleted
-        }
+        // The cancellation comes from the claim itself: after the insert has returned and before the cleanup's first
+        // suspension, the one moment a cancelled caller could leave the fresh row behind.
+        lateinit var share: Job
+        share = side.launch(Dispatchers.Default, start = CoroutineStart.LAZY) { vm.openFreshChatIf(T, { share.cancel(); false }) {} }
+        share.start()
+        withTimeout(60_000) { share.join() }
         assertEquals(listOf(T), db.sessionDao().all().map { it.key })
         assertEquals(T, vm.selected.value)
     }
