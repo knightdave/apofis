@@ -1,6 +1,10 @@
 package xyz.rycerz.apofis.db
 
+import android.Manifest
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationManager
+import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
@@ -16,13 +20,18 @@ import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.notify.Notifier
+import xyz.rycerz.apofis.notify.ensureChannels
 
 private const val NAME = "migrate.db"
 
 /**
  * Upgrades from every released schema, built exactly as exported in app/schemas, through the builder users get. Room
  * validates every table against the current entities when it opens a migrated file, so a migration that leaves the
- * schema different from version 3 fails here.
+ * schema different from version 4 fails here.
  */
 @RunWith(RobolectricTestRunner::class)
 class MigrationTest {
@@ -33,7 +42,7 @@ class MigrationTest {
         app.deleteDatabase(NAME)
     }
 
-    private fun create(version: Int) {
+    private fun create(version: Int, seed: (SQLiteDatabase) -> Unit = {}) {
         app.deleteDatabase(NAME)
         val schema = JSONObject(File("schemas/xyz.rycerz.apofis.db.AppDatabase/$version.json").readText()).getJSONObject("database")
         SQLiteDatabase.openOrCreateDatabase(app.getDatabasePath(NAME).apply { parentFile!!.mkdirs() }, null).use { db ->
@@ -57,6 +66,7 @@ class MigrationTest {
                 "INSERT INTO ActiveRunEntity (runId, sessionKey, lastSeq, status, startedAt, polling, stopRequested) " +
                     "VALUES ('run_1', 'apofis-a', 4, 'running', 9, 0, 1)",
             )
+            seed(db)
             db.version = version
         }
     }
@@ -73,7 +83,7 @@ class MigrationTest {
     }
 
     @Test
-    fun version1To3() = runTest {
+    fun version1To4() = runTest {
         create(1)
         val db = openAppDatabase(app, NAME)
         try {
@@ -86,7 +96,7 @@ class MigrationTest {
     }
 
     @Test
-    fun version2To3() = runTest {
+    fun version2To4() = runTest {
         create(2)
         val db = openAppDatabase(app, NAME)
         try {
@@ -104,16 +114,19 @@ class MigrationTest {
 
     @Test
     fun productionBuilderHasFullChain() = runTest {
-        create(2)
-        val old = openAppDatabase(app, NAME, arrayOf(MIGRATION_1_2)) // the list before version 3
-        try {
-            old.sessionDao().get("apofis-a")
-            fail("opened a version 2 file without a migration to 3")
-        } catch (_: IllegalStateException) {
-            // Room refuses: no path from 2 to 3 and no destructive fallback
-        } finally {
-            old.close()
+        for ((version, chain) in listOf(2 to arrayOf(MIGRATION_1_2), 3 to arrayOf(MIGRATION_1_2, MIGRATION_2_3))) {
+            create(version)
+            val old = openAppDatabase(app, NAME, chain) // the list before the next version
+            try {
+                old.sessionDao().get("apofis-a")
+                fail("opened a version $version file without a migration to ${version + 1}")
+            } catch (_: IllegalStateException) {
+                // Room refuses: no path to the current version and no destructive fallback
+            } finally {
+                old.close()
+            }
         }
+        create(2)
         val db = openAppDatabase(app, NAME)
         try {
             assertKept(db)
@@ -128,6 +141,99 @@ class MigrationTest {
     fun noDestructiveFallback() {
         val hits = File("src/main").walk().filter { it.isFile && it.extension == "kt" && it.readText().contains("fallbackToDestructiveMigration") }.toList()
         assertTrue("destructive fallback in $hits", hits.isEmpty())
-        assertTrue(File("schemas/xyz.rycerz.apofis.db.AppDatabase/3.json").isFile)
+        assertTrue(File("schemas/xyz.rycerz.apofis.db.AppDatabase/4.json").isFile)
+    }
+
+    /** Version 3 rows in every table, as a user upgrading from Milestone 3 has them. */
+    private fun seedVersion3(db: SQLiteDatabase) {
+        db.execSQL(
+            "INSERT INTO SessionEntity (`key`, currentId, lineageIds, title, pinned, archived, startedAt, lastActiveAt, messageCount, preview, stale, existsOnServer, hidden) VALUES " +
+                "('apofis-h', 'apofis-h', '', 'Hidden', 0, 0, 2.0, NULL, 0, NULL, 0, 1, 1), " +
+                "('apofis-r', 'apofis-r', '', NULL, 0, 1, 3.0, NULL, 0, NULL, 0, 0, 0), " +
+                "('apofis-p', 'x3', 'x1,x2', 'Pinned', 1, 0, 4.0, 5.5, 3, 'pv', 1, 1, 0)",
+        )
+        db.execSQL(
+            "INSERT INTO PendingSendEntity (idempotencyKey, sessionKey, text, requestBody, createdAt, state, runId, error, attempted) " +
+                "VALUES ('k2', 'apofis-r', 'q \"x\"', '{\"session_id\":\"apofis-r\",\"input\":\"q \\\"x\\\"\"}', 77, 'failed', NULL, 'expired_uncertain', 1)",
+        )
+        db.execSQL("INSERT INTO ReplyOutcomeEntity (sessionKey, afterMessageId, outcome, detail) VALUES ('apofis-a', 1, 'stopped', 'why')")
+        db.execSQL(
+            "INSERT INTO NoticeOutboxEntity (eventId, sessionKey, runId, runStartedAt, notice, generation, createdAt) " +
+                "VALUES ('run:run_1', 'apofis-a', 'run_1', 9, 'FINISHED', 3, 11)",
+        )
+        db.execSQL(
+            "INSERT INTO NoticeStateEntity (sessionKey, generation, runStartedAt, runId, notice, eventId, alerted) " +
+                "VALUES ('apofis-p', 3, 8, 'run_0', 'REQUEST', 'req:1', '[\"e1\"]')",
+        )
+    }
+
+    private fun session(key: String, currentId: String = key) =
+        SessionEntity(key, currentId, "", null, false, false, 1.0, null, 0, null, false, true)
+
+    @Test
+    @Config(sdk = [37])
+    fun version3To4() = runTest {
+        create(3, ::seedVersion3)
+        val db = openAppDatabase(app, NAME)
+        try {
+            val dao = db.sessionDao()
+            assertEquals(session("apofis-a").copy(title = "Chat", messageCount = 1, createStarted = true), dao.get("apofis-a"))
+            assertEquals(session("apofis-h").copy(title = "Hidden", startedAt = 2.0, hidden = true, createStarted = true), dao.get("apofis-h"))
+            assertEquals(session("apofis-r").copy(archived = true, startedAt = 3.0, existsOnServer = false), dao.get("apofis-r"))
+            assertEquals(
+                SessionEntity("apofis-p", "x3", "x1,x2", "Pinned", true, false, 4.0, 5.5, 3, "pv", true, true, createStarted = true),
+                dao.get("apofis-p"),
+            )
+            assertEquals(4, dao.all().size)
+            assertEquals(listOf(MessageEntity("apofis-a", 0, 1, "user", null, "hi", null, null, null, null, 1.0, null)), db.messageDao().rows("apofis-a"))
+            assertEquals(PendingSendEntity("k", "apofis-a", "unsent", "{}", 1, "sending", "run_1", null, attempted = true), db.pendingSendDao().get("k"))
+            assertEquals(
+                PendingSendEntity("k2", "apofis-r", "q \"x\"", """{"session_id":"apofis-r","input":"q \"x\""}""", 77, "failed", null, "expired_uncertain", attempted = true),
+                db.pendingSendDao().get("k2"),
+            )
+            assertEquals(ActiveRunEntity("run_1", "apofis-a", 4, "running", 9, polling = false, stopRequested = true), db.activeRunDao().get("run_1"))
+            assertEquals(listOf(ReplyOutcomeEntity("apofis-a", 1, "stopped", "why")), db.replyOutcomeDao().rows("apofis-a"))
+            // The outbox replays on the next start, and the notice order keeps its alerted requests.
+            assertEquals(listOf(NoticeOutboxEntity("run:run_1", "apofis-a", "run_1", 9, "FINISHED", 3, 11)), db.noticeOutboxDao().all(3))
+            assertEquals(NoticeStateEntity("apofis-p", 3, 8, "run_0", "REQUEST", "req:1", """["e1"]"""), db.noticeStateDao().get("apofis-p"))
+            assertEquals(emptyList<String>(), db.imageBindingDao().allDigests())
+            assertEquals(emptyList<String>(), db.pendingSendDao().allImages().filter { it.isNotEmpty() })
+            // The new table works.
+            db.imageBindingDao().upsert(ImageBindingEntity("apofis-a", 1, "d1,d2"))
+            assertEquals(listOf(ImageBindingEntity("apofis-a", 1, "d1,d2")), db.imageBindingDao().forSession("apofis-a"))
+
+            // The production notifier replays the migrated outbox: the finish is posted once, silently, and consumed.
+            shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+            ensureChannels(app)
+            val nm = app.getSystemService(NotificationManager::class.java)
+            val notifier = Notifier(app, app.getSharedPreferences("migrate-notify", Context.MODE_PRIVATE), db, { 3L }, { null }, backgroundScope)
+            notifier.replayOutbox(3)
+            val shown = nm.activeNotifications.single()
+            assertEquals("apofis-a", shown.tag)
+            assertEquals(app.getString(R.string.notif_reply_finished), shown.notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString())
+            assertTrue(shown.notification.groupAlertBehavior == Notification.GROUP_ALERT_SUMMARY && shown.notification.group != null)
+            assertTrue(db.noticeOutboxDao().all(3).isEmpty())
+            assertEquals("run:run_1", db.noticeStateDao().get("apofis-a")!!.eventId)
+            nm.cancelAll()
+            notifier.replayOutbox(3)
+            assertTrue(nm.activeNotifications.isEmpty()) // nothing left to post
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun createStartedFollowsExistsOnServerFromEveryVersion() = runTest {
+        for (version in 1..3) {
+            create(version) { it.execSQL("INSERT INTO SessionEntity (`key`, currentId, lineageIds, pinned, archived, startedAt, messageCount, stale, existsOnServer, hidden) VALUES ('apofis-l', 'apofis-l', '', 0, 0, 1.0, 0, 0, 0, 0)") }
+            val db = openAppDatabase(app, NAME)
+            try {
+                assertTrue(db.sessionDao().get("apofis-a")!!.createStarted)
+                assertFalse(db.sessionDao().get("apofis-l")!!.createStarted)
+                assertEquals(PendingSendEntity("k", "apofis-a", "unsent", "{}", 1, "sending", "run_1", null, attempted = true), db.pendingSendDao().get("k"))
+            } finally {
+                db.close()
+            }
+        }
     }
 }
