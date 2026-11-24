@@ -14,6 +14,7 @@ data class UserMessage(
     val runId: String? = null, // the run this message started, while its send is still pending (bubble or the server row showing it)
     val images: List<String?> = emptyList(), // per image its full digest when this phone's photo is bound or pending, else null (a placeholder)
     val raw: String = text, // the stored content: the delivery evidence, never shown
+    val shortened: Boolean = false, // stored cut to the row bound: [raw] is a prefix of what the server holds
 ) : ChatItem
 
 enum class SendState { QUEUED, SENDING, FAILED, SENT }
@@ -26,6 +27,8 @@ data class AssistantReply(
     val live: Boolean = false,
     val outcome: ReplyOutcome? = null,
     val rowIds: List<Long> = emptyList(), // every assistant and tool row grouped into this reply
+    val droppedToolCalls: Int = 0, // calls its rows did not store, to keep each row within the bound
+    val shortened: Boolean = false, // a row's content or reasoning was stored cut
 ) : ChatItem
 
 data class Notice(override val key: String, val kind: String, val text: String) : ChatItem
