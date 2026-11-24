@@ -25,4 +25,6 @@ object Motion {
     const val PULSE_PERIOD = 1800
     const val SPINNER_PERIOD = 1000
     const val SMOOTH_TICK = 50
+    const val VIEWER_IN = 300
+    const val VIEWER_OUT = 240
 }

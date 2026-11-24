@@ -107,6 +107,10 @@ import xyz.rycerz.apofis.chat.UserMessage
 import java.time.LocalDate
 import java.time.ZoneId
 import xyz.rycerz.apofis.ui.theme.wash
+import xyz.rycerz.apofis.ui.image.ImageViewer
+import xyz.rycerz.apofis.ui.image.LocalImageOpen
+import xyz.rycerz.apofis.ui.image.ViewerImage
+import xyz.rycerz.apofis.ui.image.ViewerImageSaver
 
 /**
  * The chat: the message list fills the screen under a transparent top bar (title and status line) and the bottom area
@@ -139,6 +143,7 @@ fun ChatScreen(
     val uriHandler = LocalUriHandler.current
     var linkFailed by remember { mutableStateOf(false) } // shown until the next send or the next link that opens
     var selectKey by rememberSaveable { mutableStateOf<String?>(null) } // the Select view's item; never its text
+    var viewer by rememberSaveable(stateSaver = ViewerImageSaver) { mutableStateOf<ViewerImage?>(null) } // the open image
     // The request sits at the bottom; a same-id request with a new generation is a new request and is revealed again.
     val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
@@ -170,6 +175,7 @@ fun ChatScreen(
     val actionsNow = rememberUpdatedState(actions)
     val gate = remember { Gate { coveredRead.value() } }
     val passGate: (() -> Unit) -> Unit = remember { gate::pass } // one instance: a new one would recompose the bar
+    val openImage: (ViewerImage) -> Unit = remember { { image -> gate.pass { viewer = image } } } // one instance, as above
     val gated = remember { CoveredActions({ actionsNow.value }, gate) }
     val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
     val openConnection = remember { { gate.pass { barCallbacks.value.onOpenConnection() } } }
@@ -417,7 +423,7 @@ fun ChatScreen(
         measure
     }
     // Controls inside the layout (the bar slots' buttons, the approval's More) reach the same gate.
-    CompositionLocalProvider(LocalChatGate provides passGate) {
+    CompositionLocalProvider(LocalChatGate provides passGate, LocalImageOpen provides openImage) {
         SubcomposeLayout(
             modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).testTag("chat.key:${state.sessionKey}").semantics { isTraversalGroup = true }, // the end-to-end tests read the open chat's key here
             policy,
@@ -478,7 +484,10 @@ fun ChatScreen(
         // Looked up on every change, so full arguments and the result show as soon as they exist; closes once gone.
         val found = steps.find(state.items, subject)
         LaunchedEffect(found == null) { if (found == null) detail = null }
-        found?.let { ToolDetailSheet(it.step, it.live, onDismiss = { detail = null }) }
+        found?.let {
+            OverChat()
+            ToolDetailSheet(it.step, it.live, onDismiss = { detail = null })
+        }
     }
     selectKey?.let { key ->
         // Only the stored part is searched (a live merge appends just the live reply, which has no Select), once per
@@ -489,10 +498,15 @@ fun ChatScreen(
         // A restored view waits for the transcript to load; once loaded, a miss closes it for good.
         LaunchedEffect(text == null, state.loaded) { if (text == null && state.loaded) selectKey = null }
         if (text != null) {
+            OverChat()
             Dialog(onDismissRequest = { selectKey = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
                 CompositionLocalProvider(LocalChatFontScale provides chatFontScale) { SelectTextScreen(text, onBack = { selectKey = null }) }
             }
         }
+    }
+    viewer?.let { image ->
+        OverChat()
+        ImageViewer(image, onClose = { viewer = null })
     }
 }
 
@@ -542,7 +556,8 @@ private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: (
 }
 
 @Composable
-private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, dismiss: Int, onConfirm: () -> Unit, onDismiss: () -> Unit, destructive: Boolean = false) =
+private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, dismiss: Int, onConfirm: () -> Unit, onDismiss: () -> Unit, destructive: Boolean = false) {
+    OverChat()
     ApofisDialog(stringResource(title), stringResource(confirm), onConfirm, stringResource(dismiss), onDismiss, destructive) {
         Column {
             // The message itself, so a dialog for another message is visibly another dialog.
@@ -550,6 +565,7 @@ private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, di
             Text(stringResource(text), Modifier.padding(top = 12.dp))
         }
     }
+}
 
 @Composable
 private fun WashTextButton(label: Int, onClick: () -> Unit) {

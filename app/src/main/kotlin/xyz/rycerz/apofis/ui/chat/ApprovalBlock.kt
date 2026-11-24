@@ -44,6 +44,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -95,6 +97,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
             }
             if (command.length > ONE_LINE_MAX) SmallTextButton(R.string.chat_approval_full_command, { chatGate { reading = true } })
             if (reading) {
+                OverChat()
                 Dialog(onDismissRequest = { reading = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
                     SelectTextScreen(command, onBack = { reading = false })
                 }
@@ -115,6 +118,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                     ApofisIconButton(onClick = { chatGate { menu = true } }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
                         Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
                     }
+                    if (menu && !answering) OverChat()
                     DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
                         val session = remember { MutableInteractionSource() }
                         val sessionPress = remember { Press() }
@@ -251,30 +255,52 @@ private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerG
  * that pointer's down, one from a key release uses that key's down; an activation with no press of its own (an
  * accessibility action) uses none and is judged when it arrives. Nothing else blocks an answer.
  */
-internal class AnswerGate(private val clock: () -> Long, private val settle: Long) {
+internal class AnswerGate(private val clock: () -> Long, private val settle: Long, val overlays: Overlays = Overlays()) {
     private val shownAt = clock()
 
     /** Called by an answer control's click with that control's press record: consumes the press it came from. */
     fun accepts(press: Press): Boolean {
-        val begun: Pair<Long, AnswerGate>? = when {
+        val begun: Triple<Long, AnswerGate, Int>? = when {
             press.pointerReleasing -> press.pointerDown.also { press.pointerDown = null; press.pointerReleasing = false } ?: return false
             press.keyReleasing -> press.keyReleased.also { press.keyReleased = null; press.keyReleasing = false } ?: return false
             else -> null // no press of its own
         }
         if (begun != null && begun.second !== this) return false // begun on another request
+        if (begun != null && begun.third != overlays.opened) return false // a window opened over the chat since it began
         return (begun?.first ?: clock()) - shownAt >= settle
     }
 }
 
 /**
- * One answer control's presses: the pointer gesture in progress (its down's own uptime and request) and the
- * activation keys held on it (each key's own down time), plus which release is being dispatched right now.
+ * Windows opened over the chat so far (a viewer, sheet, dialog or menu; [OverChat]). A press remembers the count at
+ * its down, so one that began before a window opened answers nothing; closing a window changes nothing. Main thread.
+ */
+internal class Overlays {
+    var opened = 0
+}
+
+/** The chat's [Overlays]; one instance by default, so every host and every answer gate share it. */
+internal val LocalOverlays = staticCompositionLocalOf { Overlays() }
+
+/** Placed in the composition of a window that opens over the chat (with it, once per showing): see [Overlays]. */
+@Composable
+internal fun OverChat() {
+    val overlays = LocalOverlays.current
+    DisposableEffect(overlays) {
+        overlays.opened++
+        onDispose {}
+    }
+}
+
+/**
+ * One answer control's presses: the pointer gesture in progress (its down's own uptime, request and [Overlays] count)
+ * and the activation keys held on it (the same for each key's own down), plus which release is being dispatched now.
  */
 internal class Press {
-    var pointerDown: Pair<Long, AnswerGate>? = null
+    var pointerDown: Triple<Long, AnswerGate, Int>? = null
     var pointerReleasing = false // the release of that pointer gesture is being dispatched
-    val keyDowns = HashMap<Key, Pair<Long, AnswerGate>>()
-    var keyReleased: Pair<Long, AnswerGate>? = null // the down of the key whose release is being dispatched
+    val keyDowns = HashMap<Key, Triple<Long, AnswerGate, Int>>()
+    var keyReleased: Triple<Long, AnswerGate, Int>? = null // the down of the key whose release is being dispatched
     var keyReleasing = false
 }
 
@@ -290,7 +316,7 @@ private fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
         awaitEachGesture {
             try {
                 val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                press.pointerDown = down.uptimeMillis to gate
+                press.pointerDown = Triple(down.uptimeMillis, gate, gate.overlays.opened)
                 do {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
                 } while (event.changes.any { it.pressed })
@@ -306,7 +332,7 @@ private fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
     .onPreviewKeyEvent {
         if (it.key in activationKeys) {
             if (it.type == KeyEventType.KeyDown && it.nativeKeyEvent.repeatCount == 0) {
-                press.keyDowns[it.key] = it.nativeKeyEvent.eventTime to gate
+                press.keyDowns[it.key] = Triple(it.nativeKeyEvent.eventTime, gate, gate.overlays.opened)
             } else if (it.type == KeyEventType.KeyUp) {
                 press.keyReleased = press.keyDowns.remove(it.key)
                 press.keyReleasing = true

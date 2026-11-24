@@ -55,6 +55,11 @@ data class ApofisColors(
     val scrim: Color,
     val pressWash: Color,
     val handle: Color,
+    val viewerBackdrop: Color, // the image viewer's page, black in every theme
+    val onViewer: Color, // text and glyphs on the viewer's backdrop
+    val thumbChip: Color, // the dark round chip over a photo (the viewer's close button)
+    val thumbChipGlyph: Color, // non-text on thumbChip: 3:1
+    val thumbPlaceholder: Color, // an image tile or thumbnail with no picture; its glyph is muted
 )
 
 private val White = Color(0xFFFFFFFF)
@@ -195,6 +200,11 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
         pressWash = on.copy(alpha = if (dark) 0.14f else 0.12f),
         // The sheet handle is a non-text cue: the UI map's 0.2, raised in 0.05 steps until it reaches 3:1 over the page.
         handle = on.copy(alpha = (4..20).map { it * 0.05f }.first { contrastRatio(on.at(it, page), page) >= 3.0 || it >= 1f }),
+        viewerBackdrop = Black,
+        onViewer = White,
+        thumbChip = Black.at(0.5f, page), // the reference's dark fill, made opaque over the page
+        thumbChipGlyph = White,
+        thumbPlaceholder = on.at(0.045f, page),
     )
 }
 

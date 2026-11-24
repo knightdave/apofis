@@ -53,6 +53,21 @@ import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
+import androidx.compose.ui.test.isRoot
+import androidx.compose.ui.test.click
+import java.time.ZoneOffset
+import xyz.rycerz.apofis.chat.SendState
+import xyz.rycerz.apofis.chat.ToolStep
+import xyz.rycerz.apofis.chat.UserMessage
+import xyz.rycerz.apofis.ui.FIXED_NOW
+import xyz.rycerz.apofis.ui.FIXED_TODAY
+import xyz.rycerz.apofis.ui.markdown.dataUrl
+import xyz.rycerz.apofis.ui.markdown.pngBytes
 
 /**
  * The answer guard: a request accepts an answer only from a press that began at least the double-tap interval
@@ -360,5 +375,118 @@ class AnswerGuardTest {
         assertEquals(1, approvals.size)
         rule.onNodeWithText("Deny").performClick() // a fresh pointer press, in time
         assertEquals(2, approvals.size)
+    }
+
+    // ---- a press begun before a window opened over the chat answers nothing (Task 3; nothing restarts on close) ----
+
+    private var ui by mutableStateOf<ChatUiState?>(null)
+    private val tile = hasContentDescription("A dot") and hasClickAction()
+    private val step = hasText("terminal") and hasClickAction()
+
+    /** The chat screen with a stored reply (a tool step and a data image) above the live approval. */
+    private fun hostChat() {
+        val items = listOf(
+            UserMessage("u1", "Look", steered = false, timestamp = FIXED_NOW, state = SendState.QUEUED, idempotencyKey = "q1"),
+            AssistantReply("r0", listOf(ToolStep("c1", "terminal", "command=ls", "ok", resultTruncated = false, error = false, running = false)), "![A dot](${dataUrl(pngBytes(4, 3))})", FIXED_NOW),
+        )
+        val live = live(approval)
+        ui = ChatUiState("k", "Chat", StatusLine.WORKING, withLive(items, live) { FIXED_NOW }, ComposerMode.STOP, "", "hermes.example", live)
+        rule.setContent { Themed { ui?.let { now -> ChatScreen(now, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, currentState = { now }) } } }
+        rule.waitUntil(10_000) { tick(16); exists(tile) } // the image decodes off the main thread; the interval passes meanwhile
+        tick(1_000)
+    }
+
+    private fun exists(m: SemanticsMatcher) = rule.onAllNodes(m).fetchSemanticsNodes().isNotEmpty()
+
+    private fun windows() = rule.onAllNodes(isDialog()).fetchSemanticsNodes().size
+
+    private fun openViewer() {
+        rule.onNode(tile).performSemanticsAction(SemanticsActions.OnClick)
+        rule.waitUntil(10_000) { tick(16); exists(hasContentDescription("Close image")) }
+    }
+
+    private fun closeViewer() {
+        rule.onNodeWithContentDescription("Close image").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(0, windows())
+    }
+
+    @Test
+    fun viewerBlocksApprovalGuard() {
+        hostChat()
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) } // well after the interval
+        tick(50)
+        openViewer()
+        closeViewer()
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+    }
+
+    @Test
+    fun answerRightAfterViewerClosesGoesThrough() {
+        hostChat()
+        openViewer()
+        closeViewer()
+        rule.onNodeWithText("Allow once").performClick() // at once: closing restarts nothing
+        assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.ONCE)), approvals)
+    }
+
+    @Test
+    fun aConfirmDialogBlocksAPressBegunBeforeIt() {
+        hostChat()
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        ui = ui!!.copy(confirmCancel = "q1")
+        tick(48)
+        assertEquals(1, windows())
+        ui = ui!!.copy(confirmCancel = null)
+        tick(48)
+        assertEquals(0, windows())
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun theToolSheetBlocksAPressBegunBeforeIt() {
+        hostChat()
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        rule.onNode(step).performSemanticsAction(SemanticsActions.OnClick)
+        tick(1_000)
+        assertEquals(1, windows())
+        rule.mainClock.autoAdvance = true // the sheet's own hide animation needs frames
+        val roots = rule.onAllNodes(isRoot())
+        roots[roots.fetchSemanticsNodes().size - 1].performTouchInput { click(Offset(centerX, 10f)) } // a tap on its scrim
+        rule.waitForIdle()
+        rule.mainClock.autoAdvance = false
+        assertEquals(0, windows())
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
+    }
+
+    @Test
+    fun theBlocksOwnReaderBlocksAPressBegunBeforeIt() {
+        rule.setContent { Themed { Footer(approval.copy(command = "x".repeat(ONE_LINE_MAX + 1))) } }
+        tick(1_000)
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(50)
+        rule.onNodeWithText("Show full command").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(1, windows())
+        rule.onNodeWithContentDescription("Back").performSemanticsAction(SemanticsActions.OnClick)
+        tick(48)
+        assertEquals(0, windows())
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+        rule.onNodeWithText("Allow once").performClick()
+        assertEquals(1, approvals.size)
     }
 }
