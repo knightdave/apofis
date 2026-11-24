@@ -38,6 +38,8 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.chat.Composer
+import xyz.rycerz.apofis.chat.ComposerNote
+import xyz.rycerz.apofis.chat.NoteKind
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.openAppDatabase
 import xyz.rycerz.apofis.images.Encoded
@@ -66,6 +68,10 @@ import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.CredentialStore
 import xyz.rycerz.apofis.settings.Credentials
 import xyz.rycerz.apofis.settings.Preferences
+import xyz.rycerz.apofis.share.Share
+import xyz.rycerz.apofis.share.SHARE_NOTE_ORDER
+import xyz.rycerz.apofis.share.ShareIntent
+import xyz.rycerz.apofis.share.readShare
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.RunStarter
 import xyz.rycerz.apofis.sync.SendQueue
@@ -316,6 +322,83 @@ class AppContainer(
         if (epoch() != epoch) return false // switched during the lookup; the route compares the epoch again anyway
         chatRequest.value = epoch to key
         return true
+    }
+
+    /** Test hook: reads an offered share into memory. */
+    internal var readSharedItems: suspend (ShareIntent) -> Share = { readShare(app, it) }
+
+    // The one share slot, in memory only (a process death drops it). Guarded by shareLock: the version, the read job
+    // and every write of the slot.
+    private val shareLock = Any()
+    private var shareVersion = 0L
+    private val shareSlot = MutableStateFlow<Share?>(null)
+
+    /** The read of the newest offered share; for tests. */
+    internal var shareJob: Job? = null
+        private set
+
+    /** The share waiting for Accept or Cancel; it waits across a switch and while not connected. */
+    val pendingShare: StateFlow<Share?> = shareSlot.asStateFlow()
+
+    /** A new share: the older read is cancelled and an unaccepted older share goes; this one shows once it is read. */
+    fun offerShare(share: ShareIntent) = synchronized(shareLock) {
+        val version = ++shareVersion
+        shareJob?.cancel()
+        shareSlot.value = null
+        shareJob = scope.launch {
+            startup.join() // the start-up sweep of decode temps must not take a live one
+            val read = readSharedItems(share)
+            synchronized(shareLock) { if (shareVersion == version) shareSlot.value = read.copy(version = version) }
+        }
+    }
+
+    /** Cancel of the sheet that showed [version]: a newer share it did not show stays. */
+    fun cancelShare(version: Long) = synchronized(shareLock) {
+        if (shareSlot.value?.version == version) shareSlot.value = null
+    }
+
+    /**
+     * One atomic step: true, and the slot emptied, only while the slot holds [token]'s share and the connection that
+     * showed it is still the current, open one. Never throws (the drawer calls it with a fresh row not yet decided).
+     */
+    fun claimShare(token: ShareToken): Boolean = try {
+        synchronized(shareLock) {
+            (live(token) && shareSlot.value?.version == token.version).also { if (it) shareSlot.value = null }
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    // The checks of tapTarget: the connection that showed the share is open, current and of the current epoch.
+    private fun live(token: ShareToken): Boolean {
+        val c = connection.value
+        return c != null && c.isOpen && c.generation == token.generation && token.generation == epoch()
+    }
+
+    /**
+     * Accept of what the sheet showed ([token]): stores the images, then [open] (the drawer's openFreshChatIf) creates
+     * and selects a fresh chat only if [claimShare] holds and fills its draft: the text as a user edit, the images ready,
+     * one note. False with nothing changed when the share, the connection or the open chat is no longer the one shown;
+     * files already stored are then unreferenced and collected later.
+     */
+    suspend fun acceptShare(token: ShareToken, open: suspend (selected: String, claim: () -> Boolean, fill: suspend (String) -> Unit) -> String?): Boolean {
+        val share = shareSlot.value?.takeIf { it.version == token.version } ?: return false
+        val notes = share.notes.toHashSet()
+        val digests = ArrayList<String>()
+        for (jpeg in share.images) {
+            try {
+                // A fresh put is too young for any collection until the draft names it.
+                digests += imageStore.put(jpeg) { live(token) } ?: return false
+            } catch (_: IOException) {
+                notes += NoteKind.SHARE_IMAGES_FAILED
+            }
+        }
+        return open(token.selectedKey, { claimShare(token) }) { k ->
+            // Nothing suspends here: a cancelled caller cannot leave half a draft.
+            composer.edit(k, share.text, composer.current(k).revision)
+            composer.addImages(k, digests.size).zip(digests).forEach { (id, digest) -> composer.setImage(id, digest) }
+            SHARE_NOTE_ORDER.firstOrNull { it in notes }?.let { composer.setNote(k, ComposerNote(it)) }
+        } != null
     }
 
     /**
@@ -586,6 +669,9 @@ class AppContainer(
         })
     }
 }
+
+/** What a share sheet showed: the share's version, the connection's generation and the open chat. */
+data class ShareToken(val version: Long, val generation: Long, val selectedKey: String)
 
 /** The chat key of a notification's tap intent for [generation], or null for anything else (checked by round trip). */
 internal fun chatKey(intent: Intent?, generation: Long): String? {

@@ -53,6 +53,9 @@ import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.ShareToken
+import xyz.rycerz.apofis.share.ShareSheet
+import xyz.rycerz.apofis.sync.isTemporaryKey
 import xyz.rycerz.apofis.ui.chat.ChatScreen
 import xyz.rycerz.apofis.ui.chat.LocalChatGate
 import xyz.rycerz.apofis.ui.chat.ChatViewModel
@@ -180,6 +183,7 @@ internal fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewMode
     val query by drawer.query.collectAsState()
     val refreshFailed by drawer.refreshFailed.collectAsState()
     val prompt by drawer.prompt.collectAsState()
+    val share by container.pendingShare.collectAsState()
     var showArchived by rememberSaveable { mutableStateOf(false) }
     val drawerState = rememberPushDrawerState()
     val scope = rememberCoroutineScope()
@@ -266,7 +270,31 @@ internal fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewMode
                 }
             }
         }
-        prompt?.let { PromptOverChat(it, drawer) }
+        val p = prompt
+        val shared = share
+        val sel = selected
+        if (p != null) {
+            PromptOverChat(p, drawer) // the share waits until the prompt closes
+        } else if (shared != null && sel != null) {
+            val token = ShareToken(shared.version, conn.generation, sel)
+            // A new window for every share, connection and open chat: a press held in an old one accepts nothing.
+            key(token) {
+                OverChat(LocalOverlays.current, token)
+                ShareSheet(
+                    shared,
+                    temporary = isTemporaryKey(sel),
+                    onAccept = {
+                        scope.launch {
+                            if (container.acceptShare(token, drawer::openFreshChatIf)) {
+                                showArchived = false
+                                drawerState.close()
+                            }
+                        }
+                    },
+                    onCancel = { container.cancelShare(shared.version) },
+                )
+            }
+        }
     }
 }
 
