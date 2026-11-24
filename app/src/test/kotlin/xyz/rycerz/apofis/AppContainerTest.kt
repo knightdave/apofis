@@ -276,7 +276,7 @@ class AppContainerTest {
             val lock = launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); held.await() } }
             locked.await()
             val repo = old.repo
-            old.composer.send("apofis-a") { repo.send("apofis-a", it) }!! // waits for the lock: not stored yet
+            old.composer.sendWithImages("apofis-a") { t, _ -> repo.send("apofis-a", t) }!! // waits for the lock: not stored yet
             val switching = CompletableDeferred<Unit>()
             container.beforeSwitch = { switching.complete(Unit) }
             val connect = async(Dispatchers.IO) { container.connect(first.copy(apiKey = "k2")) }
@@ -317,7 +317,7 @@ class AppContainerTest {
         val first = container.connected()!!
         first.composer.edit("apofis-a", "half a thought")
         first.composer.edit("apofis-b", "not stored")
-        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        first.composer.sendWithImages("apofis-b") { _, _ -> throw IllegalStateException("not stored") }!!.join()
         failNextKeyUse = true
 
         expectFailure(A.copy(apiKey = "key-a2"))
@@ -338,10 +338,10 @@ class AppContainerTest {
         addSession("apofis-a")
         first.composer.edit("apofis-a", "half a thought")
         first.composer.edit("apofis-b", "not stored")
-        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        first.composer.sendWithImages("apofis-b") { _, _ -> throw IllegalStateException("not stored") }!!.join()
         val release = CompletableDeferred<Unit>()
         first.composer.edit("apofis-c", "being stored")
-        first.composer.send("apofis-c") { release.await() }!!
+        first.composer.sendWithImages("apofis-c") { _, _ -> release.await() }!!
         container.beforeSwitch = { release.complete(Unit) }
         val before = container.scope.coroutineContext.job.children.filter { it.isActive }.toSet()
         flaky.failPutOf = failPut
@@ -379,7 +379,7 @@ class AppContainerTest {
         addSession("apofis-a")
         first.composer.edit("apofis-a", "half a thought")
         first.composer.edit("apofis-b", "not stored")
-        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        first.composer.sendWithImages("apofis-b") { _, _ -> throw IllegalStateException("not stored") }!!.join()
         container.beforeSwitch = { throw IllegalStateException("setup failed") }
         try {
             container.connect(B)
@@ -412,7 +412,7 @@ class AppContainerTest {
         ))
         first.composer.edit("apofis-a", "half a thought")
         first.composer.edit("apofis-b", "not stored")
-        first.composer.send("apofis-b") { throw IllegalStateException("not stored") }!!.join()
+        first.composer.sendWithImages("apofis-b") { _, _ -> throw IllegalStateException("not stored") }!!.join()
         return faulty
     }
 

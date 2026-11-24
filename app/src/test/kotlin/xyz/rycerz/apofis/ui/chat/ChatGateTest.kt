@@ -18,10 +18,12 @@ class ChatGateTest {
     /**
      * Exempt, passed straight on: typing (dropping it could lose text), the six confirm and dismiss callbacks of the
      * confirmation dialogs, which are their own windows above the drawer, seen whole and answered deliberately, and the
-     * choice sheets' dismissal, the sheet being its own window above the drawer too.
+     * choice sheets' dismissal, the sheet being its own window above the drawer too, and the picker's result
+     * ([ChatActions.onImagesPicked]), which comes from a window above the chat like the dialogs' confirms: dropping it
+     * would lose the user's pick.
      */
     private val notActions = setOf(
-        "onDraftChange",
+        "onDraftChange", "onImagesPicked",
         "onConfirmRetry", "onDismissRetry", "onConfirmCancel", "onDismissCancel", "onConfirmDiscard", "onDismissDiscard",
         "closeSheet",
     )
@@ -39,6 +41,7 @@ class ChatGateTest {
             java.lang.Long.TYPE -> 0L
             java.lang.Boolean.TYPE -> false
             ApprovalChoice::class.java -> ApprovalChoice.ONCE
+            List::class.java -> emptyList<Any>()
             else -> null
         }
     }.toTypedArray()

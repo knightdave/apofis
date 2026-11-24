@@ -115,20 +115,14 @@ class Composer(private val scope: CoroutineScope) {
         change(sessionKey) { s, _ -> if (s.revision == basedOnRevision && !s.sending) s.copy(draft = text) else s }
 
     /**
-     * Sends the draft with [store] unless a send of this chat is in flight, the draft is blank or it holds images (then
-     * null; [sendWithImages] sends those). The field
-     * keeps showing the text until it is stored: [store] calls [Stored.stored] once the text is durably accepted (or
-     * simply returns), and only then the field empties. [store] must throw only when nothing was stored: the text then
-     * leaves the field for [ComposerState.unsent], joined after any earlier unsent text with a blank line. Cancellation
-     * ([clear]) lets it go. [SendTooLarge] keeps the draft as it is and sets the note [NoteKind.IMAGES_TOO_LARGE].
-     */
-    fun send(sessionKey: String, store: suspend Stored.(String) -> Unit): Job? =
-        start(sessionKey, { it.images.isEmpty() }) { text, _ -> store(text) }
-
-    /**
-     * Like [send], with the draft's ready images: [store] gets the text and their digests (failed photos are left out).
-     * Nothing starts while a photo is processing, or when the text is blank and no photo is ready. The photos leave the
-     * draft with the text: into [ComposerState.unsent] with it when the store fails.
+     * Sends the draft and its ready images with [store] unless a send of this chat is in flight (then null): [store] gets
+     * the text and their digests (failed photos are left out). Nothing starts while a photo is processing, or when the
+     * text is blank and no photo is ready. The field keeps showing the text until it is stored: [store] calls
+     * [Stored.stored] once the text is durably accepted (or simply returns), and only then the field empties. [store]
+     * must throw only when nothing was stored: the text then leaves the field for [ComposerState.unsent], joined after any
+     * earlier unsent text with a blank line. Cancellation ([clear]) lets it go. [SendTooLarge] keeps the draft as it is
+     * and sets the note [NoteKind.IMAGES_TOO_LARGE]. The photos leave the draft with the text: into
+     * [ComposerState.unsent] with it when the store fails. Starting a send clears the note.
      */
     fun sendWithImages(sessionKey: String, store: suspend Stored.(String, List<String>) -> Unit): Job? =
         start(sessionKey, { s -> s.images.none { it.processing } }, store)
@@ -148,7 +142,7 @@ class Composer(private val scope: CoroutineScope) {
                     return@with s.copy(note = ComposerNote(NoteKind.IMAGES_LIMIT))
                 }
                 text = s.draft.takeIf { !s.sending && allowed(s) && (it.isNotBlank() || s.images.any { i -> i.digest != null }) }
-                if (text == null) s else s.copy(sending = true, revision = tick) // the field drawn before takes no edit
+                if (text == null) s else s.copy(sending = true, revision = tick, note = null) // the field drawn before takes no edit
             }
         }
         val claimedText = text ?: return null

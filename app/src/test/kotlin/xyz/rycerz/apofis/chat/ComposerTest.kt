@@ -28,7 +28,7 @@ class ComposerTest {
 
     private fun fail(key: String, text: String) = runBlocking {
         type(key, text)
-        withTimeout(60_000) { composer.send(key) { throw IllegalStateException("not stored") }!!.join() }
+        withTimeout(60_000) { composer.sendWithImages(key) { _, _ -> throw IllegalStateException("not stored") }!!.join() }
     }
 
     @Test
@@ -60,7 +60,7 @@ class ComposerTest {
         type("a", "hello")
         val stored = CompletableDeferred<Unit>()
         val delivered = CompletableDeferred<Unit>()
-        val send = composer.send("a") { stored(); stored.complete(Unit); delivered.await() }!!
+        val send = composer.sendWithImages("a") { _, _ -> stored(); stored.complete(Unit); delivered.await() }!!
         withTimeout(60_000) { stored.await() }
         assertEquals("", composer.current("a").draft) // stored: emptied in that step
         assertFalse(composer.current("a").sending)
@@ -88,7 +88,7 @@ class ComposerTest {
         type("a", "hello")
         val shown = composer.current("a").revision
         val release = CompletableDeferred<Unit>()
-        val send = composer.send("a") { release.await() }!!
+        val send = composer.sendWithImages("a") { _, _ -> release.await() }!!
         composer.edit("a", "hello!", shown) // the field still showed the sent text
         assertEquals("hello", composer.current("a").draft) // kept, unchanged, until it is stored
         composer.edit("a", "hello!", composer.current("a").revision) // nor any edit while it is sent
@@ -98,14 +98,14 @@ class ComposerTest {
         assertEquals("", composer.current("a").draft)
     }
 
-    private fun sendOk(key: String) = runBlocking { withTimeout(60_000) { composer.send(key) {}!!.join() } }
+    private fun sendOk(key: String) = runBlocking { withTimeout(60_000) { composer.sendWithImages(key) { _, _ -> }!!.join() } }
 
     @Test
     fun typingRightAfterASuccessfulSendKeepsEveryCharacter() {
         type("a", "first")
         val beforeSend = composer.current("a").revision
         val release = CompletableDeferred<Unit>()
-        val send = composer.send("a") { release.await() }!!
+        val send = composer.sendWithImages("a") { _, _ -> release.await() }!!
         val whileSending = composer.current("a").revision // the read-only field showing "first" while it is stored
         release.complete(Unit)
         runBlocking { withTimeout(60_000) { send.join() } }
@@ -228,7 +228,7 @@ class ComposerTest {
     fun aDeletedChatIsRememberedOnlyWhileItsSendIsInFlight() = runBlocking {
         type("a", "hello")
         val release = CompletableDeferred<Unit>()
-        val send = composer.send("a") { release.await(); throw IllegalStateException("chat gone") }!!
+        val send = composer.sendWithImages("a") { _, _ -> release.await(); throw IllegalStateException("chat gone") }!!
         composer.remove("a")
         type("a", "late edit") // nothing may recreate a deleted chat
         assertEquals(setOf("a"), composer.keys)
@@ -244,7 +244,7 @@ class ComposerTest {
         type("b", "draft")
         type("c", "sending")
         val never = CompletableDeferred<Unit>()
-        val send = composer.send("c") { never.await(); throw IllegalStateException("not stored") }!!
+        val send = composer.sendWithImages("c") { _, _ -> never.await(); throw IllegalStateException("not stored") }!!
 
         composer.clear()
 

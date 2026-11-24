@@ -399,7 +399,7 @@ class ComposerViewTest {
         val holder = DraftHolder(scope)
         holder.edit("k", "hello", holder.current("k").revision)
         var stores = 0
-        onSendHook = { holder.send("k") { stores++; awaitCancellation() } != null }
+        onSendHook = { holder.sendWithImages("k") { _, _ -> stores++; awaitCancellation() } != null }
         draft = "hello"
         subject = "chat-1"
         show()
@@ -723,7 +723,7 @@ class ComposerViewTest {
         val holder = DraftHolder(scope)
         holder.edit("k", "hello", holder.current("k").revision)
         var stores = 0
-        onSendHook = { holder.send("k") { stores++; awaitCancellation() } != null }
+        onSendHook = { holder.sendWithImages("k") { _, _ -> stores++; awaitCancellation() } != null }
         draft = "hello"
         enter = true
         show()
@@ -941,7 +941,7 @@ class ComposerViewTest {
         ui = ui.copy(draft = s.draft, draftRevision = s.revision, composer = if (s.draft.isBlank()) ComposerMode.SEND_DISABLED else ComposerMode.SEND)
         val actions = object : ChatActions {
             override fun onDraftChange(text: String, basedOnRevision: Long) = holder.edit(k, text, basedOnRevision)
-            override fun onSendClick(): Boolean = holder.send(k) { stores += it; awaitCancellation() } != null
+            override fun onSendClick(): Boolean = holder.sendWithImages(k) { t, _ -> stores += t; awaitCancellation() } != null
         }
         showChat(actions = actions, enterToSend = true)
     }
@@ -1107,7 +1107,7 @@ class ComposerViewTest {
         val body = ChromeProbe.bodyCompositions
         val bottom = ChromeProbe.bottomCompositions
         val root = ChromeProbe.rootMeasures
-        for (i in 1..30) { // one line: the bottom area keeps its height
+        for (i in 1..20) { // one line (Plus takes 48 dp of the field): the bottom area keeps its height
             ui = ui.copy(draft = "x".repeat(i), composer = ComposerMode.SEND)
             frames(1)
         }
