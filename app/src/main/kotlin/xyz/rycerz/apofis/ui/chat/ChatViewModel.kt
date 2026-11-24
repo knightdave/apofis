@@ -66,6 +66,9 @@ data class ChatUiState(
     val loaded: Boolean = true, // false only before the stored transcript first arrives (items empty but not known empty)
     val choice: ChatModel = ChatModel(), // the chat's model choice, stored on this phone only
     val sheet: ChoiceSheet? = null, // the model or reasoning sheet while it is open
+    // From the moment an open decides to fetch the history of a chat with no stored rows until that fetch ends, the wait
+    // for the repository's lock included (another request may hold it meanwhile).
+    val firstLoad: Boolean = false,
 )
 
 /** The reasoning sheet's levels: null is the server's default, "none" is Off; five of the server's eight (decision 19). */
@@ -159,6 +162,7 @@ private data class Local(
     val confirmCancel: String? = null,
     val confirmDiscard: Long? = null,
     val sheet: ChoiceSheet? = null,
+    val firstLoad: Boolean = false,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean, val choice: ChatModel)
@@ -223,6 +227,7 @@ class ChatViewModel(
             draftRevision = c.revision,
             choice = e.choice,
             sheet = l.sheet,
+            firstLoad = l.firstLoad,
         )
     }.stateIn(
         viewModelScope,
@@ -232,7 +237,9 @@ class ChatViewModel(
         },
     )
 
-    private var opening: Job? = null
+    @Volatile // tests read it from another thread
+    internal var opening: Job? = null // the running or last open; read by tests to wait for it
+        private set
     private var fetch: Job? = null // the model sheet's request
 
     init {
@@ -247,14 +254,25 @@ class ChatViewModel(
     /**
      * The chat was opened, now or again (a tap on its row while it is shown): fetches its history when it needs it.
      * Decided by the session row alone; unsent bubbles say nothing about the cache. A local-only chat makes no request.
-     * A failure shows on the status line.
+     * A failure shows on the status line. When it decides to fetch a chat with no stored rows, [ChatUiState.firstLoad]
+     * (the skeleton) is set until that fetch ends (success, failure or cancellation), the wait for the repository's lock
+     * included, and the last failure of this view model's own requests is retired so a retry does not pulse under the old
+     * error (a 401 of such a request too); the device's connectivity and the follower's rejected-key flag come from
+     * elsewhere and stay. A stale chat with stored rows is fetched without either. As before, any request of this view
+     * model that ends without a failure clears that last failure as well, an open that fetches nothing included.
      */
     fun onOpened() {
         if (opening?.isActive == true) return // one load at a time: the one running reads the newest state anyway
         opening = launchRequest {
             val session = repo.session(sessionKey).first()
-            if (session != null && session.existsOnServer && (session.stale || !repo.hasCachedMessages(sessionKey))) {
+            if (session == null || !session.existsOnServer) return@launchRequest
+            val first = !repo.hasCachedMessages(sessionKey)
+            if (!first && !session.stale) return@launchRequest
+            if (first) local.update { it.copy(firstLoad = true, failure = null) }
+            try {
                 repo.syncMessages(sessionKey)
+            } finally {
+                local.update { it.copy(firstLoad = false) } // single flight: no other open can have set it meanwhile
             }
         }
     }

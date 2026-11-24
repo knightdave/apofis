@@ -60,6 +60,7 @@ data class ApofisColors(
     val thumbChip: Color, // the dark round chip over a photo (the viewer's close button)
     val thumbChipGlyph: Color, // non-text on thumbChip: 3:1
     val thumbPlaceholder: Color, // an image tile or thumbnail with no picture; its glyph is muted
+    val skeleton: Color, // the loading skeleton's bars: decoration, no contrast floor
 )
 
 private val White = Color(0xFFFFFFFF)
@@ -205,6 +206,7 @@ internal fun apofisColors(scheme: ColorScheme, dark: Boolean): ApofisColors {
         thumbChip = Black.at(0.5f, page), // the reference's dark fill, made opaque over the page
         thumbChipGlyph = White,
         thumbPlaceholder = on.at(0.045f, page),
+        skeleton = on.at(0.08f, page), // the switchOffTrack recipe
     )
 }
 

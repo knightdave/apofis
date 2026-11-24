@@ -222,6 +222,21 @@ class ThemeTokensTest {
         }
     }
 
+    /**
+     * The loading skeleton's fill is decoration, so it has no contrast floor, but it is the `switchOffTrack` recipe
+     * (onSurface 0.08 over the page) and stays visibly apart from the page in every palette, pure black and white included.
+     */
+    @Test
+    fun skeletonStandsApartFromThePage() {
+        val failures = mutableListOf<String>()
+        for ((name, scheme, c) in themes) {
+            assertClose(over(scheme.onSurface, 0.08f, scheme.surface), c.skeleton)
+            val ratio = contrastRatio(c.skeleton, scheme.surface)
+            if (ratio < SKELETON_APART) failures += "$name: skeleton on the page is %.3f:1".format(ratio)
+        }
+        assertEquals(emptyList<String>(), failures)
+    }
+
     @Test
     fun readableOnBlendsUntilItPasses() {
         val darkOnSurface = Color(0xFFF9F9F9)
@@ -236,5 +251,8 @@ class ThemeTokensTest {
     private companion object {
         /** The measured worst case of selected text in the composer with frosted glass on, over any content (known limit). */
         const val SELECTED_WITH_BLUR = 3.729 // green dark, pure off
+
+        /** The least contrast between the skeleton and the page (decoration: no floor of its own, only this pin). */
+        const val SKELETON_APART = 1.12 // measured lowest: 1.120, green and purple dark on pure black
     }
 }
