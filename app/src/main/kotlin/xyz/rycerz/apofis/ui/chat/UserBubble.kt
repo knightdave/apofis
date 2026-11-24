@@ -227,5 +227,6 @@ internal fun failureText(code: String?): Int = when (code) {
     SendError.PROTOCOL -> R.string.chat_error_protocol
     SendError.HTTP_ERROR -> R.string.chat_error_http_error
     SendError.IMAGE_MISSING -> R.string.send_error_image_missing
+    SendError.STEER_NOT_DELIVERED -> R.string.chat_error_steer_not_delivered
     else -> R.string.chat_error_unknown
 }

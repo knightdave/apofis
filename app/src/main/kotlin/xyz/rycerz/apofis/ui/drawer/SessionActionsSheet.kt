@@ -21,6 +21,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.sync.TITLE_MAX
+import xyz.rycerz.apofis.sync.cleanTitle
+import xyz.rycerz.apofis.sync.takeCodePoints
 import xyz.rycerz.apofis.ui.theme.ApofisDialog
 import xyz.rycerz.apofis.ui.theme.ApofisSheet
 import xyz.rycerz.apofis.ui.theme.SheetRow
@@ -95,12 +98,12 @@ private fun RenameDialog(prompt: Prompt, actions: PromptActions) {
         onConfirm = { actions.confirmRename(prompt.token, title) },
         dismissLabel = stringResource(R.string.cancel),
         onDismiss = { actions.dismiss(prompt.token) },
-        confirmEnabled = title.isNotBlank() && !prompt.busy && !prompt.gone,
+        confirmEnabled = cleanTitle(title) != null && !prompt.busy && !prompt.gone,
     ) {
         Column {
             OutlinedTextField(
                 title,
-                { title = it.take(TITLE_MAX) },
+                { title = it.takeCodePoints(TITLE_MAX) },
                 Modifier.fillMaxWidth(),
                 label = { Text(stringResource(R.string.drawer_rename_hint)) },
                 singleLine = true,

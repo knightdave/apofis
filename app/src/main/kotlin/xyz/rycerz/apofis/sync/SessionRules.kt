@@ -34,3 +34,33 @@ fun titleFrom(text: String): String {
     val cut = line.take(TITLE_LIMIT)
     return if (cut.length == TITLE_LIMIT && cut.last().isHighSurrogate()) cut.dropLast(1) else cut
 }
+
+/** The longest title the app gives a chat: 100 (H11) minus the longest create suffix " (9)". */
+const val TITLE_MAX = 96
+
+/**
+ * A title as the server would keep it (its sanitizer, counted the same way): whitespace becomes a space, control and
+ * invisible format characters and unpaired surrogates go, space runs collapse, the ends are trimmed, and at most
+ * [TITLE_MAX] code points stay. Null when nothing remains.
+ */
+fun cleanTitle(text: String): String? {
+    val kept = StringBuilder()
+    var i = 0
+    while (i < text.length) {
+        val cp = text.codePointAt(i)
+        i += Character.charCount(cp)
+        val type = Character.getType(cp).toByte()
+        when {
+            Character.isWhitespace(cp) || Character.isSpaceChar(cp) -> kept.append(' ')
+            type == Character.CONTROL || type == Character.FORMAT || type == Character.SURROGATE -> Unit
+            else -> kept.appendCodePoint(cp)
+        }
+    }
+    return kept.replace(SPACES, " ").trim().takeCodePoints(TITLE_MAX).trimEnd().ifEmpty { null }
+}
+
+private val SPACES = Regex(" {2,}")
+
+/** At most [n] code points; a surrogate pair is never split. */
+internal fun String.takeCodePoints(n: Int): String =
+    if (codePointCount(0, length) <= n) this else substring(0, offsetByCodePoints(0, n))

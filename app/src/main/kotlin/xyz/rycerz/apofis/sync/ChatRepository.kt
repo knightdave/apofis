@@ -394,12 +394,26 @@ class ChatRepository(
      * chat fails locally; an unknown one throws IllegalArgumentException; see [SendQueue.submit] for the other refusals.
      * Every choice change started before this call ([changeChoice]), in any chat of this connection, finishes before the
      * message is handed to the queue. The queue freezes the choice stored at the moment it stores the message, which can
-     * include a change made after the call.
+     * include a change made after the call. [steerRun] and [steerOnly]: see [SendQueue.submit].
      */
-    suspend fun send(sessionKey: String, text: String, images: List<String> = emptyList(), onStored: (key: String) -> Unit = {}) {
+    suspend fun send(
+        sessionKey: String,
+        text: String,
+        images: List<String> = emptyList(),
+        steerRun: String? = null,
+        steerOnly: Boolean = false,
+        onStored: (key: String) -> Unit = {}, // last: callers pass it as a trailing lambda
+    ) {
         requireAppKey(sessionKey)
         choiceChanges.withLock {}
-        queue().submit(sessionKey, text, onStored, images)
+        queue().submit(sessionKey, text, onStored, images, steerRun, steerOnly)
+    }
+
+    /** /queue: like [send], but always queued, never a steer; it starts after the running reply, or at once. */
+    suspend fun queue(sessionKey: String, text: String, images: List<String> = emptyList(), onStored: (key: String) -> Unit = {}) {
+        requireAppKey(sessionKey)
+        choiceChanges.withLock {}
+        queue().submit(sessionKey, text, onStored, images, steer = false)
     }
 
     /**

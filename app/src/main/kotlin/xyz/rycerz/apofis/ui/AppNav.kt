@@ -250,7 +250,7 @@ internal fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewMode
                         // Scoped to this chat being on screen: leaving clears the view model, its collectors and its
                         // connectivity subscription. Its draft lives in the connection's holder, not here.
                         val chatOwner = rememberViewModelStoreOwner()
-                        val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online) }
+                        val vm = viewModel(viewModelStoreOwner = chatOwner) { ChatViewModel(sessionKey, conn, container.online, onNew = { drawer.newChat() }) }
                         // The first send the composer accepts asks for the notification permission, once ever, through the
                         // launcher of the composition that is collecting (the view model holds none).
                         LaunchedEffect(vm, askNotifications) { vm.sendAccepted.collect { askNotifications() } }

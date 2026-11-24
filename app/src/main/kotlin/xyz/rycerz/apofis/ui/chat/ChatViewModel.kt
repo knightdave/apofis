@@ -37,6 +37,11 @@ import xyz.rycerz.apofis.api.ChatModel
 import xyz.rycerz.apofis.api.ModelOptions
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.Command
+import xyz.rycerz.apofis.chat.ComposerState
+import xyz.rycerz.apofis.chat.Parsed
+import xyz.rycerz.apofis.chat.parseCommand
+import xyz.rycerz.apofis.images.ImageLimits
 import xyz.rycerz.apofis.chat.ComposerNote
 import xyz.rycerz.apofis.chat.DraftImage
 import xyz.rycerz.apofis.chat.NoteKind
@@ -48,6 +53,9 @@ import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.sync.CancelResult
 import xyz.rycerz.apofis.sync.RetryResult
+import xyz.rycerz.apofis.sync.SendTooLarge
+import xyz.rycerz.apofis.sync.cleanTitle
+import xyz.rycerz.apofis.sync.takeCodePoints
 
 data class ChatUiState(
     val sessionKey: String,
@@ -110,9 +118,17 @@ interface ChatActions {
     /** [basedOnRevision]: [ChatUiState.draftRevision] of the state the field showed. */
     fun onDraftChange(text: String, basedOnRevision: Long) {}
 
-    /** Sends the current draft; ignored while a send is being stored. */
-    /** Asks the draft holder to send the draft now; true when it took it (nothing to send, or a send in flight: false). */
+    /**
+     * Asks the draft holder to send the draft now, or runs it when it is a command line; true when it took it (nothing
+     * to send, a send in flight or a refused command: false).
+     */
     fun onSendClick(): Boolean = false
+
+    /** [onSendClick] from the screen; [steerRun]: the run the Steer button was drawn for (a send steers only that run). */
+    fun onSendClick(steerRun: String?): Boolean = onSendClick()
+
+    /** A no-text command tapped in the palette: the same dispatch, claim, refusals and return value as [onSendClick]. */
+    fun onCommand(command: Command): Boolean = false
     /** [runId]: the run the Stop button was drawn for. */
     fun onStopClick(runId: String) {}
     fun onRetry(idempotencyKey: String) {}
@@ -183,6 +199,7 @@ class ChatViewModel(
     private val sessionKey: String,
     private val connected: Connected,
     online: Flow<Boolean> = flowOf(true),
+    private val onNew: () -> Unit = {}, // /new: the drawer's New chat
 ) : ViewModel(), ChatActions {
     private val accepted = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
@@ -299,19 +316,148 @@ class ChatViewModel(
         if (composer.current(sessionKey).note != null) composer.setNote(sessionKey, null) // any keystroke clears the note
     }
 
-    override fun onSendClick(): Boolean {
+    // The claimed draft and revision of the command still running: Enter again on the same draft does nothing meanwhile.
+    private var commandInFlight: Pair<String, Long>? = null
+
+    /** The live run this view model shows: what the screen draws its Steer and Stop for. */
+    override fun onSendClick(): Boolean = onSendClick(state.value.live?.runId)
+
+    override fun onSendClick(steerRun: String?): Boolean = dispatch(steerRun)
+
+    override fun onCommand(command: Command): Boolean = dispatch(state.value.live?.runId, command)
+
+    /**
+     * The one submit path (button, IME action, hardware Enter, palette): reads the holder now and decides from the
+     * claimed draft whether it is a message or a command line. A command line is never sent as text; a refusal sets
+     * its note and keeps the draft's text and photos; a command that ran clears the draft only if it still holds the
+     * claimed text at the claimed revision. [runId]: the run a steer or /stop is for.
+     */
+    private fun dispatch(runId: String?, tapped: Command? = null): Boolean {
+        val claim = composer.current(sessionKey)
+        if (claim.sending) return false // the holder takes nothing while a send is being stored
+        val (command, text) = when (val parsed = tapped?.let { Parsed.Run(it, "") } ?: parseCommand(claim.draft)) {
+            Parsed.Message -> return send(runId)
+            is Parsed.Unknown -> return refuse(NoteKind.CMD_UNKNOWN, "/${parsed.word}".takeCodePoints(32))
+            is Parsed.Run -> parsed
+        }
+        val claimed = claim.draft to claim.revision
+        if (commandInFlight == claimed) return false
+        val ready = claim.images.mapNotNull { it.digest }
+        when {
+            !command.takesText && text.isNotBlank() -> return refuse(NoteKind.CMD_NO_TEXT, "/${command.word}")
+            command.takesText && text.isBlank() -> return refuse(NoteKind.CMD_NEEDS_TEXT)
+            command == Command.STEER && claim.images.isNotEmpty() -> return refuse(NoteKind.CMD_STEER_NO_IMAGES)
+            (command == Command.STEER || command == Command.STOP) && runId == null -> return refuse(NoteKind.CMD_NOTHING_RUNNING)
+            command == Command.STEER && state.value.live?.status != "running" -> return refuse(NoteKind.CMD_NOTHING_RUNNING)
+            command == Command.QUEUE && claim.images.any { it.processing } -> return false // like a send: wait for the photo
+            command == Command.QUEUE && ready.size > ImageLimits.MAX_IMAGES -> return refuse(NoteKind.IMAGES_LIMIT)
+        }
+        val title = if (command == Command.TITLE) cleanTitle(text) ?: return refuse(NoteKind.CMD_NEEDS_TEXT) else null
+        commandInFlight = claimed
+        val running: Job? = when (command) {
+            Command.NEW -> {
+                clearIfClaimed(claim) // first: the chat left behind is empty, so New chat can reuse it
+                onNew()
+                null
+            }
+            Command.MODEL -> {
+                openModelSheet()
+                clearIfClaimed(claim)
+                null
+            }
+            Command.REASONING -> {
+                openReasoningSheet()
+                clearIfClaimed(claim)
+                null
+            }
+            Command.STOP -> launchRequest {
+                follower.stop(sessionKey, checkNotNull(runId))
+                clearIfClaimed(claim)
+            }
+            Command.FAST -> choose(close = false, onStored = {
+                composer.setNote(sessionKey, ComposerNote(if (it.fast == true) NoteKind.FAST_ON else NoteKind.FAST_OFF))
+                clearIfClaimed(claim)
+            }) { it.copy(fast = it.fast != true) }
+            Command.TITLE -> launchRequest {
+                try {
+                    repo.rename(sessionKey, checkNotNull(title))
+                    clearIfClaimed(claim)
+                } catch (e: ApiError.Http) {
+                    if (e.code != "invalid_title") throw e
+                    composer.setNote(sessionKey, ComposerNote(NoteKind.CMD_TITLE_REFUSED))
+                }
+            }
+            Command.STEER, Command.QUEUE -> store(command, text, claim, ready, runId)
+        }
+        if (running == null) commandInFlight = null else running.invokeOnCompletion { if (commandInFlight == claimed) commandInFlight = null }
+        return true
+    }
+
+    private fun refuse(kind: NoteKind, arg: String? = null): Boolean {
+        composer.setNote(sessionKey, ComposerNote(kind, arg))
+        return false
+    }
+
+    /**
+     * Clears the draft a command ran from, only if the holder still has [claim]'s text at its revision (a user edit keeps
+     * the revision, so the text is compared too). Called on the main thread, where user edits arrive too. Not through
+     * [onDraftChange], so a note set just before stays.
+     */
+    private fun clearIfClaimed(claim: ComposerState) {
+        if (composer.current(sessionKey).let { it.draft == claim.draft && it.revision == claim.revision }) composer.edit(sessionKey, "", claim.revision)
+    }
+
+    /**
+     * A row of this view model's send, plain or by command, was stored with [key]: the screen pins the list once the
+     * transcript shows it. Harmless once this view model was cleared.
+     */
+    private fun published(key: String) = local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) }
+
+    private fun send(runId: String?): Boolean {
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.sendWithImages(sessionKey) { text, images ->
-            // The field empties only once the text is stored; delivery problems after that show on the bubble. The
-            // counter tells the screen a row was stored, with the row's key, at the commit: the screen pins once the
-            // transcript shows it. Harmless once this view model was cleared. Published before stored() releases the
-            // claim: the next send of this chat cannot be claimed, so cannot publish its key, before this one has.
-            repo.send(sessionKey, text, images, onStored = { key -> local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) }; stored() })
+            // The field empties only once the text is stored; delivery problems after that show on the bubble. Published
+            // before stored() releases the claim: the next send of this chat cannot be claimed, so cannot publish its
+            // key, before this one has.
+            repo.send(sessionKey, text, images, onStored = { key -> published(key); stored() }, steerRun = runId)
             local.update { it.copy(notes = emptyMap()) }
         }
         if (started != null) accepted.tryEmit(Unit)
         return started != null
     }
+
+    /**
+     * /steer (only the drawn run, never a run send) and /queue (always queued, with the draft's ready photos). Not
+     * cancelled with the view model, like a pick: leaving the chat must not cut off a store whose draft was not cleared.
+     * A store that fails keeps the draft; a steer with no running run at the insert stores nothing.
+     */
+    private fun store(command: Command, text: String, claim: ComposerState, images: List<String>, runId: String?): Job =
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable) {
+                var stored = false
+                val onStored = { key: String ->
+                    stored = true
+                    published(key)
+                    accepted.tryEmit(Unit)
+                    clearIfClaimed(claim)
+                    if (command == Command.QUEUE) claim.images.forEach { composer.removeImage(sessionKey, it.id) } // failed ones too, as a send
+                }
+                try {
+                    if (command == Command.STEER) {
+                        repo.send(sessionKey, text, onStored = onStored, steerRun = runId, steerOnly = true)
+                    } else {
+                        repo.queue(sessionKey, text, images, onStored)
+                    }
+                    if (stored) local.update { it.copy(notes = emptyMap()) } else composer.setNote(sessionKey, ComposerNote(NoteKind.CMD_NOTHING_RUNNING))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: SendTooLarge) {
+                    composer.setNote(sessionKey, ComposerNote(NoteKind.IMAGES_TOO_LARGE))
+                } catch (_: Exception) {
+                    // nothing was stored (unknown or closed chat, a missing photo file): the draft stays
+                }
+            }
+        }
 
     override fun onStopClick(runId: String) = request { follower.stop(sessionKey, runId) }
 
@@ -408,25 +554,34 @@ class ChatViewModel(
         local.update { it.copy(sheet = null) }
     }
 
-    override fun pickModel(provider: String?, model: String?) = choose { it.copy(model = model, provider = provider) }
+    override fun pickModel(provider: String?, model: String?) {
+        choose { it.copy(model = model, provider = provider) }
+    }
 
-    override fun pickReasoning(level: String?) = choose { it.copy(reasoning = level) }
+    override fun pickReasoning(level: String?) {
+        choose { it.copy(reasoning = level) }
+    }
 
-    override fun toggleFast() = choose(close = false) { it.copy(fast = it.fast != true) }
+    override fun toggleFast() {
+        choose(close = false) { it.copy(fast = it.fast != true) }
+    }
 
     /**
      * Changes this chat's stored choice on this phone, in this connection only; makes no request. Started undispatched,
      * the change takes its place in the repository's choice order before this returns (so a send tapped next, from any
      * view model, waits for it), and it is not cancelled with the view model. A cleared view model starts nothing; a
-     * closed connection or a failed write drops it and the old choice stays.
+     * closed connection or a failed write drops it and the old choice stays. [onStored] gets the choice written, only
+     * when one was (a missing chat is left alone). Returns the write's job, null when nothing was started.
      */
-    private fun choose(close: Boolean = true, change: (ChatModel) -> ChatModel) {
-        if (!viewModelScope.isActive) return
+    private fun choose(close: Boolean = true, onStored: (ChatModel) -> Unit = {}, change: (ChatModel) -> ChatModel): Job? {
+        if (!viewModelScope.isActive) return null
         if (close) closeSheet()
-        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+        return viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
             withContext(NonCancellable) {
                 try {
-                    connected.repo.changeChoice(sessionKey, change) // connected.repo throws once the connection is closed
+                    var next: ChatModel? = null
+                    connected.repo.changeChoice(sessionKey) { change(it).also { c -> next = c } } // connected.repo throws once the connection is closed
+                    next?.let(onStored)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
