@@ -4,6 +4,7 @@ import androidx.room.withTransaction
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -87,7 +88,7 @@ private val handoff = Mutex()
 
 private enum class Attempt { STARTED, FAILED, STOP }
 
-/** How a drain ended: nothing left queued; sends left only behind busy chats; or stopped at a failure that stops all. */
+/** How a drain ended: nothing left to send; work left (behind busy chats, or a steer deferred); or stopped at a failure that stops all. */
 private enum class Drained { EMPTY, BLOCKED, STOPPED }
 
 private val UNCERTAIN_ERRORS = setOf(SendError.STEER_UNCERTAIN, SendError.UNCONFIRMED, SendError.EXPIRED_UNCERTAIN)
@@ -102,6 +103,9 @@ internal suspend fun quarantineAttemptedSends(db: AppDatabase) =
 
 /** Thrown inside the locks once the owning connection is closed. Writes pass it on; [SendQueue.drain] returns false. */
 private class QueueClosed : IllegalStateException("closed")
+
+/** Thrown by a steer the server refused for the key: like a queued send's 401, it stops the drain. */
+private class KeyRefused : Exception()
 
 /**
  * The durable path from "send" to "run started". Each message is stored with its exact request body and
@@ -124,6 +128,9 @@ class SendQueue(
     private val imageSize: (String) -> Long? = { null },
 ) {
     private val pendingDao = db.pendingSendDao()
+
+    // Drains of this queue that stopped, counted so a worker learns of a stop inside a settle's nested drain.
+    private val stops = java.util.concurrent.atomic.AtomicInteger()
 
     /** Test-only: runs in [retry] after its read and decision, before its write. */
     internal var beforeRetryWrite: suspend () -> Unit = {}
@@ -191,7 +198,7 @@ class SendQueue(
 
     /**
      * Starts queued sends oldest first. A session with a send in progress or an active run is skipped; its next
-     * send starts on a later drain, as the server runs one turn per session at a time. True when nothing is left queued.
+     * send starts on a later drain, as the server runs one turn per session at a time. True when nothing is left to send.
      */
     suspend fun drain(): Boolean = drainOnce() == Drained.EMPTY
 
@@ -217,16 +224,19 @@ class SendQueue(
                     Attempt.STOP -> return@withLock Drained.STOPPED
                 }
             }
-            if (pendingDao.allQueued().isEmpty()) Drained.EMPTY else Drained.BLOCKED
+            if (pendingDao.needsDrain()) Drained.BLOCKED else Drained.EMPTY
         } catch (_: QueueClosed) {
             Drained.STOPPED
+        } catch (_: KeyRefused) {
+            Drained.STOPPED
         }
-    }
+    }.also { if (it == Drained.STOPPED) stops.incrementAndGet() }
 
     /**
      * For SendWorker: [drain]; when queued sends still wait behind an active run (in the background no follower sees it
      * end), [settle] checks each such run once, outside the drain lock since its Finish drains on its own, then drains again.
-     * A drain that stopped (refused key, no network, closed queue) is left to the worker's backoff: nothing more is tried.
+     * A drain that stopped (refused key, no network, closed queue), also one nested in a settle, is left to the worker's
+     * backoff: nothing more is settled or drained.
      */
     suspend fun drainSettlingRuns(): Boolean {
         when (drainOnce()) {
@@ -234,6 +244,7 @@ class SendQueue(
             Drained.STOPPED -> return false
             Drained.BLOCKED -> Unit
         }
+        val before = stops.get()
         val blocking = db.activeRunDao().blockingQueued()
         if (blocking.isEmpty()) return false
         var undelivered = false
@@ -247,6 +258,7 @@ class SendQueue(
             } catch (_: Exception) {
                 // checked again on the worker's next try
             }
+            if (stops.get() != before) return false
         }
         return drain() && !undelivered
     }
@@ -343,16 +355,24 @@ class SendQueue(
         return steer(row.copy(runId = run.runId))
     }
 
-    /** Under both locks. Returns true when the steer was refused and the row became a queued run send. */
-    private suspend fun steer(row: PendingSendEntity): Boolean {
+    /**
+     * Under both locks. Returns true when the steer was refused and the row became a queued run send. A steer past the
+     * send expiry fails unsent; a refused key throws [KeyRefused]. Not cancellable: a new send's worker REPLACE must not
+     * cut the request off and leave its delivery uncertain.
+     */
+    private suspend fun steer(row: PendingSendEntity): Boolean = withContext(NonCancellable) {
         val sent = row.copy(attempted = true)
         ensureOpen()
-        if (pendingDao.update(sent) == 0) return false
+        if (pendingDao.update(sent) == 0) return@withContext false
+        if (expired(row)) {
+            fail(row, SendError.EXPIRED) // never sent: not attempted
+            return@withContext false
+        }
         try {
             api.steer(checkNotNull(row.runId), row.text)
             ensureOpen()
             pendingDao.update(sent.copy(state = PendingState.STEERED))
-            return false
+            return@withContext false
         } catch (e: ApiError) {
             ensureOpen()
             // A failed steer drops its run id, so cleanup of the run's rows cannot delete the undelivered text.
@@ -360,11 +380,14 @@ class SendQueue(
             when {
                 // The run is gone or no longer steerable: the text was not delivered, so send it as a new turn.
                 e == ApiError.NotFound || e is ApiError.Conflict ->
-                    return pendingDao.update(row.copy(state = PendingState.QUEUED, runId = null, attempted = false)) == 1
-                refused(e) -> pendingDao.update(failed.copy(error = errorCode(e), attempted = false))
+                    return@withContext pendingDao.update(row.copy(state = PendingState.QUEUED, runId = null, attempted = false)) == 1
+                refused(e) -> {
+                    pendingDao.update(failed.copy(error = errorCode(e), attempted = false))
+                    if (e == ApiError.Unauthorized) throw KeyRefused() // every later send would be refused too
+                }
                 else -> pendingDao.update(failed.copy(error = SendError.STEER_UNCERTAIN))
             }
-            return false
+            false
         }
     }
 

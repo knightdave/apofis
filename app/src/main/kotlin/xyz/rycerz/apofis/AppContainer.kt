@@ -544,9 +544,9 @@ class AppContainer(
     }
 
     // On every start with a connection and after every switch, so a process death between cancelling the durable
-    // work and enqueueing it again cannot strand queued sends. Idempotent: unique work, KEEP.
+    // work and enqueueing it again cannot strand queued sends or stored steers. Idempotent: unique work, KEEP.
     private suspend fun scheduleQueuedSends() {
-        runCatching { if (db.pendingSendDao().allQueued().isNotEmpty()) SendWorker.ensureScheduled(app) }.onFailure(::logFailure)
+        runCatching { if (db.pendingSendDao().needsDrain()) SendWorker.ensureScheduled(app) }.onFailure(::logFailure)
     }
 
     private fun commitOrThrow(editor: SharedPreferences.Editor) {

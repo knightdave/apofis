@@ -1600,4 +1600,47 @@ class SendQueueTest {
             assertRefused(listOf(d), expected = SendTooLarge::class.java)
         }
     }
+
+    // Issue 16 row 6: a stored steer is never delivered past the send expiry.
+    @Test
+    fun oldSteerNeverDelivered() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "a day late")
+        clock += SEND_EXPIRY_MS + 1
+        respond(fixture("steer_response.json")) // served only if the steer is wrongly sent
+
+        assertTrue(queue.drain())
+
+        assertEquals(0, server.requestCount)
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals(SendError.EXPIRED, row.error)
+        assertFalse(row.attempted)
+    }
+
+    // Issue 16 row 9: a refused key on a recovered steer stops the drain before any other send is tried.
+    @Test
+    fun recoveredSteer401KeepsOthersQueued() = runTest {
+        addSession("apofis-a")
+        addSession("apofis-b")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "steer under a refused key")
+        clock += 1
+        val waiting = queue.enqueue("apofis-b", "waits for a fixed key")
+        repeat(2) { respond("""{"error":{"code":"invalid_api_key"}}""", 401) } // two, so a second request fails the count
+
+        assertFalse(queue.drain())
+
+        assertEquals(1, server.requestCount)
+        val a = rows("apofis-a").single()
+        assertEquals("failed", a.state)
+        assertEquals(SendError.UNAUTHORIZED, a.error)
+        assertFalse(a.attempted)
+        val b = pending(waiting)
+        assertEquals("queued", b.state)
+        assertFalse(b.attempted)
+    }
 }

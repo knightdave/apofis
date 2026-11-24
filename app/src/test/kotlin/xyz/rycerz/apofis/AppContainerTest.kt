@@ -641,6 +641,28 @@ class AppContainerTest {
         container.connect(B)
         assertEquals(B, container.connected()!!.credentials)
     }
+
+    // Issue 16 row 8: a stored steer not yet sent (deferred by a delete the process did not survive) re-arms the worker.
+    @Test
+    fun deferredSteerRearmedAfterRestart() = runTest {
+        container.connect(A)
+        addSession("apofis-a")
+        db.pendingSendDao().upsert(
+            xyz.rycerz.apofis.db.PendingSendEntity( // qualified: this test is the only change to the file
+                idempotencyKey = "k", sessionKey = "apofis-a", text = "also do this", requestBody = "{}", createdAt = 1L,
+                state = "steering", runId = "run_1", error = null, attempted = false,
+            ),
+        )
+        val work = WorkManager.getInstance(app)
+        work.cancelAllWork().result.get()
+
+        val restarted = AppContainer(app, store) { db }
+        restarted.connected()
+
+        eventually("send work") {
+            work.getWorkInfosForUniqueWork(SendWorker.WORK_NAME).get().any { it.state == WorkInfo.State.ENQUEUED }
+        }
+    }
 }
 
 /** The real app, except that commits to the cache preferences throw while [failCommits] is set. */
