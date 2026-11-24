@@ -19,8 +19,14 @@ private const val STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 private const val ARG_VALUE_LIMIT = 40
 private const val STORED_PREVIEW = "apofis_preview" // the arguments preview of a call stored by [storedToolCalls]
 
-/** Turns stored session rows (oldest first) into chat items. Linear in the number of rows. */
-fun buildTranscript(rows: List<MessageDto>): List<ChatItem> {
+/** The key of the bubble showing user row [id]; the one place it is made. */
+fun userKey(id: Long) = "u$id"
+
+/**
+ * Turns stored session rows (oldest first) into chat items. Linear in the number of rows. A plain user row shows its
+ * parsed text and, per parsed image, the digest [bindings] (message id to digests) holds for it, else a placeholder.
+ */
+fun buildTranscript(rows: List<MessageDto>, bindings: Map<Long, List<String>> = emptyMap()): List<ChatItem> {
     val items = mutableListOf<Any>() // ChatItem, or a ReplyBuilder that may still receive tool results
     var reply: ReplyBuilder? = null
     // Calls waiting for a result, up to the next user bubble, even across notices.
@@ -33,8 +39,13 @@ fun buildTranscript(rows: List<MessageDto>): List<ChatItem> {
                 reply = null
                 waiting = HashMap() // fresh, since clear() keeps the peak capacity and costs that much per turn
                 val steered = kind == "steer"
-                val text = if (steered) unwrapSteer(row.content) else row.content
-                items += UserMessage("u${row.id}", text, steered, row.timestamp)
+                items += if (kind == null) {
+                    val parsed = parseUserContent(row.content)
+                    val images = bindings[row.id] ?: parsed.images.map { null }
+                    UserMessage(userKey(row.id), parsed.text, false, row.timestamp, images = images, raw = row.content)
+                } else {
+                    UserMessage(userKey(row.id), if (steered) unwrapSteer(row.content) else row.content, steered, row.timestamp, raw = row.content)
+                }
             }
             kind != null -> {
                 reply = null
