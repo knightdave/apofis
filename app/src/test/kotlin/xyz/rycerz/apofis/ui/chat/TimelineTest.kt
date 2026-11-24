@@ -67,6 +67,7 @@ import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.FIXED_TODAY
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.text.graphemeCut
 
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
@@ -461,7 +462,7 @@ class TimelineTest {
         for (text in generated + reviewer) {
             val caps = if (text.length > 2000) (1..text.length step 7) + (text.length - 120 until text.length).filter { it > 0 } + 1499 + 1500 + 20000 else 1..text.length
             for (cap in caps) {
-                val cut = cutAt(text, 0, cap)
+                val cut = graphemeCut(text, 0, cap, up = false)
                 val expected = lastBoundary(text, cap)
                 assertTrue("cap $cap exceeded: $cut", cut <= cap)
                 if (expected > 0) assertEquals("cap $cap in ${text.take(30)}", expected, cut)

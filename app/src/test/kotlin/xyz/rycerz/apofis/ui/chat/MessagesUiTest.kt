@@ -66,6 +66,7 @@ import xyz.rycerz.apofis.ui.FIXED_TODAY
 import xyz.rycerz.apofis.ui.markdown.COPY_NOTE_MS
 import xyz.rycerz.apofis.ui.markdown.MAX_CLIP_CHARS
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
+import xyz.rycerz.apofis.ui.text.graphemeCut
 
 /** Action rows, the user bubble collapse and the Select view. */
 @RunWith(RobolectricTestRunner::class)
@@ -322,7 +323,7 @@ class MessagesUiTest {
         val out = ArrayList<String>()
         var start = 0
         do {
-            val end = pieceEnd(text, start)
+            val end = graphemeCut(text, start, start + PAGE_CHARS, up = true)
             out += text.substring(start, end)
             start = end
         } while (start < text.length)
