@@ -44,6 +44,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.sync.isTemporaryKey
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.EaseOutCubic
 import xyz.rycerz.apofis.ui.theme.Motion
@@ -118,7 +119,7 @@ private fun Title(state: ChatUiState, onOpenConnection: () -> Unit, onRetryLoad:
             .padding(horizontal = 4.dp),
         verticalArrangement = Arrangement.Center,
     ) {
-        val title = state.title.ifEmpty { stringResource(R.string.chat_new_title) }
+        val title = if (isTemporaryKey(state.sessionKey)) stringResource(R.string.chat_temporary_title) else state.title.ifEmpty { stringResource(R.string.chat_new_title) }
         AnimatedContent(
             title,
             transitionSpec = {

@@ -1,0 +1,660 @@
+package xyz.rycerz.apofis.ui.drawer
+
+import android.app.Application
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import androidx.work.testing.WorkManagerTestInitHelper
+import java.time.ZoneOffset
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import javax.crypto.KeyGenerator
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import mockwebserver3.Dispatcher
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
+import mockwebserver3.RecordedRequest
+import mockwebserver3.SocketEffect
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import xyz.rycerz.apofis.AppContainer
+import xyz.rycerz.apofis.Connected
+import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.chat.ComposerNote
+import xyz.rycerz.apofis.chat.NoteKind
+import xyz.rycerz.apofis.db.ActiveRunEntity
+import xyz.rycerz.apofis.db.AppDatabase
+import xyz.rycerz.apofis.db.MessageEntity
+import xyz.rycerz.apofis.db.PendingSendEntity
+import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.push.WakeTarget
+import xyz.rycerz.apofis.push.check
+import xyz.rycerz.apofis.run.RunFollower
+import xyz.rycerz.apofis.settings.CredentialStore
+import xyz.rycerz.apofis.settings.Credentials
+import xyz.rycerz.apofis.sync.ChatRepository
+import xyz.rycerz.apofis.sync.SendQueue
+import xyz.rycerz.apofis.sync.isBeingDeleted
+import xyz.rycerz.apofis.sync.isTemporaryKey
+
+internal const val T = "apofis-tmp-t"
+internal const val T2 = "apofis-tmp-u"
+internal const val A = "apofis-a"
+internal const val B = "apofis-b"
+
+/**
+ * The drawer's graph for the temporary chat tests: a real repository, queue and follower against a recording server.
+ * Main runs eagerly (unconfined) on [leaveClock]: the leave's ten second bound moves only when a test advances it, so
+ * a request or a Room query on another thread never makes it fire. (Under runTest the runner skips to any pending
+ * virtual timeout, even Long.MAX_VALUE, while the test waits on another thread; the bodies use runBlocking.)
+ * Room runs its queries one at a time on [roomThread], in order: see [settled].
+ */
+abstract class TemporaryFixture {
+    protected lateinit var server: MockWebServer
+    protected lateinit var db: AppDatabase
+    protected lateinit var connected: Connected
+    protected lateinit var follower: RunFollower
+    protected val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    protected val routes = ConcurrentHashMap<String, (RecordedRequest) -> MockResponse>()
+    protected val requests = CopyOnWriteArrayList<RecordedRequest>()
+    protected val store = ViewModelStore()
+    protected val clock = AtomicLong(1_800_000_000_000L)
+    protected val leaveClock = TestCoroutineScheduler()
+    protected val gaveUp = AtomicBoolean(false)
+    private val created = CopyOnWriteArrayList<DrawerViewModel>()
+    private val stores = CopyOnWriteArrayList<ViewModelStore>()
+    private val roomThread = Executors.newSingleThreadExecutor()
+
+    @Before
+    fun setUpGraph() {
+        Dispatchers.setMain(UnconfinedTestDispatcher(leaveClock))
+        server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requests += request
+                return routes["${request.method} ${request.target.substringBefore('?')}"]?.invoke(request)
+                    ?: MockResponse.Builder().code(500).build()
+            }
+        }
+        server.start()
+        db = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Application>(), AppDatabase::class.java)
+            .allowMainThreadQueries().setQueryCoroutineContext(roomThread.asCoroutineDispatcher()).build()
+        val api = HermesApi(server.url("/").toString(), "secret-key")
+        lateinit var f: RunFollower
+        val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, clock::get, {})
+        val repo = ChatRepository(api, db, clock::get, queue)
+        f = RunFollower(api, db, repo, scope, delayMs = { delay(minOf(it, 20L)) })
+        follower = f
+        connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, f, AtomicBoolean(true), scope)
+    }
+
+    @After
+    fun tearDownGraph() {
+        assertFalse("a held response timed out", gaveUp.get())
+        val scopes = created.map { it.viewModelScope.coroutineContext.job }
+        store.clear()
+        stores.forEach { it.clear() }
+        runBlocking { withTimeout(60_000) { scopes.joinAll() } }
+        follower.pauseAll()
+        runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
+        db.close()
+        roomThread.shutdown()
+        server.close()
+        Dispatchers.resetMain()
+    }
+
+    /**
+     * Every Room query queued before this one has run, with the work it resumed (Main is eager) up to its next query:
+     * a leave started earlier has by now set its deleting mark ([isBeingDeleted]).
+     */
+    protected suspend fun settled() {
+        db.sessionDao().get("")
+    }
+
+    protected fun vm(lastChat: String? = null, on: Connected = connected, into: ViewModelStore = store): DrawerViewModel = ViewModelProvider.create(
+        into,
+        viewModelFactory { initializer { DrawerViewModel(on, lastChat = lastChat, now = clock::get, zone = { ZoneOffset.UTC }) } },
+    ).get(DrawerViewModel::class).also {
+        created += it
+        stores += into
+    }
+
+    /** Holds a response until the test opens the gate; a timeout never answers normally and fails the test. */
+    protected fun CountDownLatch.hold() {
+        if (!await(10, TimeUnit.SECONDS)) {
+            gaveUp.set(true)
+            throw IllegalStateException("a held response timed out")
+        }
+    }
+
+    protected fun json(code: Int, body: String) = MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build()
+
+    protected fun deleted(id: String) {
+        routes["DELETE /api/sessions/$id"] = { json(200, """{"object":"hermes.session.deleted","id":"$id","deleted":true}""") }
+    }
+
+    protected fun stopOk(run: String) {
+        routes["POST /v1/runs/$run/stop"] = { json(200, """{"run_id":"$run","status":"stopping"}""") }
+    }
+
+    protected suspend fun session(
+        key: String,
+        title: String = "Title $key",
+        onServer: Boolean = true,
+        createStarted: Boolean = false,
+        currentId: String = key,
+        lineage: String = "",
+        hidden: Boolean = false,
+        active: Double = clock.get() / 1000.0,
+    ) = db.sessionDao().upsert(
+        SessionEntity(
+            key = key, currentId = currentId, lineageIds = lineage, title = title, pinned = false, archived = false, startedAt = active,
+            lastActiveAt = active, messageCount = 2, preview = null, stale = false, existsOnServer = onServer, hidden = hidden,
+            createStarted = createStarted,
+        ),
+    )
+
+    protected suspend fun message(key: String, text: String = "hello") = db.messageDao().insertAll(
+        listOf(MessageEntity(key, 0, 1, "user", null, text, null, null, null, null, clock.get() / 1000.0, null)),
+    )
+
+    protected suspend fun pending(key: String, id: String = "p-$key") =
+        db.pendingSendDao().upsert(PendingSendEntity(id, key, "queued text", "{}", clock.get(), "queued", null, null))
+
+    protected suspend fun run(key: String, run: String) = db.activeRunDao().upsert(ActiveRunEntity(run, key, null, "running", 1L))
+
+    protected fun lines() = requests.map { "${it.method} ${it.target}" }
+    protected fun deletes() = lines().filter { it.startsWith("DELETE ") }
+    protected fun stops() = lines().filter { it.endsWith("/stop") }
+
+    protected suspend fun <V> StateFlow<V>.await(condition: (V) -> Boolean): V =
+        withContext(Dispatchers.Default) { withTimeout(60_000) { first(condition) } }
+
+    /** A watchdog only: waits in real time for work on other threads (the server, Room). */
+    protected suspend fun until(condition: suspend () -> Boolean) =
+        withContext(Dispatchers.Default) { withTimeout(60_000) { while (!condition()) delay(5) } }
+
+    protected fun List<DrawerRow>.chats() = filterIsInstance<DrawerRow.Chat>().map { it.key }
+
+    protected fun note(key: String) = connected.composer.current(key).note
+
+    protected val notDeleted = ComposerNote(NoteKind.TEMPORARY_NOT_DELETED)
+}
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [37])
+class TemporaryLeaveTest : TemporaryFixture() {
+
+    @Test
+    fun hiddenOnlyWhileOpen() = runBlocking<Unit> {
+        session(T, title = "Secret plan")
+        session(A)
+        routes["DELETE /api/sessions/$T"] = { MockResponse.Builder().code(500).build() }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.rows.await { A in it.chats() && T !in it.chats() }
+        vm.onQuery("Secret")
+        vm.rows.await { it.chats().isEmpty() } // search leaves it out too while it is open
+
+        vm.onQuery("")
+        vm.onSelect(A)
+        until { note(A) == notDeleted } // the leave failed
+        assertTrue(T in vm.rows.await { T in it.chats() }.chats()) // listed (its row draws the fixed title)
+        vm.onQuery("Secret")
+        assertEquals(listOf(T), vm.rows.await { T in it.chats() }.chats()) // found by its stored title
+
+        vm.onQuery("")
+        vm.onSelect(T)
+        vm.selected.await { it == T }
+        vm.rows.await { T !in it.chats() }
+        vm.onQuery("Secret")
+        vm.rows.await { it.chats().isEmpty() }
+        assertEquals(1, deletes().size)
+    }
+
+    @Test
+    fun failedLeaveKeepsAndListsIt() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        message(T)
+        pending(T)
+        routes["DELETE /api/sessions/$T"] = { MockResponse.Builder().onResponseStart(SocketEffect.CloseSocket()).build() } // offline
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+
+        vm.onSelect(A)
+        until { note(A) == notDeleted }
+        assertNotNull(db.sessionDao().get(T))
+        assertTrue(db.messageDao().hasRows(T))
+        assertEquals(1, db.pendingSendDao().rows(T).size)
+        vm.rows.await { T in it.chats() }
+
+        deleted(T) // online again: the drawer's Delete removes it
+        vm.onDeleteRequest(T)
+        vm.confirmDelete(vm.prompt.value!!.token)
+        vm.prompt.await { it == null }
+        assertNull(db.sessionDao().get(T))
+        assertEquals(A, vm.selected.value)
+    }
+
+    @Test
+    fun leaveDeletesNewestFirstRootLast() = runBlocking<Unit> {
+        val r = "apofis-tmp-r"
+        session(r, currentId = "s2", lineage = "s1")
+        session(A)
+        listOf("s2", "s1", r).forEach(::deleted)
+        val vm = vm(lastChat = r)
+        vm.selected.await { it == r }
+
+        vm.onSelect(A)
+        until { db.sessionDao().get(r) == null }
+        assertEquals(listOf("DELETE /api/sessions/s2", "DELETE /api/sessions/s1", "DELETE /api/sessions/$r"), deletes())
+        assertNull(note(A))
+    }
+
+    @Test
+    fun leaveStopsAtFirstInexactAnswer() = runBlocking<Unit> {
+        val r = "apofis-tmp-r"
+        session(r, currentId = "s2", lineage = "s1")
+        session(A)
+        deleted("s2")
+        routes["DELETE /api/sessions/s1"] = { json(200, """{"deleted":true}""") }
+        deleted(r)
+        val vm = vm(lastChat = r)
+        vm.selected.await { it == r }
+
+        vm.onSelect(A)
+        until { note(A) == notDeleted }
+        assertEquals(listOf("DELETE /api/sessions/s2", "DELETE /api/sessions/s1"), deletes())
+        assertNotNull(db.sessionDao().get(r))
+        vm.rows.await { r in it.chats() }
+    }
+
+    @Test
+    fun leaveWaitsForStoppedRunThenDeletes() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        run(T, "run_t")
+        stopOk("run_t")
+        // A DELETE that arrives while the run is still stored meets the server's 409, as a running turn would.
+        val removed = AtomicBoolean(false)
+        routes["DELETE /api/sessions/$T"] = {
+            if (removed.get()) json(200, """{"object":"hermes.session.deleted","id":"$T","deleted":true}""")
+            else json(409, """{"error":{"code":"session_active_turn","message":"busy"}}""")
+        }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+
+        vm.onSelect(A)
+        until { stops().isNotEmpty() }
+        leaveClock.advanceTimeBy(9_000) // the manual clock: nine seconds pass while the run is still stored
+        assertTrue(deletes().isEmpty())
+        assertNull(note(A))
+
+        removed.set(true)
+        db.activeRunDao().delete("run_t") // the follower removes it when the run ends
+        until { db.sessionDao().get(T) == null }
+        assertEquals(listOf("POST /v1/runs/run_t/stop"), stops())
+        assertEquals(listOf("DELETE /api/sessions/$T"), deletes())
+        assertNull(note(A))
+    }
+
+    @Test
+    fun leaveGivesUpAfterTenSeconds() = runBlocking<Unit> {
+        // The run never ends.
+        session(T)
+        session(T2)
+        session(A)
+        session(B)
+        run(T, "run_t")
+        stopOk("run_t")
+        deleted(T)
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.onSelect(A)
+        until { stops().isNotEmpty() }
+        leaveClock.advanceTimeBy(9_999)
+        assertNull(note(A))
+        leaveClock.advanceTimeBy(1)
+        leaveClock.runCurrent()
+        until { note(A) == notDeleted }
+        assertTrue(deletes().isEmpty())
+        assertNotNull(db.sessionDao().get(T))
+        vm.rows.await { T in it.chats() }
+
+        // The server never answers; its late 409 changes nothing more.
+        val gate = CountDownLatch(1)
+        routes["DELETE /api/sessions/$T2"] = { gate.hold(); json(409, """{"error":{"code":"session_active_turn","message":"busy"}}""") }
+        vm.onSelect(T2)
+        vm.selected.await { it == T2 }
+        vm.onSelect(B)
+        until { deletes().contains("DELETE /api/sessions/$T2") }
+        leaveClock.advanceTimeBy(10_000)
+        leaveClock.runCurrent()
+        until { note(B) == notDeleted }
+        gate.countDown()
+        until { !isBeingDeleted(T2) }
+        assertNotNull(db.sessionDao().get(T2))
+        vm.rows.await { T2 in it.chats() }
+        assertEquals(B, vm.selected.value)
+        assertEquals(notDeleted, note(B))
+        assertEquals(1, deletes().count { it == "DELETE /api/sessions/$T2" })
+    }
+
+    @Test
+    fun leaveDoesNotBlockNextSelection() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        session(B)
+        val gate = CountDownLatch(1)
+        routes["DELETE /api/sessions/$T"] = { gate.hold(); json(200, """{"object":"hermes.session.deleted","id":"$T","deleted":true}""") }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.onSelect(A)
+        until { deletes().isNotEmpty() }
+
+        vm.onSelect(B) // takes only the selection lock: done while the DELETE is held
+        vm.selected.await { it == B }
+        assertFalse("selected only after the held DELETE gave up", gaveUp.get())
+        assertEquals(1L, gate.count)
+
+        // A new chat needs the repository lock, which the held DELETE keeps: it completes once that answers.
+        val fresh = async(Dispatchers.Default) { vm.onNewChat() }
+        gate.countDown()
+        val key = withTimeout(60_000) { fresh.await() }
+        assertEquals(key, vm.selected.value)
+        until { db.sessionDao().get(T) == null }
+    }
+
+    @Test
+    fun listedAfterRestartWithAnotherChatSelected() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        val vm = vm(lastChat = A) // the selection was stored, the process died before the Delete
+        vm.selected.await { it == A }
+        vm.rows.await { T in it.chats() && A in it.chats() }
+        assertTrue(requests.isEmpty())
+    }
+
+    @Test
+    fun storedTemporaryStaysOpenAtStart() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.rows.await { A in it.chats() && T !in it.chats() }
+        assertTrue(requests.isEmpty())
+        assertNotNull(db.sessionDao().get(T))
+    }
+
+    @Test
+    fun newChatLeaves() = runBlocking<Unit> {
+        val vm = vm()
+        vm.selected.await { it != null }
+        val local = vm.toggleTemporary()!! // an empty, never-created temporary chat
+        vm.newChat() // the drawer's New chat row
+        val ordinary = vm.selected.await { it != local }!!
+        assertFalse(isTemporaryKey(ordinary))
+        until { db.sessionDao().get(local) == null }
+        assertTrue(requests.isEmpty())
+
+        session(T)
+        message(T)
+        deleted(T)
+        vm.onSelect(T)
+        vm.selected.await { it == T }
+        vm.newChat()
+        val next = vm.selected.await { it != T }!!
+        assertFalse(isTemporaryKey(next))
+        until { db.sessionDao().get(T) == null }
+        assertEquals(listOf("DELETE /api/sessions/$T"), deletes())
+    }
+
+    @Test
+    fun notificationTapForAnotherChatLeaves() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        deleted(T)
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        assertTrue(vm.selectTapped(A) { true })
+        assertEquals(A, vm.selected.value)
+        until { db.sessionDao().get(T) == null }
+        assertEquals(listOf("DELETE /api/sessions/$T"), deletes())
+    }
+
+    @Test
+    fun callerCancelledAfterSelectionStillDeletes() = runBlocking<Unit> {
+        session(T)
+        session(T2)
+        session(A)
+        val gate = CountDownLatch(1)
+        routes["DELETE /api/sessions/$T"] = { gate.hold(); json(200, """{"object":"hermes.session.deleted","id":"$T","deleted":true}""") }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        val caller = launch(Dispatchers.Default) { vm.selectTapped(A) { true } }
+        until { deletes().isNotEmpty() }
+        caller.cancelAndJoin() // a recreated activity
+        gate.countDown()
+        until { db.sessionDao().get(T) == null }
+
+        // A share accepted from a temporary chat, its caller cancelled while it fills the new chat; the DELETE fails.
+        val failGate = CountDownLatch(1)
+        routes["DELETE /api/sessions/$T2"] = { failGate.hold(); MockResponse.Builder().code(500).build() }
+        vm.onSelect(T2)
+        vm.selected.await { it == T2 }
+        var fresh: String? = null
+        val sharer = launch(Dispatchers.Default) { vm.openFreshChatIf(T2, { true }) { fresh = it; awaitCancellation() } }
+        until { fresh != null }
+        sharer.cancelAndJoin()
+        until { deletes().contains("DELETE /api/sessions/$T2") }
+        failGate.countDown()
+        until { note(fresh!!) == notDeleted }
+        assertEquals(fresh, vm.selected.value)
+        assertNotNull(db.sessionDao().get(T2))
+        vm.rows.await { T2 in it.chats() }
+    }
+
+    @Test
+    fun neverCreatedTemporaryLeavesLocally() = runBlocking<Unit> {
+        val vm = vm()
+        vm.selected.await { it != null }
+        val local = vm.toggleTemporary()!!
+        session(A)
+        vm.onSelect(A)
+        vm.selected.await { it == A }
+        until { db.sessionDao().get(local) == null }
+        assertTrue(requests.isEmpty())
+        assertNull(note(A))
+    }
+
+    @Test
+    fun openFreshChatIfLostClaimLeavesNothing() = runBlocking<Unit> {
+        session(T)
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        var filled = false
+        assertNull(vm.openFreshChatIf(T, { false }) { filled = true })
+        assertNull(vm.openFreshChatIf(A, { true }) { filled = true }) // not the selected chat
+        assertFalse(filled)
+        assertEquals(T, vm.selected.value)
+        assertEquals(listOf(T), db.sessionDao().all().map { it.key })
+        assertTrue(requests.isEmpty())
+    }
+
+    // ---- controls: nothing but leaving deletes ----
+
+    @Test
+    fun drawerSelectionOfTheSameChatKeepsIt() = runBlocking<Unit> {
+        session(T)
+        deleted(T)
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.onSelect(T)
+        vm.reopened.await { it?.key == T }
+        assertTrue(vm.selectTapped(T) { true })
+        settled()
+        assertFalse(isBeingDeleted(T))
+        assertEquals(T, vm.selected.value)
+        assertNotNull(db.sessionDao().get(T))
+        assertTrue(requests.isEmpty())
+    }
+
+    @Test
+    fun staleTargetLeavesNothing() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        session("apofis-h", hidden = true)
+        deleted(T)
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.onSelect("apofis-gone")
+        vm.onSelect("apofis-h")
+        assertFalse(vm.selectTapped(A) { false }) // a tap of another graph
+        assertFalse(vm.selectTapped("apofis-gone") { true })
+        settled()
+        assertFalse(isBeingDeleted(T))
+        assertEquals(T, vm.selected.value)
+        assertNotNull(db.sessionDao().get(T))
+        assertTrue(requests.isEmpty())
+    }
+
+    @Test
+    fun viewModelTeardownLeavesNothing() = runBlocking<Unit> {
+        session(T)
+        run(T, "run_t")
+        stopOk("run_t")
+        deleted(T)
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        store.clear()
+        assertNotNull(db.sessionDao().get(T))
+        assertTrue(stops().isEmpty())
+        assertTrue(deletes().isEmpty())
+    }
+
+    // ---- controls through the app's container: a switch, a key change and the background lanes ----
+
+    private val app = ApplicationProvider.getApplicationContext<Application>()
+    private val aes = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+
+    private suspend fun container(): AppContainer {
+        WorkManagerTestInitHelper.initializeTestWorkManager(app)
+        return AppContainer(app, CredentialStore(app) { aes }) { db }
+    }
+
+    @Test
+    fun serverSwitchDeletesNothing() = runBlocking<Unit> {
+        val other = MockWebServer()
+        val otherRequests = CopyOnWriteArrayList<RecordedRequest>()
+        other.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                otherRequests += request
+                return MockResponse.Builder().code(500).build()
+            }
+        }
+        other.start()
+        try {
+            val c = container()
+            c.connect(Credentials(server.url("/").toString(), "key-1"))
+            session(T)
+            run(T, "run_t")
+            stopOk("run_t")
+            deleted(T)
+            c.preferences.lastChat = T
+            val graph = ViewModelStore()
+            val first = vm(lastChat = T, on = c.connected()!!, into = graph)
+            first.selected.await { it == T }
+
+            c.connect(Credentials(other.url("/").toString(), "key-1")) // another server: the cached tables go
+            graph.clear()
+            val second = vm(lastChat = c.preferences.lastChat, on = c.connected()!!, into = ViewModelStore())
+            second.selected.await { it != null }
+            assertTrue(deletes().isEmpty() && stops().isEmpty())
+            assertTrue(otherRequests.none { it.method == "DELETE" || it.target.endsWith("/stop") })
+        } finally {
+            other.close()
+        }
+    }
+
+    @Test
+    fun keyChangeAtSameServerKeepsTemporary() = runBlocking<Unit> {
+        val c = container()
+        c.connect(Credentials(server.url("/").toString(), "key-1"))
+        session(T)
+        session(A)
+        deleted(T)
+        c.preferences.lastChat = T
+        val graph = ViewModelStore()
+        vm(lastChat = T, on = c.connected()!!, into = graph).selected.await { it == T }
+
+        c.connect(Credentials(server.url("/").toString(), "key-2")) // the same server: the cache stays
+        graph.clear()
+        val next = vm(lastChat = c.preferences.lastChat, on = c.connected()!!, into = ViewModelStore())
+        next.selected.await { it == T }
+        next.rows.await { A in it.chats() && T !in it.chats() }
+        assertNotNull(db.sessionDao().get(T))
+        assertTrue(deletes().isEmpty())
+    }
+
+    @Test
+    fun workerAndPushStartsLeaveNothing() = runBlocking<Unit> {
+        val c = container()
+        c.connect(Credentials(server.url("/").toString(), "key-1"))
+        session(T)
+        run(T, "run_t")
+        pending(T)
+        stopOk("run_t")
+        deleted(T)
+        c.preferences.lastChat = T
+
+        // A process started by the send worker or a push wake: the container only, no drawer.
+        val cold = container()
+        val conn = cold.load()!!
+        runCatching { conn.sendQueue.drainSettlingRuns() }
+        runCatching { check(app, WakeTarget(conn, cold.epoch(), cold.notifier)) }
+        assertNotNull(db.sessionDao().get(T))
+        assertTrue(stops().isEmpty())
+        assertTrue(deletes().isEmpty())
+        assertEquals(T, cold.preferences.lastChat)
+        assertNotEquals(0, requests.size) // the lanes did run against the server
+    }
+}
