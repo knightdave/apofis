@@ -335,13 +335,15 @@ class ShareIntakeTest {
     @Test
     fun newestShareWins() = runBlocking<Unit> {
         val c = container
-        c.readSharedItems = { text((it as ShareIntent.Text).text) }
+        val secondRead = CompletableDeferred<Unit>()
+        c.readSharedItems = { val t = (it as ShareIntent.Text).text; if (t == "second") secondRead.await(); text(t) }
         c.offerShare(ShareIntent.Text("first"))
         val first = withTimeout(10_000) { c.pendingShare.first { it != null } }!!
         assertEquals("first", first.text)
 
         c.offerShare(ShareIntent.Text("second"))
-        assertNull(c.pendingShare.value) // the older sheet closes at once
+        assertNull(c.pendingShare.value) // the older sheet closes at once, before the newer one is read
+        secondRead.complete(Unit)
         val second = withTimeout(10_000) { c.pendingShare.first { it != null } }!!
         assertEquals("second", second.text)
         assertTrue(second.version > first.version)

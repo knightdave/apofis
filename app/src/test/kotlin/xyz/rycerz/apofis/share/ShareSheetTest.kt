@@ -255,8 +255,8 @@ class ShareSheetTest : ShareFixture() {
     fun acceptOpensNewChatWithDraft() = inRoute(SHARED_A, seedA()) {
         waitSelected { it == SHARED_A }
         val photos = listOf(photo(Color.RED), photo(Color.BLUE))
-        offer("Look at these", photos)
-        waitVisible(title)
+        offer("Look at these", photos, setOf(NoteKind.SHARE_TEXT_CUT, NoteKind.SHARE_IMAGES_FAILED))
+        waitVisible(str(R.string.share_images_failed))
         rule.onNodeWithText(accept).performClick()
         val k = acceptedFrom(SHARED_A)
         waitGone(title)
@@ -269,7 +269,7 @@ class ShareSheetTest : ShareFixture() {
         assertEquals(photos.map(::sha), draft.images.map { it.digest })
         assertTrue(draft.images.none { it.processing || it.failed })
         draft.images.forEach { assertNotNull(container.imageStore.read(it.digest!!)) }
-        assertNull(draft.note)
+        assertEquals(ComposerNote(NoteKind.SHARE_IMAGES_FAILED), draft.note) // one note, in the sheet's order
         assertNull(container.pendingShare.value)
         assertEquals(emptyList<String>(), writes())
         waitVisible("Look at these") // the composer shows the draft
@@ -375,6 +375,25 @@ class ShareSheetTest : ShareFixture() {
         assertFalse(visible("first share"))
     }
 
+    /** An Accept of a share no longer in the slot, or for a connection no longer current, stores nothing and opens nothing. */
+    @Test
+    fun staleAcceptStoresNothing() = inRoute(SHARED_A, seedA()) {
+        waitSelected { it == SHARED_A }
+        val a = offer("the share", listOf(photo(Color.RED)))
+        var opened = 0
+        val count: suspend (String, () -> Boolean, suspend (String) -> Unit) -> String? = { _, _, _ -> opened++; null }
+        assertFalse(acceptAs(a.copy(version = a.version + 1), SHARED_A, count)) // a version the slot does not hold
+        assertEquals(emptyList<String>(), imageFiles())
+
+        val generation = container.connection.value!!.generation
+        runBlocking { container.connect(Credentials(url, "key-2")) } // a key change at the same server keeps the cache
+        val stale = ShareToken(a.version, generation, SHARED_A)
+        assertFalse(runBlocking { container.acceptShare(stale, count) })
+        assertEquals(emptyList<String>(), imageFiles())
+        assertEquals(0, opened)
+        assertEquals(a, container.pendingShare.value)
+    }
+
     @Test
     fun switchAfterPutReshows() = inRoute(SHARED_A, seedA()) {
         waitSelected { it == SHARED_A }
@@ -440,7 +459,20 @@ class ShareSheetTest : ShareFixture() {
         assertEquals(keys + k, sessionKeys())
         assertEquals("only once", composerOf(k).draft)
         assertEquals(1, composerOf(k).images.size)
-        assertFalse(container.claimShare(ShareToken(0, container.connection.value!!.generation, k)))
+        assertNull(container.pendingShare.value)
+    }
+
+    @Test
+    fun sheetWaitsForDrawerPrompt() = inRoute(SHARED_A, seedA()) {
+        waitSelected { it == SHARED_A }
+        drawer().onLongPress(SHARED_A)
+        waitVisible(str(R.string.drawer_rename))
+        offer("after the prompt")
+        rule.waitForIdle()
+        assertFalse(visible(title)) // a drawer prompt is shown first
+        Espresso.pressBack()
+        waitVisible("after the prompt")
+        assertTrue(visible(title))
     }
 
     @Test
