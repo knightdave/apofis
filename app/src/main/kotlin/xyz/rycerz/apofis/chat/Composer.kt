@@ -253,6 +253,23 @@ class Composer(private val scope: CoroutineScope) {
     /** Discards the unsent entry [id], the one the user agreed to discard; any other entry stays. */
     fun discard(sessionKey: String, id: Long) = change(sessionKey) { s, _ -> if (s.unsent?.id == id) s.copy(unsent = null) else s }
 
+    /**
+     * Moves the composer of [from] to [to] (a chat made temporary or ordinary): draft, photos, note and unsent text, on a
+     * fresh revision, so an edit drawn before is dropped. False, with nothing changed, while a send of [from] is being
+     * stored or either key is a deleted chat with a send in flight.
+     */
+    fun move(from: String, to: String): Boolean {
+        var moved = false
+        book.update { b ->
+            val entry = b.entries[from]
+            moved = from !in b.gone && to !in b.gone && entry?.sending != true
+            if (!moved) return@update b
+            val rest = b.copy(entries = b.entries - from, rested = b.rested - from - to)
+            if (entry == null) rest else rest.copy(entries = rest.entries + (to to entry.copy(revision = b.counter + 1)), counter = b.counter + 1)
+        }
+        return moved
+    }
+
     /** The chat was deleted with the user's confirmation: its entry goes, and a send failing later brings nothing back. */
     fun remove(sessionKey: String) = book.update { b ->
         val inFlight = b.entries[sessionKey]?.sending == true

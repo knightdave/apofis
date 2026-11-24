@@ -28,6 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import xyz.rycerz.apofis.OPEN_CHAT
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.sync.isTemporaryKey
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.NoticeStateEntity
 
@@ -332,7 +333,9 @@ class Notifier(
 
     /** A chat that may be named: on this phone and not hidden. */
     private suspend fun title(key: String): String? =
-        db.sessionDao().get(key)?.takeIf { !it.hidden }?.let { it.title?.takeIf(String::isNotBlank) ?: context.getString(R.string.chat_new_title) }
+        db.sessionDao().get(key)?.takeIf { !it.hidden }?.let {
+            if (isTemporaryKey(it.key)) context.getString(R.string.chat_temporary_title) else it.title?.takeIf(String::isNotBlank) ?: context.getString(R.string.chat_new_title)
+        }
 
     private fun shownIn(key: String) = nm.activeNotifications.filter { it.tag == key }
     private fun StatusBarNotification.extra(name: String) = notification.extras.getString(name)
