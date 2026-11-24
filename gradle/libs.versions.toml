@@ -1,6 +1,6 @@
 [versions]
 # Android SDK levels. Single source of truth: Gradle reads these via `libs`,
-# flake.nix via builtins.fromTOML and CI via scripts/sdk-packages.sh.
+# flake.nix via builtins.fromTOML and CI via scripts/sdk-versions.sh.
 minSdk = "31"
 compileSdk = "37"
 compileSdkMinor = "2"

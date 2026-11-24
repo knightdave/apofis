@@ -36,12 +36,13 @@ import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ChatText
 import xyz.rycerz.apofis.ui.theme.scaled
+import xyz.rycerz.apofis.ui.text.graphemeCut
 
 /**
  * A message's raw text (line endings LF), selectable, on its own page: selection across lazy list rows is unreliable.
- * Any length: the text is shown in [pieceEnd] pieces, one lazy item each, found as the reader reaches the last one
- * (opening reads one piece, never the whole message); selection works within a piece, and the shown pieces
- * concatenate to the text exactly. Nothing is saved: a reopened or recreated view starts at the top.
+ * Any length: the text is shown in [PAGE_CHARS] pieces ([graphemeCut] up), one lazy item each, found as the reader
+ * reaches the last one (opening reads one piece, never the whole message); selection works within a piece, and the
+ * shown pieces concatenate to the text exactly. Nothing is saved: a reopened or recreated view starts at the top.
  */
 @Composable
 fun SelectTextScreen(text: CharSequence, onBack: () -> Unit) {
@@ -70,7 +71,7 @@ private fun Pieces(text: CharSequence) {
     var found by remember { mutableIntStateOf(1) }
     val listState = remember { LazyListState() } // not saved: see above
     fun end(i: Int): Int {
-        while (ends.size <= i) ends += pieceEnd(text, ends.lastOrNull() ?: 0)
+        while (ends.size <= i) ends += selectPieceEnd(text, ends.lastOrNull() ?: 0)
         return ends[i]
     }
     // The next piece once the last found one is on screen (laid out, not merely prefetched).
@@ -92,3 +93,7 @@ private class Source {
     var text: CharSequence? = null
     var version = 0
 }
+
+/** The end of the Select piece of [text] that starts at [start]: [PAGE_CHARS] on, at the end of [text] at most. */
+internal fun selectPieceEnd(text: CharSequence, start: Int): Int =
+    graphemeCut(text, start, start + minOf(PAGE_CHARS, text.length - start), up = true) // never past Int range
