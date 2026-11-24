@@ -311,7 +311,15 @@ class ImageSendTest {
         tap(plus)
         assertTrue(launches[2].contract is PickMultipleVisualMedia)
         assertEquals(2, pickLimit(launches[2]))
-        assertEquals(0, recorder.limits)
+        ui = state(ready(9))
+        frames(3)
+        tap(plus)
+        assertTrue("one left: the single picker", launches[3].contract is PickVisualMedia)
+        ui = state(ready(10))
+        frames(3)
+        tap(plus)
+        assertEquals(4, launches.size)
+        assertEquals(1, recorder.limits)
     }
 
     @Test
