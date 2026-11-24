@@ -38,9 +38,21 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextReplacement
+import xyz.rycerz.apofis.settings.ThemeMode
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.db.AppDatabase
@@ -59,7 +71,12 @@ private const val FACE = "😀" // one code point, two UTF-16 units
 /** The drawer's rename: counted in code points, cleaned as the server cleans, and short enough for a create suffix. */
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE) // the dialog's window settles only with native graphics, as in SessionActionsSheetTest
+@Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
 class RenameTest {
+    @get:Rule
+    val rule = createComposeRule()
+
     private lateinit var server: MockWebServer
     private lateinit var db: AppDatabase
     private lateinit var connected: Connected
@@ -177,6 +194,27 @@ class RenameTest {
         assertEquals(base, creates.first())
         assertEquals("$base (9)", creates.last())
         assertEquals(100, creates.last().codePointCount(0, creates.last().length)) // Hermes' limit, counted as Python's len
+    }
+
+    /** The dialog's field keeps at most TITLE_MAX code points, never half a pair; Save needs a title cleanTitle keeps. */
+    @Test
+    fun renameFieldCapsCodePoints() {
+        val confirmed = CopyOnWriteArrayList<String>()
+        val actions = object : PromptActions {
+            override fun confirmRename(token: Long, title: String) {
+                confirmed += title
+            }
+        }
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                PromptHost(Prompt(PromptKind.RENAME, KEY, "", pinned = false, archived = false, running = false, token = 1), actions)
+            }
+        }
+        rule.onNode(hasSetTextAction()).performTextReplacement("\u200B\u2060")
+        rule.onNodeWithText("Save").assertIsNotEnabled()
+        rule.onNode(hasSetTextAction()).performTextReplacement("a" + FACE.repeat(200))
+        rule.onNodeWithText("Save").assertIsEnabled().performClick()
+        assertEquals(listOf("a" + FACE.repeat(TITLE_MAX - 1)), confirmed)
     }
 
     private fun json(code: Int, body: String) = MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build()

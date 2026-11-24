@@ -722,6 +722,24 @@ class CommandDispatchTest {
         assertEquals("a\nb\nc", composer().draft)
     }
 
+    /** Issue 16 row 5: the screen's Steer passes the run it was drawn for, through the gate, to the view model. */
+    @Test
+    fun steerButtonPassesItsDrawnRun() {
+        val passed = CopyOnWriteArrayList<String?>()
+        val actions = object : ChatActions {
+            override fun onSendClick(steerRun: String?): Boolean = passed.add(steerRun).let { false }
+        }
+        val live = xyz.rycerz.apofis.run.LiveReply(RUN, "running", "", emptyList(), null, xyz.rycerz.apofis.run.Connection.LIVE)
+        val state = ChatUiState(KEY, "Plans", StatusLine.WORKING, emptyList(), ComposerMode.STEER, "and also", live = live)
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                ChatScreen(state, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+            }
+        }
+        rule.onNode(hasTestTag(SEND_TAG)).performClick()
+        assertEquals(listOf<String?>(RUN), passed)
+    }
+
     @Test
     fun drawnRunIsTheSteerTarget() = runBlocking<Unit> {
         session(onServer = true)
