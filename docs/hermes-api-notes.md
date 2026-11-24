@@ -109,6 +109,8 @@ or `fast` (`gateway/platforms/api_server_request_options.py`).
 ### DELETE /api/sessions/{id}
 200 `session_delete.json` (`{object: "hermes.session.deleted", id, deleted: true}`). 409
 `session_active_turn` while a turn is running (`api_server.py:3207-3208`): stop first.
+The app counts a 404 with the code `session_not_found` as deleted and treats an answer with
+`deleted: false` (or for another id) as a failure.
 
 ### GET /api/sessions/{id}/messages?order=oldest&include_compacted=true
 `{object: "list", session_id, data: [...], pagination: {limit, offset, order, returned}}`.

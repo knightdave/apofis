@@ -246,7 +246,7 @@ class DrawerViewModelTest {
     @Test
     fun deleteOpenChatSwitchesToNew() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
-        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"object":"hermes.session.deleted","id":"apofis-a","deleted":true}""")
         val vm = vm()
         vm.selected.await { it == "apofis-a" }
         vm.rows.await { it.chats().isNotEmpty() }
@@ -267,8 +267,8 @@ class DrawerViewModelTest {
     fun deleteNeedsTheOpenPromptsToken() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
         addSession("apofis-b", "Bike repair")
-        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
-        routes["DELETE /api/sessions/apofis-b"] = ok("""{"deleted":true}""")
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"object":"hermes.session.deleted","id":"apofis-a","deleted":true}""")
+        routes["DELETE /api/sessions/apofis-b"] = ok("""{"object":"hermes.session.deleted","id":"apofis-b","deleted":true}""")
         val vm = vm()
         vm.rows.await { it.chats().size == 2 }
 
@@ -294,7 +294,7 @@ class DrawerViewModelTest {
     @Test
     fun runStartedAfterTheDialogOpenedNeedsAnotherConfirm() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
-        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"object":"hermes.session.deleted","id":"apofis-a","deleted":true}""")
         routes["POST /v1/runs/run_a/stop"] = ok("""{"run_id":"run_a","status":"stopping"}""")
         routes["POST /v1/runs/run_b/stop"] = ok("""{"run_id":"run_b","status":"stopping"}""")
         val vm = vm()
@@ -381,7 +381,7 @@ class DrawerViewModelTest {
     @Test
     fun sendFailingAfterTheChatWasDeletedLeavesNoEntry() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
-        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""")
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"object":"hermes.session.deleted","id":"apofis-a","deleted":true}""")
         val vm = vm()
         vm.rows.await { it.chats().isNotEmpty() }
         val composer = connected.composer
@@ -507,7 +507,7 @@ class DrawerViewModelTest {
     fun failedStopKeepsTheChat() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
         db.activeRunDao().upsert(ActiveRunEntity("run_a", "apofis-a", null, "running", 1L))
-        routes["DELETE /api/sessions/apofis-a"] = ok("""{"deleted":true}""") // the stop answers 500
+        routes["DELETE /api/sessions/apofis-a"] = ok("""{"object":"hermes.session.deleted","id":"apofis-a","deleted":true}""") // the stop answers 500
         val vm = vm()
         vm.rows.await { it.chats().any { c -> c.running } }
         vm.onDeleteRequest("apofis-a")

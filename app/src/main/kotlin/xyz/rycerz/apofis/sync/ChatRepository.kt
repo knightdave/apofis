@@ -338,13 +338,16 @@ class ChatRepository(
         deleting -= sessionKey
     }
 
-    /** Server first: local rows, unsent messages included, go only once the server confirmed. */
+    /**
+     * Server first: one DELETE per recorded server id ([deleteTargets]); local rows, unsent messages included, go only
+     * once every one confirmed. The first failure ends the Delete with nothing local touched.
+     */
     suspend fun delete(sessionKey: String) {
         requireAppKey(sessionKey)
         lock.withLock {
             ensureOpen()
             val session = sessionDao.get(sessionKey) ?: return
-            if (session.existsOnServer) api.deleteSession(session.currentId)
+            if (session.existsOnServer || session.createStarted) for (id in deleteTargets(session)) { ensureOpen(); api.deleteSession(id) }
             ensureOpen()
             sessionDao.delete(sessionKey)
         }
@@ -471,6 +474,10 @@ private fun String.digestList(): List<String> = split(',').filter { it.isNotEmpt
 private fun requireAppKey(sessionKey: String) = require(!isReservedId(sessionKey)) { "reserved session id" }
 
 private fun SessionEntity.lineage(): List<String> = lineageIds.split(',').filter { it.isNotEmpty() }
+
+/** Every server id of [row] to delete: the current one, the lineage newest first, the key (the lineage root) once and last. */
+internal fun deleteTargets(row: SessionEntity): List<String> =
+    (listOf(row.currentId) + row.lineage().asReversed()).filter { it != row.key }.distinct() + row.key
 
 /** This row under server id [id], the previous current id kept in the lineage so old ids still resolve. */
 private fun SessionEntity.movedTo(id: String, extra: List<String> = emptyList()): SessionEntity =

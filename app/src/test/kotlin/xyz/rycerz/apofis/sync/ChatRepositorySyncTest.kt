@@ -565,7 +565,7 @@ class ChatRepositorySyncTest {
         val listed = responses.hold(
             MockResponse.Builder().code(200).body(page(sessionJson("apofis-s"))).addHeader("Content-Type", "application/json").build(),
         )
-        respond(fixture("session_delete.json"))
+        respond("""{"object":"hermes.session.deleted","id":"apofis-s","deleted":true}""")
         val refresh = launch(Dispatchers.Default) { repo.refreshSessions() }
         withContext(Dispatchers.IO) { server.takeRequest() } // the refresh is fetching
         // A second instance over the same database: the lock must be process-wide, not per repository.
