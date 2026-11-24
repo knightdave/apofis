@@ -13,7 +13,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.onAllNodesWithContentDescription
+import androidx.compose.ui.test.assertIsFocused
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.performKeyInput
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.requestFocus
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -317,6 +324,38 @@ class TemporaryToggleTest : TemporaryFixture() {
     }
 
     @Test
+    fun toggleWaitsOnlyForItsOwnChat() = runBlocking<Unit> {
+        val (vm, old) = fresh()
+        session(A)
+        // Another chat's send, past its durable store and still running (as a delivery would).
+        val delivering = CompletableDeferred<Unit>()
+        composer.edit(B, "for B", composer.current(B).revision)
+        val other = composer.sendWithImages(B) { _, _ ->
+            stored()
+            delivering.await()
+        }!!
+        try {
+            until { !composer.current(B).sending }
+            composer.edit(old, "hello", composer.current(old).revision)
+            val shown = vm.shown(NewChatState.TEMPORARY_OFF)
+            val lock = heldLock()
+            val toggle = side.async(start = CoroutineStart.UNDISPATCHED) { vm.toggleTemporary(shown) }
+            val storing = CompletableDeferred<Unit>()
+            composer.sendWithImages(old) { text, _ -> storing.await(); connected.repo.send(old, text) }!! // claimed now
+            lock.release()
+            until { db.sessionDao().all().any { isTemporaryKey(it.key) } } // replaced while that send is storing
+            storing.complete(Unit)
+            val new = withTimeout(10_000) { toggle.await() }!! // a watchdog: it fails, it never waits for B
+            assertEquals("hello", composer.current(new).unsent?.text)
+            vm.onSelect(A)
+            withTimeout(10_000) { vm.selected.await { it == A } }
+            assertTrue(other.isActive) // all of it before B's send ended
+        } finally {
+            delivering.complete(Unit)
+        }
+    }
+
+    @Test
     fun replacementIsOneTransaction() = runBlocking<Unit> {
         val (vm, old) = fresh()
         composer.edit(old, "half", composer.current(old).revision)
@@ -517,6 +556,7 @@ class TemporaryToggleTest : TemporaryFixture() {
     private var haptics = 0
     private var routeShown by mutableStateOf(true)
     private var routeContainer: AppContainer? = null
+    private lateinit var inputMode: androidx.compose.ui.input.InputModeManager
 
     /**
      * Ends a route test: the route leaves the composition (its chat view models are cleared), the container's own
@@ -548,7 +588,18 @@ class TemporaryToggleTest : TemporaryFixture() {
             }
         }
         themed {
+            inputMode = androidx.compose.ui.platform.LocalInputModeManager.current
             if (routeShown) CompositionLocalProvider(LocalHaptics provides counting) { ChatRoute(container, conn, owner, 0, onSettings = {}, onConnection = {}) }
+        }
+    }
+
+    /** [route], then [body]; the route is always taken down before teardown, also when an assertion fails. */
+    private fun inRoute(lastChat: String, seed: suspend () -> Unit, body: () -> Unit) {
+        route(lastChat, seed)
+        try {
+            body()
+        } finally {
+            finishRoute()
         }
     }
 
@@ -559,8 +610,7 @@ class TemporaryToggleTest : TemporaryFixture() {
 
     /** Through the real bar slot: the toggle changes the key with one haptic; in state New chat it opens a new chat. */
     @Test
-    fun barTogglesThroughTheRoute() {
-        route("apofis-o") { session("apofis-o", onServer = false) }
+    fun barTogglesThroughTheRoute() = inRoute("apofis-o", { session("apofis-o", onServer = false) }) {
         waitForLabel(R.string.chat_temporary_on)
         rule.onNodeWithContentDescription(str(R.string.chat_temporary_on)).performClick()
         waitForLabel(R.string.chat_temporary_off)
@@ -573,18 +623,64 @@ class TemporaryToggleTest : TemporaryFixture() {
         rule.onNodeWithContentDescription(str(R.string.drawer_new_chat)).performClick()
         rule.waitUntil(10_000) { drawer().selected.value.let { it != tmp && it != null && !isTemporaryKey(it) } }
         assertEquals(1, haptics) // none for a New chat
-        finishRoute()
+    }
+
+    /** Makes the open never-created temporary chat T busy (a stored send whose create started): the bar shows New chat. */
+    private fun makeTBusy() {
+        runBlocking {
+            pending(T)
+            db.sessionDao().upsert(db.sessionDao().get(T)!!.copy(createStarted = true))
+        }
+        waitForLabel(R.string.drawer_new_chat) // recomposed for the same T
+    }
+
+    /** Nothing happened to T: still open, its row there, no DELETE, no haptic. Waits behind the selection lock first. */
+    private fun assertTUntouched() {
+        assertTrue(runBlocking { drawer().selectTapped(T) { true } }) // true only if no New chat (and leave of T) ran first
+        assertEquals(T, drawer().selected.value)
+        assertNotNull(runBlocking { db.sessionDao().get(T) })
+        assertTrue(deletes().isEmpty())
+        assertEquals(0, haptics)
+    }
+
+    /** A pointer press that began on "Make this a normal chat" ends without a click once the button shows New chat. */
+    @Test
+    fun pressAcrossTheButtonsStatesDoesNothing() = inRoute(T, { session(T, onServer = false) }) {
+        deleted(T)
+        waitForLabel(R.string.chat_temporary_off)
+        val at = rule.onNodeWithContentDescription(str(R.string.chat_temporary_off)).fetchSemanticsNode().boundsInRoot.center
+        rule.onRoot().performTouchInput { down(at) }
+        makeTBusy()
+        rule.onRoot().performTouchInput { up() }
+        rule.waitForIdle()
+        assertTUntouched()
+    }
+
+    /** The same with Enter held on the focused button. */
+    @OptIn(ExperimentalTestApi::class)
+    @Test
+    fun keyPressAcrossTheButtonsStatesDoesNothing() = inRoute(T, { session(T, onServer = false) }) {
+        deleted(T)
+        waitForLabel(R.string.chat_temporary_off)
+        val button = rule.onNodeWithContentDescription(str(R.string.chat_temporary_off))
+        rule.runOnUiThread { inputMode.requestInputMode(androidx.compose.ui.input.InputMode.Keyboard) } // as a Tab would
+        button.requestFocus()
+        button.assertIsFocused()
+        button.performKeyInput { keyDown(Key.Enter) }
+        makeTBusy()
+        rule.onRoot().performKeyInput { keyUp(Key.Enter) }
+        rule.waitForIdle()
+        assertTUntouched()
     }
 
     /** Right after the selection changed, before Room delivered the new chat's state, the bar shows New chat. */
     @Test
-    fun barShowsNewChatUntilItsStateCatchesUp() {
-        route("apofis-o") { session("apofis-o", onServer = false) }
+    fun barShowsNewChatUntilItsStateCatchesUp() = inRoute("apofis-o", { session("apofis-o", onServer = false) }) {
         waitForLabel(R.string.chat_temporary_on)
-        val roomHeld = CountDownLatch(1)
+        val roomHeld = gate()
         try {
             // The claim holds Room just before the selection changes, so the new key's state cannot arrive yet.
-            val fresh = runBlocking { drawer().openFreshChatIf("apofis-o", { roomThread.execute { roomHeld.await(10, TimeUnit.SECONDS) }; true }) {} }
+            val fresh = runBlocking { drawer().openFreshChatIf("apofis-o", { roomThread.execute { roomHeld.hold() }; true }) {} }
             assertEquals(fresh, drawer().selected.value)
             rule.waitForIdle()
             rule.onNodeWithContentDescription(str(R.string.drawer_new_chat)).assertExists()
@@ -593,16 +689,17 @@ class TemporaryToggleTest : TemporaryFixture() {
             roomHeld.countDown()
         }
         waitForLabel(R.string.chat_temporary_on) // the fresh empty chat's own state
-        finishRoute()
     }
 
     @Test
-    fun chromeStableWithTemporaryMark() {
-        val ordinary = "apofis-o"
-        route(ordinary) {
-            session(ordinary, title = "Garden plans", onServer = false)
+    fun chromeStableWithTemporaryMark() = inRoute(
+        "apofis-o",
+        {
+            session("apofis-o", title = "Garden plans", onServer = false)
             session(T, title = "Secret plan", onServer = false)
-        }
+        },
+    ) {
+        val ordinary = "apofis-o"
         rule.onNodeWithTag("chat.title").assertTextEquals("Garden plans")
 
         fun stream(chat: String) {
@@ -633,6 +730,5 @@ class TemporaryToggleTest : TemporaryFixture() {
         rule.waitUntil(10_000) { rule.onAllNodesWithText(str(R.string.chat_temporary_title)).fetchSemanticsNodes().isNotEmpty() }
         rule.onNodeWithTag("chat.title").assertTextEquals(str(R.string.chat_temporary_title))
         stream(T)
-        finishRoute()
     }
 }

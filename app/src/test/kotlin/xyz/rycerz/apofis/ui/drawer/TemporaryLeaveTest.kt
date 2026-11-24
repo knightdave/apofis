@@ -1,6 +1,13 @@
 package xyz.rycerz.apofis.ui.drawer
 
 import android.app.Application
+import android.database.Cursor
+import android.database.sqlite.SQLiteException
+import android.os.CancellationSignal
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.SupportSQLiteQuery
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewModelScope
@@ -110,6 +117,13 @@ abstract class TemporaryFixture {
     protected val clock = AtomicLong(1_800_000_000_000L)
     protected val leaveClock = TestCoroutineScheduler()
     protected val gaveUp = AtomicBoolean(false)
+    private val gates = CopyOnWriteArrayList<CountDownLatch>()
+
+    /** A gate the test opens; every gate is also opened at teardown, so a failed assertion never leaves one shut. */
+    protected fun gate() = CountDownLatch(1).also { gates += it }
+
+    /** The fixture's SQLite, which can hold or fail a read of one session row (see [SessionReads.arm]). */
+    protected val reads = SessionReads()
     private val created = CopyOnWriteArrayList<DrawerViewModel>()
     private val stores = CopyOnWriteArrayList<ViewModelStore>()
     protected val roomThread = Executors.newSingleThreadExecutor()
@@ -127,7 +141,7 @@ abstract class TemporaryFixture {
         }
         server.start()
         db = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Application>(), AppDatabase::class.java)
-            .allowMainThreadQueries().setQueryCoroutineContext(roomThread.asCoroutineDispatcher()).build()
+            .allowMainThreadQueries().setQueryCoroutineContext(roomThread.asCoroutineDispatcher()).openHelperFactory(reads).build()
         val api = HermesApi(server.url("/").toString(), "secret-key")
         lateinit var f: RunFollower
         val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, clock::get, {})
@@ -140,6 +154,7 @@ abstract class TemporaryFixture {
 
     @After
     fun tearDownGraph() {
+        gates.forEach { it.countDown() }
         assertFalse("a held response timed out", gaveUp.get())
         val scopes = created.map { it.viewModelScope.coroutineContext.job }
         store.clear()
@@ -162,11 +177,62 @@ abstract class TemporaryFixture {
         db.sessionDao().get("")
     }
 
+    /** Exceptions that no coroutine handled, as the threads' default handler saw them while [block] ran. */
+    protected suspend fun uncaughtDuring(block: suspend () -> Unit): List<Throwable> {
+        val seen = CopyOnWriteArrayList<Throwable>()
+        val before = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { _, e -> seen += e }
+        try {
+            block()
+        } finally {
+            Thread.setDefaultUncaughtExceptionHandler(before)
+        }
+        return seen
+    }
+
     /**
-     * After a leave's Delete ended ([isBeingDeleted] false): its last two Room reads (the left chat, then the chat the
-     * note would go to) have answered, and the note, written inline after the second, is in place if it ever will be.
+     * Wraps the fixture's SQLite: once armed, it counts the reads of one session row (`SELECT * FROM SessionEntity WHERE
+     * key = ?`, the DAO's `get`) and acts on one of them, on the Room thread: it holds it until [release] opens, or fails
+     * it as a storage error would.
      */
-    protected suspend fun afterLeave() = repeat(3) { settled() }
+    protected inner class SessionReads : SupportSQLiteOpenHelper.Factory {
+        private val real = FrameworkSQLiteOpenHelperFactory()
+        @Volatile private var pass = -1
+        @Volatile private var fail = false
+        val reached = CompletableDeferred<Unit>()
+        val release = gate()
+
+        /** The read that comes after [pass] more such reads is held (or, with [fail], throws). */
+        fun arm(pass: Int, fail: Boolean = false) {
+            this.fail = fail
+            this.pass = pass
+        }
+
+        private fun seen(sql: String) {
+            if (pass < 0 || !sql.trimStart().startsWith("SELECT * FROM SessionEntity WHERE `key` = ?")) return
+            if (pass-- > 0) return
+            pass = -1
+            reached.complete(Unit)
+            if (fail) throw SQLiteException("disk I/O error")
+            release.hold()
+        }
+
+        override fun create(configuration: SupportSQLiteOpenHelper.Configuration): SupportSQLiteOpenHelper {
+            val h = real.create(configuration)
+            return object : SupportSQLiteOpenHelper by h {
+                override val writableDatabase: SupportSQLiteDatabase get() = wrap(h.writableDatabase)
+                override val readableDatabase: SupportSQLiteDatabase get() = wrap(h.readableDatabase)
+            }
+        }
+
+        private fun wrap(d: SupportSQLiteDatabase) = object : SupportSQLiteDatabase by d {
+            override fun query(query: String): Cursor = seen(query).let { d.query(query) }
+            override fun query(query: String, bindArgs: Array<out Any?>): Cursor = seen(query).let { d.query(query, bindArgs) }
+            override fun query(query: SupportSQLiteQuery): Cursor = seen(query.sql).let { d.query(query) }
+            override fun query(query: SupportSQLiteQuery, cancellationSignal: CancellationSignal?): Cursor =
+                seen(query.sql).let { d.query(query, cancellationSignal) }
+        }
+    }
 
     protected fun vm(lastChat: String? = null, on: Connected = connected, into: ViewModelStore = store): DrawerViewModel = ViewModelProvider.create(
         into,
@@ -314,6 +380,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         vm.onSelect(A)
         until { db.sessionDao().get(r) == null }
         assertEquals(listOf("DELETE /api/sessions/s2", "DELETE /api/sessions/s1", "DELETE /api/sessions/$r"), deletes())
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         assertNull(note(A))
     }
 
@@ -354,13 +421,14 @@ class TemporaryLeaveTest : TemporaryFixture() {
         until { stops().isNotEmpty() }
         leaveClock.advanceTimeBy(9_000) // the manual clock: nine seconds pass while the run is still stored
         assertTrue(deletes().isEmpty())
-        assertNull(note(A))
+        assertNull(note(A)) // not yet: the leave still waits for the run
 
         removed.set(true)
         db.activeRunDao().delete("run_t") // the follower removes it when the run ends
         until { db.sessionDao().get(T) == null }
         assertEquals(listOf("POST /v1/runs/run_t/stop"), stops())
         assertEquals(listOf("DELETE /api/sessions/$T"), deletes())
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         assertNull(note(A))
     }
 
@@ -379,7 +447,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         vm.onSelect(A)
         until { stops().isNotEmpty() }
         leaveClock.advanceTimeBy(9_999)
-        assertNull(note(A))
+        assertNull(note(A)) // not yet: one millisecond is left
         leaveClock.advanceTimeBy(1)
         leaveClock.runCurrent()
         until { note(A) == notDeleted }
@@ -388,7 +456,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         vm.rows.await { T in it.chats() }
 
         // The server never answers; its late 409 changes nothing more.
-        val gate = CountDownLatch(1)
+        val gate = gate()
         routes["DELETE /api/sessions/$T2"] = { gate.hold(); json(409, """{"error":{"code":"session_active_turn","message":"busy"}}""") }
         vm.onSelect(T2)
         vm.selected.await { it == T2 }
@@ -411,7 +479,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         session(T)
         session(A)
         session(B)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         routes["DELETE /api/sessions/$T"] = { gate.hold(); json(200, """{"object":"hermes.session.deleted","id":"$T","deleted":true}""") }
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
@@ -496,7 +564,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         session(T)
         session(T2)
         session(A)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         routes["DELETE /api/sessions/$T"] = { gate.hold(); json(200, """{"object":"hermes.session.deleted","id":"$T","deleted":true}""") }
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
@@ -514,7 +582,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         until { db.sessionDao().get(T) == null }
 
         // A share accepted from a temporary chat, its caller cancelled while it fills the new chat; the DELETE fails.
-        val failGate = CountDownLatch(1)
+        val failGate = gate()
         routes["DELETE /api/sessions/$T2"] = { failGate.hold(); MockResponse.Builder().code(500).build() }
         vm.onSelect(T2)
         vm.selected.await { it == T2 }
@@ -540,6 +608,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         vm.selected.await { it == A }
         until { db.sessionDao().get(local) == null }
         assertTrue(requests.isEmpty())
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         assertNull(note(A))
     }
 
@@ -577,7 +646,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
     fun chatBeingLeftIsSetAsideWhileItsDeleteIsHeld() = runBlocking<Unit> {
         session(T, title = "Secret plan")
         session(A)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         routes["DELETE /api/sessions/$T"] = { gate.hold(); MockResponse.Builder().code(500).build() }
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
@@ -612,6 +681,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
 
         db.activeRunDao().delete("run_t")
         until { db.sessionDao().get(T) == null }
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         assertNull(note(A))
     }
 
@@ -621,10 +691,10 @@ class TemporaryLeaveTest : TemporaryFixture() {
         deleted(T)
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
-        val roomHeld = CountDownLatch(1)
+        val roomHeld = gate()
         try {
             // A share: the claim holds Room just before the selection changes, so the leave's first read cannot answer.
-            val fresh = vm.openFreshChatIf(T, { roomThread.execute { roomHeld.await(10, TimeUnit.SECONDS) }; true }) {}
+            val fresh = vm.openFreshChatIf(T, { roomThread.execute { roomHeld.hold() }; true }) {}
             assertEquals(fresh, vm.selected.value)
             vm.onLongPress(T) // synchronous: neither the selection lock nor Room
             assertNull(vm.prompt.value)
@@ -643,7 +713,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         session(T)
         session(T2)
         session(A)
-        val first = CountDownLatch(1)
+        val first = gate()
         routes["DELETE /api/sessions/$T"] = { first.hold(); MockResponse.Builder().code(500).build() }
         deleted(T2)
         val vm = vm(lastChat = T)
@@ -657,8 +727,8 @@ class TemporaryLeaveTest : TemporaryFixture() {
         assertSetAside(vm, T2, open = A)
 
         first.countDown() // T's leave fails; T2's, waiting behind it for the repository lock, then succeeds
-        until { db.sessionDao().get(T2) == null && !isBeingDeleted(T2) }
-        afterLeave()
+        until { db.sessionDao().get(T2) == null }
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         vm.rows.await { T in it.chats() && T2 !in it.chats() }
         assertNotNull(db.sessionDao().get(T))
         assertFalse(T2 in connected.composer.keys) // the note for the gone T2 left no entry behind
@@ -672,7 +742,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
     fun deleteCommittedBeforeTheTimeoutSetsNoNote() = runBlocking<Unit> {
         session(T)
         session(A)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         routes["DELETE /api/sessions/$T"] = { gate.hold(); json(200, """{"object":"hermes.session.deleted","id":"$T","deleted":true}""") }
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
@@ -689,8 +759,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         leaveClock.runCurrent()
         cleanupHeld.complete(Unit)
         holder.join()
-        until { !isBeingDeleted(T) }
-        afterLeave()
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         assertNull(note(A))
     }
 
@@ -698,7 +767,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
     fun closedConnectionSetsNoNote() = runBlocking<Unit> {
         session(T)
         session(A)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         routes["DELETE /api/sessions/$T"] = { gate.hold(); MockResponse.Builder().code(500).build() }
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
@@ -706,8 +775,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
         until { deletes().isNotEmpty() }
         connected.close() // a switch closes the graph before its drawer is cleared
         gate.countDown()
-        until { !isBeingDeleted(T) }
-        afterLeave()
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         assertFalse(A in connected.composer.keys)
         assertNotNull(db.sessionDao().get(T))
     }
@@ -716,7 +784,7 @@ class TemporaryLeaveTest : TemporaryFixture() {
     fun goneDestinationGetsNoNote() = runBlocking<Unit> {
         session(T)
         session(A)
-        val gate = CountDownLatch(1)
+        val gate = gate()
         routes["DELETE /api/sessions/$T"] = { gate.hold(); MockResponse.Builder().code(500).build() }
         val vm = vm(lastChat = T)
         vm.selected.await { it == T }
@@ -724,10 +792,91 @@ class TemporaryLeaveTest : TemporaryFixture() {
         until { deletes().isNotEmpty() }
         db.sessionDao().delete(A) // removed meanwhile (a refresh, another phone)
         gate.countDown()
-        until { !isBeingDeleted(T) }
-        afterLeave()
+        withTimeout(60_000) { vm.leavesEnded() } // the note decision is made
         assertFalse(A in connected.composer.keys)
         assertNotNull(db.sessionDao().get(T))
+    }
+
+    @Test
+    fun failingReadAfterTheAttemptThrowsNothing() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        val gate = gate()
+        routes["DELETE /api/sessions/$T"] = { gate.hold(); MockResponse.Builder().code(500).build() }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.onSelect(A)
+        until { deletes().isNotEmpty() }
+        reads.arm(pass = 0, fail = true) // the leave's first read after the attempt fails, as a storage error would
+        val uncaught = uncaughtDuring {
+            gate.countDown()
+            withTimeout(60_000) { vm.leavesEnded() } // the key has left the set
+        }
+        assertTrue(reads.reached.isCompleted)
+        assertEquals(emptyList<Throwable>(), uncaught)
+        assertFalse(A in connected.composer.keys) // eligibility unknown: no note
+        assertNotNull(db.sessionDao().get(T))
+    }
+
+    @Test
+    fun connectionClosedDuringTheLastReadSetsNoNote() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        val gate = gate()
+        routes["DELETE /api/sessions/$T"] = { gate.hold(); MockResponse.Builder().code(500).build() }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.onSelect(A)
+        until { deletes().isNotEmpty() }
+        reads.arm(pass = 1) // the second read after the attempt (the chat the note would go to) is held
+        gate.countDown()
+        withTimeout(60_000) { reads.reached.await() }
+        connected.close() // a switch closes the graph while that read is held
+        reads.release.countDown()
+        withTimeout(60_000) { vm.leavesEnded() }
+        assertFalse(A in connected.composer.keys)
+    }
+
+    @Test
+    fun deleteDialogOpenedBeforeTheLeaveIsRefused() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        db.sessionDao().upsert(db.sessionDao().get(T)!!.copy(archived = true)) // an open archived chat stays in the archive
+        val first = gate()
+        val answered = java.util.concurrent.atomic.AtomicInteger()
+        routes["DELETE /api/sessions/$T"] = { if (answered.getAndIncrement() == 0) first.hold(); MockResponse.Builder().code(500).build() }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.archived.await { rows -> rows.any { it.key == T } } // loaded: the dialog can be opened for it
+        vm.onDeleteRequest(T) // before the leave starts
+        val prompt = vm.prompt.value!!
+        assertEquals(PromptKind.DELETE, prompt.kind)
+        vm.onSelect(A)
+        until { deletes().isNotEmpty() }
+        vm.confirmDelete(prompt.token) // while the leave's DELETE is held
+        first.countDown()
+        withTimeout(60_000) { vm.leavesEnded() }
+        until { vm.busyActions() == 0 }
+        assertEquals(ActionError.FAILED, vm.prompt.value?.error)
+        assertEquals(listOf("DELETE /api/sessions/$T"), deletes())
+    }
+
+    @Test
+    fun archivedChatBeingLeftIsNotInTheArchive() = runBlocking<Unit> {
+        session(T)
+        session(A)
+        db.sessionDao().upsert(db.sessionDao().get(T)!!.copy(archived = true))
+        val gate = gate()
+        routes["DELETE /api/sessions/$T"] = { gate.hold(); MockResponse.Builder().code(500).build() }
+        val vm = vm(lastChat = T)
+        vm.selected.await { it == T }
+        vm.archived.await { rows -> rows.any { it.key == T } } // listed in the archive while open
+        vm.onSelect(A)
+        until { deletes().isNotEmpty() }
+        vm.archived.await { rows -> rows.none { it.key == T } }
+        gate.countDown()
+        withTimeout(60_000) { vm.leavesEnded() }
+        vm.archived.await { rows -> rows.any { it.key == T } } // the leave failed: back in the archive
     }
 
     // ---- a share's fresh chat is never orphaned ----

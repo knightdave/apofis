@@ -201,7 +201,8 @@ internal fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewMode
         val button = drawer.newChatButton.collectAsState().value
         // A state computed for another chat (the selection just changed) is never drawn: New chat until it catches up.
         val shown = if (button.key == drawer.selected.collectAsState().value) button else NewChat(button.key, NewChatState.NEW)
-        NewChatButton(shown.state) { drawer.newChat(shown, haptics::selection) }
+        // A new node when what it shows changes: a press that began on the old one ends without a click.
+        key(shown) { NewChatButton(shown.state) { drawer.newChat(shown, haptics::selection) } }
     }
     // One mark for every window over the chat and its drawer (the answer guard, see [Overlays]).
     val overlays = remember { Overlays() }

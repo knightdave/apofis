@@ -323,7 +323,8 @@ class DrawerViewModel(
             val new = newSessionId(temporary = !isTemporaryKey(old))
             if (!repo.replaceEmptyLocal(old, new)) return@withContext null
             // A send claimed before the replacement fails on the missing row; its text then moves as the unsent entry.
-            while (!composer.move(old, new)) composer.settle()
+            // Waits for this chat's own send only, never for other chats' deliveries.
+            while (!composer.move(old, new)) composer.state(old).first { !it.sending }
             selectedFlow.value = new
             new
         }
@@ -480,15 +481,28 @@ class DrawerViewModel(
                 // kept: the note below says so
             }
             // The row decides, not the timeout: a Delete that committed while its cleanup overran sets no note. Nothing is
-            // written for a closed connection (its composer is the next one's) or into a chat that is gone.
-            if (connection.isOpen && db.sessionDao().get(previous) != null && db.sessionDao().get(newKey) != null) {
-                composer.setNote(newKey, ComposerNote(NoteKind.TEMPORARY_NOT_DELETED))
+            // written into a chat that is gone, or for a closed connection (its composer is the next one's): the open flag
+            // is read last, with nothing suspending before the write. A read that fails sets nothing (a database closed by
+            // a switch): eligibility could not be established.
+            try {
+                if (db.sessionDao().get(previous) != null && db.sessionDao().get(newKey) != null && connection.isOpen) {
+                    composer.setNote(newKey, ComposerNote(NoteKind.TEMPORARY_NOT_DELETED))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // no note
             }
         }.also { job -> job.invokeOnCompletion { leavingFlow.update { it - previous } } }
     }
 
     /** For tests: actions started and not yet applied. */
     internal fun busyActions(): Int = inFlight.get()
+
+    /** For tests: returns once no leave is in flight, so after each one's note decision (the set empties on completion). */
+    internal suspend fun leavesEnded() {
+        leavingFlow.first { it.isEmpty() }
+    }
 
     /** For tests: the last drawer refresh, to join. */
     internal var refreshJob: Job? = null
