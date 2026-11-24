@@ -20,8 +20,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.yield
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import java.util.concurrent.atomic.AtomicBoolean
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.images.ImageStore
@@ -325,32 +325,39 @@ class DraftImagesTest {
 
     @Test
     fun secondPickQueuesBehindFirst() {
-        val c = container()
-        wait { c.connect(A) }
+        // A connection whose scope runs on a test scheduler: each step runs exactly what is ready, no real time involved.
+        val scheduler = TestCoroutineScheduler()
+        val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(scheduler))
         val gate = CompletableDeferred<Unit>()
-        val entered = CompletableDeferred<Unit>()
-        val order = Collections.synchronizedList(mutableListOf<Uri>())
-        val inFlight = AtomicInteger()
+        val order = mutableListOf<Uri>()
+        var inFlight = 0
         var overlapped = false
-        c.convertImage = {
-            if (inFlight.incrementAndGet() > 1) overlapped = true
-            order += it
-            if (it == uri(1)) entered.complete(Unit).also { gate.await() }
-            Encoded.Ok(bytesOf(it)).also { inFlight.decrementAndGet() }
-        }
-        val conn = c.connected()!!
+        val api = HermesApi(server.url("/").toString(), "secret-key")
+        val queue = SendQueue(api, db, RunStarter { _, _ -> }, { 1_000L })
+        val repo = ChatRepository(api, db, { 1_000L }, queue)
+        val conn = Connected(
+            A, api, db, repo, queue, RunFollower(api, db, repo, scope), AtomicBoolean(true), scope, composer, 0,
+            ImageStore(imagesDir(), System::currentTimeMillis),
+            { uri ->
+                if (++inFlight > 1) overlapped = true
+                order += uri
+                if (uri == uri(1)) gate.await()
+                inFlight--
+                Encoded.Failed(ImageFailure.UNREADABLE) // no file, so nothing here leaves the scheduler
+            },
+        )
         val first = conn.attachImages(K, listOf(uri(1), uri(2)))!!
-        wait { entered.await() }
+        scheduler.runCurrent() // job 1 takes the lock and is held in the converter
         val second = conn.attachImages(K, listOf(uri(3)))!!
-        assertEquals(3, c.composer.current(K).images.count { it.processing }) // all three placeholders wait
-        // The second pick does not reach the converter while the first holds it (a bounded wait that expects nothing).
-        assertNull(runBlocking { withTimeoutOrNull(500) { while (uri(3) !in order) yield() } })
-        assertEquals(listOf(uri(1)), order.toList())
+        scheduler.runCurrent() // job 2 runs as far as it can: to the lock
+        assertEquals(listOf(uri(1)), order)
+        assertEquals(3, composer.current(K).images.count { it.processing })
         gate.complete(Unit)
-        wait { first.join(); second.join() }
+        scheduler.advanceUntilIdle()
+        assertTrue(first.isCompleted && second.isCompleted)
         assertEquals(listOf(uri(1), uri(2), uri(3)), order)
         assertFalse(overlapped)
-        assertTrue(c.composer.current(K).images.none { it.processing })
+        scope.cancel()
     }
 
     @Test
@@ -451,6 +458,18 @@ class DraftImagesTest {
         assertEquals("caption", composer.current(K).draft)
         wait { composer.sendWithImages(K) { _, _ -> }!!.join() }
 
+        // Whitespace only counts as blank too, on either side.
+        fail("  ", D1)
+        type(K, "hello")
+        composer.putBack(K)
+        assertEquals("hello", composer.current(K).draft)
+        wait { composer.sendWithImages(K) { _, _ -> }!!.join() }
+        fail("caption", D1)
+        type(K, "  ")
+        composer.putBack(K)
+        assertEquals("caption", composer.current(K).draft)
+        wait { composer.sendWithImages(K) { _, _ -> }!!.join() }
+
         // The unsent join: blank on either side is left out; two captions join as before.
         fail("", D1)
         fail("second", D2)
@@ -459,6 +478,12 @@ class DraftImagesTest {
         assertEquals("second", composer.current(K).unsent!!.text)
         fail("third", D2)
         assertEquals("second\n\nthird", composer.current(K).unsent!!.text)
+        composer.discard(K, composer.current(K).unsent!!.id)
+        fail("  ", D1)
+        fail("fourth", D2)
+        assertEquals("fourth", composer.current(K).unsent!!.text)
+        fail("  ", D1)
+        assertEquals("fourth", composer.current(K).unsent!!.text)
     }
 
     @Test

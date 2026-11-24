@@ -336,7 +336,8 @@ class AppContainer(
      * is seen in one of the two), then, in one transaction, orphaned bindings go and pending rows and bindings are read
      * (so a confirmation moving digests from one to the other hides nothing). Under the store's lock: a second call
      * waits for the first, then makes its own full pass. A failure to read the references is logged and skips the run;
-     * a file that cannot be listed or deleted is skipped silently and tried again by the next run. Never throws.
+     * a file that cannot be listed or deleted is skipped silently and tried again by the next run. Only cancellation
+     * is rethrown.
      */
     suspend fun collectImages() {
         try {
@@ -569,7 +570,7 @@ class AppContainer(
             api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get,
             settle = { if (open.get()) follower.settle(it) }, readImage = imageStore::read, imageSize = imageStore::size,
         )
-        val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get, afterDelete = ::collectImages)
+        val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get, afterDelete = { scope.launch { collectImages() } })
         val generation = epoch()
         follower = RunFollower(api, db, repo, runScope, onRunFinished = {
             if (open.get()) {

@@ -13,9 +13,6 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import mockwebserver3.Dispatcher
@@ -228,9 +225,13 @@ class ImageGcTest {
         val young = file(2, ageMs = MINUTE)
         bind("apofis-x", 1, old, young)
         deleteAnswers("apofis-x")
+        val started = CompletableDeferred<Unit>()
+        c.beforeImageRows = { c.beforeImageRows = {}; started.complete(Unit) }
         wait { c.connected()!!.repo.delete("apofis-x") }
+        wait { started.await() } // the collection the Delete started
+        wait { c.collectImages() } // waits behind it under the store's lock
         assertEquals(emptyList<Any>(), bindings("apofis-x"))
-        assertFalse(exists(old)) // gone when the Delete returns
+        assertFalse(exists(old))
         assertTrue(exists(young))
         age(young)
         wait { c.collectImages() }
@@ -247,8 +248,10 @@ class ImageGcTest {
         deleteAnswers("apofis-1")
         deleteAnswers("apofis-2")
         wait { c.connected()!!.repo.delete("apofis-1") }
+        wait { c.collectImages() } // behind the one the Delete started
         assertTrue(exists(d))
         wait { c.connected()!!.repo.delete("apofis-2") }
+        wait { c.collectImages() }
         assertFalse(exists(d))
     }
 
@@ -360,25 +363,23 @@ class ImageGcTest {
     }
 
     @Test
-    fun cancelledDeleteStillReturns() {
+    fun deleteReturnsWhileCollectionHeld() {
         session("apofis-x")
         deleteAnswers("apofis-x")
         val entered = CompletableDeferred<Unit>()
         val gate = CompletableDeferred<Unit>()
         c.beforeImageRows = { entered.complete(Unit); gate.await() }
         var after = false
-        val repo = c.connected()!!.repo
-        val caller = CoroutineScope(Dispatchers.Default).launch {
-            repo.delete("apofis-x")
+        wait {
+            c.connected()!!.repo.delete("apofis-x") // the watchdog fails if this waits for the held collection
             after = true // the drawer's cleanup after a Delete
         }
-        wait { entered.await() }
-        caller.cancel()
-        gate.complete(Unit)
-        wait { caller.join() }
-        c.beforeImageRows = {}
         assertTrue(after)
         assertNull(wait { db.sessionDao().get("apofis-x") })
+        wait { entered.await() } // the collection it started is still held
+        c.beforeImageRows = {}
+        gate.complete(Unit)
+        wait { c.collectImages() } // behind the released one
     }
 
     @Test

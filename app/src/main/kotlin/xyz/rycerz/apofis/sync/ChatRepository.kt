@@ -59,7 +59,7 @@ internal suspend fun <T> withRepositoryLock(block: suspend () -> T): T = lock.wi
  * [sendQueue] is needed only by [send], [cancelSend] and [retrySend].
  * [active] turns false when the app switches servers: mutating calls then throw IllegalStateException("closed") and
  * sync calls return without touching rows, each checked inside the lock before every request and first write.
- * [afterDelete] runs after each [delete] that removed the chat's rows, outside the lock; the delete returns after it.
+ * [afterDelete] runs after each [delete] that removed the chat's rows, outside the lock, and must return at once.
  */
 class ChatRepository(
     private val api: HermesApi,
@@ -67,7 +67,7 @@ class ChatRepository(
     private val now: () -> Long = System::currentTimeMillis,
     private val sendQueue: SendQueue? = null,
     private val active: () -> Boolean = { true },
-    private val afterDelete: suspend () -> Unit = {},
+    private val afterDelete: () -> Unit = {},
 ) {
     private val sessionDao = db.sessionDao()
 
@@ -348,7 +348,7 @@ class ChatRepository(
             ensureOpen()
             sessionDao.delete(sessionKey)
         }
-        withContext(NonCancellable) { afterDelete() } // the rows are gone: the caller learns it even when cancelled now
+        afterDelete()
     }
 
     /**
