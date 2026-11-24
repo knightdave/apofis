@@ -263,36 +263,40 @@ class ChatRepository(
     }
 
     /**
-     * In the sync transaction, on the fetched rows, before a run end settles anything (R13, R17): binds each image send
-     * the rows confirm to its row, only when that match is unambiguous, then drops every binding whose row is gone or
-     * no longer carries exactly the bound digests' hints. A binding is never rebuilt from anything else.
+     * In the sync transaction, on the fetched rows, before a run end settles anything (R13, R17). First drops every
+     * binding no fetched row with its id still supports (a plain user row whose own hints are exactly the bound digests'
+     * first 32 hex); a repeated id keeps it while any of its rows does, whatever their order. Then binds each image send
+     * the rows confirm to its row, only when that match is unambiguous. A binding is never rebuilt from anything else.
      */
     private suspend fun bindImages(sessionKey: String, rows: List<MessageEntity>) {
         val dao = db.imageBindingDao()
-        val sending = db.pendingSendDao().rows(sessionKey).filter { it.state == PendingState.SENDING }
-        if (sending.any { it.images.isNotEmpty() }) {
-            val shown = buildTranscript(rows.map { it.toDto() }).filterIsInstance<UserMessage>()
-            val ids = rows.associateBy({ userKey(it.id) }, { it.id })
-            val bound = dao.forSession(sessionKey).associate { it.messageId to it.digests }
-            val used = HashSet<String>()
-            for (p in sending) { // in the transcript's order, so the row bound is the row that hides the bubble
-                val m = matchIn(p, shown, used) ?: continue
-                if (p.images.isEmpty()) continue
-                val id = ids.getValue(m.key)
-                val unambiguous = parseUserContent(m.raw).images == p.images.digestList().map { it.take(32) } &&
-                    shown.none { it !== m && delivers(p, it) } &&
-                    sending.none { it !== p && delivers(it, m) } &&
-                    (bound[id] ?: p.images) == p.images
-                if (unambiguous) dao.upsert(ImageBindingEntity(sessionKey, id, p.images))
+        val kept = dao.forSession(sessionKey)
+        if (kept.isNotEmpty()) {
+            val byId = rows.groupBy { it.id }
+            for (b in kept) {
+                val hints = b.digests.digestList().map { it.take(32) }
+                val holds = byId[b.messageId].orEmpty().any {
+                    it.role == "user" && it.displayKind == null && parseUserContent(it.content).images == hints
+                }
+                if (!holds) dao.delete(sessionKey, b.messageId)
             }
         }
-        val kept = dao.forSession(sessionKey).ifEmpty { return }
-        val byId = rows.associateBy { it.id }
-        for (b in kept) {
-            val row = byId[b.messageId]
-            val holds = row != null && row.role == "user" && row.displayKind == null &&
-                parseUserContent(row.content).images == b.digests.digestList().map { it.take(32) }
-            if (!holds) dao.delete(sessionKey, b.messageId)
+        val sending = db.pendingSendDao().rows(sessionKey).filter { it.state == PendingState.SENDING }
+        if (sending.none { it.images.isNotEmpty() }) return
+        val shown = buildTranscript(rows.map { it.toDto() }).filterIsInstance<UserMessage>()
+        val ids = rows.associateBy({ userKey(it.id) }, { it.id }) // a repeated id gives one key, so either row's key finds it
+        val bound = dao.forSession(sessionKey).associate { it.messageId to it.digests }
+        val used = HashSet<String>()
+        for (p in sending) { // in the transcript's order, so the row bound is the row that hides the bubble
+            val m = matchIn(p, shown, used) ?: continue
+            if (p.images.isEmpty()) continue
+            val id = ids.getValue(m.key)
+            // The matched row's own hints are the evidence: on display a row with the same id but other hints shows none.
+            val unambiguous = parseUserContent(m.raw).images == p.images.digestList().map { it.take(32) } &&
+                shown.none { it !== m && delivers(p, it) } &&
+                sending.none { it !== p && delivers(it, m) } &&
+                (bound[id] ?: p.images) == p.images // after the check, only a binding whose digests share these prefixes
+            if (unambiguous) dao.upsert(ImageBindingEntity(sessionKey, id, p.images))
         }
     }
 

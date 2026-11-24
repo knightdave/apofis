@@ -24,7 +24,8 @@ fun userKey(id: Long) = "u$id"
 
 /**
  * Turns stored session rows (oldest first) into chat items. Linear in the number of rows. A plain user row shows its
- * parsed text and, per parsed image, the digest [bindings] (message id to digests) holds for it, else a placeholder.
+ * parsed text and the digests [bindings] (message id to digests) holds for its id when its own hints are exactly
+ * their first 32 hex, in order; otherwise one placeholder per parsed image. So a row never borrows another row's photo.
  */
 fun buildTranscript(rows: List<MessageDto>, bindings: Map<Long, List<String>> = emptyMap()): List<ChatItem> {
     val items = mutableListOf<Any>() // ChatItem, or a ReplyBuilder that may still receive tool results
@@ -41,7 +42,7 @@ fun buildTranscript(rows: List<MessageDto>, bindings: Map<Long, List<String>> = 
                 val steered = kind == "steer"
                 items += if (kind == null) {
                     val parsed = parseUserContent(row.content)
-                    val images = bindings[row.id] ?: parsed.images.map { null }
+                    val images = bindings[row.id]?.takeIf { d -> d.map { it.take(32) } == parsed.images } ?: parsed.images.map { null }
                     UserMessage(userKey(row.id), parsed.text, false, row.timestamp, images = images, raw = row.content)
                 } else {
                     UserMessage(userKey(row.id), if (steered) unwrapSteer(row.content) else row.content, steered, row.timestamp, raw = row.content)

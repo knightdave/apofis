@@ -2,6 +2,8 @@ package xyz.rycerz.apofis.chat
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import xyz.rycerz.apofis.api.MessageDto
+import xyz.rycerz.apofis.ui.chat.actionable
 
 class UserContentTest {
     private val a = "a".repeat(32)
@@ -89,24 +91,52 @@ class UserContentTest {
 
     @Test
     fun hostile() {
-        val inputs = listOf(
-            "",
-            "[".repeat(200_000),
-            "[".repeat(400_000) + "\n\n${hint(a)}\n[screenshot]",
-            "[screenshot]x",
-            "x\r\n\r\n${hint(a)}\r\n[screenshot]",
-            "\uD800\n\n[Image attached: \uDC00\uD800]\n[screenshot]",
-            "\n".repeat(50) + "[screenshot]",
-            "\n\n" + "[screenshot]\n".repeat(30) + "[screenshot]",
-            "[Image attached at: " + "api_".repeat(5_000) + "]\n[screenshot]",
+        val long = "[".repeat(400_000)
+        val expected = mapOf(
+            "" to plain(""),
+            "[".repeat(200_000) to plain("[".repeat(200_000)),
+            "$long\n\n${hint(a)}\n[screenshot]" to UserContent(long, listOf(a)),
+            "x\n\n[Image attached: $long]\n[screenshot]" to UserContent("x", listOf(null)), // a hint of any length
+            "x\n\n[Image attached at: $long]\n[screenshot]" to plain("x\n\n[Image attached at: $long]\n[screenshot]"),
+            "x\n\n[Image attached at: ${"api_".repeat(5_000)}]\n[screenshot]" to
+                plain("x\n\n[Image attached at: ${"api_".repeat(5_000)}]\n[screenshot]"),
+            "[screenshot]x" to plain("[screenshot]x"),
+            "x\r\n\r\n${hint(a)}\r\n[screenshot]" to plain("x\r\n\r\n${hint(a)}\r\n[screenshot]"),
+            "\uD800\n\n[Image attached: \uDC00\uD800]\n[screenshot]" to UserContent("\uD800", listOf(null)),
+            "\n".repeat(50) + "[screenshot]" to plain("\n".repeat(50) + "[screenshot]"),
+            "\n\n" + "[screenshot]\n".repeat(30) + "[screenshot]" to plain("\n\n" + "[screenshot]\n".repeat(30) + "[screenshot]"),
+            "x\n\n]\n[screenshot]" to plain("x\n\n]\n[screenshot]"),
+            "x\n\n[Image attached: \n[screenshot]" to plain("x\n\n[Image attached: \n[screenshot]"),
         )
-        for (input in inputs) parseUserContent(input) // no exception
-        assertEquals(plain(""), parseUserContent(""))
-        assertEquals(plain("[screenshot]x"), parseUserContent("[screenshot]x"))
-        val crlf = "x\r\n\r\n${hint(a)}\r\n[screenshot]"
-        assertEquals(plain(crlf), parseUserContent(crlf))
-        assertEquals(UserContent("\uD800", listOf(null)), parseUserContent("\uD800\n\n[Image attached: \uDC00\uD800]\n[screenshot]"))
-        assertEquals(UserContent("[".repeat(400_000), listOf(a)), parseUserContent("[".repeat(400_000) + "\n\n${hint(a)}\n[screenshot]"))
+        for ((input, result) in expected) assertEquals(result, parseUserContent(input))
+    }
+
+    @Test
+    fun longUnknownHintStaysInTheBlock() {
+        for (length in listOf(4_200, 4_201)) {
+            val unknown = "[Image attached: https://example.org/" + "u".repeat(length - 38) + "]"
+            assertEquals(length, unknown.length)
+            val content = "cap\n\n${hint(a)}\n$unknown\n[screenshot]\n[screenshot]"
+            assertEquals(UserContent("cap", listOf(a, null)), parseUserContent(content))
+            val items = buildTranscript(listOf(MessageDto(1, "user", null, content, null, null, null, null, 1.0, null)))
+            assertEquals("cap", (items.single() as UserMessage).text)
+            assertEquals("cap", actionable(items, "u1")) // Copy
+            assertEquals("cap", actionable(items, "u1", fullMessage = true)) // Select and the full reader
+        }
+    }
+
+    @Test
+    fun digestIsExactly32LowerCaseHex() {
+        for (digest in listOf("a".repeat(31), "a".repeat(33), "A".repeat(32), "g".repeat(32))) {
+            val content = "x\n\n[Image attached at: /p/api_$digest.jpg]\n[screenshot]"
+            assertEquals(plain(content), parseUserContent(content))
+        }
+        for (name in listOf("api_${a}.]", "api_${a}jpg]", "api_${a}.JPG]", "ap_${a}.jpg]", "${a}.jpg]")) {
+            val content = "x\n\n[Image attached at: $name\n[screenshot]"
+            assertEquals(plain(content), parseUserContent(content))
+        }
+        assertEquals(UserContent("x", listOf(a)), parseUserContent("x\n\n[Image attached at: api_$a.j]\n[screenshot]"))
+        assertEquals(UserContent("x", listOf(a)), parseUserContent("x\n\n[Image attached at: /a]b/api_x/api_$a.jpeg]\n[screenshot]"))
     }
 
     @Test

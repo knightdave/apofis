@@ -2,13 +2,10 @@ package xyz.rycerz.apofis.sync
 
 import android.content.Context
 import androidx.room.Room
-import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.filterNotNull
@@ -35,6 +32,7 @@ import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.db.AppDatabase
+import xyz.rycerz.apofis.db.ImageBindingEntity
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.ui.chat.actionable
@@ -88,8 +86,11 @@ class ImageBindingTest {
     private fun block(vararg digests: String) =
         "\n\n" + digests.joinToString("\n") { hint(it) } + "\n" + digests.joinToString("\n") { "[screenshot]" }
 
-    private fun row(id: Long, content: String, role: String = "user") =
-        buildJsonObject { put("id", id); put("role", role); put("content", content); put("timestamp", 1.0) }.toString()
+    private fun row(id: Long, content: String, role: String = "user", kind: String? = null) =
+        buildJsonObject {
+            put("id", id); put("role", role); put("content", content); put("timestamp", 1.0)
+            if (kind != null) put("display_kind", kind)
+        }.toString()
 
     private fun serve(vararg rows: String) {
         val body = """{"object":"list","session_id":"$KEY","data":[${rows.joinToString(",")}]}"""
@@ -126,22 +127,22 @@ class ImageBindingTest {
     @Test
     fun bindingWrittenWithTheStoredRow() = runTest {
         seed("k", "cap", listOf(D1))
+        // A settlement that fails rolls back the stored rows and the binding with them.
         serve(row(1, "cap" + block(D1)))
-        lateinit var reader: Deferred<Pair<List<Long>, List<Long>>>
+        val failed = runCatching { repo.syncMessages(KEY, afterReplace = { _ -> error("settlement failed") }) }
+        assertEquals("settlement failed", failed.exceptionOrNull()?.message)
+        assertEquals(emptyList<Long>(), db.messageDao().rows(KEY).map { it.id })
+        assertEquals(emptyMap<Long, String>(), bindings())
+        assertNotNull(db.pendingSendDao().get("k"))
+
         assertTrue(
             repo.syncMessages(KEY, afterReplace = { _ ->
                 // Inside the transaction, where the run follower settles: the row and its binding are both written.
                 assertEquals(mapOf(1L to D1), bindings())
                 assertEquals(listOf(1L), db.messageDao().rows(KEY).map { it.id })
-                // A reader outside the transaction, started while it is open.
-                reader = async(Dispatchers.IO) {
-                    db.withTransaction { db.messageDao().rows(KEY).map { it.id } to db.imageBindingDao().forSession(KEY).map { it.messageId } }
-                }
                 db.pendingSendDao().delete("k") // the settlement removes the send after the binding was written
             }),
         )
-        val (rows, bound) = withContext(Dispatchers.IO) { withTimeout(10_000) { reader.await() } }
-        assertTrue("row $rows, bindings $bound", (rows.isEmpty() && bound.isEmpty()) || (rows == listOf(1L) && bound == listOf(1L)))
         assertEquals(mapOf(1L to D1), bindings())
         assertEquals(listOf(D1), users().single().images)
     }
@@ -170,20 +171,76 @@ class ImageBindingTest {
     }
 
     @Test
-    fun bindingWrittenAloneRemaps() = runTest {
+    fun bindingChangeAloneRemaps() = runTest {
         val latest = MutableStateFlow<List<ChatItem>?>(null)
         backgroundScope.launch(Dispatchers.IO) { repo.transcript(KEY).collect { latest.value = it } }
-        suspend fun awaitShown(condition: (List<ChatItem>) -> Boolean) =
-            withContext(Dispatchers.IO) { withTimeout(10_000) { latest.filterNotNull().first(condition) } }
+        suspend fun awaitImages(images: List<String?>) =
+            withContext(Dispatchers.IO) { withTimeout(10_000) { latest.filterNotNull().first { items -> items.any { it.key == "u1" && (it as UserMessage).images == images } } } }
         seed("other", "other", emptyList())
         sync(row(1, "cap" + block(D1)))
-        awaitShown { items -> items.any { it.key == "u1" && (it as UserMessage).images == listOf(null) } }
+        awaitImages(listOf(null))
 
-        // The send is stored after the row arrived; the next sync returns the same rows and only writes the binding.
-        seed("k", "cap", listOf(D1))
-        sync(row(1, "cap" + block(D1)))
+        // Only the binding table changes, through the DAO: no sync, no other table touched.
+        db.imageBindingDao().upsert(ImageBindingEntity(KEY, 1L, D1))
+        awaitImages(listOf(D1))
+        db.imageBindingDao().delete(KEY, 1L)
+        awaitImages(listOf(null))
+    }
+
+    @Test
+    fun duplicateIdNeverBorrowsAPhoto() = runTest {
+        // Written in both row orders: the row with the block under a repeated id is bound, the one without shows none.
+        seed("k1", "cap", listOf(D1))
+        seed("k2", "two", listOf(D2))
+        sync(row(7, "other"), row(7, "cap" + block(D1)), row(8, "two" + block(D2)), row(8, "plain"))
+        assertEquals(mapOf(7L to D1, 8L to D2), bindings())
+        assertEquals(listOf(emptyList(), listOf(D1), listOf(D2), emptyList()), users().map { it.images })
+        assertEquals(listOf("other", "cap", "two", "plain"), users().map { it.text })
+
+        // A previously bound id is kept in either order while one of its rows carries the hints, also after the sends.
+        runEnd(row(7, "cap" + block(D1)), row(7, "other"), row(8, "plain"), row(8, "two" + block(D2)))
+        assertEquals(mapOf(7L to D1, 8L to D2), bindings())
+        assertEquals(listOf(listOf(D1), emptyList(), emptyList(), listOf(D2)), users().map { it.images })
+        restart()
+        sync(row(7, "other"), row(7, "cap" + block(D1)), row(8, "two" + block(D2)), row(8, "plain"))
+        assertEquals(mapOf(7L to D1, 8L to D2), bindings())
+        assertEquals(listOf(emptyList(), listOf(D1), listOf(D2), emptyList()), users().map { it.images })
+
+        // Without a row carrying the hints the binding goes, whatever the order.
+        sync(row(7, "other"), row(7, "cap"), row(8, "plain"), row(8, "two"))
+        assertEquals(emptyMap<Long, String>(), bindings())
+    }
+
+    @Test
+    fun rewrittenRowIsBoundToTheSendInFlightInTheSameSync() = runTest {
+        seed("k1", "one", listOf(D1))
+        runEnd(row(1, "one" + block(D1)))
         assertEquals(mapOf(1L to D1), bindings())
-        awaitShown { items -> items.any { it.key == "u1" && (it as UserMessage).images == listOf(D1) } }
+
+        // Row 1 is rewritten under its id with B's block while B's send is in flight, and the run settles in that sync.
+        seed("k2", "two", listOf(D2))
+        runEnd(row(1, "two" + block(D2)))
+        assertEquals(mapOf(1L to D2), bindings())
+        sync(row(1, "two" + block(D2)))
+        assertEquals(mapOf(1L to D2), bindings())
+        restart()
+        assertEquals(mapOf(1L to D2), bindings())
+        assertEquals(listOf(listOf(D2)), users().map { it.images })
+    }
+
+    @Test
+    fun parserRunsOnlyOnPlainUserRows() = runTest {
+        seed("k", "cap", listOf(D1))
+        val notification = "cap" + block(D1)
+        val steer = "[OUT-OF-BAND USER MESSAGE - sent while you were working]\ncap\n[/OUT-OF-BAND USER MESSAGE]" + block(D1)
+        sync(row(1, notification, kind = "internal_notification"), row(2, steer, kind = "steer"))
+
+        assertEquals(listOf("u1", "u2", "pk"), shown().map { it.key }) // the pending bubble stays
+        val (shownNotification, shownSteer) = users()
+        assertEquals(notification, shownNotification.text)
+        assertEquals(steer, shownSteer.text)
+        assertEquals(listOf(emptyList<String?>(), emptyList()), listOf(shownNotification.images, shownSteer.images))
+        assertEquals(emptyMap<Long, String>(), bindings())
     }
 
     @Test

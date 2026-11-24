@@ -6,6 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -164,9 +165,9 @@ class DeliveryMatchTest {
         assertEquals(emptyMap<Long, String>(), bindings())
     }
 
-    @Test
-    fun settlementUsesRaw() = runTest {
-        serve(row(10, "caption\n\n${hint(D1)}\n[screenshot]"), row(11, "A cat.", role = "assistant"))
+    /** A real run follower follows the run of send "k" to its end; the server then returns [rows]. */
+    private suspend fun TestScope.runEndsWith(text: String, images: List<String>, vararg rows: String) {
+        serve(*rows)
         routes["/v1/runs/$RUN/events"] = {
             MockResponse.Builder().body(": open\n\nid: 0\ndata: {\"event\":\"run.completed\",\"seq\":0}\n\n")
                 .addHeader("Content-Type", "text/event-stream").build()
@@ -174,13 +175,38 @@ class DeliveryMatchTest {
         val done = CompletableDeferred<Unit>()
         val follower = RunFollower(HermesApi(server.url("/").toString(), "secret-key"), db, repo, backgroundScope, onRunFinished = { done.complete(Unit) })
         follower.resumeAll() // before the run is stored, so only the start below follows it (as RunFollowerTest's started)
-        seed("k", "caption", listOf(D1))
+        seed("k", text, images)
         db.activeRunDao().upsert(ActiveRunEntity(RUN, KEY, null, "running", 1L))
         follower.onRunStarted(KEY, RUN)
         done.await()
+    }
+
+    @Test
+    fun settlementUsesRaw() = runTest {
+        runEndsWith("caption", listOf(D1), row(10, "caption\n\n${hint(D1)}\n[screenshot]"), row(11, "A cat.", role = "assistant"))
 
         assertNull(db.pendingSendDao().get("k")) // confirmed and removed, not marked unconfirmed
         assertEquals(listOf("u10", "r11"), shown().map { it.key })
         assertEquals(mapOf(10L to D1), bindings()) // bound by the sync before the settlement removed the send
+    }
+
+    @Test
+    fun settlementRefusesTheSameCaptionWithAnotherPhoto() = runTest {
+        runEndsWith("caption", listOf(D1), row(10, "caption\n\n${hint(D2)}\n[screenshot]"), row(11, "A dog.", role = "assistant"))
+
+        val left = db.pendingSendDao().get("k")!!
+        assertEquals("failed", left.state)
+        assertEquals("unconfirmed", left.error)
+        assertEquals(emptyMap<Long, String>(), bindings())
+    }
+
+    @Test
+    fun settlementOfATextOnlySendComparesItsWholeText() = runTest {
+        val text = "hi\n\n${hint(D1)}\n[screenshot]"
+        runEndsWith(text, emptyList(), row(10, text), row(11, "Hello.", role = "assistant"))
+
+        assertNull(db.pendingSendDao().get("k")) // removed on raw equality
+        assertEquals("hi", (shown().first() as UserMessage).text) // although the shown caption differs from the text
+        assertEquals(emptyMap<Long, String>(), bindings())
     }
 }
