@@ -21,6 +21,8 @@ import java.time.ZoneOffset
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -29,6 +31,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
@@ -121,6 +124,7 @@ class CommandDispatchTest {
     private val drawers = CopyOnWriteArrayList<DrawerViewModel>()
     private val latches = CopyOnWriteArrayList<CountDownLatch>()
     private val timedOut = AtomicBoolean(false)
+    private val executors = CopyOnWriteArrayList<ExecutorService>() // dispatchers a test made; shut down after the view models end
 
     /** When set, a store waits before its transaction (after the dispatch returned) until it completes. */
     @Volatile private var storeGate: CompletableDeferred<Unit>? = null
@@ -162,6 +166,7 @@ class CommandDispatchTest {
         val jobs = (chats + drawers).map { it.viewModelScope.coroutineContext.job }
         stores.forEach { it.clear() }
         runBlocking { withTimeout(60_000) { jobs.joinAll() } }
+        executors.forEach { it.shutdown() }
         follower.pauseAll()
         runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
         db.close()
@@ -419,9 +424,15 @@ class CommandDispatchTest {
         assertTrue(lines().none { it == "POST /v1/runs" })
     }
 
-    /** The store, and with it the steer's request body, is built off the main thread, as a plain send's is. */
+    /**
+     * Astra I7: the store, and with it the steer's request body, is built off the main thread, as a plain send's is. Main
+     * is a thread of its own here (the fixture's Main is unconfined, which runs anything anywhere), so what runs on Main
+     * shows by its thread.
+     */
     @Test
     fun steerIsStoredOffTheMainThread() = runBlocking<Unit> {
+        val main = Executors.newSingleThreadExecutor { Thread(it, "main-like") }.also { executors += it }
+        Dispatchers.setMain(main.asCoroutineDispatcher())
         session(onServer = true)
         steerOk()
         heldRun()
@@ -431,6 +442,7 @@ class CommandDispatchTest {
         assertTrue(vm.ended { vm.onSendClick() })
         assertEquals(PendingState.STEERED, rows().single().state)
         assertNotNull(storeThread)
+        assertNotEquals("main-like", storeThread!!.name)
         assertNotEquals(android.os.Looper.getMainLooper().thread, storeThread)
     }
 
