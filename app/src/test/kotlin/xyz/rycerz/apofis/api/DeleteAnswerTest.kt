@@ -52,6 +52,30 @@ class DeleteAnswerTest {
     }
 
     @Test
+    fun numericIdThrows() = runTest {
+        respond(200, """{"object":"hermes.session.deleted","id":123,"deleted":true}""")
+        assertEquals(ApiError.Protocol, deleteError("123"))
+    }
+
+    @Test
+    fun genuineBodyWithOtherSuccessStatusThrows() = runTest {
+        for (code in listOf(201, 202)) {
+            respond(code, """{"object":"hermes.session.deleted","id":"s","deleted":true}""")
+            assertEquals("status $code", ApiError.Protocol, deleteError())
+        }
+    }
+
+    @Test
+    fun notFoundCodeIsFiltered() = runTest {
+        // The delete path uses the shared filter: a code outside the machine-code shape, or one that echoes the key, is dropped.
+        respond(404, """{"error":{"code":"secret-key"}}""")
+        assertEquals(ApiError.Http(404, null), deleteError())
+        api = HermesApi(server.url("/").toString(), "key_0123456789abcdef")
+        respond(404, """{"error":{"code":"key_0123456789abcdef"}}""")
+        assertEquals(ApiError.Http(404, null), deleteError())
+    }
+
+    @Test
     fun missingFlagThrows() = runTest {
         respond(200, """{"object":"hermes.session.deleted","id":"s"}""")
         assertEquals(ApiError.Protocol, deleteError())
@@ -97,6 +121,7 @@ class DeleteAnswerTest {
     fun genuineSuccessReturns() = runTest {
         respond(200, """{"object":"hermes.session.deleted","id":"s","deleted":true}""")
         api.deleteSession("s")
+        assertEquals(1, server.requestCount) // a Delete that sent nothing fails here instead of waiting for a request
         val req = server.takeRequest()
         assertEquals("DELETE", req.method)
         assertEquals("/api/sessions/s", req.url.encodedPath)

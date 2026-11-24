@@ -20,6 +20,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.MessageEntity
 import xyz.rycerz.apofis.db.PendingSendEntity
@@ -111,8 +112,12 @@ class ChatDeleteTest {
 
     @Test
     fun deletesNewestFirstRootLast() = runTest {
-        seed(session(currentId = "s2", lineageIds = "s0,s1"))
-        assertEquals(listOf("s2", "s1", "s0", KEY), deleteTargets(session(currentId = "s2", lineageIds = "s0,s1")))
+        // Repeated non-root ids and a copy of the current id in the stored lineage still give one DELETE each.
+        val row = session(currentId = "s2", lineageIds = "s0,s0,s1,s1,s2")
+        seed(row)
+        db.activeRunDao().upsert(ActiveRunEntity("run_1", KEY, null, "running", 1L))
+        assertEquals(5, rowsOf(KEY))
+        assertEquals(listOf("s2", "s1", "s0", KEY), deleteTargets(row))
         listOf("s2", "s1", "s0", KEY).forEach(::deleted)
         repo.delete(KEY)
         assertEquals(listOf("s2", "s1", "s0", KEY), deletedPaths())
@@ -177,6 +182,58 @@ class ChatDeleteTest {
         }
         assertEquals(listOf("s2"), deletedPaths())
         assertEquals(4, rowsOf(KEY))
+    }
+
+    @Test
+    fun unusableRecordedIdFailsTheDeleteAtThatId() = runTest {
+        seed(session(currentId = "s2", lineageIds = "s0,.."))
+        deleted("s2")
+        try {
+            repo.delete(KEY)
+            fail("expected IllegalArgumentException")
+        } catch (_: IllegalArgumentException) {
+            // expected: the id check refuses ".." before its request
+        }
+        assertEquals(listOf("s2"), deletedPaths())
+        assertEquals(4, rowsOf(KEY))
+        assertEquals(emptyList<Int>(), afterDeleteSaw)
+    }
+
+    @Test
+    fun idWithACommaIsNeverSplitIntoTargets() = runTest {
+        val key = "apofis-a,b"
+        db.sessionDao().upsert(session(currentId = key, lineageIds = "").copy(key = key))
+        // A refresh lists the chat under a new tip t whose server lineage names the first id.
+        respond(
+            200,
+            """{"object":"list","data":[{"id":"t","source":"api_server","title":"x","pinned":false,"archived":false,""" +
+                """"hidden":false,"started_at":1.0,"last_active":2.0,"message_count":3,"preview":"p",""" +
+                """"_lineage_root_id":"$key","_lineage_ids":["$key","t"]}],"has_more":false}""",
+        )
+        repo.refreshSessions()
+        assertEquals(1, server.requestCount)
+        assertEquals("GET", server.takeRequest().method) // the list
+        taken = 1
+        val stored = db.sessionDao().get(key)!!
+        assertEquals("t", stored.currentId)
+        assertEquals("", stored.lineageIds) // no fragment of the first id is stored
+        deleted("t")
+        deleted(key)
+        repo.delete(key)
+        assertEquals(listOf("t", "apofis-a,b"), deletedPaths()) // one request each, never "b" or "apofis-a"
+        assertEquals(0, rowsOf(key))
+    }
+
+    @Test
+    fun newChatFromTheListStoresNoIdWithAComma() = runTest {
+        respond(
+            200,
+            """{"object":"list","data":[{"id":"t","source":"api_server","title":"x","pinned":false,"archived":false,""" +
+                """"hidden":false,"started_at":1.0,"last_active":2.0,"message_count":3,"preview":"p",""" +
+                """"_lineage_root_id":"$KEY","_lineage_ids":["$KEY","a,b","t"]}],"has_more":false}""",
+        )
+        repo.refreshSessions()
+        assertEquals(KEY, db.sessionDao().get(KEY)!!.lineageIds)
     }
 
     @Test

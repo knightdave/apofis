@@ -531,6 +531,21 @@ class DrawerViewModelTest {
     }
 
     @Test
+    fun proxyNotFoundPageKeepsTheChat() = runTest {
+        addSession("apofis-a", "Trip to Lisbon")
+        routes["DELETE /api/sessions/apofis-a"] = {
+            MockResponse.Builder().code(404).body("<html><body>Not Found</body></html>").addHeader("Content-Type", "text/html").build()
+        }
+        val vm = vm()
+        vm.rows.await { it.chats().isNotEmpty() }
+        vm.onDeleteRequest("apofis-a")
+        vm.confirmDelete(vm.prompt.value!!.token)
+        assertEquals(ActionError.FAILED, vm.prompt.await { it?.error != null }!!.error)
+        assertTrue(requests.any { it.method == "DELETE" })
+        assertTrue(db.sessionDao().get("apofis-a") != null)
+    }
+
+    @Test
     fun lateCompletionLeavesANewerPromptAlone() = runTest {
         addSession("apofis-a", "Trip to Lisbon")
         addSession("apofis-b", "Bike repair")

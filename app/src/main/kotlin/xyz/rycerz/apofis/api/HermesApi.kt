@@ -72,7 +72,7 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
 
     /**
      * Returns only when [id] is gone: a 200 with the deleted object for exactly [id], or a 404 `session_not_found`.
-     * Any other 2xx is [ApiError.Protocol], any other 404 is [ApiError.Http], the rest maps as for every call.
+     * Any other 2xx (201 and 202 too) is [ApiError.Protocol], any other 404 is [ApiError.Http], the rest maps as for every call.
      */
     suspend fun deleteSession(id: String) = exchange(request(url("api/sessions", id)).delete().build(), checked = false) { response ->
         when {
@@ -81,7 +81,9 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
             else -> {
                 val o = decode<JsonObject>(response)
                 fun field(key: String, quoted: Boolean) = (o[key] as? JsonPrimitive)?.takeIf { it.isString == quoted }?.content
-                if (field("object", true) != "hermes.session.deleted" || field("id", true) != id || field("deleted", false) != "true") {
+                if (response.code != 200 || field("object", true) != "hermes.session.deleted" ||
+                    field("id", true) != id || field("deleted", false) != "true"
+                ) {
                     throw ApiError.Protocol
                 }
             }

@@ -506,13 +506,16 @@ private fun SessionEntity.lineage(): List<String> = lineageIds.split(',').filter
 internal fun deleteTargets(row: SessionEntity): List<String> =
     (listOf(row.currentId) + row.lineage().asReversed()).filter { it != row.key }.distinct() + row.key
 
-/** This row under server id [id], the previous current id kept in the lineage so old ids still resolve. */
+/**
+ * This row under server id [id], the previous current id kept in the lineage so old ids still resolve. An id with a
+ * comma is left out: the stored list is comma separated, and a split fragment could name (and delete) another chat.
+ */
 private fun SessionEntity.movedTo(id: String, extra: List<String> = emptyList()): SessionEntity =
-    copy(currentId = id, lineageIds = (lineage() + currentId + extra).distinct().filter { it != id }.joinToString(","))
+    copy(currentId = id, lineageIds = (lineage() + currentId + extra).distinct().filter { it != id && ',' !in it }.joinToString(","))
 
 private fun SessionDto.toEntity(cached: SessionEntity?): SessionEntity {
     val base = cached?.movedTo(id, lineageIds) ?: SessionEntity(
-        key = sessionKeyOf(this), currentId = id, lineageIds = lineageIds.filter { it != id }.joinToString(","),
+        key = sessionKeyOf(this), currentId = id, lineageIds = lineageIds.filter { it != id && ',' !in it }.joinToString(","),
         title = null, pinned = false, archived = false, startedAt = startedAt, lastActiveAt = null, messageCount = 0,
         preview = null, stale = true, existsOnServer = true,
     )
