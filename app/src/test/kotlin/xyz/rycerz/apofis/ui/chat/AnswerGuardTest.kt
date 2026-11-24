@@ -227,7 +227,6 @@ class AnswerGuardTest {
         tick(300)
         rule.onNodeWithContentDescription("More approval options").performClick()
         settle()
-        settle() // a tap on an item comes after the frame that showed the menu (a down at the mark itself is refused)
         rule.onNodeWithText("Allow for this chat").performClick()
         assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.SESSION)), approvals)
     }
