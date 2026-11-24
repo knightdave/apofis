@@ -33,6 +33,7 @@ import xyz.rycerz.apofis.db.MessageEntity
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.ReplyOutcomeEntity
 import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.db.choice
 
 private const val SESSION_PAGE = 200
 private const val MESSAGE_PAGE = 500
@@ -70,6 +71,9 @@ class ChatRepository(
     private val afterDelete: () -> Unit = {},
 ) {
     private val sessionDao = db.sessionDao()
+
+    // Orders choice changes among themselves and before later sends; one per connection, as the repository is.
+    private val choiceChanges = Mutex()
 
     private val refreshes = MutableStateFlow(0L)
 
@@ -358,23 +362,43 @@ class ChatRepository(
      * Steers the session's running run, else queues [text] and tries to start it at once; with [images] (digests) it is
      * always queued. The message is stored before any request; [onStored] runs once it is (before any request). A hidden
      * chat fails locally; an unknown one throws IllegalArgumentException; see [SendQueue.submit] for the other refusals.
+     * Every choice change started before this call ([changeChoice]), in any chat of this connection, finishes before the
+     * message is handed to the queue. The queue freezes the choice stored at the moment it stores the message, which can
+     * include a change made after the call.
      */
     suspend fun send(sessionKey: String, text: String, images: List<String> = emptyList(), onStored: () -> Unit = {}) {
         requireAppKey(sessionKey)
+        choiceChanges.withLock {}
         queue().submit(sessionKey, text, onStored, images)
     }
 
     /**
-     * Stores the chat's model choice on this phone only (no server call); sends stored from now on carry it. A name over
-     * [MAX_CHOICE_CHARS] is refused (IllegalArgumentException): the size margins of a send assume it.
+     * Stores the chat's model choice on this phone only; see [changeChoice], whose order it shares. A name over
+     * [MAX_CHOICE_CHARS] is refused (IllegalArgumentException) before any lock, whether or not the chat exists.
      */
     suspend fun setChoice(sessionKey: String, choice: ChatModel) {
         requireAppKey(sessionKey)
-        require(listOfNotNull(choice.model, choice.provider, choice.reasoning).all { it.length <= MAX_CHOICE_CHARS }) { "choice too long" }
-        lock.withLock {
-            ensureOpen()
-            val session = sessionDao.get(sessionKey) ?: return
-            sessionDao.upsert(session.copy(model = choice.model, provider = choice.provider, reasoning = choice.reasoning, fast = choice.fast))
+        requireShortNames(choice)
+        changeChoice(sessionKey) { choice }
+    }
+
+    /**
+     * Applies [change] to the chat's stored model choice on this phone only (no server call); sends stored from now on
+     * carry it, and a [send] started after this call waits for it. The read and the write are one critical section
+     * (under the choice lock, then the repository lock), so two changes never undo each other, whoever makes them. A
+     * name over [MAX_CHOICE_CHARS] is refused (IllegalArgumentException): the size margins of a send assume it. A
+     * missing chat is left alone.
+     */
+    suspend fun changeChoice(sessionKey: String, change: (ChatModel) -> ChatModel) {
+        requireAppKey(sessionKey)
+        choiceChanges.withLock {
+            lock.withLock {
+                ensureOpen()
+                val session = sessionDao.get(sessionKey) ?: return
+                val choice = change(session.choice())
+                requireShortNames(choice)
+                sessionDao.upsert(session.copy(model = choice.model, provider = choice.provider, reasoning = choice.reasoning, fast = choice.fast))
+            }
         }
     }
 
@@ -432,6 +456,9 @@ class ChatRepository(
     }
 
     private fun ensureOpen() = check(active()) { "closed" }
+
+    private fun requireShortNames(choice: ChatModel) =
+        require(listOfNotNull(choice.model, choice.provider, choice.reasoning).all { it.length <= MAX_CHOICE_CHARS }) { "choice too long" }
 }
 
 private const val DELIVERY_WINDOW_S = 60.0

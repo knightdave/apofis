@@ -5,7 +5,10 @@ import android.net.ConnectivityManager
 import android.net.Network
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -22,15 +25,20 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
+import xyz.rycerz.apofis.api.ChatModel
+import xyz.rycerz.apofis.api.ModelOptions
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
+import xyz.rycerz.apofis.db.choice
 import xyz.rycerz.apofis.run.AnswerResult
 import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
@@ -56,7 +64,22 @@ data class ChatUiState(
     val confirmDiscard: UnsentText? = null, // the unsent entry the user asked to discard, while it is still the one shown
     val draftRevision: Long = 0, // the draft's revision: an edit is applied only on the revision it was typed on
     val loaded: Boolean = true, // false only before the stored transcript first arrives (items empty but not known empty)
+    val choice: ChatModel = ChatModel(), // the chat's model choice, stored on this phone only
+    val sheet: ChoiceSheet? = null, // the model or reasoning sheet while it is open
 )
+
+/** The reasoning sheet's levels: null is the server's default, "none" is Off; five of the server's eight (decision 19). */
+val REASONING_LEVELS = listOf(null, "none", "low", "medium", "high")
+
+/** An open choice sheet. */
+sealed interface ChoiceSheet {
+    /**
+     * [options]: the server's models once fetched, held only here and never stored; [failed]: the fetch failed. Not a
+     * data class: each open is its own sheet, so a second open while the first is loading replaces it.
+     */
+    class Model(val options: ModelOptions? = null, val failed: Boolean = false) : ChoiceSheet
+    data object Reasoning : ChoiceSheet
+}
 
 /** A request Hermes waits on, by id and execution generation: a new generation is a different request. */
 data class RequestRef(val requestId: String, val executionGeneration: Long)
@@ -111,6 +134,18 @@ interface ChatActions {
     fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) {}
     fun onClarify(requestId: String, executionGeneration: Long, answer: String) {}
     fun onResolveUnknown() {}
+
+    /** Opens the model sheet and asks the server for its models; again while open, asks again (Retry). */
+    fun openModelSheet() {}
+    fun openReasoningSheet() {}
+    fun closeSheet() {}
+
+    /** Stores the chat's model on this phone (null and null: the server's default) and closes the sheet; no request. */
+    fun pickModel(provider: String?, model: String?) {}
+    fun pickReasoning(level: String?) {}
+
+    /** Flips this chat's stored fast mode on this phone (unset counts as off). */
+    fun toggleFast() {}
 }
 
 private enum class Failure { NETWORK, UNAUTHORIZED, SERVER, GONE }
@@ -123,9 +158,10 @@ private data class Local(
     val composerNote: ComposerNote? = null,
     val confirmCancel: String? = null,
     val confirmDiscard: Long? = null,
+    val sheet: ChoiceSheet? = null,
 )
 
-private data class Env(val title: String, val online: Boolean, val rejected: Boolean)
+private data class Env(val title: String, val online: Boolean, val rejected: Boolean, val choice: ChatModel)
 
 /** One chat. [online] is the device's connectivity (see [onlineFlow]); it defaults to always online for tests. */
 class ChatViewModel(
@@ -148,7 +184,7 @@ class ChatViewModel(
     private val content = combine(repo.transcript(sessionKey), follower.live(sessionKey)) { t, l -> merger.merge(t, l) to l }
 
     private val env = combine(repo.session(sessionKey), online.distinctUntilChanged(), follower.credentialsRejected) { s, o, r ->
-        Env(s?.title.orEmpty(), o, r)
+        Env(s?.title.orEmpty(), o, r, s?.choice() ?: ChatModel())
     }
 
     val state: StateFlow<ChatUiState> = combine(content, composer.state(sessionKey), env, local) { (items, live), c, e, l ->
@@ -185,6 +221,8 @@ class ChatViewModel(
             unsent = c.unsent,
             confirmDiscard = c.unsent?.takeIf { it.id == l.confirmDiscard },
             draftRevision = c.revision,
+            choice = e.choice,
+            sheet = l.sheet,
         )
     }.stateIn(
         viewModelScope,
@@ -195,6 +233,7 @@ class ChatViewModel(
     )
 
     private var opening: Job? = null
+    private var fetch: Job? = null // the model sheet's request
 
     init {
         // One check now, again whenever the chat turns stale, and again after every completed session refresh (on return
@@ -297,6 +336,60 @@ class ChatViewModel(
     }
 
     override fun onResolveUnknown() = request { follower.resolveUnknown(sessionKey) }
+
+    override fun openModelSheet() {
+        val asked = ChoiceSheet.Model() // this request's sheet: its answer applies only while this very instance is open
+        local.update { it.copy(sheet = asked) }
+        fetch?.cancel()
+        fetch = viewModelScope.launch {
+            val options = try {
+                connected.api.modelOptions()
+            } catch (_: ApiError) {
+                null
+            } catch (_: IllegalStateException) {
+                return@launch // the connection was closed by a switch
+            }
+            // A closed connection is an old generation: its answer is dropped, as is one for a sheet closed or opened again.
+            if (connected.isOpen) local.update { if (it.sheet === asked) it.copy(sheet = ChoiceSheet.Model(options, failed = options == null)) else it }
+        }
+    }
+
+    override fun openReasoningSheet() {
+        fetch?.cancel()
+        local.update { it.copy(sheet = ChoiceSheet.Reasoning) }
+    }
+
+    override fun closeSheet() {
+        fetch?.cancel()
+        local.update { it.copy(sheet = null) }
+    }
+
+    override fun pickModel(provider: String?, model: String?) = choose { it.copy(model = model, provider = provider) }
+
+    override fun pickReasoning(level: String?) = choose { it.copy(reasoning = level) }
+
+    override fun toggleFast() = choose(close = false) { it.copy(fast = it.fast != true) }
+
+    /**
+     * Changes this chat's stored choice on this phone, in this connection only; makes no request. Started undispatched,
+     * the change takes its place in the repository's choice order before this returns (so a send tapped next, from any
+     * view model, waits for it), and it is not cancelled with the view model. A cleared view model starts nothing; a
+     * closed connection or a failed write drops it and the old choice stays.
+     */
+    private fun choose(close: Boolean = true, change: (ChatModel) -> ChatModel) {
+        if (!viewModelScope.isActive) return
+        if (close) closeSheet()
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable) {
+                try {
+                    connected.repo.changeChoice(sessionKey, change) // connected.repo throws once the connection is closed
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
 
     /**
      * Sends one answer at a time. Notes are kept by the answered request (the one drawn when tapped). CHANGED records
