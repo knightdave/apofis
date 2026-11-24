@@ -17,6 +17,7 @@ import mockwebserver3.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -43,7 +44,7 @@ class SendWorkerTest {
     private lateinit var api: HermesApi
     private lateinit var queue: SendQueue
     private val holding = HoldingQueue()
-    private val clock = 10_000_000L
+    @Volatile private var clock = 10_000_000L
 
     @Before
     fun setUp() {
@@ -69,6 +70,9 @@ class SendWorkerTest {
         server.enqueue(MockResponse.Builder().code(code).body(body).addHeader("Content-Type", "application/json").build())
 
     private fun refusedKey() = respond("""{"error":{"code":"invalid_api_key"}}""", 401)
+
+    // Served only to a request a regression sends, so it fails on the request count at once instead of stalling.
+    private fun canary() = respond("""{"error":{"code":"weird_thing"}}""", 500)
 
     private suspend fun take() = withContext(Dispatchers.IO) { server.takeRequest(5, TimeUnit.SECONDS)!! }
 
@@ -104,6 +108,7 @@ class SendWorkerTest {
         val gate = holding.hold(
             MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json").build(),
         )
+        canary()
         lateinit var workerJob: Job
         queue = SendQueue(api, db, { _, _ -> }, { clock }, schedule = { workerJob.cancel() })
         val w = worker()
@@ -111,6 +116,7 @@ class SendWorkerTest {
         assertEquals("/v1/runs/run_1/steer", take().target) // the steer is in flight
 
         queue.enqueue("apofis-b", "a new message") // arms the worker again: REPLACE cancels the running one
+        assertTrue(workerJob.isCancelled)
         gate.countDown()
         workerJob.join()
 
@@ -127,6 +133,7 @@ class SendWorkerTest {
         addSession("apofis-a")
         running("apofis-a")
         storedSteer("apofis-a")
+        canary()
         queue = SendQueue(api, db, { _, _ -> }, { clock })
         val repo = ChatRepository(api, db, { clock }, queue)
         repo.beginDelete("apofis-a")
@@ -173,9 +180,15 @@ class SendWorkerTest {
             db.activeRunDao().delete(it) // the follower saw the run end; its finish drains
             queue.drain()
         })
-        queue.enqueue("apofis-a", "behind run a")
-        queue.enqueue("apofis-c", "behind run c")
-        repeat(2) { refusedKey() } // two, so a second request fails the count
+        // Two sends behind each run: whichever chat is settled first, its second send is a witness that any further
+        // drain by the worker would start at once.
+        for (text in listOf("first behind run", "second behind run")) {
+            for (chat in listOf("apofis-a", "apofis-c")) {
+                queue.enqueue(chat, text)
+                clock += 1
+            }
+        }
+        repeat(3) { refusedKey() } // enough that a worker which goes on fails the count at once instead of stalling
 
         assertEquals(ListenableWorker.Result.retry(), worker().doWork())
 
@@ -183,7 +196,8 @@ class SendWorkerTest {
         // blockingQueued has no order: either chat may be settled first.
         val sends = rows("apofis-a") + rows("apofis-c")
         assertEquals(1, sends.count { it.state == "failed" && it.error == SendError.UNAUTHORIZED })
-        val left = sends.single { it.state == "queued" }
-        assertFalse(left.attempted)
+        val left = sends.filter { it.state == "queued" }
+        assertEquals(3, left.size)
+        assertTrue(left.none { it.attempted })
     }
 }

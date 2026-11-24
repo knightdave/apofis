@@ -363,11 +363,11 @@ class SendQueue(
     private suspend fun steer(row: PendingSendEntity): Boolean = withContext(NonCancellable) {
         val sent = row.copy(attempted = true)
         ensureOpen()
-        if (pendingDao.update(sent) == 0) return@withContext false
         if (expired(row)) {
-            fail(row, SendError.EXPIRED) // never sent: not attempted
+            fail(row, SendError.EXPIRED) // before the attempted mark: an expired steer is never written as attempted
             return@withContext false
         }
+        if (pendingDao.update(sent) == 0) return@withContext false
         try {
             api.steer(checkNotNull(row.runId), row.text)
             ensureOpen()

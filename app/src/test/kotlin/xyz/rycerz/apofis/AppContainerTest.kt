@@ -653,14 +653,21 @@ class AppContainerTest {
                 state = "steering", runId = "run_1", error = null, attempted = false,
             ),
         )
+        container.scope.coroutineContext.job.let { it.cancel(); it.join() } // the first process ends: none of its jobs outlives it
         val work = WorkManager.getInstance(app)
         work.cancelAllWork().result.get()
 
         val restarted = AppContainer(app, store) { db }
-        restarted.connected()
-
-        eventually("send work") {
-            work.getWorkInfosForUniqueWork(SendWorker.WORK_NAME).get().any { it.state == WorkInfo.State.ENQUEUED }
+        try {
+            restarted.connected()
+            // WorkManager's own signal that the work is enqueued; the timeout is only a watchdog that fails.
+            withContext(Dispatchers.Default) {
+                kotlinx.coroutines.withTimeout(10_000) {
+                    work.getWorkInfosForUniqueWorkFlow(SendWorker.WORK_NAME).first { infos -> infos.any { it.state == WorkInfo.State.ENQUEUED } }
+                }
+            }
+        } finally {
+            restarted.scope.coroutineContext.job.let { it.cancel(); it.join() } // before the database closes
         }
     }
 }

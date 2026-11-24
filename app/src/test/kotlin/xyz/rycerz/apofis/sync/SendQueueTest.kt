@@ -1643,4 +1643,70 @@ class SendQueueTest {
         assertEquals("queued", b.state)
         assertFalse(b.attempted)
     }
+
+    // Issue 16 row 9: only a refused key stops the drain. A recovered steer answered 503 fails with its own error and the
+    // other chat's send still starts.
+    @Test
+    fun recoveredSteer503DoesNotStopTheDrain() = runTest {
+        addSession("apofis-a")
+        addSession("apofis-b")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "steer the server refuses")
+        clock += 1
+        val other = queue.enqueue("apofis-b", "starts anyway")
+        respond("{}", 503)
+        respond(runStart("run_2"), 202)
+
+        assertTrue(queue.drain())
+
+        assertEquals(2, server.requestCount)
+        val a = rows("apofis-a").single()
+        assertEquals("failed", a.state)
+        assertEquals(SendError.HTTP_ERROR, a.error)
+        assertFalse(a.attempted)
+        assertEquals("sending", pending(other).state)
+    }
+
+    // Issue 16 row 9: a foreground steer refused for the key fails its own row; the stop never leaves submit, so the
+    // caller never offers the stored text again.
+    @Test
+    fun foregroundSteer401StaysInsideSubmit() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        repeat(2) { respond("""{"error":{"code":"invalid_api_key"}}""", 401) } // two, so a second request fails the count
+
+        queue.submit("apofis-a", "steer under a refused key")
+
+        assertEquals(1, server.requestCount)
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals(SendError.UNAUTHORIZED, row.error)
+        assertFalse(row.attempted)
+    }
+
+    // Issue 16 row 7: the steer cannot be cancelled, so the open check is what keeps an answer that arrives after a
+    // server switch from being written: the row stays as the request left it.
+    @Test
+    fun steerAnsweredAfterTheSwitchWritesNothing() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "also do this")
+        val gate = holding.hold(
+            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json").build(),
+        )
+        val open = java.util.concurrent.atomic.AtomicBoolean(true) // read on the drain's thread
+        val closing = imageQueue(db, active = open::get)
+        val drained = async(Dispatchers.Default) { closing.drain() }
+        assertEquals("/v1/runs/run_1/steer", take().target)
+
+        open.set(false) // the server switched while the steer was in flight
+        gate.countDown()
+
+        assertFalse(drained.await())
+        val row = rows("apofis-a").single()
+        assertEquals("steering", row.state)
+        assertTrue(row.attempted)
+    }
 }
