@@ -162,14 +162,13 @@ fun ChatScreen(
     // The list follows the bottom when a send's row was stored (the view model's counter), never on the tap itself: a
     // refused send, a picker result or a finished photo moves nothing. Starts equal, so recreation pins nothing. The pin
     // waits until the transcript shows the stored row (by its key), so it acts on the list that holds it whichever
-    // reaches the screen first; a row not found (no key) pins at once. Only the stored part is searched, once per change
-    // of it, never per streamed token.
+    // reaches the screen first. Only the stored part is searched, once per change of it, never per streamed token.
     val seenStored = remember { longArrayOf(state.storedSends) }
     val pinPending = state.storedSends != seenStored[0]
     @Suppress("UNCHECKED_CAST") val storedPart = (state.items as? Joined<ChatItem>)?.head ?: state.items
     val storedKey = state.storedKey
     val storedShown = remember(storedPart, storedKey, pinPending) {
-        pinPending && (storedKey == null || storedPart.asReversed().any { (it as? UserMessage)?.idempotencyKey == storedKey })
+        pinPending && storedKey != null && storedPart.asReversed().any { (it as? UserMessage)?.idempotencyKey == storedKey }
     }
     LaunchedEffect(state.storedSends, storedShown) {
         if (storedShown && state.storedSends != seenStored[0]) {

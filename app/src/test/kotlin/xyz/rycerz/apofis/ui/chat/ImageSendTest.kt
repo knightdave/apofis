@@ -523,7 +523,7 @@ class ImageSendTest {
     @Test
     fun storedSendPinsReader() {
         host(state(), index = 10)
-        ui = ui.copy(storedSends = 1)
+        ui = ui.copy(storedSends = 1, storedKey = "q1", items = history + sent) // as the view model publishes: count, key, row
         frames(10)
         assertEquals(0, list.firstVisibleItemIndex)
         assertEquals(0, list.firstVisibleItemScrollOffset)
@@ -566,13 +566,28 @@ class ImageSendTest {
         assertNewRowShown("row first")
     }
 
+    /** Another pending row reaching the transcript does not satisfy a pin that waits for A; A arriving does. */
+    @Test
+    fun anotherPendingRowDoesNotSatisfyThePin() {
+        host(state(), index = 10)
+        ui = ui.copy(storedSends = 1, storedKey = "q1")
+        frames(3)
+        val other = UserMessage("other", "Retried", steered = false, timestamp = FIXED_NOW, state = SendState.QUEUED, idempotencyKey = "r1")
+        ui = ui.copy(items = history + other)
+        frames(10)
+        assertTrue("another row: the reader stays up (${list.firstVisibleItemIndex})", list.firstVisibleItemIndex >= 10)
+        ui = ui.copy(items = history + other + sent)
+        frames(10)
+        assertNewRowShown("then A")
+    }
+
     /** A screen that starts with a count above zero pins nothing for it; the next stored send pins. */
     @Test
     fun counterAboveZeroPinsOnlyOnChange() {
-        host(state().copy(storedSends = 3), index = 10)
+        host(state().copy(storedSends = 3, storedKey = "q0"), index = 10)
         frames(10)
         assertEquals(10, list.firstVisibleItemIndex)
-        ui = ui.copy(storedSends = 4)
+        ui = ui.copy(storedSends = 4, storedKey = "q1", items = history + sent)
         frames(10)
         assertEquals(0, list.firstVisibleItemIndex)
     }
@@ -933,6 +948,9 @@ class ImageSendViewModelTest {
     private lateinit var connected: Connected
     private lateinit var follower: RunFollower
     private lateinit var store: ImageStore
+    private lateinit var api: HermesApi
+    private lateinit var queue: SendQueue
+    private lateinit var repo: ChatRepository
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val routes = ConcurrentHashMap<String, (RecordedRequest) -> MockResponse>()
     private val requests = java.util.concurrent.CopyOnWriteArrayList<RecordedRequest>()
@@ -956,10 +974,10 @@ class ImageSendViewModelTest {
         server.start()
         db = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).allowMainThreadQueries().build()
         store = ImageStore(File(app.filesDir, "vm-images-${System.nanoTime()}"), System::currentTimeMillis)
-        val api = HermesApi(server.url("/").toString(), "secret-key")
+        api = HermesApi(server.url("/").toString(), "secret-key")
         lateinit var f: RunFollower
-        val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, readImage = store::read, imageSize = store::size)
-        val repo = ChatRepository(api, db, System::currentTimeMillis, queue)
+        queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, readImage = store::read, imageSize = store::size)
+        repo = ChatRepository(api, db, System::currentTimeMillis, queue)
         f = RunFollower(api, db, repo, scope, delayMs = { delay(minOf(it, 20L)) })
         follower = f
         connected = Connected(
@@ -982,7 +1000,7 @@ class ImageSendViewModelTest {
         assertEquals("held streams whose watchdog fired", 0, watchdog.get())
     }
 
-    private fun vm(): ChatViewModel = ViewModelProvider.create(vms, viewModelFactory { initializer { ChatViewModel(KEY, connected, kotlinx.coroutines.flow.flowOf(true)) } })
+    private fun vm(c: Connected = connected): ChatViewModel = ViewModelProvider.create(vms, viewModelFactory { initializer { ChatViewModel(KEY, c, kotlinx.coroutines.flow.flowOf(true)) } })
         .get("vm${created.size}", ChatViewModel::class).also { created += it }
 
     private fun <T> wait(block: suspend () -> T): T = runBlocking { withTimeout(10_000) { block() } }
@@ -1030,6 +1048,58 @@ class ImageSendViewModelTest {
         follower.onRunStarted(KEY, RUN)
     }
 
+    /**
+     * The stored event names the row this send stored, even when another pending row of the chat appears between the
+     * commit and the next state (a retry of an expired row stores a fresh key with a later creation time). The view
+     * model's main dispatcher is a queue the test drains, so nothing of it runs in between unless pumped.
+     */
+    @Test
+    fun storedKeyIsTheSentRowsEvenWhenAFresherRowAppears() {
+        addSession()
+        val mainTasks = java.util.concurrent.LinkedBlockingQueue<Runnable>()
+        Dispatchers.setMain(object : kotlinx.coroutines.CoroutineDispatcher() {
+            override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) = mainTasks.put(block)
+        })
+        fun pumpUntil(what: String, done: () -> Boolean) {
+            while (!done()) (mainTasks.poll(10, TimeUnit.SECONDS) ?: throw AssertionError("timed out waiting for $what")).run()
+        }
+        try {
+            val vm = vm()
+            connected.composer.edit(KEY, "A", connected.composer.current(KEY).revision)
+            assertTrue(vm.onSendClick())
+            val a = wait { db.pendingSendDao().observe(KEY).first { rows -> rows.any { it.text == "A" } } }.single { it.text == "A" }.idempotencyKey
+            wait { db.pendingSendDao().upsert(PendingSendEntity("r-fresh", KEY, "retried", "{}", System.currentTimeMillis() + 60_000, "queued", null, null, attempted = false)) }
+            pumpUntil("the stored event") { vm.state.value.storedSends == 1L }
+            assertEquals("the sent row's key, never the other's", a, vm.state.value.storedKey)
+        } finally {
+            Dispatchers.setMain(UnconfinedTestDispatcher())
+            while (true) (mainTasks.poll() ?: break).run()
+        }
+    }
+
+    /**
+     * Sending makes no read of the pending table first. The view model's own database handle has no pending table (any
+     * read through it throws); the send goes through the repository's database, so the message is stored.
+     */
+    @Test
+    fun sendingReadsNoPendingRowsFirst() {
+        addSession()
+        val broken = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).allowMainThreadQueries().build()
+        broken.openHelper.writableDatabase.execSQL("DROP TABLE PendingSendEntity")
+        val c = Connected(
+            Credentials(server.url("/").toString(), "secret-key"), api, broken, repo, queue, follower, AtomicBoolean(true), scope,
+            connected.composer, 0, store, { convert(it) },
+        )
+        val vm = vm(c)
+        connected.composer.edit(KEY, "kept", connected.composer.current(KEY).revision)
+        assertTrue(vm.onSendClick())
+        val done = vm.await { !it.sending && (it.storedSends == 1L || it.unsent != null) }
+        assertNull("not moved to Not stored", done.unsent)
+        assertEquals(1L, done.storedSends)
+        assertEquals(listOf("kept"), wait { db.pendingSendDao().rows(KEY) }.map { it.text })
+        broken.close()
+    }
+
     /** The first state after the view model is built already carries the draft's photos. */
     @Test
     fun firstStateCarriesTheDraftPhotos() {
@@ -1041,14 +1111,17 @@ class ImageSendViewModelTest {
     @Test
     fun stopBesideSendAfterPostsOneStop() {
         addSession()
-        val stopped = kotlinx.coroutines.CompletableDeferred<Unit>()
-        routes["/v1/runs/$RUN/stop"] = { r -> json("""{"run_id":"$RUN","status":"stopping"}""")(r).also { stopped.complete(Unit) } }
+        routes["/v1/runs/$RUN/stop"] = json("""{"run_id":"$RUN","status":"stopping"}""")
         val vm = vm()
         liveRun()
         val d = readyPhoto()
         assertEquals(ComposerMode.SEND_AFTER, vm.await { it.live != null && it.images.singleOrNull()?.digest == d }.composer)
+        val children = { vm.viewModelScope.coroutineContext.job.children.toSet() }
+        val before = children()
         vm.onStopClick(RUN)
-        wait { stopped.await() }
+        val action = children() - before // the request the tap started: the stop POST and the status read after it
+        assertTrue(action.isNotEmpty())
+        wait { action.forEach { it.join() } } // settled: only now are the requests counted
         assertEquals(1, requests.count { it.method == "POST" && it.target == "/v1/runs/$RUN/stop" })
         assertEquals(0, requests.count { it.method == "POST" && it.target.substringBefore('?') == "/v1/runs" })
         assertEquals(listOf(d), connected.composer.current(KEY).images.map { it.digest })

@@ -303,16 +303,9 @@ class ChatViewModel(
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.sendWithImages(sessionKey) { text, images ->
             // The field empties only once the text is stored; delivery problems after that show on the bubble. The
-            // counter tells the screen a row was stored, with the row's key: the screen pins once the transcript shows it.
-            val pending = connected.db.pendingSendDao()
-            val before = pending.rows(sessionKey).mapTo(HashSet()) { it.idempotencyKey }
-            repo.send(sessionKey, text, images, onStored = {
-                stored()
-                viewModelScope.launch { // harmless once this view model was cleared
-                    val key = runCatching { pending.rows(sessionKey).lastOrNull { it.idempotencyKey !in before }?.idempotencyKey }.getOrNull()
-                    local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) }
-                }
-            })
+            // counter tells the screen a row was stored, with the row's key, at the commit: the screen pins once the
+            // transcript shows it. Harmless once this view model was cleared.
+            repo.send(sessionKey, text, images, onStored = { key -> stored(); local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) } })
             local.update { it.copy(notes = emptyMap()) }
         }
         if (started != null) accepted.tryEmit(Unit)
