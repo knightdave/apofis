@@ -4,6 +4,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.sync.isTemporaryKey
 
 sealed interface DrawerRow {
     data class Header(val label: GroupLabel) : DrawerRow
@@ -26,7 +27,7 @@ sealed interface GroupLabel {
 fun groupSessions(sessions: List<SessionEntity>, query: String, selectedKey: String?, today: LocalDate, zone: ZoneId): List<DrawerRow> {
     val q = query.trim()
     val shown = sessions
-        .filter { q.isEmpty() || it.title.orEmpty().contains(q, ignoreCase = true) }
+        .filter { (q.isEmpty() || it.title.orEmpty().contains(q, ignoreCase = true)) && !(it.key == selectedKey && isTemporaryKey(it.key)) }
         .sortedByDescending { it.lastActiveAt ?: it.startedAt }
     val groups = shown.groupBy { s ->
         if (s.pinned) {

@@ -71,6 +71,7 @@ import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.sync.isTemporaryKey
 
 /** What a chat row can do besides opening; the same actions are offered to accessibility services on the row. */
 interface DrawerActions {
@@ -290,7 +291,7 @@ internal fun ChatRow(row: DrawerRow.Chat, onClick: () -> Unit, onLongPress: () -
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            row.title.ifEmpty { stringResource(R.string.chat_new_title) },
+            if (isTemporaryKey(row.key)) stringResource(R.string.chat_temporary_title) else row.title.ifEmpty { stringResource(R.string.chat_new_title) },
             Modifier.weight(1f),
             style = MaterialTheme.typography.bodyLarge,
             color = scheme.onSurface,

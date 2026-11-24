@@ -21,7 +21,12 @@ fun isAppSession(dto: SessionDto): Boolean =
 
 fun sessionKeyOf(dto: SessionDto): String = dto.lineageRootId ?: dto.id
 
-fun newSessionId(): String = "apofis-" + UUID.randomUUID()
+/** Keys of temporary chats: ordinary stored chats, deleted when the user leaves them in the app. */
+const val TEMPORARY_PREFIX = "apofis-tmp-"
+
+fun isTemporaryKey(key: String): Boolean = key.startsWith(TEMPORARY_PREFIX)
+
+fun newSessionId(temporary: Boolean = false): String = (if (temporary) TEMPORARY_PREFIX else "apofis-") + UUID.randomUUID()
 
 /** First non-blank line, trimmed, at most 60 characters; "" when there is none. */
 fun titleFrom(text: String): String {

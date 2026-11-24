@@ -9,11 +9,15 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.lifecycle.ViewModelStoreOwner
 import xyz.rycerz.apofis.ui.drawer.ArchivedScreen
 import xyz.rycerz.apofis.ui.drawer.DrawerActions
 import xyz.rycerz.apofis.ui.drawer.DrawerContent
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
+import xyz.rycerz.apofis.ui.drawer.NewChat
+import xyz.rycerz.apofis.ui.drawer.NewChatState
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.drawer.PromptHost
 import xyz.rycerz.apofis.ui.drawer.Prompt
 import xyz.rycerz.apofis.ui.drawer.PromptActions
@@ -166,7 +170,7 @@ fun AppNav(container: AppContainer) {
  * Choosing never leaves a blank screen: while loading, or after a failure (with Retry), the chat screen itself shows.
  */
 @Composable
-private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner, taps: Int, onSettings: () -> Unit, onConnection: () -> Unit) {
+internal fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModelStoreOwner, taps: Int, onSettings: () -> Unit, onConnection: () -> Unit) {
     val prefs = container.preferences
     val drawer = drawerOf(container, conn, owner)
     val selected by drawer.selected.collectAsState()
@@ -192,7 +196,14 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     val drawerButton: @Composable () -> Unit = {
         DrawerButton(Modifier.focusRequester(drawerButtonFocus)) { scope.launch { drawerState.open() } }
     }
-    val newChatButton: @Composable RowScope.() -> Unit = { NewChatButton(drawer::newChat) }
+    val newChatButton: @Composable RowScope.() -> Unit = {
+        val haptics = ApofisTheme.haptics
+        val button = drawer.newChatButton.collectAsState().value
+        // A state computed for another chat (the selection just changed) is never drawn: New chat until it catches up.
+        val shown = if (button.key == drawer.selected.collectAsState().value) button else NewChat(button.key, NewChatState.NEW)
+        // A new node when what it shows changes: a press that began on the old one ends without a click.
+        key(shown) { NewChatButton(shown.state) { drawer.newChat(shown, haptics::selection) } }
+    }
     // One mark for every window over the chat and its drawer (the answer guard, see [Overlays]).
     val overlays = remember { Overlays() }
     CompositionLocalProvider(LocalOverlays provides overlays) {
@@ -278,12 +289,22 @@ internal fun DrawerButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
     }
 }
 
-/** The chat bar's New chat button, through the chat's action gate. */
+/** The chat bar's New chat button, through the chat's action gate; on a never-created empty chat, the temporary toggle. */
 @Composable
-internal fun NewChatButton(onNewChat: () -> Unit) {
+internal fun NewChatButton(state: NewChatState = NewChatState.NEW, onNewChat: () -> Unit) {
     val gate = LocalChatGate.current
-    ApofisIconButton(onClick = { gate(onNewChat) }, contentDescription = stringResource(R.string.drawer_new_chat)) {
-        Icon(painterResource(R.drawable.lucide_square_pen), contentDescription = null, Modifier.size(20.dp))
+    val label = when (state) {
+        NewChatState.NEW -> R.string.drawer_new_chat
+        NewChatState.TEMPORARY_OFF -> R.string.chat_temporary_on
+        NewChatState.TEMPORARY_ON -> R.string.chat_temporary_off
+    }
+    ApofisIconButton(onClick = { gate(onNewChat) }, contentDescription = stringResource(label)) {
+        Icon(
+            painterResource(if (state == NewChatState.NEW) R.drawable.lucide_square_pen else R.drawable.lucide_message_square_dashed),
+            contentDescription = null,
+            Modifier.size(20.dp),
+            tint = if (state == NewChatState.TEMPORARY_ON) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+        )
     }
 }
 

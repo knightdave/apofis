@@ -325,6 +325,29 @@ class ChatRepository(
         id
     }
 
+    /**
+     * Replaces the never-created, empty local chat [key] by the same row under [newKey] (its model choice, title, pin and
+     * start kept), in one transaction under the lock: a pending send is stored in a transaction under another lock. False,
+     * with nothing changed, when [key] may exist on the server or holds messages, pending sends or a delete in progress.
+     */
+    suspend fun replaceEmptyLocal(key: String, newKey: String): Boolean {
+        requireAppKey(key)
+        return lock.withLock {
+            db.withTransaction {
+                ensureOpen()
+                val row = sessionDao.get(key)
+                if (row == null || row.existsOnServer || row.createStarted || isBeingDeleted(key) || db.messageDao().hasRows(key) ||
+                    db.pendingSendDao().rows(key).isNotEmpty()
+                ) {
+                    return@withTransaction false
+                }
+                sessionDao.delete(key)
+                sessionDao.upsert(row.copy(key = newKey, currentId = newKey))
+                true
+            }
+        }
+    }
+
     suspend fun rename(sessionKey: String, title: String) =
         update(sessionKey, { api.patchSession(it, title = title) }) { it.copy(title = title) }
 

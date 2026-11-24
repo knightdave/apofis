@@ -190,7 +190,7 @@ fun ChatScreen(
     // The slots read their inputs through these holders, so each recomposes only when its own inputs change: a streamed
     // token changes the transcript, never the header's or the composer's inputs (equal values notify nothing).
     val latest = rememberUpdatedState(state.forTranscript()) // typing changes nothing the transcript reads
-    val barInput = rememberUpdatedState(ChatUiState("", state.title, state.status, emptyList(), ComposerMode.SEND_DISABLED, "", state.host))
+    val barInput = rememberUpdatedState(ChatUiState(state.sessionKey, state.title, state.status, emptyList(), ComposerMode.SEND_DISABLED, "", state.host))
     val bottomInput = rememberUpdatedState(
         BottomInput(
             state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
