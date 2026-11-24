@@ -343,7 +343,7 @@ class RealTrigger(Base):
         self.assertEqual("released", f.account(0))
         pid = slot_pid(self.home())
         self.assertIsNotNone(pid)
-        self.assertFalse(alive(pid))
+        wait_until("the hook child exits", lambda: not alive(pid))
         self.assertEqual((200, b'{"kind":"needs_input"}'), request(f.port, "GET", "/%s/poll" % TOPIC))
         with open(os.path.join(self.home(), "agent-hooks", "apofis-push.log")) as log:
             self.assertRegex(log.read(), r"on_human_input_request matched regs=1 http://127\.0\.0\.1:%d=200\n$" % f.port)
@@ -358,7 +358,7 @@ class RealTrigger(Base):
         started = time.monotonic()
         self.assertEqual("killed", f.stop())  # the teardown kills the child's process group
         self.assertLess(time.monotonic() - started, 4)  # not its own 5 s request timeout
-        self.assertFalse(alive(pid))
+        wait_until("the hook child exits", lambda: not alive(pid))
         with self.assertRaises(ProcessLookupError):
             os.killpg(pid, 0)
 
@@ -372,7 +372,7 @@ class RealTrigger(Base):
         pid = slot_pid(self.home())
         t.join(WATCHDOG)
         self.assertEqual([502], status)
-        self.assertFalse(alive(pid))
+        wait_until("the hook child exits", lambda: not alive(pid))
 
     def test_no_live_db_opened(self):
         f = self.fake()

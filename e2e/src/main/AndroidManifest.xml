@@ -17,5 +17,12 @@
                 <action android:name="org.unifiedpush.android.distributor.UNREGISTER" />
             </intent-filter>
         </receiver>
+        <!-- The share fixtures (FixtureImageProvider.kt): not exported, read by the app only through the URI grant of
+             the share intent. Only this test APK has it; no app manifest names it. -->
+        <provider
+            android:name=".FixtureImageProvider"
+            android:authorities="xyz.rycerz.apofis.e2e.fixtures"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>

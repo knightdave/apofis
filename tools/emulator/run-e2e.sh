@@ -7,6 +7,8 @@
 #   tools/emulator/run-e2e.sh --test <Class[#method]>   any test in the e2e module (a push or model method: its row)
 #   tools/emulator/run-e2e.sh --push              the push scenarios with a local fake ntfy, no model run
 #   tools/emulator/run-e2e.sh --push-model        the three model scenarios of Milestone 3 (at most 3 model starts)
+#   tools/emulator/run-e2e.sh --m4                the Milestone 4 share and temporary chat scenarios, no live transport, no model run
+#   tools/emulator/run-e2e.sh --m4-model          the four model scenarios of Milestone 4 (at most 4 model starts)
 #
 # Runs on the build host; it calls itself on the emulator host with --remote and --in-shell (internal).
 # tools/emulator/run-e2e-selftest.sh sources it (APOFIS_E2E_LIB=1) to test its safeguards without any host.
@@ -32,7 +34,8 @@ PKG=xyz.rycerz.apofis.e2e
 RUNNER=$PKG/androidx.test.runner.AndroidJUnitRunner
 AVD=apofis-e2e
 IMAGE="system-images;android-37.0;default;x86_64"
-SESSION_RE='apofis-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+SESSION_RE="apofis-(tmp-)?$UUID_RE" # an app chat; apofis-tmp-: a temporary chat (Milestone 4)
 RUN_RE='run_[0-9a-f]{32}'
 RUNID_RE='[0-9]{8}-[0-9]{6}-[0-9a-f]{4}'
 # The processes of an e2e run on the emulator host: the emulator, our adb server, either remote mode of this script.
@@ -64,12 +67,18 @@ PUSH_ALL=("${PUSH_TESTS[@]}" pushWakesKilledApp)
 # one message and no steer. A method without a proved bound is not listed (steerDuringRun: a refused steer can become a
 # fresh run). Their selections reserve the bound in the shared ledger before instrumentation.
 PUSH_MODEL=(PushE2eTest#pushWakesKilledApp SurvivalE2eTest#connectAndChat SurvivalE2eTest#replySurvivesProcessDeath)
-declare -A MODEL_BOUND=([PushE2eTest#pushWakesKilledApp]=1 [SurvivalE2eTest#connectAndChat]=1 [SurvivalE2eTest#replySurvivesProcessDeath]=1)
-LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m3 # shared by every worktree, outside any checkout
-LEDGER_LIMIT=8
+declare -A MODEL_BOUND=([PushE2eTest#pushWakesKilledApp]=1 [SurvivalE2eTest#connectAndChat]=1 [SurvivalE2eTest#replySurvivesProcessDeath]=1
+  [ImageE2eTest#imageSendConfirms]=1 [M4E2eTest#temporaryChatGoneAfterLeaving]=1 [M4E2eTest#modelChoiceReachesRun]=1)
+# Milestone 4: every model method reserves here (Milestone 3's ledger, model-budget-m3, is closed and stays untouched).
+LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m4 # shared by every worktree, outside any checkout
+LEDGER_LIMIT=10
+# Milestone 4. --m4 runs these with no live transport (0 model starts); --m4-model these, in the table's order.
+M4_TESTS=(ShareE2eTest#shareTextAndImageOpensNewChat ShareE2eTest#pixelCapJustOverRefused M4E2eTest#temporaryToggleMarks)
+M4_MODEL=(ImageE2eTest#imageSendConfirms M4E2eTest#temporaryChatGoneAfterLeaving M4E2eTest#modelChoiceReachesRun SurvivalE2eTest#replySurvivesProcessDeath)
+# The keys of GET /api/model/options whose presence --m4 records (top level or on a provider row), never their values.
+M4_KEYS=(providers model provider slug models capabilities usage limit warning)
 LIVE_DB=/home/hermes/.hermes/state.db # opened only by the per-install listing (push_listing), read-only
 PUSH_SCRIPT=server/apofis-push/apofis_push.py
-UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 PUSHID_RE="apofis-push-$UUID_RE-[1-9][0-9]{0,5}"
 
 # The emulator host never prints anything to the build host's terminal. It reports progress and failures as codes;
@@ -289,14 +298,17 @@ bg() { "$@" </dev/null {proto}<&- & child=$!; local rc=0; wait "$child" || rc=$?
 adb() { bounded "${ADB_TIMEOUT:-60}" "$ADB_BIN" "$@" </dev/null; }
 free_port() { local o; o=$(ss -Hltn "sport = :$1") || rdie ss; [ -z "$o" ]; }
 
-# The am instrument filter of a selection. --full (all) never runs the push scenarios: they need push provisioning.
+# The am instrument filter of a selection. --full (all) never runs the push scenarios (they need push provisioning) nor
+# the Milestone 4 classes (their model methods need a reservation, their share methods no live transport).
 instrument_filter() {
   local f
   case $1 in
-    all) echo "-e package $PKG -e notClass $PKG.PushE2eTest" ;;
+    all) echo "-e package $PKG -e notClass $PKG.PushE2eTest,$PKG.ImageE2eTest,$PKG.M4E2eTest,$PKG.ShareE2eTest" ;;
     smoke) echo "-e class $PKG.SmokeE2eTest,$PKG.HarnessSelfTest" ;;
     push) f=$(printf "$PKG.PushE2eTest#%s," "${PUSH_TESTS[@]}"); echo "-e class ${f%,}" ;;
     push-model) f=$(printf "$PKG.%s," "${PUSH_MODEL[@]}"); echo "-e class ${f%,}" ;;
+    m4) f=$(printf "$PKG.%s," "${M4_TESTS[@]}"); echo "-e class ${f%,}" ;;
+    m4-model) f=$(printf "$PKG.%s," "${M4_MODEL[@]}"); echo "-e class ${f%,}" ;;
     *) echo "-e class $PKG.$1" ;;
   esac
 }
@@ -310,7 +322,7 @@ push_args_ok() {
 remote() {
   local tests=$1 tunnel_port=$2 run_id=$3 nonce=$4 push_port=$5 push_topic=$6 push_installs=$7 d
   no_core_dumps || rdie core
-  [[ $tests =~ ^(all|smoke|push|push-model|[A-Za-z0-9_#]+)$ && $tunnel_port =~ ^[0-9]+$ && $run_id =~ ^$RUNID_RE$ && $nonce =~ ^[0-9a-f]{8}$ ]] ||
+  [[ $tests =~ ^(all|smoke|push|push-model|m4|m4-model|[A-Za-z0-9_#]+)$ && $tunnel_port =~ ^[0-9]+$ && $run_id =~ ^$RUNID_RE$ && $nonce =~ ^[0-9a-f]{8}$ ]] ||
     rdie args
   push_args_ok "$push_port" "$push_topic" "$push_installs" || rdie args
   root=$HOME/$REMOTE_DIR
@@ -466,7 +478,7 @@ finish() {
   if [ -n "$booted" ]; then
     ADB_TIMEOUT=90 adb pull "$DEVICE_OUT" "$out/device" >/dev/null 2>&1
     pull_rc=$?
-    if ADB_TIMEOUT=60 adb logcat -d -v threadtime ApofisE2e:V ApofisWake:I TestRunner:V AndroidRuntime:E '*:S' >"$out/logcat.txt" 2>/dev/null &&
+    if ADB_TIMEOUT=60 adb logcat -d -v threadtime ApofisE2e:V ApofisWake:I ApofisShare:I TestRunner:V AndroidRuntime:E '*:S' >"$out/logcat.txt" 2>/dev/null &&
       [ -s "$out/logcat.txt" ]; then logcat_ok=1; else rmsg logcat-failed; rc=$CLEANUP_EXIT; fi
   fi
   report_sessions "$pull_rc"
@@ -681,7 +693,8 @@ check_sessions() {
   local rf=$E2E_OUT/$run_id/results.txt passed=''
   if [ -n "$published" ] && [ -f "$rf" ] && [ -r "$rf" ] && [ -s "$rf" ] &&
     { grep -qvE '^[A-Za-z0-9]+\.[A-Za-z0-9]+ (PASS|FAIL)$' "$rf"; [ "$?" = 1 ]; }; then # 1: no malformed row; 2: grep failed
-    passed=$(sed -nE 's/^(SurvivalE2eTest\.([A-Za-z]*)|PushE2eTest\.(pushWakesKilledApp)) PASS$/\2\3/p' "$rf") || { passed=''; bad=1; }
+    passed=$(sed -nE 's/^(SurvivalE2eTest\.([A-Za-z]*)|PushE2eTest\.(pushWakesKilledApp)|ImageE2eTest\.(imageSendConfirms)|M4E2eTest\.(temporaryChatGoneAfterLeaving|modelChoiceReachesRun)) PASS$/\2\3\4\5/p' "$rf") ||
+      { passed=''; bad=1; }
     # The list must be exactly what the instrumentation itself reported, from the same verified copy: a list that
     # disagrees proves nothing about which scenarios sent. No server id is ever inferred from a test name.
     if ! reported_rows "$E2E_OUT/$run_id/instrument.txt" | cmp -s - <(sort -u "$rf"); then
@@ -702,6 +715,8 @@ check_sessions() {
     fi
     bad=1
   done
+  # --m4's methods run with no live transport: any journal line means one of their requests may have reached the server.
+  if [ "$mode" = m4 ] && [ "${#journal[@]}" != 0 ]; then log "FAILED: --m4 runs with no live transport, yet its journal names a server session"; ok=1; fi
   if [ -n "$bad" ]; then
     log "FAILED: the session journal is missing a line, or a line is incomplete or unmatched; sessions this run created may remain on the server (only complete entries are checked and deleted)"
     ok=1
@@ -802,16 +817,18 @@ select_tests() {
       [ -n "$tests" ] || return 1 ;;
     push) tests=push push=("${PUSH_TESTS[@]}") model_capable='' ;;
     push-model) tests=push-model push=(pushWakesKilledApp) models=("${PUSH_MODEL[@]}") ;;
+    m4) tests=m4 model_capable='' ;;
+    m4-model) tests=m4-model models=("${M4_MODEL[@]}") ;;
     test)
       known_test "$a" || return 1
       tests=$a
       case $a in
         PushE2eTest#*) push=("${a#PushE2eTest#}") ;;
-        PushE2eTest) return 1 ;; # the class would run the model method without its reservation
+        PushE2eTest | ImageE2eTest | M4E2eTest) return 1 ;; # the class would run a model method without its reservation
       esac
       [ -z "${MODEL_BOUND[$a]+x}" ] || models=("$a")
       case $a in SmokeE2eTest | SmokeE2eTest#* | HarnessSelfTest | HarnessSelfTest#* | PushE2eTest#connectorLifecycle | \
-        PushE2eTest#hostilePushes | PushE2eTest#permissionAndTestPush) model_capable='' ;; esac ;;
+        PushE2eTest#hostilePushes | PushE2eTest#permissionAndTestPush | ShareE2eTest | ShareE2eTest#* | M4E2eTest#temporaryToggleMarks) model_capable='' ;; esac ;;
     *) return 1 ;;
   esac
   [[ $tests =~ ^[A-Za-z0-9_#-]+$ ]] # the strict token check, before any remote command is built from it
@@ -855,6 +872,15 @@ ledger_check() {
 }
 
 ledger_total() { ledger_check "$1"; }
+
+# True when the ledger reads and already holds a reservation (released or not) of any --m4-model method: the whole mode
+# is never reserved again, retries go method by method (--test).
+m4_mode_reserved() {
+  local m
+  ledger_check "$LEDGER" >/dev/null || return 1
+  for m in "${M4_MODEL[@]}"; do grep -qE "^reserve $RUNID_RE $m [0-9]+$" "$LEDGER" && return 0; done
+  return 1
+}
 
 # ledger_reserve <ledger> <limit> <run id> <method>=<bound>...: under flock, appends one reservation per method only when
 # the ledger reads and its count plus these bounds stays within <limit>; fails (appending nothing) otherwise.
@@ -1046,7 +1072,7 @@ observe_starts() {
     elif ledger_release "$LEDGER" "$run_id" "$m"; then log "ledger: $m released (the key never left this host)"
     else log "FAILED: ledger: could not release the reservation of $m"; return 1; fi
   done
-  [ "${#owned[@]}" = 0 ] || log "ledger: $(ledger_total "$LEDGER" || echo unknown) of $LEDGER_LIMIT model starts counted for Milestone 3"
+  [ "${#owned[@]}" = 0 ] || log "ledger: $(ledger_total "$LEDGER" || echo unknown) of $LEDGER_LIMIT model starts counted for Milestone 4"
 }
 
 # Lists the user's home and config entries and /tmp entries owned by the user on the emulator host (never printed).
@@ -1140,7 +1166,7 @@ end_local() {
   fi
   # The push directory (the fake's run directory, its log, the run-private homes) goes once the fake is gone.
   if [ -n "$push_dir" ] && [ -z "$fake_pid" ] && [ -z "$keep_push" ]; then remove_tree "$push_dir" || { log "FAILED: could not remove $push_dir"; r=1; }; push_dir=''; fi
-  if [ -n "$tmp" ]; then rm -f "$tmp/in" "$tmp/out" "$tmp/wd" "$tmp/before.txt" "$tmp/after.txt" "$tmp/files"; rmdir "$tmp"; tmp=''; fi
+  if [ -n "$tmp" ]; then rm -f "$tmp/in" "$tmp/out" "$tmp/wd" "$tmp/before.txt" "$tmp/after.txt" "$tmp/files" "$tmp/m4-read.json"; rmdir "$tmp"; tmp=''; fi
   return "$r"
 }
 
@@ -1429,6 +1455,8 @@ evaluate() {
     test) [[ $arg != *'#'* ]] || expected=("$arg") ;;
     push) for t in "${PUSH_TESTS[@]}"; do expected+=("PushE2eTest#$t"); done ;;
     push-model) expected=("${PUSH_MODEL[@]}") ;;
+    m4) expected=("${M4_TESTS[@]}") ;;
+    m4-model) expected=("${M4_MODEL[@]}") ;;
   esac
   if [[ $mode == smoke || $mode == full ]]; then for t in "${SELFTESTS[@]}"; do expected+=("HarnessSelfTest#$t"); done; fi
   log "results:"
@@ -1450,11 +1478,45 @@ evaluate() {
     esac
   done
   [ -s "$dir/logcat.txt" ] || { log "  missing logcat.txt (logcat retrieval failed)"; bad=1; }
+  if [ "$mode" = m4 ]; then
+    if share_log_ok "$dir/logcat.txt"; then log "  share log: exactly one ApofisShare image TOO_LARGE line"
+    else log "  FAILED: share log: not exactly one ApofisShare image line naming TOO_LARGE"; bad=1; fi
+  fi
   if [ "$bad" != 0 ]; then
     # From the verified copy (checksums matched, key absent): the test failures' stack traces.
     grep -A12 '^INSTRUMENTATION_STATUS: stack=' "$dir/instrument.txt" | head -60 >&2
     return 1
   fi
+}
+
+# share_log_ok <logcat>: exactly one ApofisShare image line (one per refused image), and it names TOO_LARGE: the one
+# refusal --m4 expects, the 8001 x 8000 share's pixel cap. Prints nothing.
+share_log_ok() {
+  local l
+  l=$(tr -d '\r' <"$1" | grep -E ' I ApofisShare: image [A-Z_]+$') || return 1
+  [ "$(grep -c . <<<"$l")" = 1 ] && [[ $l == *' image TOO_LARGE' ]]
+}
+
+# --m4's two authenticated reads, each reduced at once to fixed booleans: whether an enabled toolset offers
+# image_generate, and which keys of M4_KEYS GET /api/model/options holds. Logs only <key>=true|false|unknown (unknown on
+# a non-200 answer or a body that does not parse); never a body, a value or the status. The body file is removed here.
+m4_server_reads() {
+  local f=$tmp/m4-read.json v='' code k line='' allow
+  code=$(hermes GET v1/toolsets "$f") || code=error
+  [ "$code" != 200 ] || v=$(jq '[.data[] | select(.enabled == true and ((.tools // []) | index("image_generate")))] | length > 0' "$f" 2>/dev/null) || v=''
+  rm -f "$f"
+  [[ $v =~ ^(true|false)$ ]] || v=unknown
+  log "server read v1/toolsets: image_gen_enabled=$v"
+  allow=$(printf '"%s",' "${M4_KEYS[@]}")
+  v=''
+  code=$(hermes GET api/model/options "$f") || code=error
+  # shellcheck disable=SC2016 # jq code
+  [ "$code" != 200 ] || v=$(jq -r --argjson allow "[${allow%,}]" '(keys + [.providers[]? | keys[]]) | unique as $s
+    | $allow | map(. as $k | "\($k)=\($s | index($k) != null)") | join(" ")' "$f" 2>/dev/null) || v=''
+  rm -f "$f"
+  for k in "${M4_KEYS[@]}"; do line+=" $k=(true|false)"; done
+  [[ " $v" =~ ^${line}$ ]] || { v=''; for k in "${M4_KEYS[@]}"; do v+=" $k=unknown"; done; v=${v# }; }
+  log "server read api/model/options: $v"
 }
 
 main() {
@@ -1466,13 +1528,18 @@ main() {
     --test) arg=${2:?test class} mode=test ;;
     --push) mode=push ;;
     --push-model) mode='push-model' ;;
+    --m4) mode=m4 ;;
+    --m4-model) mode=m4-model ;;
     --remote) shift; remote "$@"; return ;;
     --in-shell) shift; in_shell "$@"; return ;;
-    *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]> | --push | --push-model" >&2; exit 2 ;;
+    *) echo "usage: $0 --smoke | --full | --scenario <name> | --test <Class[#method]> | --push | --push-model | --m4 | --m4-model" >&2; exit 2 ;;
   esac
   # The whole command line is checked before anything happens: one option, and its one argument where it takes one.
   [ "$#" = "$([ -n "$arg" ] && echo 2 || echo 1)" ] || die "bad arguments: one selection, with its one argument"
   select_tests "$mode" "$arg" || die "not a selection of this harness: ${1} ${arg}"
+  if [ "$mode" = m4-model ] && m4_mode_reserved; then
+    die "ledger: --m4-model was reserved before in $LEDGER; retry single methods with --test, in the table's order; nothing started"
+  fi
   no_core_dumps || die "could not disable core dumps"
   # The first action: this host's lock, before anything else is touched here or on the emulator host.
   exec 7>"${XDG_RUNTIME_DIR:-/tmp}/apofis-e2e.lock"
@@ -1561,6 +1628,7 @@ main() {
   import_export "$HOST:$REMOTE_DIR/.state/runs/$run_id/export/" || exit "$SCANFAIL_EXIT"
   log "copied and verified (checksums match, key absent from the copy)"
   evaluate "$E2E_OUT/$run_id" || die "tests failed or evidence is missing; files in $E2E_OUT/$run_id"
+  [ "$mode" != m4 ] || m4_server_reads
   log "PASSED; files in $E2E_OUT/$run_id (server checks and cleanup follow)"
 }
 

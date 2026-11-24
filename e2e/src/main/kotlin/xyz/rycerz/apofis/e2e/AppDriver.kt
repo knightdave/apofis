@@ -21,7 +21,7 @@ const val POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS"
 const val OUT_DIR = "/data/local/tmp/apofis-e2e" // written as the shell user; run-e2e.sh pulls it
 const val SESSIONS = "$OUT_DIR/sessions.txt" // the session journal, created empty by run-e2e.sh before the tests run
 private const val TAG = "ApofisE2e"
-private val SESSION_ID = Regex("apofis-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+private val SESSION_ID = Regex("apofis-(tmp-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}") // apofis-tmp-: a temporary chat
 private val RUN_ID = Regex("run_[0-9a-f]{32}")
 private val SCENARIO = Regex("[A-Za-z]{1,40}")
 private val UUID = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -162,6 +162,9 @@ class AppDriver {
         return if (out.lastOrNull() == "@@end") out.dropLast(1) else null
     }
 
+    /** The number of the app's pending sends (every chat). */
+    fun pendingCount(): Int = query("SELECT count(*) FROM PendingSendEntity;")?.singleOrNull()?.toIntOrNull() ?: fail("Could not count the pending sends")
+
     /** The app's active notification keys whose tag is [tag] (the app tags a chat's notification with its session key). */
     fun notificationsTagged(tag: String): List<String> = notifications().filter { it.split('|').getOrNull(3) == tag }
 
@@ -169,12 +172,28 @@ class AppDriver {
     fun pushPrefsRead(): String = shell("run-as $APP cat shared_prefs/push.xml")
 
     /** The server's status of run [runId], after checking it belongs to session [session]. */
-    fun runStatus(runId: String, session: String): String {
+    fun runStatus(runId: String, session: String): String = runRecord(runId, session).optString("status")
+
+    /** The server's record of run [runId], after checking it belongs to session [session]. Never logged. */
+    fun runRecord(runId: String, session: String): JSONObject {
         if (!RUN_ID.matches(runId) || !SESSION_ID.matches(session)) fail("Not a run or session id")
         val (code, body) = http("GET", "v1/runs/$runId")
         val r = if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null
         if (r?.optString("run_id") != runId || r.optString("session_id") != session) fail("GET run $runId answered $code without its session")
-        return r.optString("status")
+        return r
+    }
+
+    /** The server's model options (default model and provider, the providers and their models). Never logged. */
+    fun modelOptions(): JSONObject {
+        val (code, body) = http("GET", "api/model/options")
+        return (if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null) ?: fail("GET model options answered $code")
+    }
+
+    /** GET api/sessions/[id]: its HTTP code and the answer's error.code (null when none). Logs no body. */
+    fun sessionCode(id: String): Pair<Int, String?> {
+        if (!SESSION_ID.matches(id)) fail("Not an app session id")
+        val (code, body) = http("GET", "api/sessions/$id")
+        return code to runCatching { JSONObject(body).getJSONObject("error").getString("code") }.getOrNull()
     }
 
     /** The server title of session [id], after proving it is this run's (as [serverMessages] does). */
@@ -221,6 +240,32 @@ class AppDriver {
         else -> fail("Could not check /proc/$pid: $r")
     }
 
+    /**
+     * The state --m4 runs in, with no live transport: the app stopped before airplane mode goes off (an earlier test may
+     * have left it on), a fresh start connected through the emulator's host alias, then airplane mode, proved on by the
+     * setting and the status line. Returns the new chat's key. Nothing the app does after this reaches the server.
+     */
+    fun connectThenOffline(): String {
+        forceStop()
+        airplane(false)
+        waitFor("airplane mode off", 10_000) { !airplaneOn() }
+        freshStart()
+        val key = connect(directUrl)
+        airplane(true)
+        waitFor("airplane mode on and the status line showing Offline", 30_000) { airplaneOn() && offline() }
+        return key
+    }
+
+    /** Ends that state: the app's data is cleared (checked; it also stops the process) before airplane mode goes off. */
+    fun clearThenOnline() {
+        val cleared = shell("pm clear $APP").trim()
+        if (cleared != "Success") {
+            forceStop()
+            fail("pm clear did not confirm: $cleared; airplane mode stays on")
+        }
+        airplane(false)
+    }
+
     fun airplane(on: Boolean) {
         shell("cmd connectivity airplane-mode ${if (on) "enable" else "disable"}")
         log("airplane mode ${if (on) "on" else "off"} requested")
@@ -231,6 +276,15 @@ class AppDriver {
         "1" -> true
         "0" -> false
         else -> fail("Unexpected airplane_mode_on: $v")
+    }
+
+    /** The status line (found by its tag) says Offline. */
+    fun offline(): Boolean = snapshot().let { t -> t.tagged("status.line").any { str("chat_status_offline") in t.texts(it) } }
+
+    /** The composer is back to Send: no run is going on. */
+    fun idle(): Boolean {
+        val t = snapshot()
+        return t.tagged("composer.send").any { str("chat_send") in t.descs(it) } && t.tagged("composer.stop").isEmpty()
     }
 
     // ---- reading the screen
@@ -316,16 +370,28 @@ class AppDriver {
     }
 
     /** Clicks the clickable element showing [label] as its text or content description (or a child's text). */
-    fun click(label: String) {
+    fun click(label: String) = tap(label) { it == label }
+
+    /**
+     * Taps the command palette's row of [word] (a row tap runs the command; the draft is not sent): its label is "/word"
+     * or "word", or starts with either followed by a non-letter (the row's text merged with its description).
+     */
+    fun paletteRow(word: String) {
+        val row = Regex("/?${Regex.escape(word)}(\\P{L}.*)?", RegexOption.DOT_MATCHES_ALL)
+        tap("/$word") { row.matches(it) }
+    }
+
+    /** Taps the first enabled element whose label [matches], within 10 s; [name] is what the log and a failure say. */
+    private fun tap(name: String, matches: (String) -> Boolean) {
         // The labelled node itself or its nearest clickable ancestor (Compose may keep an icon's label on the icon).
         fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? = if (n.isClickable) n else n.parent?.let(::clickableOf)
-        fun find() = nodes { it.label() == label }.firstNotNullOfOrNull { n -> clickableOf(n)?.takeIf { it.isEnabled } }
-        waitFor("an enabled button \"$label\"", 10_000) { find() != null }
-        val target = find() ?: fail("No enabled button \"$label\". Screen: ${screen()}")
+        fun find() = nodes { n -> n.label()?.let(matches) == true }.firstNotNullOfOrNull { n -> clickableOf(n)?.takeIf { it.isEnabled } }
+        waitFor("an enabled button \"$name\"", 10_000) { find() != null }
+        val target = find() ?: fail("No enabled button \"$name\". Screen: ${screen()}")
         val bounds = Rect().also(target::getBoundsInScreen)
-        log("click \"$label\": ${target.className} $bounds")
+        log("click \"$name\": ${target.className} $bounds")
         // A real tap at the element's centre (UI Automator injects it); the element was found by its label above.
-        if (!device.click(bounds.centerX(), bounds.centerY())) fail("Tapping \"$label\" failed")
+        if (!device.click(bounds.centerX(), bounds.centerY())) fail("Tapping \"$name\" failed")
     }
 
     /**
@@ -418,13 +484,25 @@ class AppDriver {
      * Writes the scenario's one completing journal line when it sent a message: "chat <scenario> <key> <ids>", the
      * chat's server ids (current first, then earlier ones), or "none" when the app never created it on the server. The
      * build host requires exactly one such line for every scenario with a send line. Call once, at the scenario's end.
+     * [ids]: the chat's ids as read before it was left (a left temporary chat has no row to read).
      */
-    fun journalSent() {
+    fun journalSent(ids: List<String>? = null) {
         val key = sentChat ?: return
         sentChat = null
-        val row = chatRow(key)
-        val ids = if (row?.onServer == true) (listOf(row.currentId) + row.lineage).distinct().joinToString(",") else "none"
-        journal("chat $scenario $key $ids")
+        val line = if (ids != null) {
+            if (ids.size !in 1..8 || !ids.all(SESSION_ID::matches)) fail("Not 1 to 8 app session ids")
+            ids.joinToString(",")
+        } else {
+            val row = chatRow(key)
+            if (row?.onServer == true) (listOf(row.currentId) + row.lineage).distinct().joinToString(",") else "none"
+        }
+        journal("chat $scenario $key $line")
+    }
+
+    /** The server ids of chat [key] (current first, then earlier ones); fails unless the app has created it there. */
+    fun chatIds(key: String): List<String> {
+        val row = chatRow(key)?.takeIf { it.onServer } ?: fail("The chat is not on the server")
+        return (listOf(row.currentId) + row.lineage).distinct()
     }
 
     /** Journals the id of the run the app is following for chat [sessionKey] (exactly one), with that chat's id. */

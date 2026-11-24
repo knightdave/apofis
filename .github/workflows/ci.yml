@@ -10,6 +10,7 @@ jobs:
   check:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - run: python3 -I -m unittest discover -s server/apofis-push -p 'test_*.py' -v
