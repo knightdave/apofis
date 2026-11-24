@@ -13,6 +13,29 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasText
+import java.time.ZoneOffset
+import java.util.Base64
+import xyz.rycerz.apofis.api.fixture
+import xyz.rycerz.apofis.chat.AssistantReply
+import xyz.rycerz.apofis.chat.UserMessage
+import xyz.rycerz.apofis.ui.DrawerButton
+import xyz.rycerz.apofis.ui.FIXED_NOW
+import xyz.rycerz.apofis.ui.FIXED_TODAY
+import xyz.rycerz.apofis.ui.NewChatButton
+import xyz.rycerz.apofis.ui.chat.ChatActions
+import xyz.rycerz.apofis.ui.chat.ChatScreen
+import xyz.rycerz.apofis.ui.chat.ChatUiState
+import xyz.rycerz.apofis.ui.chat.ComposerMode
+import xyz.rycerz.apofis.ui.chat.SEND_TAG
+import xyz.rycerz.apofis.ui.chat.StatusLine
+import xyz.rycerz.apofis.ui.drawer.NewChatState
+import xyz.rycerz.apofis.ui.image.LocalImageStore
+import xyz.rycerz.apofis.ui.image.LocalThumbCache
+import xyz.rycerz.apofis.ui.windowShot
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -116,10 +139,16 @@ abstract class ShareFixture : TemporaryFixture() {
         ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) { if (shown) content() }
     }
 
-    /** The chat route of the container's current connection. */
+    /** The chat route of the container's current connection, with the image store and thumbnails MainActivity provides. */
     protected fun compose() = show {
         val conn = container.connection.collectAsState().value
-        if (conn != null) key(conn) { ChatRoute(container, conn, ownerOf(conn), 0, onSettings = {}, onConnection = {}) }
+        if (conn != null) {
+            key(conn) {
+                CompositionLocalProvider(LocalImageStore provides container.imageStore, LocalThumbCache provides conn.thumbs) {
+                    ChatRoute(container, conn, ownerOf(conn), 0, onSettings = {}, onConnection = {})
+                }
+            }
+        }
     }
 
     /**
@@ -176,6 +205,26 @@ abstract class ShareFixture : TemporaryFixture() {
     /** The whole fill: the text, every image ready in order, and the one note (written last). */
     protected fun filled(text: String, digests: List<String> = emptyList(), note: ComposerNote? = null): (ComposerState) -> Boolean = { s ->
         s.draft == text && s.images.map { it.digest } == digests && s.images.none { it.processing || it.failed } && s.note == note
+    }
+
+    /**
+     * The draft photo [index] of [count] is drawn from its stored file: only a decoded thumbnail opens the viewer, the
+     * placeholder (loading or unavailable) is never clickable.
+     */
+    protected fun thumbDrawn(index: Int, count: Int) = rule.onAllNodes(
+        hasContentDescription(str(R.string.chat_image, index, count)) and hasClickAction(),
+        useUnmergedTree = true,
+    ).fetchSemanticsNodes().isNotEmpty()
+
+    /** Waits until [thumbDrawn] holds for each of [indices] of [count]; on a timeout, says what the image nodes carry. */
+    protected fun waitThumbs(count: Int, vararg indices: Int) {
+        try {
+            rule.waitUntil(10_000) { indices.all { thumbDrawn(it, count) } }
+        } catch (e: androidx.compose.ui.test.ComposeTimeoutException) {
+            val nodes = rule.onAllNodes(hasContentDescription(str(R.string.chat_image, 1, count).substringBefore(" 1"), substring = true), useUnmergedTree = true)
+                .fetchSemanticsNodes().map { it.config.toString() }
+            throw AssertionError("thumbnails not drawn: $nodes", e)
+        }
     }
 
     protected fun visible(text: String) = rule.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
@@ -307,6 +356,8 @@ class ShareSheetTest : ShareFixture() {
         assertNull(container.pendingShare.value)
         assertEquals(emptyList<String>(), writes())
         waitVisible("Look at these") // the composer shows the draft
+        waitThumbs(2, 1, 2) // both photos drawn from their files
+        assertTrue(visible(str(R.string.share_images_failed))) // the note line (the sheet that also said it is gone)
     }
 
     @Test
@@ -329,6 +380,8 @@ class ShareSheetTest : ShareFixture() {
         rule.waitUntil(10_000) { SHARED_T in drawer().rows.value.chats() } // listed again: it is no longer open
         assertEquals(ComposerNote(NoteKind.TEMPORARY_NOT_DELETED), composerOf(k).note) // replaces the share's note
         assertEquals("Shared words", composerOf(k).draft)
+        waitVisible(str(R.string.chat_temporary_not_deleted)) // drawn in the new chat
+        assertFalse(visible(str(R.string.share_text_cut)))
     }
 
     @Test
@@ -358,6 +411,17 @@ class ShareSheetTest : ShareFixture() {
             bounded { container.collectImages() }
             assertEquals(listOf(digest), composerOf(k).images.map { it.digest })
             assertNotNull(container.imageStore.read(digest))
+            waitThumbs(1, 1) // the new draft's thumbnail resolves
+
+            // A send from the new chat (the composer's own path) creates the chat and starts a run carrying the photo.
+            routes["POST /api/sessions"] = { json(409, fixture("session_exists_409.json")) }
+            routes["POST /v1/runs"] = { json(202, """{"run_id":"run_1","status":"started","replayed":false}""") }
+            rule.onNodeWithTag(SEND_TAG).performClick()
+            rule.waitUntil(10_000) { requests.any { it.method == "POST" && it.target == "/v1/runs" } }
+            val run = requests.single { it.method == "POST" && it.target == "/v1/runs" }
+            val body = run.body!!.utf8()
+            assertTrue("the run carries the shared photo", Base64.getEncoder().encodeToString(same) in body)
+            assertTrue(body.contains("Shared words"))
         }
     }
 
@@ -655,6 +719,31 @@ class ShareSheetTest : ShareFixture() {
         assertTrue(visible(cancel))
         assertFalse(visible(accept))
     }
+
+    private val question = UserMessage("u1", "Which plants can share a raised bed with tomatoes?", steered = false, timestamp = FIXED_NOW)
+    private val answer = AssistantReply("r1", emptyList(), "Basil, marigolds and lettuce grow well beside tomatoes.", FIXED_NOW)
+
+    /** The sheet over a chat screen with its composer; the chat is drawn from a fixed state, so nothing loads during the capture. */
+    private fun sheetShot(name: String, key: String, share: Share, temporary: Boolean) = rule.windowShot(name, hasText(str(R.string.share_title))) {
+        ChatScreen(
+            ChatUiState(key, "Which plants can share a raised bed", StatusLine.IDLE, listOf(question, answer), ComposerMode.SEND_DISABLED, "", "hermes.example"),
+            object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY,
+            navigationIcon = { DrawerButton {} }, appBarActions = { NewChatButton(NewChatState.NEW) {} },
+        )
+        ShareSheet(share, temporary, onAccept = {}, onCancel = {})
+    }
+
+    @Test
+    @Config(qualifiers = "w360dp-h760dp-xhdpi")
+    fun share_sheet() = sheetShot(
+        "share_sheet", "apofis-1",
+        Share(1, "Tomato bed, June: basil along the south edge, marigolds at the corners, lettuce in the shade of the stakes.", List(3) { ByteArray(1) }, setOf(NoteKind.SHARE_IMAGES_FAILED)),
+        temporary = false,
+    )
+
+    @Test
+    @Config(qualifiers = "w360dp-h760dp-xhdpi")
+    fun share_sheet_temporary() = sheetShot("share_sheet_temporary", "apofis-tmp-1", Share(1, "Basil, marigolds and lettuce", emptyList(), emptySet()), temporary = true)
 
     /** The sheet lays out and reads out a short preview; Accept still fills the whole text. */
     @Test
