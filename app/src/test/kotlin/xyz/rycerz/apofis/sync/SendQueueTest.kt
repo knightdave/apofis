@@ -898,7 +898,7 @@ class SendQueueTest {
         addSession("apofis-a")
         running("apofis-a")
         val refused = holding.hold(MockResponse.Builder().code(400).body("{}").build())
-        respond(fixture("session_delete.json"))
+        respond("""{"object":"hermes.session.deleted","id":"apofis-a","deleted":true}""")
         val repo = ChatRepository(api, db, { clock }, queue)
         val send = launch(Dispatchers.Default) { repo.send("apofis-a", "steer me") }
         take()
@@ -1598,6 +1598,146 @@ class SendQueueTest {
         for (size in listOf(Long.MAX_VALUE - 1, 3L shl 61)) { // the second makes 4 * ceil(n / 3) wrap to Long.MIN_VALUE
             sizes[d] = size
             assertRefused(listOf(d), expected = SendTooLarge::class.java)
+        }
+    }
+
+    // Issue 16 row 6: a stored steer is never delivered past the send expiry.
+    @Test
+    fun oldSteerNeverDelivered() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "a day late")
+        clock += SEND_EXPIRY_MS + 1
+        respond(fixture("steer_response.json")) // served only if the steer is wrongly sent
+
+        assertTrue(queue.drain())
+
+        assertEquals(0, server.requestCount)
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals(SendError.EXPIRED, row.error)
+        assertFalse(row.attempted)
+    }
+
+    // Issue 16 row 9: a refused key on a recovered steer stops the drain before any other send is tried.
+    @Test
+    fun recoveredSteer401KeepsOthersQueued() = runTest {
+        addSession("apofis-a")
+        addSession("apofis-b")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "steer under a refused key")
+        clock += 1
+        val waiting = queue.enqueue("apofis-b", "waits for a fixed key")
+        repeat(2) { respond("""{"error":{"code":"invalid_api_key"}}""", 401) } // two, so a second request fails the count
+
+        assertFalse(queue.drain())
+
+        assertEquals(1, server.requestCount)
+        val a = rows("apofis-a").single()
+        assertEquals("failed", a.state)
+        assertEquals(SendError.UNAUTHORIZED, a.error)
+        assertFalse(a.attempted)
+        val b = pending(waiting)
+        assertEquals("queued", b.state)
+        assertFalse(b.attempted)
+    }
+
+    // Issue 16 row 9: only a refused key stops the drain. A recovered steer answered 503 fails with its own error and the
+    // other chat's send still starts.
+    @Test
+    fun recoveredSteer503DoesNotStopTheDrain() = runTest {
+        addSession("apofis-a")
+        addSession("apofis-b")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "steer the server refuses")
+        clock += 1
+        val other = queue.enqueue("apofis-b", "starts anyway")
+        respond("{}", 503)
+        respond(runStart("run_2"), 202)
+
+        assertTrue(queue.drain())
+
+        assertEquals(2, server.requestCount)
+        val a = rows("apofis-a").single()
+        assertEquals("failed", a.state)
+        assertEquals(SendError.HTTP_ERROR, a.error)
+        assertFalse(a.attempted)
+        assertEquals("sending", pending(other).state)
+    }
+
+    // Issue 16 row 9: a foreground steer refused for the key fails its own row; the stop never leaves submit, so the
+    // caller never offers the stored text again.
+    @Test
+    fun foregroundSteer401StaysInsideSubmit() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        repeat(2) { respond("""{"error":{"code":"invalid_api_key"}}""", 401) } // two, so a second request fails the count
+
+        queue.submit("apofis-a", "steer under a refused key")
+
+        assertEquals(1, server.requestCount)
+        val row = rows("apofis-a").single()
+        assertEquals("failed", row.state)
+        assertEquals(SendError.UNAUTHORIZED, row.error)
+        assertFalse(row.attempted)
+    }
+
+    // Issue 16 row 7: the steer cannot be cancelled, so the open check is what keeps an answer that arrives after a
+    // server switch from being written: the row stays as the request left it.
+    @Test
+    fun steerAnsweredAfterTheSwitchWritesNothing() = runTest {
+        addSession("apofis-a")
+        running("apofis-a")
+        var checks = 0
+        SendQueue(api, db, { _, _ -> }, { clock }, active = { checks++ < 1 }).submit("apofis-a", "also do this")
+        val gate = holding.hold(
+            MockResponse.Builder().code(200).body(fixture("steer_response.json")).addHeader("Content-Type", "application/json").build(),
+        )
+        val open = java.util.concurrent.atomic.AtomicBoolean(true) // read on the drain's thread
+        val closing = imageQueue(db, active = open::get)
+        val drained = async(Dispatchers.Default) { closing.drain() }
+        assertEquals("/v1/runs/run_1/steer", take().target)
+
+        open.set(false) // the server switched while the steer was in flight
+        gate.countDown()
+
+        assertFalse(drained.await())
+        val row = rows("apofis-a").single()
+        assertEquals("steering", row.state)
+        assertTrue(row.attempted)
+    }
+
+    // Issue 16 row 6: the deadline passes while the attempted mark is written; the steer is checked again after it, as
+    // a queued send is, and is never sent.
+    @Test
+    fun steerExpiryRecheckedAfterAttemptMark() = runTest {
+        var mark: () -> Unit = {}
+        val marking = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .setQueryCallback(Dispatchers.Unconfined) { sql, _ -> if (sql.startsWith("UPDATE") && sql.contains("PendingSendEntity")) mark() }
+            .build()
+        try {
+            marking.sessionDao().upsert(SessionEntity("apofis-a", "apofis-a", "", null, false, false, 1.0, null, 0, null, false, true))
+            marking.activeRunDao().upsert(ActiveRunEntity("run_1", "apofis-a", null, "running", 1L))
+            marking.pendingSendDao().upsert( // a recovered steer exactly at the deadline: still eligible
+                PendingSendEntity(
+                    idempotencyKey = "k", sessionKey = "apofis-a", text = "just in time", requestBody = buildRunBody("apofis-a", "just in time"),
+                    createdAt = clock - SEND_EXPIRY_MS, state = "steering", runId = "run_1", error = null, attempted = false,
+                ),
+            )
+            respond(fixture("steer_response.json")) // served only if the steer is wrongly sent
+            mark = { mark = {}; clock += 1 } // the first update of the row is the attempt mark
+            assertTrue(imageQueue(marking).drain())
+            assertEquals(0, server.requestCount)
+            val row = marking.pendingSendDao().get("k")!!
+            assertEquals("failed", row.state)
+            assertEquals(SendError.EXPIRED, row.error)
+            assertFalse(row.attempted)
+        } finally {
+            marking.close()
         }
     }
 }

@@ -131,6 +131,10 @@ interface PendingSendDao {
     @Query("SELECT * FROM PendingSendEntity WHERE state = 'queued' ORDER BY createdAt")
     suspend fun allQueued(): List<PendingSendEntity>
 
+    /** Work a drain has left: a queued send, or a stored steer not yet sent (deferred while its chat is being deleted). */
+    @Query("SELECT EXISTS(SELECT 1 FROM PendingSendEntity WHERE state = 'queued' OR (state = 'steering' AND attempted = 0))")
+    suspend fun needsDrain(): Boolean
+
     @Query("SELECT * FROM PendingSendEntity WHERE state = :state ORDER BY createdAt")
     suspend fun withState(state: String): List<PendingSendEntity>
 
