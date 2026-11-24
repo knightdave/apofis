@@ -67,10 +67,10 @@ fun ApofisSheet(onDismiss: () -> Unit, dismissible: Boolean = true, content: @Co
     }
 }
 
-/** A sheet action: icon and label in a 48 dp row with the theme wash; one selection feedback per tap. */
+/** A sheet action: icon (null: none, and no gap) and label in a 48 dp row with the theme wash; one selection feedback per tap. */
 @Composable
 fun SheetRow(
-    @DrawableRes icon: Int,
+    @DrawableRes icon: Int?,
     label: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -92,8 +92,10 @@ fun SheetRow(
             .alpha(if (enabled) 1f else 0.38f),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(painterResource(icon), null, Modifier.size(20.dp), tint = color)
-        Box(Modifier.width(14.dp))
+        if (icon != null) {
+            Icon(painterResource(icon), null, Modifier.size(20.dp), tint = color)
+            Box(Modifier.width(14.dp))
+        }
         Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge, color = color)
         trailing()
     }

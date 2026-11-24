@@ -8,6 +8,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -74,6 +75,11 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
             exchange(request(url("api/sessions", id)).delete().build()) { }
         } catch (_: ApiError.NotFound) {
         }
+    }
+
+    /** The models of the server's configured providers, for the model sheet; never stored. */
+    suspend fun modelOptions(): ModelOptions = withContext(Dispatchers.Default) { // a long list is mapped off the main thread
+        get<ModelOptionsDto>(url("api/model/options") { addQueryParameter("include_unconfigured", "false") }).options()
     }
 
     suspend fun messages(sessionId: String, limit: Int = 500, offset: Int = 0): MessagePage = get(

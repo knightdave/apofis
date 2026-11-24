@@ -16,12 +16,14 @@ import xyz.rycerz.apofis.api.ApprovalChoice
  */
 class ChatGateTest {
     /**
-     * Exempt, passed straight on: typing (dropping it could lose text) and the six confirm and dismiss callbacks of the
-     * confirmation dialogs, which are their own windows above the drawer, seen whole and answered deliberately.
+     * Exempt, passed straight on: typing (dropping it could lose text), the six confirm and dismiss callbacks of the
+     * confirmation dialogs, which are their own windows above the drawer, seen whole and answered deliberately, and the
+     * choice sheets' dismissal, the sheet being its own window above the drawer too.
      */
     private val notActions = setOf(
         "onDraftChange",
         "onConfirmRetry", "onDismissRetry", "onConfirmCancel", "onDismissCancel", "onConfirmDiscard", "onDismissDiscard",
+        "closeSheet",
     )
 
     private val methods: List<Method> = ChatActions::class.java.methods.filter { it.declaringClass == ChatActions::class.java && !Modifier.isStatic(it.modifiers) }
