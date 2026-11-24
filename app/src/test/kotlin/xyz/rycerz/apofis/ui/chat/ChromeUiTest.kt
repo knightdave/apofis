@@ -20,9 +20,7 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
@@ -53,6 +51,7 @@ import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.settings.ThemeMode
 import xyz.rycerz.apofis.ui.FIXED_NOW
 import xyz.rycerz.apofis.ui.FIXED_TODAY
+import xyz.rycerz.apofis.ui.drawnPixels
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.LocalBlur
 import xyz.rycerz.apofis.ui.theme.Motion
@@ -154,7 +153,7 @@ class ChromeUiTest {
         rule.setContent {
             Box(Modifier.testTag("plain").size(40.dp).frostedGlass(null, CircleShape, Color.Red, Color.Blue))
         }
-        assertEquals(Color.Red, rule.onNodeWithTag("plain").captureToImage().toPixelMap()[40, 40])
+        assertEquals(Color.Red, rule.onNodeWithTag("plain").drawnPixels()[40, 40])
     }
 
     @Test
@@ -165,21 +164,7 @@ class ChromeUiTest {
                 Box(Modifier.testTag("glass").size(40.dp).frostedGlass(state, CircleShape, Color.Red, Color.Blue))
             }
         }
-        assertEquals(Color.Red, rule.onNodeWithTag("glass").captureToImage().toPixelMap()[40, 40])
-    }
-
-    /**
-     * The node's pixels. Robolectric sometimes captures a frame with nothing drawn (the window background, #FAFAFA),
-     * also in unrelated goldens; such a capture is taken again after a frame, a few times at most.
-     */
-    private fun pixels(tag: String): androidx.compose.ui.graphics.PixelMap {
-        repeat(5) {
-            val px = rule.onNodeWithTag(tag).captureToImage().toPixelMap()
-            if (px[px.width / 2, px.height / 2] != Color(0xFFFAFAFA)) return px // these tests never draw the window color there
-            rule.mainClock.advanceTimeByFrame()
-            rule.waitForIdle()
-        }
-        return rule.onNodeWithTag(tag).captureToImage().toPixelMap()
+        assertEquals(Color.Red, rule.onNodeWithTag("glass").drawnPixels()[40, 40])
     }
 
     /** I8: inside the glass the backdrop's sharp ink is replaced by its blur; just outside it is unchanged. */
@@ -197,7 +182,7 @@ class ChromeUiTest {
                 }
             }
         }
-        val px = pixels("page")
+        val px = rule.onNodeWithTag("page").drawnPixels()
         val inside = px[120, 120].luminance()
         val outside = px[120, 10].luminance()
         assertTrue("outside the glass the stroke is sharp: $outside", outside < 0.1f)
@@ -252,7 +237,7 @@ class ChromeUiTest {
         for (i in cases.indices) {
             case = i
             rule.waitForIdle()
-            val px = pixels("probe")
+            val px = rule.onNodeWithTag("probe").drawnPixels()
             // The 28 dp circle (56 px) centred in 128 px: sample inside it, away from its 1 dp border.
             var lo = 1f
             var hi = 0f
