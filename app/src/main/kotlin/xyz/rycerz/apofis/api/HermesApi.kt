@@ -13,6 +13,7 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
@@ -69,11 +70,23 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         return exchange(request(url("api/sessions", id)).patch(body.toJsonRequestBody()).build()) { decode<SessionEnvelope>(it) }.session
     }
 
-    /** A missing session counts as deleted. */
-    suspend fun deleteSession(id: String) {
-        try {
-            exchange(request(url("api/sessions", id)).delete().build()) { }
-        } catch (_: ApiError.NotFound) {
+    /**
+     * Returns only when [id] is gone: a 200 with the deleted object for exactly [id], or a 404 `session_not_found`.
+     * Any other 2xx (201 and 202 too) is [ApiError.Protocol], any other 404 is [ApiError.Http], the rest maps as for every call.
+     */
+    suspend fun deleteSession(id: String) = exchange(request(url("api/sessions", id)).delete().build(), checked = false) { response ->
+        when {
+            response.code == 404 -> codeOf(response.body.string()).let { if (it != "session_not_found") throw ApiError.Http(404, it) }
+            !response.isSuccessful -> throw errorOf(response)
+            else -> {
+                val o = decode<JsonObject>(response)
+                fun field(key: String, quoted: Boolean) = (o[key] as? JsonPrimitive)?.takeIf { it.isString == quoted }?.content
+                if (response.code != 200 || field("object", true) != "hermes.session.deleted" ||
+                    field("id", true) != id || field("deleted", false) != "true"
+                ) {
+                    throw ApiError.Protocol
+                }
+            }
         }
     }
 
@@ -179,15 +192,15 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
 
     /**
      * Runs [request] on the IO dispatcher; cancelling the caller cancels the HTTP call at once. Every call but an event
-     * [stream] keeps the client's overall deadline.
+     * [stream] keeps the client's overall deadline. With [checked] false, [onSuccess] gets every status, not only 2xx.
      */
-    private suspend fun <T> exchange(request: Request, stream: Boolean = false, onSuccess: suspend (Response) -> T): T = coroutineScope {
+    private suspend fun <T> exchange(request: Request, stream: Boolean = false, checked: Boolean = true, onSuccess: suspend (Response) -> T): T = coroutineScope {
         val call = client.newCall(request)
         if (stream) call.timeout().clearTimeout() // an event stream lasts as long as its run
         val work = async(Dispatchers.IO) {
             try {
                 call.execute().use { response ->
-                    if (!response.isSuccessful) throw errorOf(response)
+                    if (checked && !response.isSuccessful) throw errorOf(response)
                     onSuccess(response)
                 }
             } catch (e: IOException) {
@@ -212,11 +225,13 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
             response.code == 503 -> return ApiError.Unavailable(response.header("Retry-After")?.trim()?.toLongOrNull())
         }
         val text = response.body.string() // the code is needed to classify, so an IOException here is Network
-        // Only a short machine code survives, and never one that echoes the key.
-        val code = runCatching { json.decodeFromString<ErrorEnvelope>(text).error.code }.getOrNull()
-            ?.takeIf { codeFormat.matches(it) && apiKey !in it }
+        val code = codeOf(text)
         return if (response.code == 409 && code != null) ApiError.Conflict(code) else ApiError.Http(response.code, code)
     }
+
+    // Only a short machine code survives, and never one that echoes the key.
+    private fun codeOf(text: String): String? = runCatching { json.decodeFromString<ErrorEnvelope>(text).error.code }.getOrNull()
+        ?.takeIf { codeFormat.matches(it) && apiKey !in it }
 
     companion object {
         /** One id rule for every method: a single path segment that cannot change the target resource. */
