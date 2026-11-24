@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
@@ -40,6 +41,10 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia
+import androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
@@ -104,6 +109,10 @@ import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.api.ChatModel
 import xyz.rycerz.apofis.chat.ComposeError
+import xyz.rycerz.apofis.chat.ComposerNote
+import xyz.rycerz.apofis.chat.DraftImage
+import xyz.rycerz.apofis.chat.NoteKind
+import xyz.rycerz.apofis.images.ImageLimits
 import xyz.rycerz.apofis.chat.UnsentText
 import xyz.rycerz.apofis.chat.UserMessage
 import java.time.LocalDate
@@ -150,6 +159,24 @@ fun ChatScreen(
     val pending = state.live?.pending?.let { RequestRef(it.requestId, it.executionGeneration) }
     LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
     val follow = rememberFollow(listState, state)
+    // The list follows the bottom when a send's row was stored (the view model's counter), never on the tap itself: a
+    // refused send, a picker result or a finished photo moves nothing. Starts equal, so recreation pins nothing. The pin
+    // waits until the transcript shows the stored row (by its key), so it acts on the list that holds it whichever
+    // reaches the screen first. Only the stored part is searched, once per change of it, never per streamed token.
+    val seenStored = remember { longArrayOf(state.storedSends) }
+    val pinPending = state.storedSends != seenStored[0]
+    @Suppress("UNCHECKED_CAST") val storedPart = (state.items as? Joined<ChatItem>)?.head ?: state.items
+    val storedKey = state.storedKey
+    val storedShown = remember(storedPart, storedKey, pinPending) {
+        pinPending && storedKey != null && storedPart.asReversed().any { (it as? UserMessage)?.idempotencyKey == storedKey }
+    }
+    LaunchedEffect(state.storedSends, storedShown) {
+        if (storedShown && state.storedSends != seenStored[0]) {
+            seenStored[0] = state.storedSends
+            follow.onSend()
+            listState.scrollToItem(0)
+        }
+    }
     val backdrop = rememberBackdropState()
     val density = LocalDensity.current
     var bottomContent by remember { mutableIntStateOf(0) } // the bottom area without the larger of keyboard and navigation bar, px
@@ -168,7 +195,7 @@ fun ChatScreen(
         BottomInput(
             state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
             state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed, enterToSend, expanded, state.sessionKey,
-            state.status == StatusLine.LOAD_FAILED,
+            state.status == StatusLine.LOAD_FAILED, state.images,
         ),
     )
     // One gate for everything the chat can do: while the drawer covers it, a press that was already down (another
@@ -180,6 +207,28 @@ fun ChatScreen(
     val openImage: (ViewerImage) -> Unit = remember { { image -> gate.pass { viewer = image } } } // one instance, as above
     val overlays = LocalOverlays.current ?: remember { Overlays() } // the windows over this chat (AppNav provides one)
     val gated = remember { CoveredActions({ actionsNow.value }, gate) }
+    // The photo picker, registered here (not in the cached bottom slot, whose lambdas are rebuilt). Its result goes to the
+    // actions current when it arrives: this chat's view model, on the connection current then.
+    val one = rememberLauncherForActivityResult(remember { PickVisualMedia() }) { uri -> uri?.let { gated.onImagesPicked(listOf(it)) } }
+    val left = ImageLimits.MAX_IMAGES - state.images.size // every entry counts, failed and processing ones too
+    val many = rememberLauncherForActivityResult(remember(left) { PickMultipleVisualMedia(left.coerceAtLeast(2)) }) { gated.onImagesPicked(it) }
+    val imagesNow = rememberUpdatedState(state.images)
+    val answerClock = rememberUpdatedState(LocalAnswerClock.current)
+    val attach = remember {
+        {
+            gate.pass {
+                val n = ImageLimits.MAX_IMAGES - imagesNow.value.size // read at tap time
+                val request = PickVisualMediaRequest(PickVisualMedia.ImageOnly)
+                // A launch that fails (no picker on the device) does nothing; one that opens covers the chat like a window.
+                val opened = when {
+                    n >= 2 -> runCatching { many.launch(request) }.isSuccess
+                    n == 1 -> runCatching { one.launch(request) }.isSuccess
+                    else -> false.also { gated.onImagesLimit() }
+                }
+                if (opened) overlays.openedAt = answerClock.value() // see [Overlays]
+            }
+        }
+    }
     val barCallbacks = rememberUpdatedState(BarCallbacks(onOpenConnection, onRetryLoad, navigationIcon, appBarActions))
     val openConnection = remember { { gate.pass { barCallbacks.value.onOpenConnection() } } }
     val retryLoad = remember { { gate.pass { barCallbacks.value.onRetryLoad() } } }
@@ -253,14 +302,10 @@ fun ChatScreen(
                         input.mode,
                         { actions.onDraftChange(it, input.draftRevision) },
                         onSend = {
-                            // The holder decides at dispatch time; only an accepted send follows the bottom.
-                            val o = objects.value // the current list and follower, at tap time
+                            // The holder decides at dispatch time.
+                            // The list follows once the row is stored (the counter effect above), never here.
                             val accepted = !input.loadFailed && callbacks.value.actions.onSendClick()
-                            if (accepted) {
-                                linkFailed = false
-                                o.follow.onSend()
-                                scope.launch { o.list.scrollToItem(0) }
-                            }
+                            if (accepted) linkFailed = false
                             accepted
                         },
                         onStop = { input.runId?.let(actions::onStopClick) }, // the run drawn, not whatever runs at tap time
@@ -269,12 +314,16 @@ fun ChatScreen(
                         expanded = input.expanded,
                         onExpandedChange = { grow -> gate.pass { expandedIn.value = if (grow) input.sessionKey else null } }, // a user action of the covered layout
                         backdrop = objects.value.backdrop,
-                        subject = if (input.mode == ComposerMode.STOP || input.mode == ComposerMode.STEER) input.runId else input.sessionKey,
+                        subject = if (input.mode == ComposerMode.STOP || input.mode == ComposerMode.STEER || input.mode == ComposerMode.SEND_AFTER) input.runId else input.sessionKey,
+                        images = input.images,
+                        attachEnabled = !input.sending && !input.loadFailed && input.sessionKey.isNotEmpty(),
+                        onAttach = attach,
+                        onRemoveImage = actions::onRemoveImage,
                     )
                 }) { measurables, constraints ->
                     val width = constraints.maxWidth
                     val (shares, composer) = measureComposer(
-                        measurables.subList(1, 5), look!!, width, available = constraints.maxHeight - statusTop, bar = barHeight,
+                        measurables.subList(1, 7), look!!, width, available = constraints.maxHeight - statusTop, bar = barHeight,
                         notes = measurables[0].maxIntrinsicHeight(width), unsent = input.unsent != null,
                     )
                     val notes = measurables[0].measure(Constraints.fixed(width, shares.notes))
@@ -477,7 +526,7 @@ fun ChatScreen(
         key(unsent.id) {
             ConfirmDialog(
                 title = R.string.chat_discard_title,
-                text = R.string.chat_discard_text,
+                text = if (unsent.images.isEmpty()) R.string.chat_discard_text else R.string.chat_discard_text_images,
                 quote = unsent.text,
                 confirm = R.string.chat_unsent_discard,
                 dismiss = R.string.chat_keep,
@@ -546,16 +595,35 @@ fun ChatScreen(
 
 @Composable
 private fun ComposerNoteLine(note: ComposerNote) = NoteLine(
-    when (note) {
-        ComposerNote.REMOVED_MAY_HAVE_SENT -> R.string.chat_note_removed_may_have_sent
-        ComposerNote.CANCEL_TOO_LATE -> R.string.chat_note_cancel_too_late
+    when (note.kind) {
+        NoteKind.REMOVED_MAY_HAVE_SENT -> R.string.chat_note_removed_may_have_sent
+        NoteKind.CANCEL_TOO_LATE -> R.string.chat_note_cancel_too_late
+        NoteKind.IMAGE_FAILED -> R.string.chat_image_failed
+        NoteKind.IMAGES_LIMIT -> R.string.chat_images_limit
+        NoteKind.IMAGES_TOO_LARGE -> R.string.chat_images_too_large
+        NoteKind.SHARE_TOO_MANY -> R.string.share_too_many
+        NoteKind.SHARE_IMAGES_FAILED -> R.string.share_images_failed
+        NoteKind.SHARE_TEXT_CUT -> R.string.share_text_cut
+        NoteKind.CMD_UNKNOWN -> R.string.cmd_unknown
+        NoteKind.CMD_NO_TEXT -> R.string.cmd_no_text
+        NoteKind.CMD_NOTHING_RUNNING -> R.string.cmd_nothing_running
+        NoteKind.CMD_NEEDS_TEXT -> R.string.cmd_needs_text
+        NoteKind.CMD_STEER_NO_IMAGES -> R.string.cmd_steer_no_images
+        NoteKind.CMD_TITLE_REFUSED -> R.string.cmd_title_refused
+        NoteKind.FAST_ON -> R.string.fast_on
+        NoteKind.FAST_OFF -> R.string.fast_off
+        NoteKind.TEMPORARY_NOT_DELETED -> R.string.chat_temporary_not_deleted
     },
+    arg = note.arg,
 )
 
-/** A note above the composer; [oneLine] keeps it to one line (the full text stays readable to accessibility). */
+/**
+ * A note above the composer; [oneLine] keeps it to one line (the full text stays readable to accessibility). [arg]
+ * fills the string's one argument, when it takes one.
+ */
 @Composable
-private fun NoteLine(text: Int, oneLine: Boolean = false) {
-    val full = stringResource(text)
+private fun NoteLine(text: Int, oneLine: Boolean = false, arg: String? = null) {
+    val full = if (arg != null) stringResource(text, arg) else stringResource(text)
     Text(
         full,
         Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(top = 6.dp).semantics { liveRegion = LiveRegionMode.Polite; contentDescription = full },
@@ -646,11 +714,12 @@ private data class BottomInput(
     val expanded: Boolean,
     val sessionKey: String,
     val loadFailed: Boolean,
+    val images: List<DraftImage>,
 )
 
 /** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it; with firstLoad (the skeleton). */
 private fun ChatUiState.forTranscript() =
-    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null)
+    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null, images = emptyList(), storedSends = 0, storedKey = null)
 
 private data class BarCallbacks(
     val onOpenConnection: () -> Unit,
@@ -679,9 +748,10 @@ internal class Gate(private val covered: () -> Boolean) {
 }
 
 /**
- * [actions] through [gate]. Exempt, and passed straight on: typing ([onDraftChange]), which dropping could lose, and
- * the six confirm and dismiss callbacks of the confirmation dialogs and the choice sheets' dismissal, each its own window
- * above the drawer.
+ * [actions] through [gate]. Exempt, and passed straight on: typing ([onDraftChange]), which dropping could lose, the
+ * six confirm and dismiss callbacks of the confirmation dialogs and the choice sheets' dismissal, each its own window
+ * above the drawer, and the photo picker's result ([onImagesPicked]), which comes from a window above the chat too:
+ * dropping it would lose the user's pick.
  */
 internal class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
     override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
@@ -706,6 +776,9 @@ internal class CoveredActions(private val actions: () -> ChatActions, private va
     override fun pickModel(provider: String?, model: String?) = gate.pass { actions().pickModel(provider, model) }
     override fun pickReasoning(level: String?) = gate.pass { actions().pickReasoning(level) }
     override fun toggleFast() = gate.pass { actions().toggleFast() }
+    override fun onImagesPicked(uris: List<Uri>) = actions().onImagesPicked(uris)
+    override fun onRemoveImage(id: Long) = gate.pass { actions().onRemoveImage(id) }
+    override fun onImagesLimit() = gate.pass { actions().onImagesLimit() }
 }
 
 /** The body lambda for the last pair of bar heights. */

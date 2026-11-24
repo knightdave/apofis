@@ -43,8 +43,9 @@ internal data class Expansion(val progress: Float, val lines: Int, val cap: Int 
 
 /**
  * The heights of every part, px, in the safe band (status inset to keyboard or navigation inset). The composer is, top
- * to bottom: [marginTop], the card ([paddingTop], the [row] holding the [field] and the action column [actions],
- * [paddingBottom]) and [marginBottom]. [bar] + [notes] + [composer] + [transcript] is the band's height.
+ * to bottom: [marginTop], the card ([paddingTop], the draft photos' [strip], the [row] holding the [field] and the
+ * action column [actions], [paddingBottom]) and [marginBottom]. [bar] + [notes] + [composer] + [transcript] is the
+ * band's height.
  */
 internal data class BottomShares(
     val barShown: Boolean,
@@ -58,8 +59,9 @@ internal data class BottomShares(
     val paddingBottom: Int,
     val marginBottom: Int,
     val transcript: Int,
+    val strip: Int = 0,
 ) {
-    val card: Int get() = paddingTop + row + paddingBottom
+    val card: Int get() = paddingTop + strip + row + paddingBottom
     val composer: Int get() = marginTop + card + marginBottom
 }
 
@@ -74,7 +76,9 @@ internal data class BottomShares(
  *  5. the rest of the notes, at their natural height (they scroll inside their share when capped);
  *  6. further field lines up to five ([field] gives the field's natural height for a room) and the room for Expand above
  *     Send when [wantsExpand] (both 48 dp targets);
- *  7. the card's padding, then its margins (up to 32 dp together; odd pixels go to the bottom).
+ *  7. the card's padding, then its margins (up to 32 dp together; odd pixels go to the bottom);
+ *  8. the draft photos' [strip] (its natural height, 0 without photos), whole or not at all: a strip cut partway would
+ *     cut its 48 dp remove targets.
  * The transcript gets what is left. Expanded ([expansion]), the layout is the collapsed one with the transcript's surplus
  * over its 64 dp moved into the field (growing with the expansion's progress, at most its cap), so expanding never makes
  * anything smaller and Collapse stands where Expand stood; where the collapsed layout has no room for Expand, an
@@ -88,18 +92,19 @@ internal fun bottomShares(
     wantsExpand: Boolean,
     expansion: Expansion?,
     d: BottomDims,
+    strip: Int = 0,
     field: (room: Int) -> Int,
 ): BottomShares {
     // Expanded, the collapsed field is the text's 1 to 5 lines (the field itself is measured once, at the result).
     val collapsedField: (Int) -> Int = if (expansion == null) field else { room -> minOf(room, d.field(expansion.lines.coerceIn(1, 5))) }
-    val c = collapsedShares(available, bar, notes, unsent, wantsExpand, d, collapsedField)
+    val c = collapsedShares(available, bar, notes, unsent, wantsExpand, d, strip, collapsedField)
     if (expansion == null || c.actions < 2 * d.target) return c
     val surplus = minOf((c.transcript - d.transcriptMin).coerceAtLeast(0), (expansion.cap - c.row).coerceAtLeast(0))
     val grow = (surplus * expansion.progress.coerceIn(0f, 1f)).toInt()
     return c.copy(row = c.row + grow, field = c.row + grow, transcript = c.transcript - grow)
 }
 
-private fun collapsedShares(available: Int, bar: Int, notes: Int, unsent: Boolean, wantsExpand: Boolean, d: BottomDims, field: (room: Int) -> Int): BottomShares {
+private fun collapsedShares(available: Int, bar: Int, notes: Int, unsent: Boolean, wantsExpand: Boolean, d: BottomDims, strip: Int, field: (room: Int) -> Int): BottomShares {
     val total = available.coerceAtLeast(0)
     var row = minOf(total, d.row1)
     var left = total - row
@@ -120,10 +125,12 @@ private fun collapsedShares(available: Int, bar: Int, notes: Int, unsent: Boolea
     left -= padding
     val margin = minOf(d.cardInsets - d.cardPadding, left)
     left -= margin
+    val stripShare = if (strip <= left) strip else 0
+    left -= stripShare
     val actions = if (wantsExpand && row >= 2 * d.target) 2 * d.target else minOf(row, d.target)
     return BottomShares(
         barShown, if (barShown) bar else 0, noticeRow + moreNotes,
-        margin / 2, padding / 2, row, minOf(fieldHeight, row), actions, padding - padding / 2, margin - margin / 2, reserve + left,
+        margin / 2, padding / 2, row, minOf(fieldHeight, row), actions, padding - padding / 2, margin - margin / 2, reserve + left, stripShare,
     )
 }
 

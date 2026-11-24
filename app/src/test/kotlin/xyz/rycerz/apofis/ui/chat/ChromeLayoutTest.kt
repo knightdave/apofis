@@ -68,6 +68,8 @@ import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.api.PendingControl
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
+import xyz.rycerz.apofis.chat.ComposerNote
+import xyz.rycerz.apofis.chat.NoteKind
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
@@ -809,7 +811,7 @@ class ChromeLayoutTest {
     @Test
     @Config(qualifiers = "w360dp-h220dp-xhdpi")
     fun anUnsentNoticeWithASecondNoteKeepsItsRow() {
-        show(chat(failed).copy(unsent = unsent, composerNote = ComposerNote.CANCEL_TOO_LATE))
+        show(chat(failed).copy(unsent = unsent, composerNote = ComposerNote(NoteKind.CANCEL_TOO_LATE)))
         insets(top = 48, bottom = 48)
         val put = button("Put back")
         assertTrue("Put back $put whole in the guaranteed row", put.top >= bottomAreaTop() - 0.5f)
@@ -821,7 +823,7 @@ class ChromeLayoutTest {
     /** The editor expanded with a note: the note keeps its natural height above the card. */
     @Test
     fun theExpandedEditorKeepsTheNotes() {
-        show(withDraft(chat(failed), 3).copy(composerNote = ComposerNote.REMOVED_MAY_HAVE_SENT))
+        show(withDraft(chat(failed), 3).copy(composerNote = ComposerNote(NoteKind.REMOVED_MAY_HAVE_SENT)))
         rule.onNode(hasContentDescription("Expand the editor")).performClick()
         rule.waitForIdle()
         rule.onNode(hasContentDescription("Collapse the editor")).assertExists()

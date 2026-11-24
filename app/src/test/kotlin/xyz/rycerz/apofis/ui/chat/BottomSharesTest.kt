@@ -132,4 +132,25 @@ class BottomSharesTest {
         assertEquals(60, s.notes)
         assertEquals(128, s.transcript)
     }
+
+    /** The draft strip gets space last, after the card's decoration, and whole or not at all: the first piece to go. */
+    @Test
+    fun theStripGetsSpaceLast() {
+        val d = Density(2f, 1f).bottomDims(style)
+        val one = d.field(1)
+        val strip = 2 * (88 + 8)
+        val bare = bottomShares(1520, 112, 60, false, false, null, d) { minOf(it, one) }
+        val roomy = bottomShares(1520, 112, 60, false, false, null, d, strip) { minOf(it, one) }
+        assertEquals(strip, roomy.strip)
+        assertEquals(bare.card + strip, roomy.card)
+        assertEquals(bare.transcript - strip, roomy.transcript)
+        assertEquals(1520, roomy.bar + roomy.notes + roomy.composer + roomy.transcript)
+        // Exactly the room the strip needs beyond every other piece's full share: it is shown.
+        val needed = bare.bar + bare.notes + bare.composer + 2 * 64 + strip
+        assertEquals(strip, bottomShares(needed, 112, 60, false, false, null, d, strip) { minOf(it, one) }.strip)
+        // One pixel less: the strip goes whole, everything else keeps the share it had without a strip.
+        val short = bottomShares(needed - 1, 112, 60, false, false, null, d, strip) { minOf(it, one) }
+        assertEquals(0, short.strip)
+        assertEquals(bottomShares(needed - 1, 112, 60, false, false, null, d) { minOf(it, one) }, short)
+    }
 }

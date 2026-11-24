@@ -389,13 +389,14 @@ class ChatRepository(
 
     /**
      * Steers the session's running run, else queues [text] and tries to start it at once; with [images] (digests) it is
-     * always queued. The message is stored before any request; [onStored] runs once it is (before any request). A hidden
+     * always queued. The message is stored before any request; [onStored] runs once it is (before any request), with the
+     * stored row's idempotency key. A hidden
      * chat fails locally; an unknown one throws IllegalArgumentException; see [SendQueue.submit] for the other refusals.
      * Every choice change started before this call ([changeChoice]), in any chat of this connection, finishes before the
      * message is handed to the queue. The queue freezes the choice stored at the moment it stores the message, which can
      * include a change made after the call.
      */
-    suspend fun send(sessionKey: String, text: String, images: List<String> = emptyList(), onStored: () -> Unit = {}) {
+    suspend fun send(sessionKey: String, text: String, images: List<String> = emptyList(), onStored: (key: String) -> Unit = {}) {
         requireAppKey(sessionKey)
         choiceChanges.withLock {}
         queue().submit(sessionKey, text, onStored, images)

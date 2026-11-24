@@ -11,12 +11,17 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -30,12 +35,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
@@ -72,6 +79,11 @@ import androidx.compose.ui.unit.isSpecified
 import androidx.compose.ui.util.lerp
 import xyz.rycerz.apofis.BuildConfig
 import xyz.rycerz.apofis.R
+import xyz.rycerz.apofis.chat.DraftImage
+import xyz.rycerz.apofis.ui.image.ImagePlaceholder
+import xyz.rycerz.apofis.ui.image.ImageThumb
+import xyz.rycerz.apofis.ui.image.LocalImageOpen
+import xyz.rycerz.apofis.ui.image.ViewerImage
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.BackdropState
@@ -92,7 +104,7 @@ private val CARD_PADDING = 8.dp
 /** Whether the main button works: a send in flight ([busy]) blocks another send or steer, never Stop. Drawing only. */
 internal fun primaryEnabled(mode: ComposerMode, busy: Boolean) = when (mode) {
     ComposerMode.SEND_DISABLED -> false
-    ComposerMode.SEND, ComposerMode.STEER -> !busy
+    ComposerMode.SEND, ComposerMode.STEER, ComposerMode.SEND_AFTER -> !busy
     ComposerMode.STOP -> true
 }
 
@@ -122,6 +134,8 @@ internal class ComposerLook(
     val lines: () -> Int,
     val expandedHeight: Dp,
     val room: ExpandRoom,
+    val strip: Int, // the draft strip's natural height, px: 0 without photos
+    val stripRoom: ExpandRoom, // whether the allocation leaves the strip its share (it is composed only then)
 )
 
 /** Whether the allocation leaves Expand its second 48 dp target: [now] for keys in this frame, [state] for composing it. */
@@ -131,15 +145,17 @@ internal class ExpandRoom {
 }
 
 /**
- * The composer's parts, in this order: the card's glass, the field, the expand button (an empty box when not shown)
- * and the action row (Stop before Steer while steering, then the primary button). They are laid out by [placeComposer]
+ * The composer's parts, in this order: the card's glass, the field, the expand button (an empty box when not shown),
+ * the action row (Stop before the primary button while steering or sending after the reply), Plus (the photo picker,
+ * [onAttach]; disabled unless [attachEnabled]) and the strip of draft [images] (an empty box when hidden; each photo
+ * has a remove control, [onRemoveImage], disabled while [busy]). They are laid out by [placeComposer]
  * with the numbers of [bottomShares]: by [Composer] on its own, or by the chat screen's bottom area together with the
  * notes, so one allocation decides every height.
  *
  * The text is the holder's [draft]; only user edits call [onDraftChange]. [onSend] asks the holder and returns whether
  * it took the draft; only then the composer collapses. The button, the IME action (only with [enterToSend]) and
  * hardware Enter (see [enterKey]) all go through it. [busy]: see [primaryEnabled]; the field also takes no edits then.
- * [subject]: what the primary action acts on (the run for Stop and Steer, the chat for Send); see [PrimaryButton].
+ * [subject]: what the primary action acts on (the run for Stop, Steer and Send after, the chat for Send); see [PrimaryButton].
  */
 @Composable
 internal fun ComposerParts(
@@ -157,6 +173,10 @@ internal fun ComposerParts(
     subject: Any? = null,
     transcript: Boolean = true,
     clock: () -> Long = System::nanoTime,
+    images: List<DraftImage> = emptyList(),
+    attachEnabled: Boolean = true,
+    onAttach: () -> Unit = {},
+    onRemoveImage: (Long) -> Unit = {},
 ): ComposerLook {
     if (BuildConfig.DEBUG) SideEffect { ChromeProbe.composerBackdropId = System.identityHashCode(backdrop) }
     val shape = RoundedCornerShape(20.dp)
@@ -222,18 +242,95 @@ internal fun ComposerParts(
         }
     }
     Row {
-        if (mode == ComposerMode.STEER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
+        // Keyed by the run it is drawn for: a press begun on one run is cancelled when another run is shown.
+        if (mode == ComposerMode.STEER || mode == ComposerMode.SEND_AFTER) key(subject) {
+            RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
+        }
         PrimaryButton(mode, busy, subject, submit, onStop, clock)
     }
-    return ComposerLook(dims, expanded, wantsExpand, progress, { lines }, expandedHeight, room)
+    ApofisIconButton(onClick = onAttach, contentDescription = stringResource(R.string.chat_attach), enabled = attachEnabled, visualSize = 24.dp) {
+        Icon(painterResource(R.drawable.lucide_plus), null, Modifier.size(20.dp), tint = colors.muted)
+    }
+    val stripRoom = remember { ExpandRoom() }
+    val stripState = rememberLazyListState() // kept while the strip is hidden, so its position comes back with it
+    Box {
+        // Composed only while the allocation gives it its share, like Expand: a hidden thumbnail keeps no focus. Lazy: a
+        // Put back may restore many photos, and only the tiles on screen are composed (and decoded).
+        if (images.isNotEmpty() && stripRoom.state.value) {
+            LazyRow(
+                Modifier.height(REMOVE_RISE + DRAFT_THUMB).onPreviewKeyEvent { !stripRoom.now }.semantics { traversalIndex = -2f },
+                state = stripState,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                itemsIndexed(images, key = { _, image -> image.id }) { i, image -> DraftThumb(image, i, images.size, busy, onRemoveImage) }
+            }
+        }
+    }
+    val strip = if (images.isEmpty()) 0 else with(density) { (REMOVE_RISE + DRAFT_THUMB + STRIP_GAP).roundToPx() }
+    return ComposerLook(dims, expanded, wantsExpand, progress, { lines }, expandedHeight, room, strip, stripRoom)
 }
 
-/** The composer's four measurables (see [ComposerParts]), measured with [shares] and placed from [y]. */
-internal class ComposerPlacement(private val glass: Placeable, private val field: Placeable, private val expand: Placeable?, private val buttons: Placeable, private val s: BottomShares, private val side: Int, private val marginX: Int) {
+private val DRAFT_THUMB = 88.dp
+private val STRIP_GAP = 8.dp // between the strip and the field's row
+// The remove target rises this far above its photo, so the 48 dp target ends above the photo's centre (a tap there opens it).
+private val REMOVE_RISE = 11.dp
+
+/**
+ * One draft photo: ready (opens the viewer when the chat provides one), processing (the spinner) or failed (the
+ * placeholder), with its remove control at the top end: an 18 dp chip 4 dp from the corner, in a 48 dp target that
+ * rises [REMOVE_RISE] above the photo; disabled while [busy].
+ */
+@Composable
+private fun DraftThumb(image: DraftImage, index: Int, count: Int, busy: Boolean, onRemove: (Long) -> Unit) {
+    val colors = ApofisTheme.colors
+    val open = LocalImageOpen.current
+    Box {
+        Box(Modifier.padding(top = REMOVE_RISE).size(DRAFT_THUMB)) {
+            val digest = image.digest
+            if (image.processing) {
+                Box(Modifier.matchParentSize().clip(MaterialTheme.shapes.small), contentAlignment = Alignment.Center) {
+                    ImagePlaceholder(Modifier.matchParentSize(), stringResource(R.string.chat_image_processing), glyph = false, glyphSize = 0.dp)
+                    Spinner(24.dp, MaterialTheme.colorScheme.primary)
+                }
+            } else {
+                ImageThumb(digest, DRAFT_THUMB, stringResource(R.string.chat_image, index + 1, count), if (digest != null && open != null) ({ open(ViewerImage.Stored(digest)) }) else null)
+            }
+        }
+        ApofisIconButton(
+            onClick = { onRemove(image.id) },
+            contentDescription = stringResource(R.string.chat_image_remove),
+            modifier = Modifier.align(Alignment.TopEnd),
+            enabled = !busy,
+            visualSize = 48.dp,
+        ) {
+            Box(Modifier.fillMaxSize().padding(top = REMOVE_RISE + 4.dp, end = 4.dp), contentAlignment = Alignment.TopEnd) {
+                Box(Modifier.size(18.dp).background(colors.thumbChip, CircleShape), contentAlignment = Alignment.Center) {
+                    Icon(painterResource(R.drawable.lucide_x), null, Modifier.size(12.dp), tint = colors.thumbChipGlyph)
+                }
+            }
+        }
+    }
+}
+
+/** The composer's six measurables (see [ComposerParts]), measured with [shares] and placed from [y]. */
+internal class ComposerPlacement(
+    private val glass: Placeable,
+    private val field: Placeable,
+    private val expand: Placeable?,
+    private val buttons: Placeable,
+    private val plus: Placeable,
+    private val strip: Placeable?,
+    private val s: BottomShares,
+    private val side: Int,
+    private val marginX: Int,
+) {
     fun Placeable.PlacementScope.place(width: Int, y: Int) {
         glass.placeRelative(marginX, y + s.marginTop)
-        val top = y + s.marginTop + s.paddingTop
-        field.placeRelative(side, top + s.row - field.height)
+        val inner = y + s.marginTop + s.paddingTop
+        strip?.placeRelative(side, inner)
+        val top = inner + s.strip // the row's top
+        plus.placeRelative(side, top + s.row - plus.height)
+        field.placeRelative(side + plus.width, top + s.row - field.height)
         expand?.placeRelative(width - side - expand.width, top)
         buttons.placeRelative(width - side - buttons.width, top + s.row - buttons.height)
     }
@@ -259,10 +356,11 @@ internal fun MeasureScope.measureComposer(
     val inner = (width - 2 * side).coerceAtLeast(0)
     val buttons = parts[3].measure(Constraints(0, inner, 0, d.target))
     val expandBox = parts[2].measure(Constraints(0, inner, 0, d.target))
-    val fieldWidth = (inner - maxOf(expandBox.width, buttons.width)).coerceAtLeast(0)
+    val plus = parts[4].measure(Constraints(0, inner, 0, d.target))
+    val fieldWidth = (inner - plus.width - maxOf(expandBox.width, buttons.width)).coerceAtLeast(0)
     var field: Placeable? = null
     val expansion = if (look.expanded) Expansion(look.progress.value, look.lines(), if (look.expandedHeight.isSpecified) look.expandedHeight.roundToPx() else Int.MAX_VALUE) else null
-    val s = bottomShares(available, bar, notes, unsent, look.wantsExpand, expansion, d) { room ->
+    val s = bottomShares(available, bar, notes, unsent, look.wantsExpand, expansion, d, look.strip) { room ->
         parts[1].measure(Constraints(fieldWidth, fieldWidth, 0, room)).also { field = it }.height // 1 to 5 lines (maxLines), scrolling inside
     }
     val f = field ?: parts[1].measure(Constraints.fixed(fieldWidth, s.field))
@@ -271,7 +369,11 @@ internal fun MeasureScope.measureComposer(
     look.room.now = fits
     if (look.room.state.value != fits) look.room.state.value = fits
     val expand = expandBox.takeIf { fits && it.height > 0 } // dropped before Send when both do not fit
-    return s to ComposerPlacement(glass, f, expand, buttons, s, side, marginX)
+    val stripShown = s.strip > 0
+    look.stripRoom.now = stripShown
+    if (look.stripRoom.state.value != stripShown) look.stripRoom.state.value = stripShown
+    val strip = parts[5].measure(Constraints(0, inner, 0, (s.strip - STRIP_GAP.roundToPx()).coerceAtLeast(0))).takeIf { stripShown }
+    return s to ComposerPlacement(glass, f, expand, buttons, plus, strip, s, side, marginX)
 }
 
 /**
@@ -296,10 +398,14 @@ internal fun Composer(
     backdrop: BackdropState? = null,
     subject: Any? = null,
     clock: () -> Long = System::nanoTime,
+    images: List<DraftImage> = emptyList(),
+    attachEnabled: Boolean = true,
+    onAttach: () -> Unit = {},
+    onRemoveImage: (Long) -> Unit = {},
 ) {
     var look: ComposerLook? = null
     Layout(
-        content = { look = ComposerParts(draft, mode, onDraftChange, onSend, onStop, busy, enterToSend, expanded, onExpandedChange, expandedHeight, backdrop, subject, transcript = false, clock = clock) },
+        content = { look = ComposerParts(draft, mode, onDraftChange, onSend, onStop, busy, enterToSend, expanded, onExpandedChange, expandedHeight, backdrop, subject, transcript = false, clock = clock, images = images, attachEnabled = attachEnabled, onAttach = onAttach, onRemoveImage = onRemoveImage) },
         modifier = modifier.fillMaxWidth().semantics { isTraversalGroup = true },
     ) { measurables, constraints ->
         val available = if (constraints.hasBoundedHeight) constraints.maxHeight else 1_000_000
@@ -330,6 +436,7 @@ private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, subm
     val labelId = when (mode) {
         ComposerMode.STEER -> R.string.chat_steer
         ComposerMode.STOP -> R.string.chat_stop
+        ComposerMode.SEND_AFTER -> R.string.chat_send_after
         else -> R.string.chat_send
     }
     val label = stringResource(labelId)

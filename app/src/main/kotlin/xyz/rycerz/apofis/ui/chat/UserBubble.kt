@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
@@ -29,12 +31,17 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.sync.SendError
+import xyz.rycerz.apofis.ui.image.ImageThumb
+import xyz.rycerz.apofis.ui.image.LocalImageOpen
+import xyz.rycerz.apofis.ui.image.ViewerImage
 import xyz.rycerz.apofis.ui.theme.ApofisIconButton
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.ChatText
@@ -78,9 +85,12 @@ internal fun collapsedPrefix(text: String): String {
 /**
  * Right aligned, at most 75 % wide, tinted with primary, collapsed to [USER_COLLAPSED_LINES] lines with Show more.
  * Expanded, it shows the first [PAGE_CHARS] piece, which always holds the collapsed prefix; a longer message then
- * offers Show full message, which opens the whole text in the Select view. A sent message has Copy and Select below;
- * unsent messages show their state and controls instead.
+ * offers Show full message, which opens the whole text in the Select view. A sent message with text has Copy and Select
+ * below; unsent messages show their state and controls instead. The message's photos ([UserMessage.images], nothing
+ * else) sit above the bubble; an entry without a local photo shows the placeholder. A message of photos only has no
+ * text bubble.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun UserBubble(
     message: UserMessage,
@@ -98,11 +108,25 @@ internal fun UserBubble(
         val more = expanded && page.length < text.length
         // Decided by the latest layout, both ways (a wider window can make a long message fit).
         var long by remember(text) { mutableStateOf(prefix.length < text.length) }
-        Box(Modifier.fillMaxWidth(0.75f), contentAlignment = Alignment.CenterEnd) {
+        val queued = if (message.state == SendState.QUEUED) 0.7f else 1f // 0.7: the contrast floor
+        if (message.images.isNotEmpty()) {
+            val open = LocalImageOpen.current
+            val n = message.images.size
+            FlowRow(
+                Modifier.fillMaxWidth().padding(bottom = if (hasText(text)) 8.dp else 0.dp).alpha(queued),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                message.images.forEachIndexed { i, d ->
+                    ImageThumb(d, 112.dp, stringResource(R.string.chat_image, i + 1, n), if (d != null && open != null) ({ open(ViewerImage.Stored(d)) }) else null)
+                }
+            }
+        }
+        if (hasText(text)) Box(Modifier.fillMaxWidth(0.75f), contentAlignment = Alignment.CenterEnd) {
             Text(
                 if (expanded) page else prefix,
                 Modifier
-                    .alpha(if (message.state == SendState.QUEUED) 0.7f else 1f) // 0.7: the contrast floor
+                    .alpha(queued)
                     .background(ApofisTheme.colors.bubbleFill, bubbleShape)
                     .padding(12.dp),
                 style = scaled(ChatText.user),
@@ -114,7 +138,7 @@ internal fun UserBubble(
                 },
             )
         }
-        if (long) {
+        if (long && hasText(text)) { // a blank caption has no text box, so nothing to expand
             Row {
                 if (expanded) SmallTextButton(R.string.chat_show_less, { expanded = false })
                 if (more) SmallTextButton(R.string.chat_show_full, { actions.onSelect(FULL + message.key) })
@@ -124,7 +148,7 @@ internal fun UserBubble(
         if (message.shortened) Caption(R.string.chat_reply_shortened)
         if (message.steered && message.state == SendState.SENT) Caption(R.string.chat_steered) // delivered
         // Before the early return: ordinary stored bubbles have no idempotency key. Offset so the icons end at the bubble's edge.
-        if (message.state == SendState.SENT) MessageActionRow(message, actions, Modifier.offset(x = 16.dp), alignEnd = true)
+        if (message.state == SendState.SENT && hasText(text)) MessageActionRow(message, actions, Modifier.offset(x = 16.dp), alignEnd = true)
         val key = message.idempotencyKey ?: return@Column
         when (message.state) {
             SendState.QUEUED -> Row(verticalAlignment = Alignment.CenterVertically) {
@@ -134,11 +158,7 @@ internal fun UserBubble(
                 CancelButton(R.string.chat_cancel_send) { onCancel(message) }
             }
             SendState.SENDING -> Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                // One linear turn per SPINNER_PERIOD while this message sends (its own active state), read in the draw phase only;
-                // static under reduced motion.
-                val time = rememberTimeMs(Motion.SPINNER_PERIOD)
-                val spin = if (ApofisTheme.reduceMotion) Modifier else Modifier.drawWithContent { rotate(time.value * 360f / Motion.SPINNER_PERIOD) { this@drawWithContent.drawContent() } }
-                Icon(painterResource(R.drawable.lucide_loader_circle), null, Modifier.size(14.dp).then(spin), tint = scheme.primary)
+                Spinner(14.dp, scheme.primary)
                 Box(Modifier.width(6.dp))
                 Caption(if (message.steered) R.string.chat_steering else R.string.chat_sending, padded = false)
             }
@@ -161,6 +181,17 @@ internal fun UserBubble(
             SendState.SENT -> Unit
         }
     }
+}
+
+/**
+ * The Milestone 2 spinner: one linear turn per SPINNER_PERIOD while it is shown (its own active state), read in the
+ * draw phase only; static under reduced motion.
+ */
+@Composable
+internal fun Spinner(size: Dp, tint: Color) {
+    val time = rememberTimeMs(Motion.SPINNER_PERIOD)
+    val spin = if (ApofisTheme.reduceMotion) Modifier else Modifier.drawWithContent { rotate(time.value * 360f / Motion.SPINNER_PERIOD) { this@drawWithContent.drawContent() } }
+    Icon(painterResource(R.drawable.lucide_loader_circle), null, Modifier.size(size).then(spin), tint = tint)
 }
 
 @Composable
