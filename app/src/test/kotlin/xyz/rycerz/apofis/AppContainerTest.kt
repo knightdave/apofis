@@ -645,21 +645,22 @@ class AppContainerTest {
     // Issue 16 row 8: a stored steer not yet sent (deferred by a delete the process did not survive) re-arms the worker.
     @Test
     fun deferredSteerRearmedAfterRestart() = runTest {
-        container.connect(A)
-        addSession("apofis-a")
-        db.pendingSendDao().upsert(
-            xyz.rycerz.apofis.db.PendingSendEntity( // qualified: this test is the only change to the file
-                idempotencyKey = "k", sessionKey = "apofis-a", text = "also do this", requestBody = "{}", createdAt = 1L,
-                state = "steering", runId = "run_1", error = null, attempted = false,
-            ),
-        )
-        container.scope.coroutineContext.job.let { it.cancel(); it.join() } // the first process ends: none of its jobs outlives it
         val work = WorkManager.getInstance(app)
-        work.cancelAllWork().result.get()
-
-        val restarted = AppContainer(app, store) { db }
+        var restarted: AppContainer? = null
+        suspend fun end(c: AppContainer) = c.scope.coroutineContext.job.let { it.cancel(); it.join() }
         try {
-            restarted.connected()
+            container.connect(A)
+            addSession("apofis-a")
+            db.pendingSendDao().upsert(
+                xyz.rycerz.apofis.db.PendingSendEntity( // qualified: this test is the only change to the file
+                    idempotencyKey = "k", sessionKey = "apofis-a", text = "also do this", requestBody = "{}", createdAt = 1L,
+                    state = "steering", runId = "run_1", error = null, attempted = false,
+                ),
+            )
+            end(container) // the first process ends: none of its jobs outlives it
+            work.cancelAllWork().result.get()
+
+            AppContainer(app, store) { db }.also { restarted = it }.connected()
             // WorkManager's own signal that the work is enqueued; the timeout is only a watchdog that fails.
             withContext(Dispatchers.Default) {
                 kotlinx.coroutines.withTimeout(10_000) {
@@ -667,7 +668,13 @@ class AppContainerTest {
                 }
             }
         } finally {
-            restarted.scope.coroutineContext.job.let { it.cancel(); it.join() } // before the database closes
+            // On every path, before the database closes: both graphs stop, then the wake lane has read what they posted.
+            withContext(kotlinx.coroutines.NonCancellable) {
+                end(container)
+                restarted?.let { end(it) }
+                xyz.rycerz.apofis.push.Wake.idle()
+                work.cancelUniqueWork(SendWorker.WORK_NAME).result.get()
+            }
         }
     }
 }

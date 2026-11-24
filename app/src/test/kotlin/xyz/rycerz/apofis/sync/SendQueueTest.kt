@@ -1709,4 +1709,35 @@ class SendQueueTest {
         assertEquals("steering", row.state)
         assertTrue(row.attempted)
     }
+
+    // Issue 16 row 6: the deadline passes while the attempted mark is written; the steer is checked again after it, as
+    // a queued send is, and is never sent.
+    @Test
+    fun steerExpiryRecheckedAfterAttemptMark() = runTest {
+        var mark: () -> Unit = {}
+        val marking = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .setQueryCallback(Dispatchers.Unconfined) { sql, _ -> if (sql.startsWith("UPDATE") && sql.contains("PendingSendEntity")) mark() }
+            .build()
+        try {
+            marking.sessionDao().upsert(SessionEntity("apofis-a", "apofis-a", "", null, false, false, 1.0, null, 0, null, false, true))
+            marking.activeRunDao().upsert(ActiveRunEntity("run_1", "apofis-a", null, "running", 1L))
+            marking.pendingSendDao().upsert( // a recovered steer exactly at the deadline: still eligible
+                PendingSendEntity(
+                    idempotencyKey = "k", sessionKey = "apofis-a", text = "just in time", requestBody = buildRunBody("apofis-a", "just in time"),
+                    createdAt = clock - SEND_EXPIRY_MS, state = "steering", runId = "run_1", error = null, attempted = false,
+                ),
+            )
+            respond(fixture("steer_response.json")) // served only if the steer is wrongly sent
+            mark = { mark = {}; clock += 1 } // the first update of the row is the attempt mark
+            assertTrue(imageQueue(marking).drain())
+            assertEquals(0, server.requestCount)
+            val row = marking.pendingSendDao().get("k")!!
+            assertEquals("failed", row.state)
+            assertEquals(SendError.EXPIRED, row.error)
+            assertFalse(row.attempted)
+        } finally {
+            marking.close()
+        }
+    }
 }

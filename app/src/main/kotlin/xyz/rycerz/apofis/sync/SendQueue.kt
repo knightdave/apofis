@@ -357,8 +357,8 @@ class SendQueue(
 
     /**
      * Under both locks. Returns true when the steer was refused and the row became a queued run send. A steer past the
-     * send expiry fails unsent; a refused key throws [KeyRefused]. Not cancellable: a new send's worker REPLACE must not
-     * cut the request off and leave its delivery uncertain.
+     * send expiry, checked before and after the attempted mark, fails unsent; a refused key throws [KeyRefused]. Not
+     * cancellable: a new send's worker REPLACE must not cut the request off and leave its delivery uncertain.
      */
     private suspend fun steer(row: PendingSendEntity): Boolean = withContext(NonCancellable) {
         val sent = row.copy(attempted = true)
@@ -368,6 +368,11 @@ class SendQueue(
             return@withContext false
         }
         if (pendingDao.update(sent) == 0) return@withContext false
+        // Again after the mark, as attemptLocked does, with nothing suspending before the request: never sent past it.
+        if (expired(row)) {
+            fail(row, SendError.EXPIRED) // the unmarked row: not attempted
+            return@withContext false
+        }
         try {
             api.steer(checkNotNull(row.runId), row.text)
             ensureOpen()
