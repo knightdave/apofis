@@ -1150,4 +1150,26 @@ class ChatRepositorySyncTest {
         assertEquals(caption, db.messageDao().rows("apofis-a").single().content) // the next sync stores the caption
         assertEquals(listOf(cutD1), repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single().images)
     }
+
+    @Test
+    fun callThatFitsExactlyIsKept() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        val calls = """[{"id":"a"},{"id":"b"},{"id":"c"}]""" // 34 units; each call costs 10 plus a comma or bracket
+        respond(
+            rawMessages(
+                "apofis-a",
+                listOf(
+                    cutRow(1, "assistant", "a".repeat(400_000 - 23), calls = calls), // 23 left: exactly two calls
+                    cutRow(2, "assistant", "a".repeat(400_000 - 22), calls = calls), // one unit less: one call
+                ),
+            ),
+        )
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertWithinBound(db)
+        val rows = db.messageDao().rows("apofis-a")
+        assertEquals("""[{"id":"a"},{"id":"b"}]""", rows[0].toolCallsJson)
+        assertEquals(1, rows[0].droppedToolCalls)
+        assertEquals("""[{"id":"a"}]""", rows[1].toolCallsJson)
+        assertEquals(2, rows[1].droppedToolCalls)
+    }
 }
