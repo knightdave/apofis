@@ -641,6 +641,42 @@ class AppContainerTest {
         container.connect(B)
         assertEquals(B, container.connected()!!.credentials)
     }
+
+    // Issue 16 row 8: a stored steer not yet sent (deferred by a delete the process did not survive) re-arms the worker.
+    @Test
+    fun deferredSteerRearmedAfterRestart() = runTest {
+        val work = WorkManager.getInstance(app)
+        var restarted: AppContainer? = null
+        suspend fun end(c: AppContainer) = c.scope.coroutineContext.job.let { it.cancel(); it.join() }
+        try {
+            container.connect(A)
+            addSession("apofis-a")
+            db.pendingSendDao().upsert(
+                xyz.rycerz.apofis.db.PendingSendEntity( // qualified: this test is the only change to the file
+                    idempotencyKey = "k", sessionKey = "apofis-a", text = "also do this", requestBody = "{}", createdAt = 1L,
+                    state = "steering", runId = "run_1", error = null, attempted = false,
+                ),
+            )
+            end(container) // the first process ends: none of its jobs outlives it
+            work.cancelAllWork().result.get()
+
+            AppContainer(app, store) { db }.also { restarted = it }.connected()
+            // WorkManager's own signal that the work is enqueued; the timeout is only a watchdog that fails.
+            withContext(Dispatchers.Default) {
+                kotlinx.coroutines.withTimeout(10_000) {
+                    work.getWorkInfosForUniqueWorkFlow(SendWorker.WORK_NAME).first { infos -> infos.any { it.state == WorkInfo.State.ENQUEUED } }
+                }
+            }
+        } finally {
+            // On every path, before the database closes: both graphs stop, then the wake lane has read what they posted.
+            withContext(kotlinx.coroutines.NonCancellable) {
+                end(container)
+                restarted?.let { end(it) }
+                xyz.rycerz.apofis.push.Wake.idle()
+                work.cancelUniqueWork(SendWorker.WORK_NAME).result.get()
+            }
+        }
+    }
 }
 
 /** The real app, except that commits to the cache preferences throw while [failCommits] is set. */
