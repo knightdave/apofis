@@ -117,11 +117,6 @@ private val DATA_IMAGE = Regex("data:image/(png|jpeg|gif|webp);base64,[A-Za-z0-9
 /** [url] when it is a base64 `data:` URL of a PNG, JPEG, GIF or WebP image (lower case, as written); else null. */
 internal fun dataImage(url: String): String? = url.takeIf { DATA_IMAGE.matches(it) }
 
-private val DATA_IMAGE_PARAGRAPH = Regex("!\\[[^\\]\\n]*\\]\\(" + DATA_IMAGE.pattern + "\\)\\s*")
-
-/** Whether [source] is one paragraph holding only a `data:` image with a plain alt, within [PARSE_MAX_CHARS]. */
-internal fun isDataImageParagraph(source: CharSequence): Boolean = source.length <= PARSE_MAX_CHARS && DATA_IMAGE_PARAGRAPH.matches(source)
-
 /** The MIME type of a URL [dataImage] accepted, in the form the decoder's label check takes. */
 internal fun dataImageType(url: String): String = url.substring("data:".length, url.indexOf(';'))
 

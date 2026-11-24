@@ -71,6 +71,7 @@ import org.junit.Assert.assertNull
 import xyz.rycerz.apofis.run.Connection
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.ui.chat.Work
+import xyz.rycerz.apofis.ui.chat.finalImage
 import xyz.rycerz.apofis.ui.chat.withLive
 import xyz.rycerz.apofis.ui.image.rememberDecoded
 
@@ -403,7 +404,7 @@ class MarkdownImageTest {
         for (file in sources) {
             val text = file.readText()
             // As calls or types: ChatScreen's own "openConnection" callback (the Connection screen) is not a network call.
-            for (word in listOf("\\bOkHttpClient\\b", "\\bURL\\(", "HttpURLConnection", "\\.openConnection\\b", "\\bokhttp3\\b", "\\.toURL\\b", "\\.openStream\\b", "Socket\\b")) {
+            for (word in listOf("\\bOkHttpClient\\b", "\\bURL\\(", "HttpURLConnection", "\\.openConnection\\b", "\\bokhttp3\\b", "\\.toURL\\b", "\\.openStream\\b", "Socket\\b", "\\.openInputStream\\b")) {
                 assertFalse("${file.name} names $word", Regex(word).containsMatchIn(text))
             }
         }
@@ -511,5 +512,33 @@ class MarkdownImageTest {
         val big = "Here:\n\n![big](data:image/png;base64," + "A".repeat(20_000) + ")"
         val finished = ChatRows(ZoneOffset.UTC).rows(listOf(reply.copy(text = big))).filterIsInstance<TextRow>()
         assertTrue(finished.none { (it.chunk as? DisplayChunk.Blocks)?.blocks.orEmpty().any { b -> b is MdBlock.Image } })
+    }
+
+    /** What the parser calls one image paragraph is one, however it is written; anything more stays literal. */
+    @Test
+    fun aFinishedReplysLastImageIsWhatTheParserSays() {
+        val url = dataUrl(onebitPng(4, 4, filler = 8_000))
+        fun finished(last: String) = ChatRows(ZoneOffset.UTC).rows(listOf(AssistantReply("r1", emptyList(), "Here:\n\n$last", FIXED_NOW))).filterIsInstance<TextRow>()
+        fun finishedTiles(last: String) = finished(last).sumOf { (it.chunk as? DisplayChunk.Blocks)?.blocks.orEmpty().sumOf(::dataTiles) }
+        assertEquals("one leading space", 1, finishedTiles(" ![late]($url)"))
+        assertEquals("an escaped closing bracket in the alt", 1, finishedTiles("![a\\]b]($url)"))
+        assertEquals("a title", 1, finishedTiles("![late]($url \"A title\")"))
+        // An image and more text in the block: the literal rows of today, not a parsed paragraph.
+        assertTrue(finished("![late]($url)\nand more text").any { (it.chunk as? DisplayChunk.Literal)?.text?.contains("and more text") == true })
+    }
+
+    /** Over the parser's bounds a finished last block is judged on its range alone: nothing is copied or parsed. */
+    @Test
+    fun anOversizedFinalBlockIsNeverCopied() {
+        fun source(length: Int, char: Char) = object : CharSequence {
+            override val length = length
+            override fun get(index: Int) = char
+            override fun subSequence(startIndex: Int, endIndex: Int): CharSequence = throw AssertionError("copied")
+            override fun toString(): String = throw AssertionError("copied")
+        }
+        for (text in listOf(source(25_000, 'x'), source(10_000, '['))) {
+            val block = LogicalBlock(0, 0, text.length, BlockKind.TEXT, "", stable = false, fenceClosed = false, BlockMode.LITERAL, text.length)
+            assertNull(finalImage(text, block))
+        }
     }
 }

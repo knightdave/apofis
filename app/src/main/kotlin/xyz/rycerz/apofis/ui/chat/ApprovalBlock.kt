@@ -83,7 +83,6 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
     val command = remember(control.command) { control.command?.takeIf { it.isNotBlank() } }
     var reading by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
     val chatGate = LocalChatGate.current // a control of the chat layout the drawer covers
-    val clock = LocalAnswerClock.current
     val choose = { press: Press, choice: ApprovalChoice -> if (gate.accepts(press)) onChoice(control.requestId, control.executionGeneration, choice) }
     ControlCard(R.string.chat_approval_title, changed, R.drawable.lucide_triangle_exclamation_point, ApofisTheme.colors.warning) {
         if (command != null) {
@@ -116,11 +115,11 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                 Pill(stringResource(R.string.chat_approval_once), filled = true, enabled = !answering, gate) { choose(it, ApprovalChoice.ONCE) }
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
-                    // Marked when asked to open, not when composed: its own items are answer controls pressed only after
-                    // it shows, so none of them may share the mark's millisecond.
-                    ApofisIconButton(onClick = { chatGate { gate.overlays.openedAt = clock(); menu = true } }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
+                    ApofisIconButton(onClick = { chatGate { menu = true } }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
                         Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
                     }
+                    // Marked once per showing, on the frame it shows, also one with no click (restored, or after answering).
+                    if (menu && !answering) OverChat(gate.overlays)
                     DropdownMenu(expanded = menu && !answering, onDismissRequest = { menu = false }) {
                         val session = remember { MutableInteractionSource() }
                         val sessionPress = remember { Press() }

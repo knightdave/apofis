@@ -65,6 +65,7 @@ import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.click
+import androidx.test.espresso.Espresso
 import java.time.ZoneOffset
 import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.ToolStep
@@ -227,6 +228,7 @@ class AnswerGuardTest {
         tick(300)
         rule.onNodeWithContentDescription("More approval options").performClick()
         settle()
+        tick(1) // the answer clock moves on before the tap: no real tap shares the menu's millisecond
         rule.onNodeWithText("Allow for this chat").performClick()
         assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.SESSION)), approvals)
     }
@@ -621,5 +623,69 @@ class AnswerGuardTest {
         rule.onNodeWithText("Allow once").performTouchInput { up() }
         settle()
         assertEquals(1, approvals.size)
+    }
+
+    // ---- closing commit: the menu is marked when it shows; a prompt by its kind ----
+
+    /** More asked at t, another answer's down at t + 5, the menu shows at t + 16: that press answers nothing. */
+    @Test
+    fun aDownBetweenMoreAndTheMenuShowingAnswersNothing() {
+        val overlays = Overlays()
+        rule.setContent { Themed { CompositionLocalProvider(LocalOverlays provides overlays) { Footer(approval) } } }
+        tick(1_000)
+        rule.onNodeWithContentDescription("More approval options").performSemanticsAction(SemanticsActions.OnClick) // asked
+        rule.mainClock.advanceTimeBy(5)
+        val down = rule.mainClock.currentTime
+        rule.onNodeWithText("Allow once").performTouchInput { down(center) }
+        tick(16)
+        assertTrue(exists(hasText("Always allow")))
+        assertTrue("shown at ${overlays.openedAt}, after the down at $down", overlays.openedAt > down)
+        rule.mainClock.autoAdvance = true // the popup's own dismissal needs frames
+        Espresso.pressBack()
+        rule.waitForIdle()
+        rule.mainClock.autoAdvance = false
+        assertTrue("the menu closed", !exists(hasText("Always allow")))
+        rule.onNodeWithText("Allow once").performTouchInput { up() }
+        settle()
+        assertTrue("$approvals", approvals.isEmpty())
+    }
+
+    @Test
+    fun aMenuItemPressedAfterTheMenuShowedAnswers() {
+        rule.setContent { Themed { Footer(approval) } }
+        tick(1_000)
+        rule.onNodeWithContentDescription("More approval options").performSemanticsAction(SemanticsActions.OnClick)
+        tick(16) // shows
+        tick(16)
+        rule.onNodeWithText("Always allow").performClick()
+        assertEquals(listOf(Triple("ctl_1", 1L, ApprovalChoice.ALWAYS)), approvals)
+    }
+
+    /** A drawer prompt marks when it shows and when its kind changes; a new token for the same dialog does not. */
+    @Test
+    fun aPromptIsMarkedByItsKindNotItsToken() {
+        val overlays = Overlays()
+        val actions = Prompt(PromptKind.ACTIONS, "k", "Chat", pinned = false, archived = false, running = false, token = 1)
+        var prompt by mutableStateOf<Prompt?>(actions)
+        rule.setContent { Themed { CompositionLocalProvider(LocalOverlays provides overlays) { prompt?.let { PromptOverChat(it, object : PromptActions {}) } } } }
+        tick(48)
+        val shown = overlays.openedAt
+        assertTrue(shown > Long.MIN_VALUE)
+        tick(100)
+        prompt = actions.copy(kind = PromptKind.DELETE, token = 2)
+        tick(48)
+        val delete = overlays.openedAt
+        assertTrue("a kind change moves it", delete > shown)
+        tick(100)
+        prompt = actions.copy(kind = PromptKind.DELETE, token = 3, running = true) // the reworded confirmation
+        tick(48)
+        prompt = prompt!!.copy(busy = true) // a plain update
+        tick(48)
+        assertEquals("the same dialog: no move", delete, overlays.openedAt)
+        prompt = null
+        tick(48)
+        prompt = actions.copy(kind = PromptKind.DELETE, token = 4) // shown again after it was gone
+        tick(48)
+        assertTrue(overlays.openedAt > delete)
     }
 }

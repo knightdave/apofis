@@ -259,10 +259,13 @@ private fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewModel
     }
 }
 
-/** A drawer prompt, a window over the chat: each showing marks the answer guard ([OverChat]), a new kind anew. */
+/**
+ * A drawer prompt, a window over the chat: each showing marks the answer guard ([OverChat]), and a change of kind (a
+ * new window); a new token for the same kind (a reworded Delete confirmation) is the same window and does not.
+ */
 @Composable
 internal fun PromptOverChat(prompt: Prompt, actions: PromptActions) {
-    OverChat(LocalOverlays.current, prompt.kind to prompt.token)
+    OverChat(LocalOverlays.current, prompt.kind)
     PromptHost(prompt, actions)
 }
 
