@@ -8,6 +8,7 @@ import android.content.res.AssetFileDescriptor
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.BadParcelableException
+import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.os.Parcelable
 import androidx.room.Room
@@ -16,11 +17,13 @@ import androidx.work.testing.WorkManagerTestInitHelper
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Random
+import java.util.concurrent.CopyOnWriteArrayList
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -39,6 +42,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
+import org.robolectric.shadows.ShadowLog
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.ShareToken
 import xyz.rycerz.apofis.chat.NoteKind
@@ -65,7 +69,8 @@ private const val OWN = "xyz.rycerz.apofis.files"
 class ShareIntakeTest {
     private val app = ApplicationProvider.getApplicationContext<Application>()
     private var made: AppContainer? = null
-    private val dbs = mutableListOf<AppDatabase>()
+    private val containers = CopyOnWriteArrayList<AppContainer>()
+    private val dbs = CopyOnWriteArrayList<AppDatabase>() // opened lazily, on whichever thread first needs one
 
     @Before
     fun setUp() {
@@ -76,11 +81,15 @@ class ShareIntakeTest {
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
     }
 
+    /** Every container's work is cancelled and has ended (or the test fails) before a database closes. */
     @After
     fun tearDown() {
-        made?.scope?.cancel()
+        runBlocking { withTimeout(60_000) { containers.forEach { it.scope.coroutineContext.job.cancelAndJoin() } } }
         dbs.forEach { it.close() }
+        assertTrue(shareLogs().none { "content:" in it || "file:" in it }) // the debug line names the reason only
     }
+
+    private fun shareLogs(): List<String> = ShadowLog.getLogsForTag("ApofisShare").map { it.msg }
 
     private fun register(authority: String, pkg: String) {
         val info = ProviderInfo().apply {
@@ -97,7 +106,7 @@ class ShareIntakeTest {
 
     private fun newContainer() = AppContainer(app, CredentialStore(app) { key }) {
         Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).build().also { dbs += it }
-    }
+    }.also { containers += it }
 
     private val container: AppContainer get() = made ?: newContainer().also { made = it }
 
@@ -216,6 +225,7 @@ class ShareIntakeTest {
         assertEquals(ShareIntent.Images(emptyList(), 2, ""), validateShare(many))
         assertEquals(setOf(NoteKind.SHARE_IMAGES_FAILED), read(many).notes)
         assertEquals(0, opens("a"))
+        assertEquals(List(3) { "image UNREADABLE" }, shareLogs()) // one line per refused image
     }
 
     @Test
@@ -247,6 +257,16 @@ class ShareIntakeTest {
         assertEquals(setOf(NoteKind.SHARE_TOO_MANY), share.notes)
         assertEquals((0 until 10).map { 1 }, (0 until 10).map { opens("u$it") })
         assertEquals(10, RouteProvider.opens.values.sumOf { it.get() })
+        assertEquals(emptyList<String>(), shareLogs()) // nothing for the images past the tenth
+    }
+
+    /** 1,000 stream URIs, duplicates included, keep their order; membership in the ClipData decides each one. */
+    @Test
+    fun thousandStreamUrisMatchedInOrder() {
+        val uris = (0 until 1000).map { uri("u$it") } + listOf(uri("u3"), uri("u3"))
+        assertEquals(ShareIntent.Images(uris, 0, ""), validateShare(sendImages(uris)))
+        val half = sendImages(uris, clipped = uris.filter { it.lastPathSegment!!.removePrefix("u").toInt() % 2 == 1 })
+        assertEquals(ShareIntent.Images(uris.filter { it.lastPathSegment!!.removePrefix("u").toInt() % 2 == 1 }, 500, ""), validateShare(half))
     }
 
     @Test
@@ -263,6 +283,7 @@ class ShareIntakeTest {
         val share = read(sendImages(listOf(uri("a"), uri("b"), uri("c"))), maxBytes = 2 * s)
         assertEquals(listOf(s, s), share.images.map { it.size.toLong() })
         assertEquals(setOf(NoteKind.SHARE_IMAGES_FAILED), share.notes)
+        assertEquals(listOf("image TOO_LARGE"), shareLogs())
     }
 
     @Test
@@ -285,6 +306,62 @@ class ShareIntakeTest {
         assertEquals(0, opens("a"))
     }
 
+    /** An intent whose every extra read counts and throws: a pair that is no share must never reach one. */
+    private class Untouchable(action: String, type: String?) : Intent(action) {
+        var reads = 0
+        init { if (type != null) setType(type) }
+        private fun touched(): Nothing { reads++; throw BadParcelableException("read") }
+        override fun getCharSequenceExtra(name: String?): CharSequence? = touched()
+        override fun <T : Any?> getParcelableExtra(name: String?, clazz: Class<T>): T? = touched()
+        override fun <T : Any?> getParcelableArrayListExtra(name: String?, clazz: Class<out T>): ArrayList<T>? = touched()
+        override fun getClipData(): ClipData? = touched()
+        override fun hasExtra(name: String?): Boolean = touched()
+        override fun getExtras(): Bundle? = touched()
+    }
+
+    @Test
+    fun noExtraReadForAPairThatIsNoShare() {
+        for ((action, type) in listOf(
+            Intent.ACTION_SEND to "*/*",
+            Intent.ACTION_SEND_MULTIPLE to "*/*",
+            Intent.ACTION_SEND_MULTIPLE to "text/plain",
+            Intent.ACTION_SEND to "text/plain; charset=utf-8",
+            Intent.ACTION_SEND to "image",
+            Intent.ACTION_SEND to null,
+            Intent.ACTION_VIEW to "text/plain",
+            Intent.ACTION_VIEW to "image/png",
+        )) {
+            val intent = Untouchable(action, type)
+            assertNull("$action $type", validateShare(intent))
+            assertEquals("$action $type", 0, intent.reads)
+        }
+    }
+
+    /** A present EXTRA_STREAM that is no URI (or no list of URIs) is no share; the ClipData is not used in its place. */
+    @Test
+    fun malformedPresentStreamIsNoShare() {
+        serve("a", noise(16))
+        val wrongOne = Intent(Intent.ACTION_SEND).setType("image/png").putExtra(Intent.EXTRA_STREAM, "content://$OTHER/a")
+        val listForOne = Intent(Intent.ACTION_SEND).setType("image/png").putParcelableArrayListExtra(Intent.EXTRA_STREAM, arrayListOf<Parcelable>(uri("a")))
+        val oneForMany = Intent(Intent.ACTION_SEND_MULTIPLE).setType("image/*").putExtra(Intent.EXTRA_STREAM, uri("a"))
+        val textsForMany = Intent(Intent.ACTION_SEND_MULTIPLE).setType("image/*").putCharSequenceArrayListExtra(Intent.EXTRA_STREAM, arrayListOf<CharSequence>("content://$OTHER/a"))
+        for (intent in listOf(wrongOne, listForOne, oneForMany, textsForMany)) {
+            intent.putExtra(Intent.EXTRA_TEXT, "caption").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).clipData = clip(listOf(uri("a")))
+            assertNull("${intent.action} ${intent.extras}", validateShare(intent))
+        }
+
+        // The text reads fine; each stream getter throws: the stream reads are guarded on their own.
+        val throwing = object : Intent(ACTION_SEND) {
+            override fun <T : Any?> getParcelableExtra(name: String?, clazz: Class<T>): T? = throw BadParcelableException("bad")
+            override fun <T : Any?> getParcelableArrayListExtra(name: String?, clazz: Class<out T>): ArrayList<T>? = throw BadParcelableException("bad")
+        }
+        throwing.putExtra(Intent.EXTRA_TEXT, "caption").putExtra(Intent.EXTRA_STREAM, uri("a")).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).clipData = clip(listOf(uri("a")))
+        for ((action, type) in listOf(Intent.ACTION_SEND to "image/png", Intent.ACTION_SEND_MULTIPLE to "image/*")) {
+            assertNull(action, validateShare(throwing.setAction(action).setType(type)))
+        }
+        assertEquals(0, opens("a"))
+    }
+
     @Test
     fun revokedUriNote() {
         RouteProvider.routes["revoked"] = { throw SecurityException("grant revoked") }
@@ -293,6 +370,7 @@ class ShareIntakeTest {
         val share = read(sendImages(listOf(uri("revoked"), uri("gone"), uri("ok"))))
         assertEquals(1, share.images.size)
         assertEquals(setOf(NoteKind.SHARE_IMAGES_FAILED), share.notes)
+        assertEquals(List(2) { "image UNREADABLE" }, shareLogs())
     }
 
     @Test
@@ -302,6 +380,7 @@ class ShareIntakeTest {
         assertTrue(share.images.isEmpty())
         assertEquals(setOf(NoteKind.SHARE_IMAGES_FAILED), share.notes)
         assertEquals(0, opens("mine"))
+        assertEquals(listOf("image NOT_AN_IMAGE"), shareLogs())
     }
 
     @Test
@@ -310,6 +389,7 @@ class ShareIntakeTest {
         val share = read(sendImage(Uri.fromFile(file)))
         assertTrue(share.images.isEmpty())
         assertEquals(setOf(NoteKind.SHARE_IMAGES_FAILED), share.notes)
+        assertEquals(listOf("image NOT_AN_IMAGE"), shareLogs())
     }
 
     @Test
@@ -388,12 +468,8 @@ class ShareIntakeTest {
         c.readSharedItems = { text("kept in memory") }
         c.offerShare(ShareIntent.Text("x"))
         withTimeout(10_000) { c.pendingShare.first { it != null } }
-        val next = newContainer() // a new process: nothing durable holds the share
-        try {
-            assertNull(next.pendingShare.value)
-        } finally {
-            next.scope.cancel()
-        }
+        val next = newContainer() // a new process: nothing durable holds the share; torn down with the others
+        assertNull(next.pendingShare.value)
     }
 
     @Test

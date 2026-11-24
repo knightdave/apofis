@@ -36,31 +36,37 @@ sealed interface ShareIntent {
 /**
  * One of the declared combinations, or null: `SEND text/plain` (EXTRA_TEXT only), `SEND image/...` (one stream and an
  * optional caption), `SEND_MULTIPLE image/...` (a stream list and an optional caption). The stream is EXTRA_STREAM, or
- * the ClipData items when it is absent. A URI is taken only with FLAG_GRANT_READ_URI_PERMISSION and only when it is an
- * item of the ClipData, where the sender's grant travels; any other is refused. Only those two extras are read.
+ * the ClipData items when it is absent; a present stream that is no URI (or no list of URIs) is no share. A URI is taken
+ * only with FLAG_GRANT_READ_URI_PERMISSION and only when it is an item of the ClipData, where the sender's grant travels;
+ * any other is refused. Only those two extras are read, and none for an action and type that are no share.
  */
 fun validateShare(intent: Intent): ShareIntent? {
     val action = intent.action
-    if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return null
     val type = intent.type ?: return null
+    // The pair is decided first: nothing of an intent that is no share is read.
+    val text = action == Intent.ACTION_SEND && type == "text/plain"
+    val images = (action == Intent.ACTION_SEND || action == Intent.ACTION_SEND_MULTIPLE) && type.startsWith("image/") && type.length > "image/".length
+    if (!text && !images) return null
     return try {
-        val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
-        when {
-            type == "text/plain" && action == Intent.ACTION_SEND -> ShareIntent.Text(text).takeIf { text.isNotEmpty() }
-            type.startsWith("image/") && type.length > "image/".length -> {
-                val clipped = intent.clipData?.let { clip -> (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri } }.orEmpty()
-                val stream = if (action == Intent.ACTION_SEND) {
-                    IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let(::listOf) ?: clipped.take(1)
-                } else {
-                    IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.filterNotNull() ?: clipped
-                }
-                if (stream.isEmpty()) return null
-                val granted = intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0
-                val (taken, refused) = stream.partition { granted && it in clipped }
-                ShareIntent.Images(taken, refused.size, text)
+        val words = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
+        if (text) return ShareIntent.Text(words).takeIf { words.isNotEmpty() }
+        val clipped = intent.clipData?.let { clip -> (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri } }.orEmpty()
+        // The ClipData is the stream only when EXTRA_STREAM is absent; a present one that is no URI (or no list of
+        // URIs) makes the intent no share.
+        val stream = when {
+            !intent.hasExtra(Intent.EXTRA_STREAM) -> if (action == Intent.ACTION_SEND) clipped.take(1) else clipped
+            action == Intent.ACTION_SEND -> listOf(IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java) ?: return null)
+            else -> {
+                val list: List<Any?> = IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java) ?: return null
+                if (list.any { it != null && it !is Uri }) return null // the element type is not checked by every getter
+                list.filterIsInstance<Uri>()
             }
-            else -> null
         }
+        if (stream.isEmpty()) return null
+        val granted = intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0
+        val clipSet = clipped.toHashSet() // one lookup per stream URI
+        val taken = stream.filter { granted && it in clipSet }
+        ShareIntent.Images(taken, stream.size - taken.size, words)
     } catch (_: RuntimeException) {
         null // an extra that cannot be unpacked
     }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -18,6 +19,10 @@ import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.NoteKind
 import xyz.rycerz.apofis.ui.theme.ApofisSheet
 import xyz.rycerz.apofis.ui.theme.SheetRow
+import xyz.rycerz.apofis.ui.text.graphemeCut
+
+/** The longest preview the sheet lays out and reads out, in UTF-16 units: four lines need no more. */
+internal const val PREVIEW_CHARS = 1_000
 
 /**
  * The incoming [share], shown before anything changes: the first lines of its text, its image count and one note, with
@@ -33,7 +38,8 @@ fun ShareSheet(share: Share, temporary: Boolean, onAccept: () -> Unit, onCancel:
         Column(Modifier.verticalScroll(rememberScrollState())) {
             Text(stringResource(R.string.share_title), Modifier.padding(start = 14.dp, bottom = 8.dp).semantics { heading() }, style = MaterialTheme.typography.titleMedium)
             if (share.text.isNotBlank()) {
-                Text(share.text, inset, style = MaterialTheme.typography.bodyMedium, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                val preview = remember(share.text) { share.text.substring(0, graphemeCut(share.text, 0, PREVIEW_CHARS, up = false)) }
+                Text(preview, inset.testTag("share_preview"), style = MaterialTheme.typography.bodyMedium, maxLines = 4, overflow = TextOverflow.Ellipsis)
             }
             if (share.images.isNotEmpty()) {
                 Text(stringResource(R.string.share_images_count, share.images.size), inset, style = MaterialTheme.typography.bodyMedium, color = quiet)

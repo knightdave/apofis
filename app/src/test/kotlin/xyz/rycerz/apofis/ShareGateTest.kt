@@ -23,6 +23,7 @@ import org.robolectric.annotation.Config
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.MessageEntity
 import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.share.SHARED_A
 import xyz.rycerz.apofis.share.SHARED_T
 import xyz.rycerz.apofis.share.Share
 import xyz.rycerz.apofis.share.ShareFixture
@@ -50,7 +51,7 @@ class ShareGateTest : ShareFixture() {
     private fun withActivity(body: () -> Unit) {
         val file = Room.databaseBuilder(app, AppDatabase::class.java, "apofis.db").allowMainThreadQueries().build()
         try {
-            runBlocking {
+            bounded {
                 file.sessionDao().upsert(SessionEntity(TMP, TMP, "", "Title", false, false, 1.0, null, 1, null, false, existsOnServer = true))
                 file.messageDao().insertAll(listOf(MessageEntity(TMP, 0, 1, "user", null, "hello", null, null, null, null, 1.0, null)))
             }
@@ -113,7 +114,7 @@ class ShareGateTest : ShareFixture() {
             }
             val before = tables()
             container.offerShare(checkNotNull(shareGate(cold, fresh = true)))
-            runBlocking { container.pendingShare.await { it != null } }
+            bounded { container.pendingShare.await { it != null } }
             compose()
             waitSelected { it == SHARED_T }
             waitVisible(str(R.string.share_deletes_temporary))
@@ -131,25 +132,61 @@ class ShareGateTest : ShareFixture() {
         }
     }
 
+    /**
+     * The route's own start-up requests in this fixture, by method and path: none. The lifecycle is not started, so the
+     * follower streams nothing, and a chat whose history is stored shows it without a fetch. The positive completion
+     * point is that history drawn on the chat screen; from then on the request log must not grow, GET included.
+     */
+    private fun startedQuietly(key: String) {
+        waitSelected { it == key }
+        waitVisible("hello") // the stored message of [key]: its screen has loaded
+        rule.waitForIdle()
+        bounded { settled() }
+        assertEquals(emptyList<String>(), lines())
+    }
+
     @Test
     fun shareWhileTemporaryReplyRunsChangesNothingBeforeAccept() = inRoute(SHARED_T, {
         session(SHARED_T, onServer = true)
         message(SHARED_T)
         run(SHARED_T, "run-1")
     }) {
-        waitSelected { it == SHARED_T }
-        rule.waitForIdle()
+        startedQuietly(SHARED_T)
         val before = tables()
         container.offerShare(checkNotNull(shareGate(send("warm"), fresh = true))) // as onNewIntent hands it over
         waitVisible(str(R.string.share_deletes_temporary))
         assertTrue(visible("warm"))
         rule.waitForIdle()
         assertEquals(SHARED_T, drawer().selected.value)
-        assertEquals(emptyList<String>(), stops())
-        assertEquals(emptyList<String>(), deletes())
-        assertEquals(emptyList<String>(), writes())
+        assertEquals(emptyList<String>(), lines()) // no request of any method
         assertEquals(before, tables())
-        assertEquals(1, runBlocking { db.activeRunDao().allForSession(SHARED_T) }.size)
+
+        rule.onNodeWithText(str(R.string.share_cancel)).performClick()
+        waitGone(str(R.string.share_title))
+        rule.waitForIdle()
+        bounded { settled() }
+        assertEquals(SHARED_T, drawer().selected.value)
+        assertEquals(emptyList<String>(), lines())
+        assertEquals(before, tables())
+        assertEquals(1, bounded { db.activeRunDao().allForSession(SHARED_T) }.size)
+    }
+
+    /** Accept into a fresh chat from an ordinary one sends nothing at all: no create, no run, no read. */
+    @Test
+    fun shareAcceptedFromOrdinaryChatSendsNothing() = inRoute(SHARED_A, {
+        session(SHARED_A, onServer = true)
+        message(SHARED_A)
+    }) {
+        startedQuietly(SHARED_A)
+        container.offerShare(checkNotNull(shareGate(send("into a new chat"), fresh = true)))
+        waitVisible(str(R.string.share_title))
+        rule.onNodeWithText(str(R.string.share_accept)).performClick()
+        val k = waitSelected { it != null && it != SHARED_A }
+        rule.waitUntil(10_000) { container.composer.current(k).draft == "into a new chat" } // the fill, which is text only
+        waitVisible("into a new chat")
+        rule.waitForIdle()
+        bounded { settled() }
+        assertEquals(emptyList<String>(), lines())
     }
 
     @Test

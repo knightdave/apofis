@@ -13,6 +13,14 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
+import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.images.ImageLimits
+import androidx.compose.ui.test.performTouchInput
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
@@ -25,9 +33,13 @@ import java.security.MessageDigest
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import androidx.lifecycle.viewModelScope
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -85,7 +97,10 @@ abstract class ShareFixture : TemporaryFixture() {
     }
 
     /** Connects to the fixture's server, then [seed]s (a new server's cache is cleared by the switch), then stores [lastChat]. */
-    protected fun connect(lastChat: String?, seed: suspend () -> Unit = {}) = runBlocking {
+    /** [block] on this thread, failing the test after 60 s instead of hanging it. */
+    protected fun <T> bounded(block: suspend CoroutineScope.() -> T): T = runBlocking { withTimeout(60_000, block) }
+
+    protected fun connect(lastChat: String?, seed: suspend () -> Unit = {}) = bounded {
         container.connect(Credentials(url, "key-1"))
         seed()
         lastChat?.let { container.preferences.lastChat = it }
@@ -107,13 +122,20 @@ abstract class ShareFixture : TemporaryFixture() {
         if (conn != null) key(conn) { ChatRoute(container, conn, ownerOf(conn), 0, onSettings = {}, onConnection = {}) }
     }
 
-    /** Takes everything down before the fixture closes the database (also when an assertion failed). */
+    /**
+     * Takes everything down before the fixture closes the database (also when an assertion failed): the route leaves the
+     * composition, then every drawer this fixture's owners hold and the container's own work (its connections and
+     * composer included) are cancelled and have ended, or the test fails after 60 s.
+     */
     protected fun finish() {
         shown = false
         rule.waitForIdle()
+        val drawers = owners.values.map { ViewModelProvider.create(it.viewModelStore)[DrawerViewModel::class].viewModelScope.coroutineContext.job }
         owners.values.forEach { it.viewModelStore.clear() }
-        container.scope.cancel()
-        runBlocking { settled() }
+        bounded {
+            (drawers + container.scope.coroutineContext.job).forEach { it.cancelAndJoin() }
+            settled()
+        }
     }
 
     protected fun inRoute(lastChat: String?, seed: suspend () -> Unit = {}, body: () -> Unit) {
@@ -127,7 +149,9 @@ abstract class ShareFixture : TemporaryFixture() {
         }
     }
 
-    protected fun drawer(): DrawerViewModel = ViewModelProvider.create(ownerOf(container.connection.value!!).viewModelStore)[DrawerViewModel::class]
+    /** The drawer of the route composed for the current connection. */
+    protected fun drawer(): DrawerViewModel =
+        ViewModelProvider.create(owners.getValue(container.connection.value!!.generation).viewModelStore)[DrawerViewModel::class]
 
     protected fun waitSelected(condition: (String?) -> Boolean): String {
         rule.waitUntil(10_000) { runCatching { condition(drawer().selected.value) }.getOrDefault(false) }
@@ -135,14 +159,23 @@ abstract class ShareFixture : TemporaryFixture() {
     }
 
     /**
-     * The fresh chat an Accept from [old] opened, once its draft is filled. The test rule runs the route's scope
-     * unconfined, so the drawer's step may go on off the main thread: the selection alone does not show that the fill
-     * (and the set-aside of a temporary chat before it) has run.
+     * The fresh chat an Accept from [old] opened, once its draft is [done]. The test rule runs the route's scope
+     * unconfined, so the drawer's step may go on off the main thread: neither the selection nor a first write shows that
+     * the whole fill has run, so [done] names the complete expected state (see [filled]).
      */
-    protected fun acceptedFrom(old: String): String {
+    protected fun acceptedFrom(old: String, done: (ComposerState) -> Boolean): String {
         val k = waitSelected { it != null && it != old }
-        rule.waitUntil(10_000) { composerOf(k).let { it.draft.isNotEmpty() || it.images.isNotEmpty() } }
+        try {
+            rule.waitUntil(10_000) { done(composerOf(k)) }
+        } catch (e: androidx.compose.ui.test.ComposeTimeoutException) {
+            throw AssertionError("the fill did not end as expected: ${composerOf(k)}", e)
+        }
         return k
+    }
+
+    /** The whole fill: the text, every image ready in order, and the one note (written last). */
+    protected fun filled(text: String, digests: List<String> = emptyList(), note: ComposerNote? = null): (ComposerState) -> Boolean = { s ->
+        s.draft == text && s.images.map { it.digest } == digests && s.images.none { it.processing || it.failed } && s.note == note
     }
 
     protected fun visible(text: String) = rule.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
@@ -150,7 +183,7 @@ abstract class ShareFixture : TemporaryFixture() {
     protected fun waitGone(text: String) = rule.waitUntil(10_000) { !visible(text) }
 
     /** Offers a share whose reading gives [text], [images] and [notes]; returns it once it is in the slot. */
-    protected fun offer(text: String = "Shared words", images: List<ByteArray> = emptyList(), notes: Set<NoteKind> = emptySet()): Share = runBlocking {
+    protected fun offer(text: String = "Shared words", images: List<ByteArray> = emptyList(), notes: Set<NoteKind> = emptySet()): Share = bounded {
         container.readSharedItems = { Share(0, text, images, notes) }
         container.offerShare(ShareIntent.Text("read by the hook"))
         container.pendingShare.await { it != null }!!
@@ -188,8 +221,8 @@ abstract class ShareFixture : TemporaryFixture() {
         private val locked = CompletableDeferred<Unit>()
         private val released = CompletableDeferred<Unit>()
         private val job = side.launch(Dispatchers.IO) { withRepositoryLock { locked.complete(Unit); released.await() } }
-        init { runBlocking { locked.await() } }
-        fun release() = runBlocking {
+        init { bounded { locked.await() } }
+        fun release() = bounded {
             released.complete(Unit)
             job.join()
         }
@@ -251,6 +284,7 @@ class ShareSheetTest : ShareFixture() {
         assertEquals(before, everything(SHARED_A))
     }
 
+
     @Test
     fun acceptOpensNewChatWithDraft() = inRoute(SHARED_A, seedA()) {
         waitSelected { it == SHARED_A }
@@ -258,12 +292,12 @@ class ShareSheetTest : ShareFixture() {
         offer("Look at these", photos, setOf(NoteKind.SHARE_TEXT_CUT, NoteKind.SHARE_IMAGES_FAILED))
         waitVisible(str(R.string.share_images_failed))
         rule.onNodeWithText(accept).performClick()
-        val k = acceptedFrom(SHARED_A)
+        val k = acceptedFrom(SHARED_A, filled("Look at these", photos.map(::sha), ComposerNote(NoteKind.SHARE_IMAGES_FAILED)))
         waitGone(title)
 
         assertFalse(isTemporaryKey(k))
-        assertNotNull(runBlocking { db.sessionDao().get(k) })
-        assertNotNull(runBlocking { db.sessionDao().get(SHARED_A) })
+        assertNotNull(bounded { db.sessionDao().get(k) })
+        assertNotNull(bounded { db.sessionDao().get(SHARED_A) })
         val draft = composerOf(k)
         assertEquals("Look at these", draft.draft)
         assertEquals(photos.map(::sha), draft.images.map { it.digest })
@@ -285,11 +319,13 @@ class ShareSheetTest : ShareFixture() {
         offer(notes = setOf(NoteKind.SHARE_TEXT_CUT))
         waitVisible(str(R.string.share_deletes_temporary))
         rule.onNodeWithText(accept).performClick()
-        val k = acceptedFrom(SHARED_T)
-        runBlocking { drawer().leavesEnded() }
+        // Only the set-aside matters before leavesEnded(): the drawer sets the chat aside before the fill's first write,
+        // and the leave's note may replace the share's at any moment after the fill.
+        val k = acceptedFrom(SHARED_T) { it.draft == "Shared words" }
+        bounded { drawer().leavesEnded() }
 
         assertEquals(listOf("DELETE /api/sessions/$SHARED_T"), deletes())
-        assertNotNull(runBlocking { db.sessionDao().get(SHARED_T) })
+        assertNotNull(bounded { db.sessionDao().get(SHARED_T) })
         rule.waitUntil(10_000) { SHARED_T in drawer().rows.value.chats() } // listed again: it is no longer open
         assertEquals(ComposerNote(NoteKind.TEMPORARY_NOT_DELETED), composerOf(k).note) // replaces the share's note
         assertEquals("Shared words", composerOf(k).draft)
@@ -304,22 +340,22 @@ class ShareSheetTest : ShareFixture() {
         }) {
             deleted(SHARED_T)
             waitSelected { it == SHARED_T }
-            val digest = runBlocking { container.imageStore.put(same)!! }
+            val digest = bounded { container.imageStore.put(same)!! }
             val id = container.composer.addImages(SHARED_T, 1).single()
             container.composer.setImage(id, digest)
 
             offer(images = listOf(same))
             waitVisible(title)
             rule.onNodeWithText(accept).performClick()
-            val k = acceptedFrom(SHARED_T)
-            runBlocking { drawer().leavesEnded() }
-            assertNull(runBlocking { db.sessionDao().get(SHARED_T) }) // left and deleted
+            val k = acceptedFrom(SHARED_T, filled("Shared words", listOf(digest)))
+            bounded { drawer().leavesEnded() }
+            assertNull(bounded { db.sessionDao().get(SHARED_T) }) // left and deleted
             assertNull(composerOf(k).note) // the leave succeeded: no note
 
             // Old enough for any collection, still named by the new draft only.
             val file = checkNotNull(container.imageStore.file(digest))
             assertTrue(file.setLastModified(System.currentTimeMillis() - 11 * 60_000))
-            runBlocking { container.collectImages() }
+            bounded { container.collectImages() }
             assertEquals(listOf(digest), composerOf(k).images.map { it.digest })
             assertNotNull(container.imageStore.read(digest))
         }
@@ -327,7 +363,7 @@ class ShareSheetTest : ShareFixture() {
 
     /** Accepts [share] directly, as the sheet would for [selected], with [open] standing in for the drawer's step. */
     private fun acceptAs(share: Share, selected: String, open: suspend (String, () -> Boolean, suspend (String) -> Unit) -> String?): Boolean =
-        runBlocking { container.acceptShare(ShareToken(share.version, container.connection.value!!.generation, selected), open) }
+        bounded { container.acceptShare(ShareToken(share.version, container.connection.value!!.generation, selected), open) }
 
     @Test
     fun shareReplacedAfterPutReshows() = inRoute(SHARED_A, seedA()) {
@@ -386,9 +422,9 @@ class ShareSheetTest : ShareFixture() {
         assertEquals(emptyList<String>(), imageFiles())
 
         val generation = container.connection.value!!.generation
-        runBlocking { container.connect(Credentials(url, "key-2")) } // a key change at the same server keeps the cache
+        bounded { container.connect(Credentials(url, "key-2")) } // a key change at the same server keeps the cache
         val stale = ShareToken(a.version, generation, SHARED_A)
-        assertFalse(runBlocking { container.acceptShare(stale, count) })
+        assertFalse(bounded { container.acceptShare(stale, count) })
         assertEquals(emptyList<String>(), imageFiles())
         assertEquals(0, opened)
         assertEquals(a, container.pendingShare.value)
@@ -426,7 +462,7 @@ class ShareSheetTest : ShareFixture() {
         val ok = acceptAs(a, SHARED_A) { sel, claim, fill ->
             old.openFreshChatIf(sel, {
                 // A key change at the same server completes while the fresh row is being created.
-                runBlocking { container.connect(Credentials(url, "key-2")) }
+                bounded { container.connect(Credentials(url, "key-2")) }
                 claim()
             }, fill)
         }
@@ -442,7 +478,8 @@ class ShareSheetTest : ShareFixture() {
     @Test
     fun doubleAcceptConsumesOnce() = inRoute(SHARED_A, seedA()) {
         waitSelected { it == SHARED_A }
-        offer("only once", listOf(photo(Color.RED)))
+        val shot = photo(Color.RED)
+        offer("only once", listOf(shot))
         waitVisible(title)
         val keys = sessionKeys()
         val held = HeldLock() // the first Accept waits for its fresh row while the second is pressed
@@ -453,7 +490,7 @@ class ShareSheetTest : ShareFixture() {
         } finally {
             held.release()
         }
-        val k = acceptedFrom(SHARED_A)
+        val k = acceptedFrom(SHARED_A, filled("only once", listOf(sha(shot))))
         waitGone(title)
         rule.waitForIdle()
         assertEquals(keys + k, sessionKeys())
@@ -496,8 +533,7 @@ class ShareSheetTest : ShareFixture() {
         waitSelected { it == SHARED_B }
         waitVisible("the share") // shown again, now for B
         rule.onNodeWithText(accept).performClick()
-        val k = acceptedFrom(SHARED_B)
-        assertEquals("the share", composerOf(k).draft)
+        acceptedFrom(SHARED_B, filled("the share"))
     }
 
     @Test
@@ -509,11 +545,11 @@ class ShareSheetTest : ShareFixture() {
         offer()
         waitVisible(title)
         rule.onNodeWithText(accept).performClick()
-        acceptedFrom(SHARED_A)
+        acceptedFrom(SHARED_A, filled("Shared words"))
         rule.waitForIdle()
         assertEquals(emptyList<String>(), stops())
         assertEquals(emptyList<String>(), writes())
-        assertEquals(1, runBlocking { db.activeRunDao().allForSession(SHARED_A) }.size)
+        assertEquals(1, bounded { db.activeRunDao().allForSession(SHARED_A) }.size)
     }
 
     @Test
@@ -524,9 +560,8 @@ class ShareSheetTest : ShareFixture() {
         offer("theirs")
         waitVisible(title)
         rule.onNodeWithText(accept).performClick()
-        val k = acceptedFrom(SHARED_A)
+        acceptedFrom(SHARED_A, filled("theirs"))
         assertEquals(before, composerOf(SHARED_A))
-        assertEquals("theirs", composerOf(k).draft)
     }
 
     @Test
@@ -536,8 +571,8 @@ class ShareSheetTest : ShareFixture() {
         offer("shared")
         waitVisible(title)
         rule.onNodeWithText(accept).performClick()
-        val k = acceptedFrom(empty) // always a fresh chat, also from an empty one
-        assertNotNull(runBlocking { db.sessionDao().get(empty) })
+        val k = acceptedFrom(empty, filled("shared")) // always a fresh chat, also from an empty one
+        assertNotNull(bounded { db.sessionDao().get(empty) })
         assertEquals("typed", composerOf(empty).draft)
         assertEquals("shared", composerOf(k).draft)
     }
@@ -552,14 +587,14 @@ class ShareSheetTest : ShareFixture() {
         offer("/stop")
         waitVisible(title)
         rule.onNodeWithText(accept).performClick()
-        val k = acceptedFrom(SHARED_A)
+        val k = acceptedFrom(SHARED_A, filled("/stop"))
         rule.waitForIdle()
-        runBlocking { container.composer.settle() }
+        bounded { container.composer.settle() }
         assertEquals("/stop", composerOf(k).draft) // nothing parsed it
         assertFalse(composerOf(k).sending)
         assertEquals(keys + k, sessionKeys())
         assertEquals(emptyList<String>(), writes())
-        assertEquals(1, runBlocking { db.activeRunDao().allForSession(SHARED_A) }.size)
+        assertEquals(1, bounded { db.activeRunDao().allForSession(SHARED_A) }.size)
     }
 
     @Test
@@ -614,5 +649,65 @@ class ShareSheetTest : ShareFixture() {
         assertTrue(visible(str(R.string.share_images_failed)))
         assertTrue(visible(cancel))
         assertFalse(visible(accept))
+
+        notes = Share(2, " \n ", emptyList(), emptySet()) // only whitespace: nothing to open either
+        rule.waitForIdle()
+        assertTrue(visible(cancel))
+        assertFalse(visible(accept))
+    }
+
+    /** The sheet lays out and reads out a short preview; Accept still fills the whole text. */
+    @Test
+    fun previewIsBoundedAcceptFillsAll() = inRoute(SHARED_A, seedA()) {
+        waitSelected { it == SHARED_A }
+        val long = "word ".repeat(20_000)
+        assertEquals(100_000, long.length)
+        offer(long)
+        waitVisible(title)
+        val preview = rule.onNodeWithTag("share_preview").fetchSemanticsNode().config.getOrNull(SemanticsProperties.Text).orEmpty().joinToString("") { it.text }
+        assertTrue(preview.length.toString(), preview.length in 1..PREVIEW_CHARS)
+        assertTrue(long.startsWith(preview))
+        rule.onNodeWithText(accept).performClick()
+        val k = acceptedFrom(SHARED_A, filled(long))
+        assertEquals(100_000, composerOf(k).draft.length)
+    }
+
+    /** A put that fails drops that photo only: the chat still opens with the others in order and the failed note. */
+    @Test
+    fun failedPutDropsThatImageOnly() = inRoute(SHARED_A, seedA()) {
+        waitSelected { it == SHARED_A }
+        val red = photo(Color.RED)
+        val blue = photo(Color.BLUE)
+        offer("", listOf(red, ByteArray(ImageLimits.MAX_SOURCE_BYTES.toInt() + 1), blue)) // the store refuses the middle one
+        waitVisible(title)
+        rule.onNodeWithText(accept).performClick()
+        acceptedFrom(SHARED_A, filled("", listOf(sha(red), sha(blue)), ComposerNote(NoteKind.SHARE_IMAGES_FAILED)))
+        assertEquals(2, imageFiles().size)
+    }
+
+    private fun shown(text: String) = runCatching { rule.onNodeWithText(text).assertIsDisplayed() }.isSuccess
+
+    /** Accept over the archive with the drawer open shows the new chat: the archive and the drawer close, as for a tap. */
+    @Test
+    fun acceptClosesArchiveAndDrawer() = inRoute(SHARED_A, {
+        seedA()()
+        db.sessionDao().upsert(
+            SessionEntity(
+                key = "apofis-old", currentId = "apofis-old", lineageIds = "", title = "Old chat", pinned = false, archived = true,
+                startedAt = 1.0, lastActiveAt = 1.0, messageCount = 1, preview = null, stale = false, existsOnServer = true,
+            ),
+        )
+    }) {
+        waitSelected { it == SHARED_A }
+        rule.onNodeWithContentDescription(str(R.string.drawer_open)).performClick()
+        rule.waitUntil(10_000) { shown(str(R.string.settings_title)) }
+        rule.onNodeWithText(str(R.string.drawer_archived)).performClick()
+        waitVisible(str(R.string.archived_title))
+        offer("from the archive")
+        waitVisible(title)
+        rule.onNodeWithText(accept).performClick()
+        acceptedFrom(SHARED_A, filled("from the archive"))
+        rule.waitUntil(10_000) { !visible(str(R.string.archived_title)) && !shown(str(R.string.settings_title)) }
+        waitVisible("from the archive") // the new chat's composer
     }
 }
