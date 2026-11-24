@@ -167,6 +167,29 @@ interface PendingSendDao {
      */
     @Query("SELECT * FROM PendingSendEntity WHERE runId = :runId AND state IN ('sending', 'steered') ORDER BY createdAt")
     suspend fun forRun(runId: String): List<PendingSendEntity>
+
+    /** The images column of every row (empty for a text send), for the image GC. */
+    @Query("SELECT images FROM PendingSendEntity")
+    suspend fun allImages(): List<String>
+}
+
+@Dao
+interface ImageBindingDao {
+    @Upsert
+    suspend fun upsert(b: ImageBindingEntity)
+
+    @Query("SELECT * FROM ImageBindingEntity WHERE sessionKey = :sessionKey ORDER BY messageId")
+    suspend fun forSession(sessionKey: String): List<ImageBindingEntity>
+
+    @Query("DELETE FROM ImageBindingEntity WHERE sessionKey = :sessionKey AND messageId = :messageId")
+    suspend fun delete(sessionKey: String, messageId: Long)
+
+    @Query("SELECT digests FROM ImageBindingEntity")
+    suspend fun allDigests(): List<String>
+
+    /** A binding lives as long as its chat row. */
+    @Query("DELETE FROM ImageBindingEntity WHERE sessionKey NOT IN (SELECT `key` FROM SessionEntity)")
+    suspend fun deleteOrphans()
 }
 
 @Dao

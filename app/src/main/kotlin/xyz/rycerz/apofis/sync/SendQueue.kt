@@ -3,16 +3,24 @@ package xyz.rycerz.apofis.sync
 import androidx.room.withTransaction
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.HermesApi
+import xyz.rycerz.apofis.api.MAX_BODY_BYTES
+import xyz.rycerz.apofis.api.MAX_EXPANDED_LENGTH
+import xyz.rycerz.apofis.api.MAX_IMAGES
 import xyz.rycerz.apofis.api.SessionDto
 import xyz.rycerz.apofis.api.buildRunBody
+import xyz.rycerz.apofis.api.expandImageRefs
+import xyz.rycerz.apofis.api.expandedSize
 import xyz.rycerz.apofis.db.ActiveRunEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.PendingSendEntity
 import xyz.rycerz.apofis.db.SessionEntity
+import xyz.rycerz.apofis.db.choice
 import xyz.rycerz.apofis.notify.NoticeNotDelivered
 
 /** Implemented by Task 8: told about every run this queue started. */
@@ -49,7 +57,15 @@ object SendError {
     const val NOT_FOUND = "not_found"
     const val PROTOCOL = "protocol"
     const val HTTP_ERROR = "http_error"
+    const val IMAGE_MISSING = "image_missing" // a file of its images is gone or changed: nothing was sent for it
 }
+
+/** Thrown by [SendQueue.submit] for a send over [MAX_ROW_BYTES] or, expanded, over MAX_BODY_BYTES: nothing was stored. */
+class SendTooLarge : Exception("too large")
+
+// Text and request body are stored in one row, and a row must fit Android's 2 MiB cursor window or the queue cannot be
+// read; the session id and model choice ride in the margin.
+const val MAX_ROW_BYTES = 1_500_000
 
 enum class RetryResult { STARTED, NEEDS_CONFIRMATION, NOT_FOUND }
 
@@ -94,6 +110,7 @@ private class QueueClosed : IllegalStateException("closed")
  * [active] turns false when the app switches servers. From then on every write ([enqueue], [submit], [cancel], [retry])
  * throws IllegalStateException("closed") and [drain] returns false, each checked inside the lock of the write and again
  * before every request, so a queue bound to the old server never sends or changes rows that belong to the new one.
+ * [readImage] and [imageSize] give an image file's bytes and size by digest, null when it is missing.
  */
 class SendQueue(
     private val api: HermesApi,
@@ -103,6 +120,8 @@ class SendQueue(
     private val schedule: suspend () -> Unit = {},
     private val active: () -> Boolean = { true },
     private val settle: suspend (runId: String) -> Unit = {},
+    private val readImage: (String) -> ByteArray? = { null },
+    private val imageSize: (String) -> Long? = { null },
 ) {
     private val pendingDao = db.pendingSendDao()
 
@@ -113,13 +132,14 @@ class SendQueue(
     suspend fun enqueue(sessionKey: String, text: String): String = store(sessionKey, text, steer = false).idempotencyKey
 
     /**
-     * For ChatRepository.send: stores [text] (see [store]), as a steer of the session's running run when there is one,
-     * then delivers it (see [deliverStored]), else drains. A hidden session fails locally; an unknown session throws
-     * IllegalArgumentException.
+     * For ChatRepository.send: stores [text] and the digests [images] (see [store]), as a steer of the session's running
+     * run when there is one and no images, then delivers it (see [deliverStored]), else drains. A hidden session fails
+     * locally; an unknown session or a missing image file throws IllegalArgumentException; a body too large to send
+     * throws [SendTooLarge].
      */
-    internal suspend fun submit(sessionKey: String, text: String, onStored: () -> Unit = {}) {
+    internal suspend fun submit(sessionKey: String, text: String, onStored: () -> Unit = {}, images: List<String> = emptyList()) {
         // Contract: a throw here means nothing was stored, so the caller may offer the text again.
-        val row = store(sessionKey, text, steer = true)
+        val row = store(sessionKey, text, steer = true, images)
         onStored() // committed with its worker armed: from here the row is the message
         if (row.state == PendingState.FAILED) return
         try {
@@ -139,12 +159,34 @@ class SendQueue(
      * started at once cannot find the queue empty and end before the row is in it. With [steer], a session with a
      * running run gets a steer of that run, stored as such before any request (not yet attempted).
      */
-    private suspend fun store(sessionKey: String, text: String, steer: Boolean): PendingSendEntity = handoff.withLock {
-        schedule()
-        db.withTransaction {
-            ensureOpen()
-            insert(sessionKey, text, steer)
+    private suspend fun store(sessionKey: String, text: String, steer: Boolean, images: List<String> = emptyList()): PendingSendEntity {
+        require(images.size <= MAX_IMAGES) { "too many images" } // before the copy: a huge list is never walked
+        val digests = images.toList() // the caller's list may change while this suspends
+        withContext(Dispatchers.IO) { admit(text, digests) }
+        return handoff.withLock {
+            schedule()
+            db.withTransaction {
+                ensureOpen()
+                insert(sessionKey, text, steer, digests)
+            }
         }
+    }
+
+    /**
+     * Decides once, before anything is armed, on the caller's inputs only: well-formed digests, each file's size known
+     * (IllegalArgumentException), no file, the row and the expanded body over their bounds ([MAX_ROW_BYTES],
+     * MAX_BODY_BYTES; [SendTooLarge]). Measured without the session id and choice, which ride in the margins of both.
+     */
+    private fun admit(text: String, images: List<String>) {
+        require(images.size <= MAX_IMAGES) { "too many images" } // on the snapshot: the caller's list may have grown
+        require(images.all { d -> d.length == 64 && d.all { it in '0'..'9' || it in 'a'..'f' } }) { "bad digest" }
+        if (text.length > MAX_ROW_BYTES) throw SendTooLarge() // each character is at least one byte
+        val sizes = images.map { d ->
+            requireNotNull(imageSize(d)?.takeIf { it >= 0 }) { "image missing" }.also { if (it > MAX_BODY_BYTES) throw SendTooLarge() }
+        }
+        val body = buildRunBody("", text, images)
+        if (text.encodeToByteArray().size + body.encodeToByteArray().size > MAX_ROW_BYTES) throw SendTooLarge()
+        if (expandedSize(body, sizes) > MAX_BODY_BYTES) throw SendTooLarge()
     }
 
     /**
@@ -258,14 +300,15 @@ class SendQueue(
     }
 
     /** In the transaction that checked the session, so a concurrent delete or refresh cannot leave an orphan row. */
-    private suspend fun insert(sessionKey: String, text: String, steer: Boolean): PendingSendEntity {
+    private suspend fun insert(sessionKey: String, text: String, steer: Boolean, images: List<String>): PendingSendEntity {
         require(!isReservedId(sessionKey)) { "reserved session id" }
         val session = requireNotNull(db.sessionDao().get(sessionKey)) { "unknown session" }
-        val run = if (steer) db.activeRunDao().forSession(sessionKey)?.takeIf { it.status == "running" } else null
+        // A message with images never steers: it waits behind the running reply (decision 5).
+        val run = if (steer && images.isEmpty()) db.activeRunDao().forSession(sessionKey)?.takeIf { it.status == "running" } else null
         val row = PendingSendEntity(
             idempotencyKey = UUID.randomUUID().toString(), sessionKey = sessionKey, text = text,
-            requestBody = buildRunBody(session.currentId, text), createdAt = now(), state = PendingState.QUEUED,
-            runId = null, error = null,
+            requestBody = buildRunBody(session.currentId, text, images, session.choice()), createdAt = now(), state = PendingState.QUEUED,
+            runId = null, error = null, images = images.joinToString(","),
         ).let {
             when {
                 session.hidden -> it.copy(state = PendingState.FAILED, error = SendError.SESSION_UNAVAILABLE)
@@ -294,7 +337,8 @@ class SendQueue(
             return false
         }
         if (isBeingDeleted(session.key)) return false
-        val run = row.runId?.let { db.activeRunDao().get(it) }?.takeIf { it.sessionKey == row.sessionKey && it.status == "running" }
+        // A row with images never steers (decision 5): like a steer whose run ended, it becomes a queued run send.
+        val run = row.runId?.takeIf { row.images.isEmpty() }?.let { db.activeRunDao().get(it) }?.takeIf { it.sessionKey == row.sessionKey && it.status == "running" }
             ?: return pendingDao.update(row.copy(state = PendingState.QUEUED, runId = null)) == 1
         return steer(row.copy(runId = run.runId))
     }
@@ -325,7 +369,10 @@ class SendQueue(
     }
 
     // Under the repository lock, so a user delete or a refresh cannot interleave with creating the chat and starting its run.
-    private suspend fun attempt(send: PendingSendEntity): Attempt = withRepositoryLock {
+    // On IO as a whole: a Retry drains from the main thread, and the request (up to MAX_BODY_BYTES) is encoded in startRun.
+    private suspend fun attempt(send: PendingSendEntity): Attempt = withContext(Dispatchers.IO) { attemptLocked(send) }
+
+    private suspend fun attemptLocked(send: PendingSendEntity): Attempt = withRepositoryLock {
         ensureOpen()
         val sessionDao = db.sessionDao()
         val session = sessionDao.get(send.sessionKey)
@@ -338,9 +385,17 @@ class SendQueue(
         var requested = false // creating the session is not an attempt to deliver the message
         val run = try {
             if (!session.existsOnServer) {
+                // Written before the request: a Delete must know the create may reach the server even if its answer is lost.
+                val starting = session.copy(createStarted = true)
+                ensureOpen()
+                sessionDao.upsert(starting)
                 val title = create(session, send.text)
                 ensureOpen()
-                sessionDao.upsert(session.copy(existsOnServer = true, title = title))
+                sessionDao.upsert(starting.copy(existsOnServer = true, title = title))
+            }
+            val body = wireBody(send) ?: run {
+                fail(send, SendError.IMAGE_MISSING) // attempted as before: nothing was sent now, an earlier request may have been
+                return@withRepositoryLock Attempt.FAILED
             }
             ensureOpen()
             if (pendingDao.update(sent) == 0) return@withRepositoryLock Attempt.FAILED
@@ -351,7 +406,7 @@ class SendQueue(
             }
             ensureOpen()
             requested = true
-            api.startRun(send.requestBody, send.idempotencyKey)
+            api.startRun(body, send.idempotencyKey)
         } catch (e: ApiError) {
             ensureOpen()
             // A refusal settles only this request: an earlier attempt may still have been accepted, so keep its flag.
@@ -417,6 +472,25 @@ class SendQueue(
     } catch (e: ApiError) {
         if (e == ApiError.Unauthorized) throw e
         null // the next session refresh brings the title
+    }
+
+    /**
+     * What [attempt] posts: the stored body, or for a row with images that body with each reference replaced by its file,
+     * re-hashed while read; null when one is missing, unreadable or changed, or the files have grown past
+     * MAX_EXPANDED_LENGTH since they were measured. Never stored; built once per attempt.
+     */
+    private fun wireBody(send: PendingSendEntity): String? {
+        if (send.images.isEmpty()) return send.requestBody
+        val read = { d: String ->
+            try {
+                readImage(d)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+        }
+        return expandImageRefs(send.requestBody, send.images.split(','), MAX_EXPANDED_LENGTH, read)
     }
 
     private fun expired(send: PendingSendEntity) = now() - send.createdAt > SEND_EXPIRY_MS

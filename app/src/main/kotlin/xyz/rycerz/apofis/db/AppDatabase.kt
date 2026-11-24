@@ -9,8 +9,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 /** Cache of the server transcript plus the user's unsent messages. */
 @Database(
-    entities = [SessionEntity::class, MessageEntity::class, PendingSendEntity::class, ActiveRunEntity::class, ReplyOutcomeEntity::class, NoticeOutboxEntity::class, NoticeStateEntity::class],
-    version = 3,
+    entities = [SessionEntity::class, MessageEntity::class, PendingSendEntity::class, ActiveRunEntity::class, ReplyOutcomeEntity::class, NoticeOutboxEntity::class, NoticeStateEntity::class, ImageBindingEntity::class],
+    version = 4,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -21,6 +21,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun replyOutcomeDao(): ReplyOutcomeDao
     abstract fun noticeOutboxDao(): NoticeOutboxDao
     abstract fun noticeStateDao(): NoticeStateDao
+    abstract fun imageBindingDao(): ImageBindingDao
 }
 
 /**
@@ -50,8 +51,34 @@ val MIGRATION_2_3 = object : Migration(2, 3) {
     }
 }
 
+/**
+ * Version 4 adds the per-chat model choice, createStarted (taken from existsOnServer: a chat created before the upgrade
+ * started its create), the image references of a pending send, the steer-only flag, the two message cut markers and the
+ * image bindings. Every row is kept; defaults equal the exported schema.
+ */
+val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        listOf(
+            "SessionEntity` ADD COLUMN `model` TEXT",
+            "SessionEntity` ADD COLUMN `provider` TEXT",
+            "SessionEntity` ADD COLUMN `reasoning` TEXT",
+            "SessionEntity` ADD COLUMN `fast` INTEGER",
+            "SessionEntity` ADD COLUMN `createStarted` INTEGER NOT NULL DEFAULT 0",
+            "MessageEntity` ADD COLUMN `droppedToolCalls` INTEGER NOT NULL DEFAULT 0",
+            "MessageEntity` ADD COLUMN `shortened` INTEGER NOT NULL DEFAULT 0",
+            "PendingSendEntity` ADD COLUMN `images` TEXT NOT NULL DEFAULT ''",
+            "PendingSendEntity` ADD COLUMN `steerOnly` INTEGER NOT NULL DEFAULT 0",
+        ).forEach { db.execSQL("ALTER TABLE `$it") }
+        db.execSQL("UPDATE SessionEntity SET createStarted = existsOnServer")
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `ImageBindingEntity` (`sessionKey` TEXT NOT NULL, `messageId` INTEGER NOT NULL, `digests` TEXT NOT NULL, " +
+                "PRIMARY KEY(`sessionKey`, `messageId`))",
+        )
+    }
+}
+
 /** Every migration, oldest first: an upgrade from any released version keeps unsent work and runs. */
-val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
+val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
 
 /** The app's database as users get it; no destructive fallback, so a missing migration fails instead of wiping data. */
 fun openAppDatabase(context: Context, name: String = "apofis.db", migrations: Array<Migration> = ALL_MIGRATIONS): AppDatabase =

@@ -124,7 +124,7 @@ internal const val CONNECTION_EPOCH = "connection_epoch"
 /** The one reader of the persisted connection epoch. */
 internal fun connectionEpoch(c: Context) = c.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).getLong(CONNECTION_EPOCH, 0)
 
-private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity")
+private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity", "ImageBindingEntity")
 private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
 
 /** Session metadata from the server; a failure changes nothing (no send rolled back, no history evicted). */
