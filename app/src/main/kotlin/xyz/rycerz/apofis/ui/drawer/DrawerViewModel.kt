@@ -7,6 +7,7 @@ import java.time.ZoneId
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,6 +42,9 @@ enum class PromptKind { ACTIONS, RENAME, DELETE }
 
 /** The bar's new-chat button: on a never-created empty chat it makes it temporary ([TEMPORARY_OFF]) or ordinary again. */
 enum class NewChatState { NEW, TEMPORARY_OFF, TEMPORARY_ON }
+
+/** The bar's button [state], computed for the chat [key]: a tap acts only on what it showed. */
+data class NewChat(val key: String?, val state: NewChatState)
 
 /** Why an action failed, shown (wrapping, never cut) in the sheet or dialog that started it. */
 enum class ActionError { NETWORK, KEY_REJECTED, NOT_FOUND, CLOSED, FAILED }
@@ -122,20 +126,23 @@ class DrawerViewModel(
 
     private val tick = MutableStateFlow(0) // bumped on open, so "Today" follows the date even without a data change
 
-    val rows: StateFlow<List<DrawerRow>> = combine(sessions, runs, queryFlow, selectedFlow, tick) { s, r, q, sel, _ ->
+    /** Temporary chats whose leave is in flight: not listed and not selectable until it ends ([leaveIf]). */
+    private val leavingFlow = MutableStateFlow<Set<String>>(emptySet())
+
+    val rows: StateFlow<List<DrawerRow>> = combine(sessions, runs, queryFlow, combine(selectedFlow, leavingFlow, ::Pair), tick) { s, r, q, (sel, leaving), _ ->
         val zone = zone()
         val today = Instant.ofEpochMilli(now()).atZone(zone).toLocalDate()
-        groupSessions(s, q, sel, today, zone).map { if (it is DrawerRow.Chat) it.withRuns(r[it.key]) else it }
+        groupSessions(s.filter { it.key !in leaving }, q, sel, today, zone).map { if (it is DrawerRow.Chat) it.withRuns(r[it.key]) else it }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /** Archived chats, most recently active first. */
-    val archived: StateFlow<List<DrawerRow.Chat>> = combine(archivedSessions, runs) { s, r ->
-        s.sortedByDescending { it.lastActiveAt ?: it.startedAt }
+    val archived: StateFlow<List<DrawerRow.Chat>> = combine(archivedSessions, runs, leavingFlow) { all, r, leaving ->
+        all.filter { it.key !in leaving }.sortedByDescending { it.lastActiveAt ?: it.startedAt }
             .map { DrawerRow.Chat(it.key, it.title.orEmpty(), selected = false, running = false, needsInput = false).withRuns(r[it.key]) }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    private val newChatFlow = MutableStateFlow(NewChatState.NEW)
-    val newChatButton: StateFlow<NewChatState> = newChatFlow.asStateFlow()
+    private val newChatFlow = MutableStateFlow(NewChat(null, NewChatState.NEW))
+    val newChatButton: StateFlow<NewChat> = newChatFlow.asStateFlow()
 
     private var lastRefresh: Long? = null
     private var refreshing = false
@@ -147,15 +154,18 @@ class DrawerViewModel(
         viewModelScope.launch {
             selectedFlow.collectLatest { key ->
                 if (key == null) {
-                    newChatFlow.value = NewChatState.NEW
+                    newChatFlow.value = NewChat(null, NewChatState.NEW)
                     return@collectLatest
                 }
                 combine(repo.session(key), db.pendingSendDao().observe(key), composer.state(key)) { s, pending, c ->
-                    when {
-                        s == null || s.existsOnServer || s.createStarted || pending.isNotEmpty() || c.sending -> NewChatState.NEW
-                        isTemporaryKey(key) -> NewChatState.TEMPORARY_ON
-                        else -> NewChatState.TEMPORARY_OFF
-                    }
+                    NewChat(
+                        key,
+                        when {
+                            s == null || s.existsOnServer || s.createStarted || pending.isNotEmpty() || c.sending -> NewChatState.NEW
+                            isTemporaryKey(key) -> NewChatState.TEMPORARY_ON
+                            else -> NewChatState.TEMPORARY_OFF
+                        },
+                    )
                 }.collect { newChatFlow.value = it }
             }
         }
@@ -239,18 +249,17 @@ class DrawerViewModel(
     override fun onSelect(key: String) {
         viewModelScope.launch {
             try {
-                var previous: String? = null
                 ops.withLock {
                     when {
                         !usable(key) -> if (selectedFlow.value == key) openNew()
                         selectedFlow.value == key -> reopenedFlow.value = Reopen(key, tokens.incrementAndGet())
                         else -> {
-                            previous = selectedFlow.value
+                            val previous = selectedFlow.value
                             selectedFlow.value = key
+                            leaveIf(previous, key)
                         }
                     }
                 }
-                leaveIf(previous, key)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -263,67 +272,61 @@ class DrawerViewModel(
      * A notification tap: under the same lock as every selection, selects and stores [key] only if the row is usable
      * and [current] (the tap still belongs to this live graph) holds, checked in the same step. True when it did.
      */
-    suspend fun selectTapped(key: String, current: () -> Boolean): Boolean {
-        var previous: String? = null
-        val selected = try {
-            ops.withLock {
-                if (!usable(key) || !current()) return@withLock false
-                previous = selectedFlow.value
-                if (previous == key) reopenedFlow.value = Reopen(key, tokens.incrementAndGet()) else selectedFlow.value = key
-                onSelected(key) // stored now, not later by the collector of a graph that may be closing
-                true
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            false // closed by a server switch
+    suspend fun selectTapped(key: String, current: () -> Boolean): Boolean = try {
+        ops.withLock {
+            if (!usable(key) || !current()) return@withLock false
+            val previous = selectedFlow.value
+            if (previous == key) reopenedFlow.value = Reopen(key, tokens.incrementAndGet()) else selectedFlow.value = key
+            leaveIf(previous, key)
+            onSelected(key) // stored now, not later by the collector of a graph that may be closing
+            true
         }
-        if (selected) leaveIf(previous, key)
-        return selected
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        false // closed by a server switch
     }
 
-    /** A chat that can be shown: its row exists here and is not hidden. */
-    private suspend fun usable(key: String) = db.sessionDao().get(key)?.hidden == false
+    /** A chat that can be shown: its row exists here, is not hidden and is not being left. */
+    private suspend fun usable(key: String) = key !in leavingFlow.value && db.sessionDao().get(key)?.hidden == false
 
     /**
      * Reuses the open chat while it is an ordinary never-created empty chat, else creates a local chat (no request) and
      * opens it; a temporary chat left this way is deleted ([leaveIf]).
      */
-    suspend fun onNewChat(): String {
-        var previous: String? = null
-        val key = ops.withLock {
-            previous = selectedFlow.value
-            selectedFlow.value?.let { current ->
-                val s = db.sessionDao().get(current)
-                if (s != null && !isTemporaryKey(current) && !s.existsOnServer && !s.createStarted && !s.archived &&
-                    !repo.hasCachedMessages(current) && db.pendingSendDao().rows(current).isEmpty() && !composer.current(current).sending
-                ) {
-                    return@withLock current
-                }
+    suspend fun onNewChat(): String = ops.withLock {
+        val previous = selectedFlow.value
+        previous?.let { current ->
+            val s = db.sessionDao().get(current)
+            if (s != null && !isTemporaryKey(current) && !s.existsOnServer && !s.createStarted && !s.archived &&
+                !repo.hasCachedMessages(current) && db.pendingSendDao().rows(current).isEmpty() && !composer.current(current).sending
+            ) {
+                return@withLock current
             }
-            openNew()
         }
-        leaveIf(previous, key)
-        return key
+        openNew().also { leaveIf(previous, it) }
     }
 
     /**
-     * The bar's toggle: the open never-created empty chat under a new key, temporary or ordinary again, its draft moved
-     * with it. The new key, or null when the toggle does not apply (nothing changed).
+     * The bar's toggle, for what the button showed ([shown]): the open never-created empty chat under a new key,
+     * temporary or ordinary again, its draft moved with it. Dropped when [shown] is no longer the button's state for the
+     * open chat. The row is replaced first, with the draft still under the old key, so text typed while the repository
+     * lock is busy stays; once replaced, the outcome is completed even if the caller is cancelled. The new key, or null
+     * when nothing changed.
      */
-    suspend fun toggleTemporary(): String? = ops.withLock {
-        val old = selectedFlow.value ?: return@withLock null
-        val new = newSessionId(temporary = !isTemporaryKey(old))
-        if (!composer.move(old, new)) return@withLock null
-        var replaced = false
-        try {
-            replaced = repo.replaceEmptyLocal(old, new)
-        } finally {
-            if (!replaced) composer.move(new, old) // the draft goes back
+    suspend fun toggleTemporary(shown: NewChat): String? = ops.withLock {
+        val old = selectedFlow.value
+        if (old == null || shown.state == NewChatState.NEW || shown.key != old || newChatFlow.value != shown || composer.current(old).sending) {
+            return@withLock null
         }
-        if (!replaced) return@withLock null
-        selectedFlow.value = new
-        new
+        withContext(NonCancellable) {
+            val new = newSessionId(temporary = !isTemporaryKey(old))
+            if (!repo.replaceEmptyLocal(old, new)) return@withContext null
+            // A send claimed before the replacement fails on the missing row; its text then moves as the unsent entry.
+            while (!composer.move(old, new)) composer.settle()
+            selectedFlow.value = new
+            new
+        }
     }
 
     /**
@@ -333,31 +336,38 @@ class DrawerViewModel(
      */
     suspend fun openFreshChatIf(selected: String, claim: () -> Boolean, fill: suspend (newKey: String) -> Unit): String? = ops.withLock {
         if (selectedFlow.value != selected) return@withLock null
-        val k = try {
-            repo.createLocalSession()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            return@withLock null // closed by a server switch
-        }
-        if (!claim()) {
-            withContext(NonCancellable) { db.sessionDao().delete(k) } // the DAO: it works while the repository is closed
-            return@withLock null
-        }
-        selectedFlow.value = k
+        // Not cancellable from the insert to the claim's outcome: a fresh row is either claimed and selected or removed.
+        val k = withContext(NonCancellable) {
+            val k = try {
+                repo.createLocalSession()
+            } catch (_: Exception) {
+                return@withContext null // closed by a server switch
+            }
+            if (!claim()) {
+                db.sessionDao().delete(k) // the DAO: it works while the repository is closed
+                return@withContext null
+            }
+            selectedFlow.value = k
+            k
+        } ?: return@withLock null
+        val leave = leaveIf(selected, k, startNow = false) // set aside now, with the selection; deleted after fill
         try {
             fill(k)
         } finally {
-            leaveIf(selected, k)
+            leave?.start()
         }
         k
     }
 
-    /** [onNewChat] for a button; [toggle] (the bar's button) toggles a temporary chat instead while that applies. */
-    fun newChat(toggle: Boolean = false) {
+    /**
+     * New chat. With [shown] (the bar's button), a toggle state toggles the open chat instead, and [onToggled] runs once
+     * when that changed the key; a stale toggle does nothing. Without it (the drawer's row, /new), always a new chat. A
+     * failure leaves the open chat as it is.
+     */
+    fun newChat(shown: NewChat? = null, onToggled: () -> Unit = {}) {
         viewModelScope.launch {
             try {
-                if (toggle && newChatButton.value != NewChatState.NEW) toggleTemporary() else onNewChat()
+                if (shown == null || shown.state == NewChatState.NEW) onNewChat() else if (toggleTemporary(shown) != null) onToggled()
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -421,6 +431,7 @@ class DrawerViewModel(
      */
     override fun confirmDelete(token: Long) = act(token, PromptKind.DELETE) { p ->
         ops.withLock {
+            if (p.key in leavingFlow.value) throw IllegalArgumentException("being left") // its leave owns the Delete
             deleteChat(p.key, p.running)
             if (selectedFlow.value == p.key) openNew()
         }
@@ -455,19 +466,25 @@ class DrawerViewModel(
      * holds no selection lock (the next selection never waits for it, a cancelled caller does not stop it), bounded at
      * ten seconds. If that fails the chat stays, listed as it is no longer open, and [newKey] gets a note.
      */
-    private fun leaveIf(previous: String?, newKey: String) {
-        if (previous == null || previous == newKey || !isTemporaryKey(previous)) return
-        viewModelScope.launch {
-            val deleted = try {
-                db.sessionDao().get(previous) == null ||
-                    withTimeoutOrNull(LEAVE_TIMEOUT_MS) { deleteChat(previous, runsMentioned = true, awaitRuns = true) } != null
+    private fun leaveIf(previous: String?, newKey: String, startNow: Boolean = true): Job? {
+        if (previous == null || previous == newKey || !isTemporaryKey(previous)) return null
+        leavingFlow.update { it + previous } // before anything suspends: from now on it cannot be listed or reopened
+        return viewModelScope.launch(start = if (startNow) CoroutineStart.DEFAULT else CoroutineStart.LAZY) {
+            try {
+                withTimeoutOrNull(LEAVE_TIMEOUT_MS) {
+                    if (db.sessionDao().get(previous) != null) deleteChat(previous, runsMentioned = true, awaitRuns = true)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                false
+                // kept: the note below says so
             }
-            if (!deleted) composer.setNote(newKey, ComposerNote(NoteKind.TEMPORARY_NOT_DELETED))
-        }
+            // The row decides, not the timeout: a Delete that committed while its cleanup overran sets no note. Nothing is
+            // written for a closed connection (its composer is the next one's) or into a chat that is gone.
+            if (connection.isOpen && db.sessionDao().get(previous) != null && db.sessionDao().get(newKey) != null) {
+                composer.setNote(newKey, ComposerNote(NoteKind.TEMPORARY_NOT_DELETED))
+            }
+        }.also { job -> job.invokeOnCompletion { leavingFlow.update { it - previous } } }
     }
 
     /** For tests: actions started and not yet applied. */
@@ -506,6 +523,7 @@ class DrawerViewModel(
     }
 
     private fun promptFor(kind: PromptKind, key: String): Prompt? {
+        if (key in leavingFlow.value) return null
         val s = (sessions.value + archivedSessions.value).firstOrNull { it.key == key } ?: return null
         return Prompt(kind, key, s.title.orEmpty(), s.pinned, s.archived, running = runs.value[key] != null, token = tokens.incrementAndGet())
     }

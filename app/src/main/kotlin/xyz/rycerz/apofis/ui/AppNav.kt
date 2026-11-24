@@ -15,7 +15,9 @@ import xyz.rycerz.apofis.ui.drawer.ArchivedScreen
 import xyz.rycerz.apofis.ui.drawer.DrawerActions
 import xyz.rycerz.apofis.ui.drawer.DrawerContent
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
+import xyz.rycerz.apofis.ui.drawer.NewChat
 import xyz.rycerz.apofis.ui.drawer.NewChatState
+import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.drawer.PromptHost
 import xyz.rycerz.apofis.ui.drawer.Prompt
 import xyz.rycerz.apofis.ui.drawer.PromptActions
@@ -194,7 +196,13 @@ internal fun ChatRoute(container: AppContainer, conn: Connected, owner: ViewMode
     val drawerButton: @Composable () -> Unit = {
         DrawerButton(Modifier.focusRequester(drawerButtonFocus)) { scope.launch { drawerState.open() } }
     }
-    val newChatButton: @Composable RowScope.() -> Unit = { NewChatButton(drawer.newChatButton.collectAsState().value) { drawer.newChat(toggle = true) } }
+    val newChatButton: @Composable RowScope.() -> Unit = {
+        val haptics = ApofisTheme.haptics
+        val button = drawer.newChatButton.collectAsState().value
+        // A state computed for another chat (the selection just changed) is never drawn: New chat until it catches up.
+        val shown = if (button.key == drawer.selected.collectAsState().value) button else NewChat(button.key, NewChatState.NEW)
+        NewChatButton(shown.state) { drawer.newChat(shown, haptics::selection) }
+    }
     // One mark for every window over the chat and its drawer (the answer guard, see [Overlays]).
     val overlays = remember { Overlays() }
     CompositionLocalProvider(LocalOverlays provides overlays) {
