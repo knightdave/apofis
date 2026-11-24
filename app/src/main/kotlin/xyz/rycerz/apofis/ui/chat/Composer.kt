@@ -11,7 +11,6 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -19,7 +18,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -240,21 +242,27 @@ internal fun ComposerParts(
         }
     }
     Row {
-        if (mode == ComposerMode.STEER || mode == ComposerMode.SEND_AFTER) RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
+        // Keyed by the run it is drawn for: a press begun on one run is cancelled when another run is shown.
+        if (mode == ComposerMode.STEER || mode == ComposerMode.SEND_AFTER) key(subject) {
+            RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
+        }
         PrimaryButton(mode, busy, subject, submit, onStop, clock)
     }
     ApofisIconButton(onClick = onAttach, contentDescription = stringResource(R.string.chat_attach), enabled = attachEnabled, visualSize = 24.dp) {
         Icon(painterResource(R.drawable.lucide_plus), null, Modifier.size(20.dp), tint = colors.muted)
     }
     val stripRoom = remember { ExpandRoom() }
+    val stripState = rememberLazyListState() // kept while the strip is hidden, so its position comes back with it
     Box {
-        // Composed only while the allocation gives it its share, like Expand: a hidden thumbnail keeps no focus.
+        // Composed only while the allocation gives it its share, like Expand: a hidden thumbnail keeps no focus. Lazy: a
+        // Put back may restore many photos, and only the tiles on screen are composed (and decoded).
         if (images.isNotEmpty() && stripRoom.state.value) {
-            Row(
-                Modifier.onPreviewKeyEvent { !stripRoom.now }.semantics { traversalIndex = -2f }.horizontalScroll(rememberScrollState()),
+            LazyRow(
+                Modifier.height(REMOVE_RISE + DRAFT_THUMB).onPreviewKeyEvent { !stripRoom.now }.semantics { traversalIndex = -2f },
+                state = stripState,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                images.forEachIndexed { i, image -> key(image.id) { DraftThumb(image, i, images.size, busy, onRemoveImage) } }
+                itemsIndexed(images, key = { _, image -> image.id }) { i, image -> DraftThumb(image, i, images.size, busy, onRemoveImage) }
             }
         }
     }

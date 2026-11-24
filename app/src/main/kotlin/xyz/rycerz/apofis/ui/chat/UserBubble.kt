@@ -138,7 +138,7 @@ internal fun UserBubble(
                 },
             )
         }
-        if (long) {
+        if (long && hasText(text)) { // a blank caption has no text box, so nothing to expand
             Row {
                 if (expanded) SmallTextButton(R.string.chat_show_less, { expanded = false })
                 if (more) SmallTextButton(R.string.chat_show_full, { actions.onSelect(FULL + message.key) })

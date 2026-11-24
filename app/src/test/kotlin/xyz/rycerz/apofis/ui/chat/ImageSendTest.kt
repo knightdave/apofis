@@ -44,9 +44,21 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.isDialog
+import androidx.compose.ui.test.junit4.StateRestorationTester
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.runtime.key
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.graphics.toPixelMap
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityOptionsCompat
@@ -103,7 +115,6 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import xyz.rycerz.apofis.ApofisApp
@@ -199,8 +210,10 @@ class ImageSendTest {
     private class Launch(val code: Int, val contract: ActivityResultContract<*, *>, val intent: Intent)
 
     private val launches = ArrayList<Launch>()
+    private var launchFails = false // as on a device without a system photo picker
     private val registry = object : ActivityResultRegistry() {
         override fun <I, O> onLaunch(requestCode: Int, contract: ActivityResultContract<I, O>, input: I, options: ActivityOptionsCompat?) {
+            if (launchFails) throw android.content.ActivityNotFoundException("no picker")
             launches += Launch(requestCode, contract, contract.createIntent(rule.activity, input))
         }
     }
@@ -251,7 +264,7 @@ class ImageSendTest {
     private val overlays = Overlays()
     private var answerClock = 1_000L
     private var cache: ThumbCache? = null
-    private val opened = ArrayList<ViewerImage>()
+    private var store: ImageStore? = null
     private lateinit var list: LazyListState
     private lateinit var scope: CoroutineScope
 
@@ -260,24 +273,31 @@ class ImageSendTest {
         rule.mainClock.advanceTimeByFrame()
     }
 
-    /** The chat at [start]; the list starts [index] rows up from the bottom (a reader when above 0). */
-    private fun host(start: ChatUiState, index: Int = 0) {
+    /**
+     * The chat at [start]; the list starts [index] rows up from the bottom (a reader when above 0). The screen is keyed by
+     * the chat, as AppNav composes it: another chat is another screen. [restoration] hosts it for a saved-state restore.
+     */
+    private fun host(start: ChatUiState, index: Int = 0, restoration: StateRestorationTester? = null) {
         ui = start
         rule.mainClock.autoAdvance = false
-        rule.setContent {
+        val content: @Composable () -> Unit = {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
                 CompositionLocalProvider(
                     LocalActivityResultRegistryOwner provides registryOwner,
                     LocalOverlays provides overlays,
                     LocalAnswerClock provides { answerClock },
                     LocalThumbCache provides cache,
+                    LocalImageStore provides store,
                 ) {
                     list = rememberLazyListState(index)
                     scope = rememberCoroutineScope()
-                    ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, coveredNow = { covered })
+                    key(ui.sessionKey) {
+                        ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, listState = list, coveredNow = { covered })
+                    }
                 }
             }
         }
+        if (restoration != null) restoration.setContent(content) else rule.setContent(content)
         frames(10)
     }
 
@@ -301,6 +321,7 @@ class ImageSendTest {
         assertTrue("the multiple picker: ${first.contract}", first.contract is PickMultipleVisualMedia)
         assertEquals(10, pickLimit(first))
         assertEquals(MediaStore.ACTION_PICK_IMAGES, first.intent.action)
+        assertEquals("images only", "image/*", first.intent.type)
 
         ui = state(ready(3))
         frames(3)
@@ -315,6 +336,7 @@ class ImageSendTest {
         frames(3)
         tap(plus)
         assertTrue("one left: the single picker", launches[3].contract is PickVisualMedia)
+        assertEquals("images only", "image/*", launches[3].intent.type)
         ui = state(ready(10))
         frames(3)
         tap(plus)
@@ -366,6 +388,24 @@ class ImageSendTest {
         assertEquals("a result marks nothing", 5_000L, overlays.openedAt)
     }
 
+    /** A launch that throws (no picker on the device) does nothing: no crash, no mark of the approval guard. */
+    @Test
+    fun aFailedLaunchDoesNothing() {
+        launchFails = true
+        host(state())
+        answerClock = 5_000L
+        tap(plus)
+        assertEquals(0, launches.size)
+        assertEquals(Long.MIN_VALUE, overlays.openedAt)
+        ui = state(ready(9)) // the single picker
+        frames(3)
+        tap(plus)
+        assertEquals(Long.MIN_VALUE, overlays.openedAt)
+        launchFails = false
+        tap(plus)
+        assertEquals(5_000L, overlays.openedAt)
+    }
+
     @Test
     fun plusUnderTheDrawerDoesNothing() {
         host(state())
@@ -399,21 +439,54 @@ class ImageSendTest {
         rule.onNode(plus, useUnmergedTree = true).assertIsNotEnabled()
     }
 
-    /** The result goes to the actions current when it arrives, never to those of the chat the picker opened in. */
+    private val uris = listOf(Uri.parse("content://picker/1"), Uri.parse("content://picker/2"))
+
+    /** On the same screen, the result goes to the actions passed when it arrives, not to those passed at the launch. */
     @Test
-    fun callbackReplacedAfterChatSwitch() {
+    fun pickerResultGoesToTheActionsCurrentOnDelivery() {
         host(state())
         val old = recorder
         tap(plus)
         val next = Recorder()
         actions = next
-        ui = state().copy(sessionKey = "k2")
         frames(3)
-        val uris = listOf(Uri.parse("content://picker/1"), Uri.parse("content://picker/2"))
         rule.runOnUiThread { registry.dispatchResult(launches.single().code, uris) }
         frames(2)
         assertEquals(emptyList<List<Uri>>(), old.picked)
         assertEquals(listOf(uris), next.picked)
+    }
+
+    /** Another chat is another screen (keyed, as AppNav does): a result for the left chat's launch reaches neither. */
+    @Test
+    fun pickerResultForALeftChatReachesNoOne() {
+        host(state())
+        val a = recorder
+        tap(plus)
+        val b = Recorder()
+        actions = b
+        ui = state().copy(sessionKey = "k2")
+        frames(5)
+        rule.runOnUiThread { registry.dispatchResult(launches.single().code, uris) }
+        frames(2)
+        assertEquals(emptyList<List<Uri>>(), a.picked)
+        assertEquals(emptyList<List<Uri>>(), b.picked)
+    }
+
+    /** The screen rebuilt from saved state registers the same key again: the restored actions get the result, once. */
+    @Test
+    fun pickerResultReachesTheRestoredScreenOnce() {
+        val restoration = StateRestorationTester(rule)
+        host(state(), restoration = restoration)
+        val before = recorder
+        tap(plus)
+        val restored = Recorder()
+        actions = restored
+        restoration.emulateSavedInstanceStateRestore()
+        frames(5)
+        rule.runOnUiThread { registry.dispatchResult(launches.single().code, uris) }
+        frames(2)
+        assertEquals(emptyList<List<Uri>>(), before.picked)
+        assertEquals(listOf(uris), restored.picked)
     }
 
     @Test
@@ -462,6 +535,121 @@ class ImageSendTest {
         assertEquals(10, list.firstVisibleItemIndex)
     }
 
+    private val sent = UserMessage("new", "And these photos", steered = false, timestamp = FIXED_NOW, state = SendState.QUEUED, idempotencyKey = "q1", images = listOf(digest(1)))
+
+    /** The new row rests whole at the bottom: the first visible item, at offset 0. */
+    private fun assertNewRowShown(case: String) {
+        val first = list.layoutInfo.visibleItemsInfo.first()
+        assertEquals("$case: the bottom item", "new", first.key)
+        assertEquals("$case: index", 0, list.firstVisibleItemIndex)
+        assertEquals("$case: offset", 0, list.firstVisibleItemScrollOffset)
+    }
+
+    /** The stored event and the transcript row reach the screen in either order, a frame apart: the new row ends shown. */
+    @Test
+    fun storedSendShowsTheNewRowWhenTheCounterComesFirst() {
+        host(state(), index = 10)
+        ui = ui.copy(storedSends = 1, storedKey = "q1")
+        frames(1)
+        ui = ui.copy(items = history + sent)
+        frames(10)
+        assertNewRowShown("counter first")
+    }
+
+    @Test
+    fun storedSendShowsTheNewRowWhenTheRowComesFirst() {
+        host(state(), index = 10)
+        ui = ui.copy(items = history + sent)
+        frames(1)
+        ui = ui.copy(storedSends = 1, storedKey = "q1")
+        frames(10)
+        assertNewRowShown("row first")
+    }
+
+    /** A screen that starts with a count above zero pins nothing for it; the next stored send pins. */
+    @Test
+    fun counterAboveZeroPinsOnlyOnChange() {
+        host(state().copy(storedSends = 3), index = 10)
+        frames(10)
+        assertEquals(10, list.firstVisibleItemIndex)
+        ui = ui.copy(storedSends = 4)
+        frames(10)
+        assertEquals(0, list.firstVisibleItemIndex)
+    }
+
+    /** A press on the secondary Stop begun while run A was drawn is cancelled when run B is drawn; a fresh press stops B. */
+    @Test
+    fun secondaryStopPressDoesNotCrossRuns() {
+        val a = LiveReply("run_a", "running", "Working", emptyList(), null, Connection.LIVE)
+        host(state(ready(1), ComposerMode.SEND_AFTER, live = a))
+        val at = rule.onNode(hasTestTag(STOP_TAG), useUnmergedTree = true).fetchSemanticsNode().boundsInRoot.center
+        rule.onRoot().performTouchInput { down(at) }
+        frames(2)
+        ui = state(ready(1), ComposerMode.SEND_AFTER, live = a.copy(runId = "run_b"))
+        frames(3)
+        rule.onRoot().performTouchInput { up() }
+        frames(3)
+        assertEquals("a press begun on run A stops nothing", emptyList<String>(), recorder.stops)
+        tap(hasTestTag(STOP_TAG))
+        assertEquals(listOf("run_b"), recorder.stops)
+        assertEquals(0, recorder.sends)
+    }
+
+    @Test
+    fun sendAfterDisabledWhileSending() {
+        val live = LiveReply("run_1", "running", "Working", emptyList(), null, Connection.LIVE)
+        host(state(ready(1), ComposerMode.SEND_AFTER, live = live).copy(sending = true))
+        rule.onNode(hasTestTag(SEND_TAG), useUnmergedTree = true).assertIsNotEnabled()
+        rule.onNode(hasTestTag(STOP_TAG), useUnmergedTree = true).assertIsEnabled()
+    }
+
+    /** A press begun on Steer and released once the button shows Send after (same run) sends nothing. */
+    @Test
+    fun pressBegunOnSteerSendsNothingOnSendAfter() {
+        val live = LiveReply("run_1", "running", "Working", emptyList(), null, Connection.LIVE)
+        host(state(mode = ComposerMode.STEER, draft = "and this", live = live))
+        val at = rule.onNode(hasTestTag(SEND_TAG), useUnmergedTree = true).fetchSemanticsNode().boundsInRoot.center
+        rule.onRoot().performTouchInput { down(at) }
+        frames(2)
+        ui = state(ready(1), ComposerMode.SEND_AFTER, "and this", live)
+        frames(3)
+        rule.onRoot().performTouchInput { up() }
+        frames(3)
+        assertEquals(0, recorder.sends)
+        tap(hasTestTag(SEND_TAG))
+        assertEquals(1, recorder.sends)
+    }
+
+    @Test
+    fun removeUnderTheDrawerDoesNothing() {
+        host(state(ready(2), ComposerMode.SEND))
+        covered = true
+        rule.onAllNodes(remove, useUnmergedTree = true)[0].performClick()
+        frames(3)
+        assertEquals(emptyList<Long>(), recorder.removed)
+        covered = false
+        rule.onAllNodes(remove, useUnmergedTree = true)[0].performClick()
+        frames(3)
+        assertEquals(listOf(1L), recorder.removed)
+    }
+
+    /** Thirty photos after Put backs: only the tiles on screen are composed (and decoded); the last can be reached and removed. */
+    @Test
+    fun thirtyPhotosStripIsLazy() {
+        cache = thumbs(30)
+        host(state(ready(30), ComposerMode.SEND))
+        val composed = count(remove)
+        assertTrue("only the tiles on screen: $composed", composed in 1..6)
+        assertEquals(0, count(hasContentDescription("Image 30 of 30")))
+        rule.onNode(hasScrollToIndexAction() and hasAnyDescendant(remove), useUnmergedTree = true).performScrollToIndex(29)
+        frames(5)
+        rule.onNode(hasContentDescription("Image 30 of 30"), useUnmergedTree = true).assertExists()
+        val last = rule.onAllNodes(remove, useUnmergedTree = true).fetchSemanticsNodes().maxBy { it.boundsInRoot.left }
+        rule.onNode(SemanticsMatcher("node ${last.id}") { it.id == last.id }, useUnmergedTree = true).performClick()
+        frames(3)
+        assertEquals(listOf(30L), recorder.removed)
+    }
+
     @Test
     fun removeControlDisabledWhileSending() {
         host(state(ready(2), ComposerMode.SEND, "two"))
@@ -489,12 +677,19 @@ class ImageSendTest {
         assertEquals(3, count(remove))
     }
 
+    /** A ready thumbnail opens its own photo: the store holds only photo 2's file, and the viewer shows a picture. */
     @Test
     fun readyThumbOpensViewer() {
-        cache = thumbs(2)
-        host(state(ready(2), ComposerMode.SEND))
-        tap(hasContentDescription("Image 2 of 2"))
-        assertEquals(1, rule.onAllNodes(isDialog()).fetchSemanticsNodes().size)
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        store = ImageStore(File(app.filesDir, "strip-${System.nanoTime()}"), System::currentTimeMillis)
+        val two = runBlocking { store!!.put(jpeg(picture(64, 48)))!! }
+        host(state(listOf(DraftImage(1, digest(1)), DraftImage(2, two)), ComposerMode.SEND))
+        val tile = hasContentDescription("Image 2 of 2") and hasClickAction()
+        rule.waitUntil(10_000) { frames(1); count(tile) == 1 } // decoded from the store
+        tap(tile)
+        rule.waitUntil(10_000) { frames(1); count(hasContentDescription("Image") and hasAnyAncestor(isDialog())) == 1 }
+        assertEquals(0, count(hasText("Image could not be shown")))
+        assertEquals(emptyList<Long>(), recorder.removed)
     }
 
     /** Each kind set through the holder's setNote, drawn above the composer with its sentence and argument. */
@@ -657,6 +852,57 @@ class ImageBubbleTest {
         assertEquals(1, count(hasText("Waiting to send")))
     }
 
+    /** Queued photos are dimmed: the same pixel of the same photo differs from the sent message's. */
+    @Test
+    fun queuedPhotosAreDimmed() {
+        var message by mutableStateOf(UserMessage("u1", "", steered = false, timestamp = FIXED_NOW, images = listOf(digest(1))))
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                CompositionLocalProvider(LocalThumbCache provides thumbs(1)) {
+                    Column(Modifier.width(360.dp)) { UserBubble(message, onRetry = {}, onCancel = {}, actions = RowActions({ listOf(message) }, {})) }
+                }
+            }
+        }
+        rule.waitForIdle()
+        fun pixel(): androidx.compose.ui.graphics.Color {
+            val map = rule.onNode(hasContentDescription("Image 1 of 1"), useUnmergedTree = true).captureToImage().toPixelMap()
+            return map[map.width * 3 / 4, map.height / 4] // inside the red quarter, away from the diagonal
+        }
+        val sent = pixel()
+        message = message.copy(state = SendState.QUEUED, idempotencyKey = "q1")
+        rule.waitForIdle()
+        val queued = pixel()
+        assertTrue("queued $queued against sent $sent", queued != sent && queued.green > sent.green)
+    }
+
+    /** A photo-only message that failed keeps Retry and Remove; one that is queued keeps Cancel (R12). */
+    @Test
+    fun photoOnlyUnsentRowsKeepTheirControls() {
+        var message by mutableStateOf(UserMessage("u1", "", steered = false, timestamp = FIXED_NOW, state = SendState.FAILED, idempotencyKey = "f1", images = listOf(digest(1))))
+        rule.setContent {
+            ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                CompositionLocalProvider(LocalThumbCache provides thumbs(1)) {
+                    Column(Modifier.width(360.dp)) { UserBubble(message, onRetry = {}, onCancel = {}, actions = RowActions({ listOf(message) }, {})) }
+                }
+            }
+        }
+        rule.waitForIdle()
+        assertEquals(1, rule.onAllNodes(hasText("Retry") and hasClickAction()).fetchSemanticsNodes().size) // merged: the text is the button's
+        assertEquals(1, count(hasContentDescription("Remove message") and hasClickAction()))
+        message = message.copy(state = SendState.QUEUED, idempotencyKey = "q1")
+        rule.waitForIdle()
+        assertEquals(1, count(hasContentDescription("Cancel sending") and hasClickAction()))
+    }
+
+    /** A photo with a caption of only line breaks has no text box, so no Show more or Show less either. */
+    @Test
+    fun blankCaptionHasNoExpansionControls() {
+        bubble(UserMessage("u1", "\n".repeat(12), steered = false, timestamp = FIXED_NOW, images = listOf(digest(1))))
+        assertEquals(1, count(hasContentDescription("Image 1 of 1")))
+        assertEquals(0, count(hasText("Show more")))
+        assertEquals(0, count(hasText("Show less")))
+    }
+
     /** An unbound row shows the placeholder, also when the store holds a photo whose digest starts with the server's hint. */
     @Test
     fun placeholderForUnboundRow() {
@@ -692,7 +938,8 @@ class ImageSendViewModelTest {
     private val requests = java.util.concurrent.CopyOnWriteArrayList<RecordedRequest>()
     private val vms = ViewModelStore()
     private val created = ArrayList<ChatViewModel>()
-    private val release = CountDownLatch(1)
+    private val release = CountDownLatch(1) // opened by the test only (in tearDown at the latest)
+    private val watchdog = java.util.concurrent.atomic.AtomicInteger() // held streams whose wait ran out: each fails the test
 
     @Volatile private var convert: suspend (Uri) -> Encoded = { Encoded.Ok(jpeg(picture(64, 48))) }
 
@@ -732,6 +979,7 @@ class ImageSendViewModelTest {
         db.close()
         server.close()
         Dispatchers.resetMain()
+        assertEquals("held streams whose watchdog fired", 0, watchdog.get())
     }
 
     private fun vm(): ChatViewModel = ViewModelProvider.create(vms, viewModelFactory { initializer { ChatViewModel(KEY, connected, kotlinx.coroutines.flow.flowOf(true)) } })
@@ -769,13 +1017,41 @@ class ImageSendViewModelTest {
                 """"execution_generation":3,"output":"","pending_controls":[]}""",
         )
         routes["/v1/runs/$RUN/events"] = {
-            release.await(10, TimeUnit.SECONDS)
-            MockResponse.Builder().body(": open\n\n").addHeader("Content-Type", "text/event-stream").build()
+            if (release.await(10, TimeUnit.SECONDS)) {
+                MockResponse.Builder().body(": open\n\n").addHeader("Content-Type", "text/event-stream").build()
+            } else {
+                watchdog.incrementAndGet() // never a normal answer: tearDown fails the test
+                MockResponse.Builder().code(500).build()
+            }
         }
         follower.resumeAll()
         db.activeRunDao().upsert(ActiveRunEntity(RUN, KEY, null, "running", 1L))
         db.pendingSendDao().upsert(PendingSendEntity("p1", KEY, "hello", "{}", System.currentTimeMillis(), "sending", RUN, null, attempted = true))
         follower.onRunStarted(KEY, RUN)
+    }
+
+    /** The first state after the view model is built already carries the draft's photos. */
+    @Test
+    fun firstStateCarriesTheDraftPhotos() {
+        connected.composer.addImages(KEY, 1)
+        assertEquals(1, vm().state.value.images.size)
+    }
+
+    /** The Stop beside Send after posts one stop of the drawn run and starts no run; the photo stays in the draft. */
+    @Test
+    fun stopBesideSendAfterPostsOneStop() {
+        addSession()
+        val stopped = kotlinx.coroutines.CompletableDeferred<Unit>()
+        routes["/v1/runs/$RUN/stop"] = { r -> json("""{"run_id":"$RUN","status":"stopping"}""")(r).also { stopped.complete(Unit) } }
+        val vm = vm()
+        liveRun()
+        val d = readyPhoto()
+        assertEquals(ComposerMode.SEND_AFTER, vm.await { it.live != null && it.images.singleOrNull()?.digest == d }.composer)
+        vm.onStopClick(RUN)
+        wait { stopped.await() }
+        assertEquals(1, requests.count { it.method == "POST" && it.target == "/v1/runs/$RUN/stop" })
+        assertEquals(0, requests.count { it.method == "POST" && it.target.substringBefore('?') == "/v1/runs" })
+        assertEquals(listOf(d), connected.composer.current(KEY).images.map { it.digest })
     }
 
     @Test
@@ -840,7 +1116,8 @@ class ImageSendViewModelTest {
         addSession()
         vm.type("kept")
         assertTrue(vm.onSendClick())
-        assertEquals(1L, vm.await { it.storedSends == 1L && !it.sending }.storedSends)
+        val stored = vm.await { it.storedSends == 1L && !it.sending }
+        assertEquals("the stored row's key travels with the counter", wait { db.pendingSendDao().rows(KEY) }.single().idempotencyKey, stored.storedKey)
     }
 
     @Test
@@ -858,8 +1135,8 @@ class ImageSendViewModelTest {
         connected.composer.removeImage(KEY, processing)
         vm.type("")
         vm.await { it.images.isEmpty() && it.draft.isEmpty() }
-        readyPhoto()
-        assertEquals(ComposerMode.SEND_AFTER, vm.await { it.images.size == 1 }.composer)
+        val d = readyPhoto()
+        assertEquals(ComposerMode.SEND_AFTER, vm.await { it.images.singleOrNull()?.digest == d }.composer) // the ready snapshot itself
         vm.type("caption")
         assertEquals(ComposerMode.SEND_AFTER, vm.await { it.draft == "caption" }.composer)
     }
@@ -881,25 +1158,85 @@ class ImageSendViewModelTest {
         assertEquals(listOf<String?>(d), row.images)
         assertTrue(requests.none { it.target.contains("/steer") })
     }
+}
 
-    /** A sent photo bound to its server row shows by its full digest in a new view model over the stored rows. */
+/**
+ * A confirmed photo after a restart: the row and its binding are stored, the database is closed, and a fresh graph over
+ * the reopened file shows the row in the chat with a decoded, clickable tile for that photo.
+ */
+@RunWith(RobolectricTestRunner::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+@Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
+class ImageRestartTest {
+    @get:Rule
+    val rule = createComposeRule()
+
+    private val app = ApplicationProvider.getApplicationContext<Application>()
+
     @Test
     fun confirmedImageShowsThumbAfterRestart() {
-        val d = wait { store.put(jpeg(picture(64, 48)))!! }
-        wait {
-            db.sessionDao().upsert(
-                SessionEntity(
-                    key = KEY, currentId = KEY, lineageIds = "", title = "Plans", pinned = false, archived = false, startedAt = 1.0,
-                    lastActiveAt = null, messageCount = 1, preview = null, stale = false, existsOnServer = true,
-                ),
-            )
-            val content = "Look\n\n[Image attached at: /home/h/.hermes/cache/native-inputs/api_${d.take(32)}.jpg]\n[screenshot]"
-            db.messageDao().insertAll(listOf(MessageEntity(KEY, 0, 7, "user", null, content, null, null, null, null, 1.0, null)))
-            db.imageBindingDao().upsert(ImageBindingEntity(KEY, 7, d))
+        val name = "restart-${System.nanoTime()}.db"
+        val dir = File(app.filesDir, "restart-images-${System.nanoTime()}")
+        try {
+            val d = runBlocking { ImageStore(dir, System::currentTimeMillis).put(jpeg(picture(64, 48)))!! }
+            // The first life: the confirmed row and its binding are stored, then the database closes.
+            val before = Room.databaseBuilder(app, AppDatabase::class.java, name).build()
+            runBlocking {
+                before.sessionDao().upsert(
+                    SessionEntity(
+                        key = KEY, currentId = KEY, lineageIds = "", title = "Plans", pinned = false, archived = false, startedAt = 1.0,
+                        lastActiveAt = null, messageCount = 1, preview = null, stale = false, existsOnServer = true,
+                    ),
+                )
+                val content = "Look\n\n[Image attached at: /home/h/.hermes/cache/native-inputs/api_${d.take(32)}.jpg]\n[screenshot]"
+                before.messageDao().insertAll(listOf(MessageEntity(KEY, 0, 7, "user", null, content, null, null, null, null, FIXED_NOW, null)))
+                before.imageBindingDao().upsert(ImageBindingEntity(KEY, 7, d))
+            }
+            before.close()
+
+            // The second life: the file reopened under a fresh graph, store object and thumbnail cache.
+            val db = Room.databaseBuilder(app, AppDatabase::class.java, name).build()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val server = MockWebServer()
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest) = MockResponse.Builder().code(500).build()
+            }
+            server.start()
+            val vms = ViewModelStore()
+            lateinit var follower: RunFollower
+            try {
+                val api = HermesApi(server.url("/").toString(), "secret-key")
+                val queue = SendQueue(api, db, { s, r -> follower.onRunStarted(s, r) }, System::currentTimeMillis)
+                val repo = ChatRepository(api, db, System::currentTimeMillis, queue)
+                follower = RunFollower(api, db, repo, scope)
+                val connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, follower, AtomicBoolean(true), scope)
+                val vm = ViewModelProvider.create(vms, viewModelFactory { initializer { ChatViewModel(KEY, connected, kotlinx.coroutines.flow.flowOf(true)) } })[ChatViewModel::class]
+                val cache = ThumbCache()
+                val store = ImageStore(dir, System::currentTimeMillis)
+                rule.setContent {
+                    ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                        CompositionLocalProvider(LocalImageStore provides store, LocalThumbCache provides cache) {
+                            val state by vm.state.collectAsState()
+                            ChatScreen(state, vm, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+                        }
+                    }
+                }
+                val tile = hasContentDescription("Image 1 of 1") and hasClickAction()
+                rule.waitUntil(10_000) { rule.onAllNodes(tile, useUnmergedTree = true).fetchSemanticsNodes().size == 1 }
+                assertTrue("decoded into the fresh cache", cache.get(d) is Decoded.Ok)
+                rule.onNode(tile, useUnmergedTree = true).performClick()
+                rule.waitUntil(10_000) { rule.onAllNodes(hasContentDescription("Image") and hasAnyAncestor(isDialog()), useUnmergedTree = true).fetchSemanticsNodes().size == 1 }
+            } finally {
+                vms.clear()
+                follower.pauseAll()
+                runBlocking { withTimeout(60_000) { scope.coroutineContext.job.cancelAndJoin() } }
+                db.close()
+                server.close()
+            }
+        } finally {
+            app.deleteDatabase(name)
+            dir.deleteRecursively()
         }
-        val shown = vm().await { it.items.isNotEmpty() }.items.filterIsInstance<UserMessage>().single()
-        assertEquals("Look", shown.text)
-        assertEquals(listOf<String?>(d), shown.images)
     }
 }
 
@@ -907,21 +1244,15 @@ class ImageSendViewModelTest {
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class ImageLocalsTest {
+    @get:Rule
+    val rule = createEmptyComposeRule() // no activity of its own: its waitUntil is the watchdog over the one built below
+
     private val app = ApplicationProvider.getApplicationContext<ApofisApp>()
     private val db = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).allowMainThreadQueries().build()
     private val key = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
 
-    @After
-    fun tearDown() = db.close()
-
-    private fun until(what: String, check: () -> Boolean) {
-        repeat(1000) {
-            shadowOf(Looper.getMainLooper()).idle()
-            if (check()) return
-            Thread.sleep(10)
-        }
-        fail("timed out waiting for $what")
-    }
+    /** Runs what the paused main looper holds (the activity's composition, the drawer's work); waitUntil does not. */
+    private fun idle() = org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
 
     @Test
     fun draftThumbDecodedIntoTheConnectionsCache() {
@@ -931,25 +1262,33 @@ class ImageLocalsTest {
             override fun dispatch(request: RecordedRequest) = MockResponse.Builder().code(500).build()
         }
         server.start()
+        // The app's own container needs the Android keystore, which Robolectric lacks: this one takes its place, and the
+        // original goes back whatever happens.
+        val delegate = ApofisApp::class.java.getDeclaredField("container\$delegate").apply { isAccessible = true }
+        val original = delegate.get(app)
+        val container = AppContainer(app, CredentialStore(app) { key }) { db }
+        var controller: org.robolectric.android.controller.ActivityController<MainActivity>? = null
         try {
-            val container = AppContainer(app, CredentialStore(app) { key }) { db }
-            // The app's own container needs the Android keystore, which Robolectric lacks: this one takes its place.
-            ApofisApp::class.java.getDeclaredField("container\$delegate").apply { isAccessible = true }.set(app, lazyOf(container))
+            delegate.set(app, lazyOf(container))
             runBlocking { container.connect(Credentials(server.url("/").toString(), "key-1")) }
-            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            controller = Robolectric.buildActivity(MainActivity::class.java).setup()
             val first = container.connected()!!
-            var key: String? = null
-            until("the opened chat") { key = runBlocking { first.repo.sessions().first() }.firstOrNull()?.key; key != null }
+            // The chat the drawer opens: with none stored, the new local chat it creates (read from Room).
+            var opened: String? = null
+            rule.waitUntil(10_000) { idle(); opened = runBlocking { first.repo.sessions().first() }.firstOrNull()?.key; opened != null }
             val d = runBlocking { container.imageStore.put(jpeg(picture(64, 48)))!! }
-            container.composer.setImage(container.composer.addImages(key!!, 1).single(), d)
-            until("the draft thumbnail in the connection's cache") { first.thumbs.get(d) is Decoded.Ok }
+            container.composer.setImage(container.composer.addImages(opened!!, 1).single(), d)
+            rule.waitUntil(10_000) { idle(); first.thumbs.get(d) is Decoded.Ok }
 
             runBlocking { container.connect(Credentials(server.url("/").toString(), "key-2")) }
             val second = container.connected()!!
             assertNotSame(first.thumbs, second.thumbs)
-            until("the thumbnail decoded again into the new connection's cache") { second.thumbs.get(d) is Decoded.Ok }
-            controller.pause().stop().destroy()
+            rule.waitUntil(10_000) { idle(); second.thumbs.get(d) is Decoded.Ok }
         } finally {
+            controller?.pause()?.stop()?.destroy()
+            runBlocking { withTimeout(60_000) { container.scope.coroutineContext.job.cancelAndJoin() } } // before its database and server close
+            delegate.set(app, original)
+            db.close()
             server.close()
         }
     }
@@ -974,7 +1313,7 @@ class ImageSendScreenshotTest {
                 )
                 Composer(
                     "Why does the build fail here?", ComposerMode.SEND_DISABLED, {}, { false }, {}, Modifier.align(Alignment.BottomCenter),
-                    images = listOf(DraftImage(1, digest(1)), DraftImage(2, digest(2)), DraftImage(3, null), DraftImage(4, null, failed = true)),
+                    images = listOf(DraftImage(1, digest(1)), DraftImage(4, null, failed = true), DraftImage(3, null), DraftImage(2, digest(2))), // the failed tile inside the frame
                 )
             }
         }

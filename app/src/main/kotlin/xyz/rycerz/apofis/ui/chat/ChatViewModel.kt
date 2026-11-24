@@ -75,6 +75,7 @@ data class ChatUiState(
     val firstLoad: Boolean = false,
     val images: List<DraftImage> = emptyList(), // the draft's photos, in pick order
     val storedSends: Long = 0, // sends of this view model whose row was stored: the screen pins the list on each
+    val storedKey: String? = null, // the idempotency key of the latest of them: the pin waits until the transcript shows it
 )
 
 /** The reasoning sheet's levels: null is the server's default, "none" is Off; five of the server's eight (decision 19). */
@@ -172,6 +173,7 @@ private data class Local(
     val sheet: ChoiceSheet? = null,
     val firstLoad: Boolean = false,
     val storedSends: Long = 0,
+    val storedKey: String? = null,
 )
 
 private data class Env(val title: String, val online: Boolean, val rejected: Boolean, val choice: ChatModel)
@@ -242,6 +244,7 @@ class ChatViewModel(
             firstLoad = l.firstLoad,
             images = c.images,
             storedSends = l.storedSends,
+            storedKey = l.storedKey,
         )
     }.stateIn(
         viewModelScope,
@@ -300,8 +303,16 @@ class ChatViewModel(
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.sendWithImages(sessionKey) { text, images ->
             // The field empties only once the text is stored; delivery problems after that show on the bubble. The
-            // counter tells the screen a row was stored (it pins the list then); harmless once this view model was cleared.
-            repo.send(sessionKey, text, images, onStored = { stored(); local.update { it.copy(storedSends = it.storedSends + 1) } })
+            // counter tells the screen a row was stored, with the row's key: the screen pins once the transcript shows it.
+            val pending = connected.db.pendingSendDao()
+            val before = pending.rows(sessionKey).mapTo(HashSet()) { it.idempotencyKey }
+            repo.send(sessionKey, text, images, onStored = {
+                stored()
+                viewModelScope.launch { // harmless once this view model was cleared
+                    val key = runCatching { pending.rows(sessionKey).lastOrNull { it.idempotencyKey !in before }?.idempotencyKey }.getOrNull()
+                    local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) }
+                }
+            })
             local.update { it.copy(notes = emptyMap()) }
         }
         if (started != null) accepted.tryEmit(Unit)

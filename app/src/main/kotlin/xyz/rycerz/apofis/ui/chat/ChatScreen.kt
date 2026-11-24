@@ -160,10 +160,19 @@ fun ChatScreen(
     LaunchedEffect(pending) { if (pending != null) listState.animateScrollToItem(0) }
     val follow = rememberFollow(listState, state)
     // The list follows the bottom when a send's row was stored (the view model's counter), never on the tap itself: a
-    // refused send, a picker result or a finished photo moves nothing. Starts equal, so recreation pins nothing.
+    // refused send, a picker result or a finished photo moves nothing. Starts equal, so recreation pins nothing. The pin
+    // waits until the transcript shows the stored row (by its key), so it acts on the list that holds it whichever
+    // reaches the screen first; a row not found (no key) pins at once. Only the stored part is searched, once per change
+    // of it, never per streamed token.
     val seenStored = remember { longArrayOf(state.storedSends) }
-    LaunchedEffect(state.storedSends) {
-        if (state.storedSends != seenStored[0]) {
+    val pinPending = state.storedSends != seenStored[0]
+    @Suppress("UNCHECKED_CAST") val storedPart = (state.items as? Joined<ChatItem>)?.head ?: state.items
+    val storedKey = state.storedKey
+    val storedShown = remember(storedPart, storedKey, pinPending) {
+        pinPending && (storedKey == null || storedPart.asReversed().any { (it as? UserMessage)?.idempotencyKey == storedKey })
+    }
+    LaunchedEffect(state.storedSends, storedShown) {
+        if (storedShown && state.storedSends != seenStored[0]) {
             seenStored[0] = state.storedSends
             follow.onSend()
             listState.scrollToItem(0)
@@ -201,7 +210,7 @@ fun ChatScreen(
     val gated = remember { CoveredActions({ actionsNow.value }, gate) }
     // The photo picker, registered here (not in the cached bottom slot, whose lambdas are rebuilt). Its result goes to the
     // actions current when it arrives: this chat's view model, on the connection current then.
-    val one = rememberLauncherForActivityResult(PickVisualMedia()) { uri -> uri?.let { gated.onImagesPicked(listOf(it)) } }
+    val one = rememberLauncherForActivityResult(remember { PickVisualMedia() }) { uri -> uri?.let { gated.onImagesPicked(listOf(it)) } }
     val left = ImageLimits.MAX_IMAGES - state.images.size // every entry counts, failed and processing ones too
     val many = rememberLauncherForActivityResult(remember(left) { PickMultipleVisualMedia(left.coerceAtLeast(2)) }) { gated.onImagesPicked(it) }
     val imagesNow = rememberUpdatedState(state.images)
@@ -211,12 +220,13 @@ fun ChatScreen(
             gate.pass {
                 val n = ImageLimits.MAX_IMAGES - imagesNow.value.size // read at tap time
                 val request = PickVisualMediaRequest(PickVisualMedia.ImageOnly)
-                if (n >= 1) overlays.openedAt = answerClock.value() // the picker covers the chat like a window: see [Overlays]
-                when {
-                    n >= 2 -> many.launch(request)
-                    n == 1 -> one.launch(request)
-                    else -> gated.onImagesLimit()
+                // A launch that fails (no picker on the device) does nothing; one that opens covers the chat like a window.
+                val opened = when {
+                    n >= 2 -> runCatching { many.launch(request) }.isSuccess
+                    n == 1 -> runCatching { one.launch(request) }.isSuccess
+                    else -> false.also { gated.onImagesLimit() }
                 }
+                if (opened) overlays.openedAt = answerClock.value() // see [Overlays]
             }
         }
     }
@@ -710,7 +720,7 @@ private data class BottomInput(
 
 /** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it; with firstLoad (the skeleton). */
 private fun ChatUiState.forTranscript() =
-    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null, images = emptyList(), storedSends = 0)
+    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null, images = emptyList(), storedSends = 0, storedKey = null)
 
 private data class BarCallbacks(
     val onOpenConnection: () -> Unit,
