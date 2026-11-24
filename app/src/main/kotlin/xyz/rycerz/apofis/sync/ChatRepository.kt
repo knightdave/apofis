@@ -342,13 +342,16 @@ class ChatRepository(
         deleting -= sessionKey
     }
 
-    /** Server first: local rows, unsent messages included, go only once the server confirmed. */
+    /**
+     * Server first: one DELETE per recorded server id ([deleteTargets]); local rows, unsent messages included, go only
+     * once every one confirmed. The first failure ends the Delete with nothing local touched.
+     */
     suspend fun delete(sessionKey: String) {
         requireAppKey(sessionKey)
         lock.withLock {
             ensureOpen()
             val session = sessionDao.get(sessionKey) ?: return
-            if (session.existsOnServer) api.deleteSession(session.currentId)
+            if (session.existsOnServer || session.createStarted) for (id in deleteTargets(session)) { ensureOpen(); api.deleteSession(id) }
             ensureOpen()
             sessionDao.delete(sessionKey)
         }
@@ -499,13 +502,20 @@ private fun requireAppKey(sessionKey: String) = require(!isReservedId(sessionKey
 
 private fun SessionEntity.lineage(): List<String> = lineageIds.split(',').filter { it.isNotEmpty() }
 
-/** This row under server id [id], the previous current id kept in the lineage so old ids still resolve. */
+/** Every server id of [row] to delete: the current one, the lineage newest first, the key (the lineage root) once and last. */
+internal fun deleteTargets(row: SessionEntity): List<String> =
+    (listOf(row.currentId) + row.lineage().asReversed()).filter { it != row.key }.distinct() + row.key
+
+/**
+ * This row under server id [id], the previous current id kept in the lineage so old ids still resolve. An id with a
+ * comma is left out: the stored list is comma separated, and a split fragment could name (and delete) another chat.
+ */
 private fun SessionEntity.movedTo(id: String, extra: List<String> = emptyList()): SessionEntity =
-    copy(currentId = id, lineageIds = (lineage() + currentId + extra).distinct().filter { it != id }.joinToString(","))
+    copy(currentId = id, lineageIds = (lineage() + currentId + extra).distinct().filter { it != id && ',' !in it }.joinToString(","))
 
 private fun SessionDto.toEntity(cached: SessionEntity?): SessionEntity {
     val base = cached?.movedTo(id, lineageIds) ?: SessionEntity(
-        key = sessionKeyOf(this), currentId = id, lineageIds = lineageIds.filter { it != id }.joinToString(","),
+        key = sessionKeyOf(this), currentId = id, lineageIds = lineageIds.filter { it != id && ',' !in it }.joinToString(","),
         title = null, pinned = false, archived = false, startedAt = startedAt, lastActiveAt = null, messageCount = 0,
         preview = null, stale = true, existsOnServer = true,
     )

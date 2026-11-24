@@ -182,9 +182,9 @@ class HermesApiTest {
         serveOnce("run_stop.json")
         api.stop("r")
         serveOnce("session_delete.json")
-        api.deleteSession("x")
+        api.deleteSession("apofis-probe-1795134090-sessions-c-7aa73661e25a7f8aca381a1e7a0b5545")
         serveOnce("session_delete_foreign_source.json")
-        api.deleteSession("x")
+        api.deleteSession("apofis-probe-1795134090-foreign-77af2d275615f6eebf0850ed7f057d5d")
 
         serveOnce("session_exists_409.json", 409)
         assertNull(api.createSession("x", "t"))
