@@ -5,15 +5,19 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
+import androidx.room.withTransaction
 import androidx.work.WorkManager
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -26,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.shareIn
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -35,6 +40,11 @@ import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.openAppDatabase
+import xyz.rycerz.apofis.images.Encoded
+import xyz.rycerz.apofis.images.ImageInput
+import xyz.rycerz.apofis.images.ImageStore
+import xyz.rycerz.apofis.images.clearDecodeTemps
+import xyz.rycerz.apofis.images.toUploadJpeg
 import xyz.rycerz.apofis.notify.NOTIFY_PREFS
 import xyz.rycerz.apofis.notify.Notifier
 import xyz.rycerz.apofis.notify.chatUri
@@ -63,6 +73,7 @@ import xyz.rycerz.apofis.sync.quarantineAttemptedSends
 import xyz.rycerz.apofis.sync.withRepositoryLock
 import xyz.rycerz.apofis.ui.chat.onlineFlow
 import xyz.rycerz.apofis.ui.connect.ConnectBack
+import xyz.rycerz.apofis.ui.image.ThumbCache
 
 /**
  * Everything bound to one server and key. Closed as a whole when the credentials change. After [close]:
@@ -82,6 +93,12 @@ class Connected internal constructor(
     val composer: Composer = Composer(scope),
     /** The connection epoch this graph was built under. */
     val generation: Long = 0,
+    /** Where [attachImages] stores converted photos: the container's one store. */
+    private val imageStore: ImageStore? = null,
+    /** One picked photo to its upload JPEG; slow, it may ignore cancellation for a while. */
+    private val convert: suspend (Uri) -> Encoded = { error("no converter") },
+    /** Decoded thumbnails of this connection's chats; dropped with it. */
+    val thumbs: ThumbCache = ThumbCache(),
 ) {
     private val liveApi = api
     private val liveRepo = repo
@@ -111,6 +128,42 @@ class Connected internal constructor(
     }
 
     private fun checkOpen() = check(isOpen) { "closed" }
+
+    // Picked photos are converted one at a time, in pick order (the lock is fair), in this connection's scope: closing
+    // it cancels them without waiting, and nothing a cancelled job finishes later is stored or set.
+    private val converting = Mutex()
+
+    /**
+     * Adds a processing photo to [sessionKey]'s draft for each of [uris] that fits, then converts and stores them one
+     * at a time and sets each by id: ready, or failed (on any failure, a switch included). Returns the job, null when
+     * nothing fit.
+     */
+    fun attachImages(sessionKey: String, uris: List<Uri>): Job? {
+        val store = checkNotNull(imageStore) { "no image store" }
+        val picked = uris.toList() // counted on a snapshot
+        val ids = composer.addImages(sessionKey, picked.size)
+        if (ids.isEmpty()) return null
+        // ATOMIC: the body runs even on a closed connection, so its finally always settles the placeholders.
+        return scope.launch(start = CoroutineStart.ATOMIC) {
+            val job = coroutineContext.job
+            try {
+                converting.withLock {
+                    for ((id, uri) in ids.zip(picked)) {
+                        val digest = try {
+                            (convert(uri) as? Encoded.Ok)?.let { store.put(it.jpeg) { open.get() && job.isActive } }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            null // an IO failure or bytes over the store's cap
+                        }
+                        composer.setImage(id, digest)
+                    }
+                }
+            } finally {
+                ids.forEach { composer.setImage(it, null) } // only those still processing: cancelled before their turn
+            }
+        }
+    }
 }
 
 private const val TAG = "Apofis"
@@ -164,6 +217,15 @@ class AppContainer(
     private val db by lazy(openDatabase)
     private val cachePrefs = app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
     private val reconcile = WakeRequest.Reconcile { db.activeRunDao().any() } // read by the wake lane when it acts
+
+    /** Image files: part of the cache, emptied only with the cached tables (see [connect]). */
+    val imageStore = ImageStore(File(app.filesDir, "images"), System::currentTimeMillis)
+
+    /** Test hook: one picked photo to its upload JPEG. */
+    internal var convertImage: suspend (Uri) -> Encoded = { toUploadJpeg(app, ImageInput.Content(it)) }
+
+    /** Test hook: runs in [collectImages] after the composer's references are read, before the database's. */
+    internal var beforeImageRows: suspend () -> Unit = {}
 
     init {
         // The fallback check runs while any run is stored, push on or off; also reconciled when a connection is published.
@@ -261,6 +323,37 @@ class AppContainer(
      */
     internal val composer = Composer(CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Default + logOnly))
 
+    /** Temp files of decodes a killed process left, then the first image collection; joined by tests. */
+    internal val startup: Job = scope.launch {
+        clearDecodeTemps(app.cacheDir)
+        collectImages()
+    }
+
+    /**
+     * The one image collection: deletes every image file that no draft, unsent message, pending send or binding names,
+     * once it is ten minutes old. The composer is read first (so a send that stores its row and then empties the draft
+     * is seen in one of the two), then, in one transaction, orphaned bindings go and pending rows and bindings are read
+     * (so a confirmation moving digests from one to the other hides nothing). Under the store's lock: a second call
+     * waits for the first, then makes its own full pass. Failures are logged, never thrown.
+     */
+    suspend fun collectImages() {
+        try {
+            imageStore.collect({
+                val keep = composer.referencedImages().toHashSet()
+                beforeImageRows()
+                val rows = db.withTransaction {
+                    db.imageBindingDao().deleteOrphans()
+                    db.pendingSendDao().allImages() + db.imageBindingDao().allDigests()
+                }
+                rows.flatMapTo(keep) { it.split(',') } // one comma-separated list per row
+            })
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logFailure(e)
+        }
+    }
+
     /**
      * Test hooks: [beforeResume] runs on the lifecycle path after the started check, before the follower opens its gate;
      * [afterResume] once it has opened it; [beforeSwitch] at the start of a switch; [afterSwitchMarker] right after its marker.
@@ -356,6 +449,7 @@ class AppContainer(
                         // Not clearAllTables(): it commits the deletes, then can fail in VACUUM before the composer is cleared.
                         db.runInTransaction { CACHED_TABLES.forEach { db.openHelper.writableDatabase.execSQL("DELETE FROM `$it`") } }
                         composer.clear() // right after the commit: no draft outlives its chat, nothing survives into the new server
+                        imageStore.collect({ emptySet() }, minAgeMs = 0) // image files are part of the cache
                     }
                     // Best effort: only shrinks the file; the cache counts as cleared whatever happens here.
                     runCatching {
@@ -435,6 +529,7 @@ class AppContainer(
         runCatching { PublishWorker.recover(app) }.onFailure(::logFailure) // push work skipped while the switch ran
         if (current != null) scheduleQueuedSends()
         if (current != null) onPublished()
+        collectImages()
         foreground.refresh()
     }
 
@@ -470,9 +565,9 @@ class AppContainer(
         val starter = RunStarter { session, run -> if (open.get()) follower.onRunStarted(session, run) }
         val queue = SendQueue(
             api, db, starter, System::currentTimeMillis, { SendWorker.schedule(app) }, active = open::get,
-            settle = { if (open.get()) follower.settle(it) },
+            settle = { if (open.get()) follower.settle(it) }, readImage = imageStore::read, imageSize = imageStore::size,
         )
-        val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get)
+        val repo = ChatRepository(api, db, System::currentTimeMillis, queue, active = open::get, afterDelete = ::collectImages)
         val generation = epoch()
         follower = RunFollower(api, db, repo, runScope, onRunFinished = {
             if (open.get()) {
@@ -482,7 +577,7 @@ class AppContainer(
         }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, ended ->
             notifier.clearNeedsAnswer(key, run, generation, ended)
         }, generation = { generation })
-        return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation)
+        return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation, imageStore, { convertImage(it) })
     }
 }
 
