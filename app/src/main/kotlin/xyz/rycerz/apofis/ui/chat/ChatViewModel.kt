@@ -304,8 +304,9 @@ class ChatViewModel(
         val started = composer.sendWithImages(sessionKey) { text, images ->
             // The field empties only once the text is stored; delivery problems after that show on the bubble. The
             // counter tells the screen a row was stored, with the row's key, at the commit: the screen pins once the
-            // transcript shows it. Harmless once this view model was cleared.
-            repo.send(sessionKey, text, images, onStored = { key -> stored(); local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) } })
+            // transcript shows it. Harmless once this view model was cleared. Published before stored() releases the
+            // claim: the next send of this chat cannot be claimed, so cannot publish its key, before this one has.
+            repo.send(sessionKey, text, images, onStored = { key -> local.update { it.copy(storedSends = it.storedSends + 1, storedKey = key) }; stored() })
             local.update { it.copy(notes = emptyMap()) }
         }
         if (started != null) accepted.tryEmit(Unit)
