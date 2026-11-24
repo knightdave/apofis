@@ -20,6 +20,9 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CompletableDeferred
 import mockwebserver3.SocketEffect
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.TimeUnit
@@ -263,6 +266,44 @@ class ChoiceBodyTest {
         awaitTrue { runBodies().isNotEmpty() }
         assertEquals(listOf(buildRunBody(KEY, "hi", choice = ChatModel("model-b", "p"))), runBodies())
         settled()
+    }
+
+    @Test
+    fun aSendFromTheReopenedChatCarriesThePick() = runTest {
+        addSession(ChatModel("model-a", "p"))
+        val first = newVm()
+        val release = heldRefresh()
+        first.pickModel("p", "model-b")
+        store.clear() // the chat was left; then it is opened again: a new view model, same key and connection
+        val second = newVm()
+        second.onDraftChange("hi", connected.composer.current(KEY).revision)
+        assertTrue(second.onSendClick())
+        release.countDown()
+        awaitTrue { runBodies().isNotEmpty() }
+        assertEquals(listOf(buildRunBody(KEY, "hi", choice = ChatModel("model-b", "p"))), runBodies())
+        settled()
+    }
+
+    /**
+     * The barrier itself, with no scheduler and no real-time wait: a choice change parked at the repository lock (a
+     * test holds it) keeps a later send waiting at the choice lock. A repository without a send queue makes the send
+     * fail at once ("no send queue") the moment it passes the barrier.
+     */
+    @Test
+    fun aSendWaitsForAChoiceChangeStartedBeforeIt() = runTest {
+        addSession(ChatModel("model-a", "p"))
+        val bare = ChatRepository(connected.api, db, System::currentTimeMillis)
+        val gate = CompletableDeferred<Unit>()
+        val holder = launch(start = CoroutineStart.UNDISPATCHED) { withRepositoryLock { gate.await() } }
+        val change = launch(start = CoroutineStart.UNDISPATCHED) { bare.changeChoice(KEY) { ChatModel("model-b", "p") } }
+        val sending = async(start = CoroutineStart.UNDISPATCHED) { runCatching { bare.send(KEY, "hi") } }
+        assertFalse("the send waits behind the change", sending.isCompleted)
+        assertFalse(change.isCompleted)
+        gate.complete(Unit)
+        holder.join()
+        change.join()
+        assertEquals(ChatModel("model-b", "p"), choice())
+        assertEquals("no send queue", sending.await().exceptionOrNull()?.message)
     }
 
     @Test

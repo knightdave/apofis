@@ -25,10 +25,9 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.ApiError
@@ -235,7 +234,6 @@ class ChatViewModel(
 
     private var opening: Job? = null
     private var fetch: Job? = null // the model sheet's request
-    private val choosing = Mutex()
 
     init {
         // One check now, again whenever the chat turns stale, and again after every completed session refresh (on return
@@ -269,7 +267,6 @@ class ChatViewModel(
     override fun onSendClick(): Boolean {
         // Runs in the composer's scope: leaving the chat right after the tap must not cancel storing the message.
         val started = composer.send(sessionKey) { text ->
-            choosing.withLock {} // every pick made before the tap is stored first, so this send carries it
             // The field empties only once the text is stored; delivery problems after that show on the bubble.
             repo.send(sessionKey, text, onStored = ::stored)
             local.update { it.copy(notes = emptyMap()) } // harmless once this view model was cleared
@@ -374,20 +371,18 @@ class ChatViewModel(
     override fun toggleFast() = choose(close = false) { it.copy(fast = it.fast != true) }
 
     /**
-     * Changes this chat's stored choice on this phone, in this connection only; makes no request. The change takes its
-     * place in [choosing] before this returns (so a send tapped next waits for it) and is not cancelled with the view
-     * model; a closed connection or a failed write drops it and the old choice stays.
+     * Changes this chat's stored choice on this phone, in this connection only; makes no request. Started undispatched,
+     * the change takes its place in the repository's choice order before this returns (so a send tapped next, from any
+     * view model, waits for it), and it is not cancelled with the view model. A cleared view model starts nothing; a
+     * closed connection or a failed write drops it and the old choice stays.
      */
     private fun choose(close: Boolean = true, change: (ChatModel) -> ChatModel) {
+        if (!viewModelScope.isActive) return
         if (close) closeSheet()
         viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
             withContext(NonCancellable) {
                 try {
-                    choosing.withLock { // one read and write at a time, so quick picks never undo each other
-                        val repo = connected.repo // throws once the connection is closed: a pick belongs to its generation
-                        val session = repo.session(sessionKey).first() ?: return@withLock
-                        repo.setChoice(sessionKey, change(session.choice()))
-                    }
+                    connected.repo.changeChoice(sessionKey, change) // connected.repo throws once the connection is closed
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {

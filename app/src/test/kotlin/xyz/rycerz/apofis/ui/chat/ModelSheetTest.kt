@@ -2,6 +2,7 @@ package xyz.rycerz.apofis.ui.chat
 
 import android.content.Context
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.test.hasAnyAncestor
 import xyz.rycerz.apofis.sync.SendError
 import xyz.rycerz.apofis.chat.ReplyOutcome
 import xyz.rycerz.apofis.chat.SendState
@@ -103,6 +104,7 @@ import xyz.rycerz.apofis.ui.theme.ViewHaptics
 
 private const val KEY = "apofis-a"
 private const val OPTIONS = "/api/model/options"
+private const val HISTORY = "/api/sessions/$KEY/messages"
 
 /**
  * The model and reasoning sheets on the hosted chat screen, driven by a real [ChatViewModel] over an in-memory
@@ -167,8 +169,12 @@ class ModelSheetTest {
 
     private val expired = AtomicBoolean(false)
 
-    /** Answers [body] once [release] opens; a gate that expires answers nothing (the connection drops) and fails the test. */
-    private fun held(release: CountDownLatch, body: String): (RecordedRequest) -> MockResponse = {
+    /**
+     * Answers [body] once [release] opens, after counting down [arrived] from inside (so the test knows this very request
+     * reached its responder); a gate that expires answers nothing (the connection drops) and fails the test.
+     */
+    private fun held(release: CountDownLatch, body: String, arrived: CountDownLatch? = null): (RecordedRequest) -> MockResponse = {
+        arrived?.countDown()
         if (release.await(10, TimeUnit.SECONDS)) {
             json(body)(it)
         } else {
@@ -363,11 +369,12 @@ class ModelSheetTest {
 
     @Test
     fun lateOptionsAfterSwitchDropped() {
-        addSession()
+        quietChat()
         val release = gate()
-        routes[OPTIONS] = held(release, minimal)
+        val arrived = CountDownLatch(1)
+        routes[OPTIONS] = held(release, minimal, arrived)
         val vm = vm()
-        val fetch = heldFetch(vm)
+        val fetch = heldFetch(vm, arrived)
         open.set(false) // a server or key switch closed this connection: its generation is over
         release.countDown()
         runBlocking { withTimeout(10_000) { fetch.join() } }
@@ -378,20 +385,29 @@ class ModelSheetTest {
     }
 
     /** Opens the model sheet with its request held: returns the request's coroutine once the loading sheet shows and the GET arrived. */
-    private fun heldFetch(vm: ChatViewModel): Job {
-        rule.waitUntil(10_000) { vm.state.value.loaded } // the state follows the sheet only once every source has spoken
-        val launched = vm.launchedBy { vm.openModelSheet() }
-        rule.waitUntil(10_000) { optionRequests() == 1 && vm.loading() }
-        return launched.single { it.isActive } // the chat's own history check (if one started meanwhile) ends at once
+    private fun heldFetch(vm: ChatViewModel, arrived: CountDownLatch): Job {
+        // Quiesced first: the chat's one history check has been launched (its GET arrived), and nothing launches another,
+        // so the open below launches exactly the request.
+        rule.waitUntil(10_000) { vm.state.value.loaded && requests.any { it.target.startsWith(HISTORY) } }
+        val fetch = vm.launchedBy { vm.openModelSheet() }.single()
+        rule.waitUntil(10_000) { arrived.count == 0L && vm.loading() }
+        return fetch
+    }
+
+    /** A chat on the server with an empty history: opening it makes one observable history GET. */
+    private fun quietChat() {
+        addSession(onServer = true)
+        routes[HISTORY] = json("""{"session_id":"$KEY","data":[]}""")
     }
 
     @Test
     fun lateOptionsAfterCloseDropped() {
-        addSession()
+        quietChat()
         val release = gate()
-        routes[OPTIONS] = held(release, minimal)
+        val arrived = CountDownLatch(1)
+        routes[OPTIONS] = held(release, minimal, arrived)
         val vm = vm()
-        val fetch = heldFetch(vm)
+        val fetch = heldFetch(vm, arrived)
         vm.closeSheet()
         release.countDown()
         runBlocking { withTimeout(10_000) { fetch.join() } }
@@ -401,17 +417,19 @@ class ModelSheetTest {
 
     @Test
     fun aSecondOpenWhileLoadingShowsItsOwnList() {
-        addSession()
+        quietChat()
         val release = gate()
+        val arrivedA = CountDownLatch(1)
         val calls = AtomicInteger()
-        val a = held(release, """{"providers":[{"slug":"p","models":["from-a"]}]}""")
+        val a = held(release, """{"providers":[{"slug":"p","models":["from-a"]}]}""", arrivedA) // signals once it holds request A
         routes[OPTIONS] = { if (calls.getAndIncrement() == 0) a(it) else json("""{"providers":[{"slug":"p","models":["from-b"]}]}""")(it) }
         val vm = vm()
         host(vm)
-        heldFetch(vm)
+        val fetchA = heldFetch(vm, arrivedA)
         vm.openModelSheet() // again, while the first is loading
         waitFor(hasText("from-b"))
         release.countDown() // the first answer, released afterwards, changes nothing
+        runBlocking { withTimeout(10_000) { fetchA.join() } }
         vm.settle()
         assertTrue(exists(hasText("from-b")))
         assertTrue(!exists(hasText("from-a")))
@@ -419,11 +437,12 @@ class ModelSheetTest {
 
     @Test
     fun lateOptionsAfterChatChangeDropped() {
-        addSession()
+        quietChat()
         val release = gate()
-        routes[OPTIONS] = held(release, minimal)
+        val arrived = CountDownLatch(1)
+        routes[OPTIONS] = held(release, minimal, arrived)
         val a = vm()
-        val fetch = heldFetch(a)
+        val fetch = heldFetch(a, arrived)
         stores.single().clear() // another chat opened: AppNav clears the view model of the chat it leaves
         release.countDown()
         runBlocking { withTimeout(10_000) { fetch.join() } }
@@ -553,6 +572,13 @@ class ModelSheetTest {
 
     // ---- the screen on a plain state ----
 
+    private fun hasTagStarting(prefix: String) = SemanticsMatcher("tag starts with $prefix") { it.config.getOrElse(SemanticsProperties.TestTag) { "" }.startsWith(prefix) }
+
+    /** Each matching node's label: its text, else its content description. */
+    private fun labels(m: SemanticsMatcher) = rule.onAllNodes(m).fetchSemanticsNodes().map {
+        it.config.getOrElse(SemanticsProperties.Text) { emptyList() }.joinToString().ifEmpty { it.config.getOrElse(SemanticsProperties.ContentDescription) { emptyList() }.joinToString() }
+    }
+
     /** M3: what the screen offers for a run that failed after its message was delivered, and for a refused send. */
     @Test
     fun aFailedRunOffersNothingAndARefusedSendOffersRetryAndRemove() {
@@ -561,14 +587,17 @@ class ModelSheetTest {
             AssistantReply("r1", emptyList(), "", FIXED_NOW, outcome = ReplyOutcome.FAILED),
             UserMessage("p1", "refused", false, FIXED_NOW, SendState.FAILED, "k1", error = SendError.HTTP_ERROR, attempted = false),
         )
-        rule.setContent { Themed { ChatScreen(ChatUiState("k", "Chat", StatusLine.IDLE, items, ComposerMode.SEND_DISABLED, ""), object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
+        val noOutcome = listOf(items[0], (items[1] as AssistantReply).copy(outcome = null))
+        var shown by mutableStateOf(noOutcome) // the same run without its outcome, then failed, then the refused send alone
+        rule.setContent { Themed { ChatScreen(ChatUiState("k", "Chat", StatusLine.IDLE, shown, ComposerMode.SEND_DISABLED, ""), object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY) } }
+        val before = labels(hasClickAction()).sorted()
+        shown = items.take(2)
+        rule.waitForIdle()
         rule.onNodeWithText("The reply failed").assertExists()
-        assertEquals("one Retry, on the refused send only", 1, rule.onAllNodes(hasText("Retry")).fetchSemanticsNodes().size)
-        assertEquals(1, rule.onAllNodes(hasContentDescription("Remove message")).fetchSemanticsNodes().size)
-        val actions = rule.onAllNodes(hasClickAction()).fetchSemanticsNodes().map {
-            it.config.getOrElse(SemanticsProperties.Text) { emptyList() }.joinToString() + it.config.getOrElse(SemanticsProperties.ContentDescription) { emptyList() }.joinToString()
-        }
-        assertTrue("no other action on the two: $actions", actions.none { it.contains("again", ignoreCase = true) || it.contains("model", ignoreCase = true) })
+        assertEquals("the failed outcome adds no control", before, labels(hasClickAction()).sorted())
+        shown = items.drop(2)
+        rule.waitForIdle()
+        assertEquals("the refused send offers exactly Retry and Remove", listOf("Remove message", "Retry"), labels(hasClickAction() and hasAnyAncestor(hasTestTag("user:p1"))).sorted())
     }
 
     private val approval = PendingControl("approval", "ctl_1", 1, "rm -rf ~/old", null)
