@@ -38,25 +38,34 @@ class CutMarkersTest {
 
     @Test
     fun replyShowsDroppedCallsAndShortened() {
-        val reply = AssistantReply("r2", emptyList(), "cut", FIXED_NOW)
-        var cut by mutableStateOf(false)
-        show { Footer(if (cut) reply.copy(droppedToolCalls = 3, shortened = true) else reply) }
+        var reply by mutableStateOf(AssistantReply("r2", emptyList(), "cut", FIXED_NOW))
+        show { Footer(reply) }
         rule.onNodeWithText(NOT_STORED).assertDoesNotExist()
         rule.onNodeWithText(SHORTENED).assertDoesNotExist()
 
-        cut = true
+        reply = reply.copy(droppedToolCalls = 3) // each line has its own condition
+        rule.onNodeWithText(NOT_STORED).assertIsDisplayed()
+        rule.onNodeWithText(SHORTENED).assertDoesNotExist()
+
+        reply = reply.copy(droppedToolCalls = 0, shortened = true)
+        rule.onNodeWithText(NOT_STORED).assertDoesNotExist()
+        rule.onNodeWithText(SHORTENED).assertIsDisplayed()
+
+        reply = reply.copy(droppedToolCalls = 3)
         rule.onNodeWithText(NOT_STORED).assertIsDisplayed()
         rule.onNodeWithText(SHORTENED).assertIsDisplayed()
     }
 
     @Test
     fun userRowShowsShortened() {
-        val message = UserMessage("u1", "cut", steered = false, timestamp = FIXED_NOW)
-        var cut by mutableStateOf(false)
-        show { Bubble(if (cut) message.copy(shortened = true) else message) }
+        var message by mutableStateOf(UserMessage("u1", "cut", steered = false, timestamp = FIXED_NOW))
+        show { Bubble(message) }
         rule.onNodeWithText(SHORTENED).assertDoesNotExist()
 
-        cut = true
+        message = message.copy(shortened = true)
+        rule.onNodeWithText(SHORTENED).assertIsDisplayed()
+
+        message = message.copy(steered = true) // a cut steer message keeps the line
         rule.onNodeWithText(SHORTENED).assertIsDisplayed()
     }
 }

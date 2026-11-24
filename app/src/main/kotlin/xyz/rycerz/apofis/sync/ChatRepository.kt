@@ -475,8 +475,8 @@ private const val DELIVERY_WINDOW_S = 60.0
  * merged steer bubble for a steer), on a row from at most a minute before the send was created. Two equal messages
  * sent within a minute can therefore confirm each other; this match never grants a photo. A [UserMessage.shortened]
  * bubble (only [ChatRepository.transcript] shows stored cuts) matches when its stored content is a prefix of the
- * trimmed text, with no image check. [used] keeps one bubble from confirming two run sends. Rows in any other state
- * are never confirmed.
+ * trimmed text, with no image check; a blank one matches nothing. [used] keeps one bubble from confirming two run
+ * sends. Rows in any other state are never confirmed.
  */
 internal fun deliveredIn(p: PendingSendEntity, shown: List<UserMessage>, used: MutableSet<String>): Boolean = matchIn(p, shown, used) != null
 
@@ -493,7 +493,7 @@ internal fun matchIn(p: PendingSendEntity, shown: List<UserMessage>, used: Mutab
 /** The run send match of [matchIn] for one bubble, whether or not another send already took it. */
 private fun delivers(p: PendingSendEntity, m: UserMessage): Boolean {
     if (m.steered || m.timestamp < p.createdAt / 1000.0 - DELIVERY_WINDOW_S) return false
-    if (m.shortened) return p.text.trim().startsWith(m.raw.trim())
+    if (m.shortened) return m.raw.isNotBlank() && p.text.trim().startsWith(m.raw.trim())
     val digests = p.images.digestList()
     if (digests.isEmpty()) return m.raw.trim() == p.text.trim()
     if (m.images.size != digests.size) return false // also keeps out rows that never carry images (notifications)
@@ -543,7 +543,7 @@ private fun MessageDto.toEntity(sessionKey: String, position: Int, bound: List<S
         content = content, reasoning = reasoning, toolCallsJson = calls, toolCallId = toolCallId, toolName = toolName,
         timestamp = timestamp, finishReason = finishReason,
     )
-    if (content.length + (reasoning?.length ?: 0) + (calls?.length ?: 0) <= STORED_ROW_CHARS) return row
+    if (content.length.toLong() + (reasoning?.length ?: 0) + (calls?.length ?: 0) <= STORED_ROW_CHARS) return row
     val parsed = if (role == "user" && displayKind == null && bound != null) parseUserContent(content) else null
     val text = if (parsed != null && parsed.images == bound?.map { it.take(32) }) parsed.text else content
     val keptContent = text.cutTo(STORED_ROW_CHARS)

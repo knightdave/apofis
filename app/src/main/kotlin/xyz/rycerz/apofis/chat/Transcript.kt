@@ -25,9 +25,9 @@ fun userKey(id: Long) = "u$id"
 /**
  * Turns stored session rows (oldest first) into chat items. Linear in the number of rows. A plain user row shows its
  * parsed text and the digests [bindings] (message id to digests) holds for its id when its own hints are exactly
- * their first 32 hex, in order; otherwise one placeholder per parsed image. So a row never borrows another row's photo.
- * [cuts] holds each row's stored cut by index (dropped calls, shortened): a shortened plain user row shows its stored
- * content unparsed with the photos bound to its id.
+ * their first 32 hex, in order; otherwise one placeholder per parsed image. So a row that is not shortened never borrows
+ * another row's photo. [cuts] holds each row's stored cut by index (dropped calls, shortened): a shortened plain user
+ * row shows its stored content unparsed with the photos bound to its id, even when another row with that id holds them.
  */
 fun buildTranscript(
     rows: List<MessageDto>,
@@ -223,13 +223,15 @@ fun storedToolCalls(text: String?): String? {
 
 /**
  * The calls of [text] (as [storedToolCalls] returns it) that fit [budget] characters: whole calls in order while they
- * fit, and how many were dropped. Null when none is kept, or when the text is no array and does not fit (never shown).
+ * fit, and how many were dropped. Elements that are no call the transcript shows (not an object, or without an id) are
+ * neither kept nor counted. Null when none is kept, or when the text is no array and does not fit (never shown).
  */
 fun fittingToolCalls(text: String?, budget: Int): Pair<String?, Int> {
     if (text == null || text.length <= budget) return text to 0
-    val calls = parse(text) as? JsonArray ?: return null to 0
-    var size = 2 // the brackets
-    val kept = calls.takeWhile { size += it.toString().length + 1; size - 1 <= budget } // a comma before each but the first
+    val array = parse(text) as? JsonArray ?: return null to 0
+    val calls = array.filter { call -> (call as? JsonObject)?.let { it.str("id") ?: it.str("call_id") } != null }
+    var left = budget - 1 // the opening bracket; each kept call then costs its length and one comma or the closing bracket
+    val kept = calls.takeWhile { left -= it.toString().length + 1; left >= 0 } // no overflow: left is at least -1 before each step
     return (if (kept.isEmpty()) null else JsonArray(kept).toString()) to calls.size - kept.size
 }
 
