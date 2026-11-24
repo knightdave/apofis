@@ -508,8 +508,8 @@ class ChatSkeletonTest {
 
     /**
      * The bars' edges at the goldens' size (360 dp wide, xhdpi): the first bar ends at 62 % of the 328 dp between the
-     * 16 dp margins, the second (end aligned, 48 %) starts at 52 % of it. A drift of 2 dp fails, which the goldens' 1 %
-     * tolerance would let through.
+     * 16 dp margins, the second (end aligned, 48 %) starts at 52 % of it. A drift of one pixel fails, which the goldens'
+     * 1 % tolerance would let through.
      */
     @Test
     fun barEdgesAtTheGoldenSize() {
@@ -521,10 +521,11 @@ class ChatSkeletonTest {
         val secondStart = px(16 + 0.52 * 328)
         val first = top + px(22.0) // the first bar's middle row
         val second = top + px(44.0 + 14 + 22) // the second bar's middle row
-        assertEquals("inside the first bar", skeletonColor.toArgb(), pixels[firstEnd - 4, first].toArgb())
-        assertEquals("after the first bar", pageColor.toArgb(), pixels[firstEnd + 4, first].toArgb())
-        assertEquals("before the second bar", pageColor.toArgb(), pixels[secondStart - 4, second].toArgb())
-        assertEquals("inside the second bar", skeletonColor.toArgb(), pixels[secondStart + 4, second].toArgb())
+        // The last pixel inside and the first outside each edge (straight at the bars' middle rows): one pixel of drift fails.
+        assertEquals("inside the first bar", skeletonColor.toArgb(), pixels[firstEnd - 1, first].toArgb())
+        assertEquals("after the first bar", pageColor.toArgb(), pixels[firstEnd, first].toArgb())
+        assertEquals("before the second bar", pageColor.toArgb(), pixels[secondStart - 1, second].toArgb())
+        assertEquals("inside the second bar", skeletonColor.toArgb(), pixels[secondStart, second].toArgb())
     }
 
     /**

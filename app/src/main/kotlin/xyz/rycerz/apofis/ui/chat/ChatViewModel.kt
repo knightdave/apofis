@@ -237,6 +237,7 @@ class ChatViewModel(
         },
     )
 
+    @Volatile // tests read it from another thread
     internal var opening: Job? = null // the running or last open; read by tests to wait for it
         private set
     private var fetch: Job? = null // the model sheet's request
@@ -255,9 +256,10 @@ class ChatViewModel(
      * Decided by the session row alone; unsent bubbles say nothing about the cache. A local-only chat makes no request.
      * A failure shows on the status line. When it decides to fetch a chat with no stored rows, [ChatUiState.firstLoad]
      * (the skeleton) is set until that fetch ends (success, failure or cancellation), the wait for the repository's lock
-     * included, and the last failure of this view model's requests is retired so a retry does not pulse under the old
-     * error; connectivity and a rejected key come from elsewhere and stay. A stale chat with stored rows is fetched
-     * without either.
+     * included, and the last failure of this view model's own requests is retired so a retry does not pulse under the old
+     * error (a 401 of such a request too); the device's connectivity and the follower's rejected-key flag come from
+     * elsewhere and stay. A stale chat with stored rows is fetched without either. As before, any request of this view
+     * model that ends without a failure clears that last failure as well, an open that fetches nothing included.
      */
     fun onOpened() {
         if (opening?.isActive == true) return // one load at a time: the one running reads the newest state anyway
