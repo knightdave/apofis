@@ -642,7 +642,7 @@ private data class BottomInput(
     val loadFailed: Boolean,
 )
 
-/** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it. */
+/** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it; with firstLoad (the skeleton). */
 private fun ChatUiState.forTranscript() =
     copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null)
 
@@ -728,6 +728,7 @@ internal object ChromeProbe {
     var bodyBackdropHasLayer = false
     var composerBackdropId = 0 // the backdrop the composer was last composed with
     var bodyCompositions = 0
+    var skeletonCompositions = 0
 }
 
 /**

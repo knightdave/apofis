@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -16,6 +17,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
+import xyz.rycerz.apofis.BuildConfig
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 import xyz.rycerz.apofis.ui.theme.Motion
@@ -37,6 +39,7 @@ fun ChatSkeleton(modifier: Modifier = Modifier) {
     val fill = ApofisTheme.colors.skeleton
     val shape = MaterialTheme.shapes.large
     val label = stringResource(R.string.chat_loading)
+    if (BuildConfig.DEBUG) SideEffect { ChromeProbe.skeletonCompositions++ }
     Column(
         modifier
             .wrapContentHeight(Alignment.Top)

@@ -452,6 +452,7 @@ class ChatSkeletonTest {
         val bottom = ChromeProbe.bottomCompositions
         val body = ChromeProbe.bodyCompositions
         val root = ChromeProbe.rootMeasures
+        val skeleton = ChromeProbe.skeletonCompositions
         val loops = PulseProbe.frames
         frames(60) // the pulse runs: it is read in a graphics layer, so it recomposes and measures nothing
         assertTrue("the pulse did not run", PulseProbe.frames >= loops + 60)
@@ -459,6 +460,7 @@ class ChatSkeletonTest {
         assertEquals("composer recomposed by the pulse", bottom, ChromeProbe.bottomCompositions)
         assertEquals("transcript recomposed by the pulse", body, ChromeProbe.bodyCompositions)
         assertEquals("root measured by the pulse", root, ChromeProbe.rootMeasures)
+        assertEquals("skeleton recomposed by the pulse", skeleton, ChromeProbe.skeletonCompositions)
         ui = chat.copy(firstLoad = false) // the load ended: only the body changes
         frames(5)
         assertFalse(exists(loading))
