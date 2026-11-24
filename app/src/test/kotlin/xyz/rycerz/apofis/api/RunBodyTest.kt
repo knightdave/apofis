@@ -158,6 +158,10 @@ class RunBodyTest {
         reads = 0
         assertNull(expandImageRefs(body, listOf(d1, d2), afterFirst - 1) { reads++; files[it] })
         assertEquals(1, reads) // stopped before the second file is read
+        val fixed = body.length + 2 * ("data:image/jpeg;base64,".length - "apofis-image:$d1".length) // the body with empty files
+        reads = 0
+        assertNull(expandImageRefs(body, listOf(d1, d2), fixed - 1) { reads++; files[it] })
+        assertEquals(0, reads) // the fixed text alone is over the maximum: no file is read
     }
 
     @Test

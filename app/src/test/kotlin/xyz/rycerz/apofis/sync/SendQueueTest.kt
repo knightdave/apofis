@@ -1445,6 +1445,12 @@ class SendQueueTest {
             override fun get(index: Int): String = throw AssertionError("element $index visited")
         }
         assertRefused(huge, expected = IllegalArgumentException::class.java)
+        var asked = 0
+        val growing = object : AbstractList<String>() { // ten when first asked, eleven by the time it is copied
+            override val size get() = if (asked++ == 0) 10 else 11
+            override fun get(index: Int): String = photos[index]
+        }
+        assertRefused(growing, expected = IllegalArgumentException::class.java)
         assertTrue(sizeAsked.isEmpty())
         queue.submit("apofis-a", "ten", images = photos.take(10))
         assertEquals(photos.take(10).joinToString(","), rows("apofis-a").single().images)

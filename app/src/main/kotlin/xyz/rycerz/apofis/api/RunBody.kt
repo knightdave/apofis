@@ -97,10 +97,11 @@ fun expandImageRefs(body: String, digests: List<String>, maxLength: Int = MAX_EX
     if (body.indexOf(PART, from) >= 0) return null
     // Fixed text first, then each file's base64: the total only grows, so the first total over the maximum is final.
     var length = body.length + digests.size.toLong() * (DATA_URL.length - REF_LENGTH)
+    if (length > maxLength) return null // the fixed text alone is too long: no file is read
     val files = ArrayList<ByteArray>(digests.size)
     for (d in digests) {
         val b = bytes(d)?.takeIf { sha256(it) == d } ?: return null
-        length += 4L * ((b.size + 2) / 3)
+        length += 4 * ((b.size + 2L) / 3)
         if (length > maxLength) return null
         files += b
     }

@@ -178,6 +178,7 @@ class SendQueue(
      * MAX_BODY_BYTES; [SendTooLarge]). Measured without the session id and choice, which ride in the margins of both.
      */
     private fun admit(text: String, images: List<String>) {
+        require(images.size <= MAX_IMAGES) { "too many images" } // on the snapshot: the caller's list may have grown
         require(images.all { d -> d.length == 64 && d.all { it in '0'..'9' || it in 'a'..'f' } }) { "bad digest" }
         if (text.length > MAX_ROW_BYTES) throw SendTooLarge() // each character is at least one byte
         val sizes = images.map { d ->
