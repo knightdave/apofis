@@ -374,7 +374,7 @@ class ModelSheetTest {
         vm.openModelSheet()
         waitFor(hasText("p0-m0"))
         val composed = rule.onAllNodes(hasText("-m", substring = true)).fetchSemanticsNodes().size
-        assertTrue("only what is on screen is composed: $composed of 1000", composed in 1..60)
+        assertTrue("only what is on screen is composed: $composed of 1000", composed in 1..24) // one provider holds 25
         rule.onNode(hasTestTag("model.list")).performScrollToNode(hasText("p39-m24"))
         rule.onNodeWithText("p39-m24").assertIsDisplayed().performClick()
         rule.waitUntil(10_000) { stored() == ChatModel("p39-m24", "p39") }
