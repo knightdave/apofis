@@ -12,6 +12,8 @@ data class UserMessage(
     val error: String? = null, // unsent only: a fixed SendError code when FAILED
     val attempted: Boolean = false, // unsent only: a request for it may already have reached the server
     val runId: String? = null, // the run this message started, while its send is still pending (bubble or the server row showing it)
+    val images: List<String?> = emptyList(), // per image its full digest when this phone's photo is bound or pending, else null (a placeholder)
+    val raw: String = text, // the stored content: the delivery evidence, never shown
 ) : ChatItem
 
 enum class SendState { QUEUED, SENDING, FAILED, SENT }
