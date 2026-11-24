@@ -20,7 +20,7 @@ fun graphemeCut(text: CharSequence, from: Int, limit: Int, up: Boolean): Int {
     if (limit >= text.length) return text.length
     if (limit <= from) return from
     if (up) {
-        var windowEnd = minOf(text.length, limit + GRAPHEME_SLACK)
+        var windowEnd = limit + minOf(GRAPHEME_SLACK, text.length - limit) // never past Int range
         if (windowEnd < text.length && text[windowEnd - 1].isHighSurrogate() && text[windowEnd].isLowSurrogate()) windowEnd++
         val bi = BreakIterator.getCharacterInstance().apply { setText(text.subSequence(from, windowEnd).toString()) }
         val b = bi.following(limit - from - 1)

@@ -426,7 +426,7 @@ private class TextPages {
  */
 internal fun pageEnd(text: CharSequence, start: Int): Int {
     if (BuildConfig.DEBUG) Work.pageEnds++
-    val cap = start + TEXT_PAGE_CHARS
+    val cap = start + minOf(TEXT_PAGE_CHARS, text.length - start) // never past Int range
     val limit = minOf(text.length, cap)
     var i = start
     var lines = 0

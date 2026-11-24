@@ -9,6 +9,9 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import xyz.rycerz.apofis.ui.chat.GRAPHEME_SLACK
 import xyz.rycerz.apofis.ui.chat.PAGE_CHARS
+import xyz.rycerz.apofis.ui.chat.TEXT_PAGE_CHARS
+import xyz.rycerz.apofis.ui.chat.pageEnd
+import xyz.rycerz.apofis.ui.chat.selectPieceEnd
 
 /**
  * [graphemeCut] against the two paging helpers it replaced, kept here verbatim as references. Both references run on
@@ -101,10 +104,48 @@ class GraphemesTest {
     @Test
     fun upEqualsTheOldPieceEndOnEveryInput() {
         var cases = 0
-        for (text in inputs()) for (from in froms(text)) for (limit in limits(text, from).filter { it > from }) {
+        for (text in inputs()) for (from in froms(text)) for (limit in limits(text, from)) {
             assertEquals("up from $from to $limit in ${text.take(20)} (${text.length})", oldPieceEnd(text, from, limit - from), graphemeCut(text, from, limit, up = true))
             cases++
         }
         assertTrue("$cases cases", cases > 20_000)
+    }
+
+    /** [length] units of plain ASCII that exist only as arithmetic: nothing is allocated or walked but a window. */
+    private class Virtual(override val length: Int) : CharSequence {
+        override fun get(index: Int): Char = if (index in 0 until length) 'a' else throw IndexOutOfBoundsException("$index")
+        override fun subSequence(startIndex: Int, endIndex: Int): CharSequence {
+            if (startIndex < 0 || endIndex > length || startIndex > endIndex) throw IndexOutOfBoundsException("$startIndex, $endIndex")
+            return Virtual(endIndex - startIndex)
+        }
+        override fun toString() = "a".repeat(length)
+    }
+
+    private val huge = Virtual(Int.MAX_VALUE - 100)
+
+    @Test
+    fun selectPiecesNearTheEndOfTheLargestTextReachItsEnd() {
+        val n = huge.length
+        // From one unit before the end, and from a start whose third page would pass Int range: the pieces reach the
+        // end, each moves on, and the end list stops growing.
+        for (start in listOf(n - 1, n - 20_001)) {
+            val ends = ArrayList<Int>()
+            var at = start
+            while (at < n && ends.size < 10) { at = selectPieceEnd(huge, at); ends += at }
+            assertEquals("pieces from $start", n, ends.last())
+            assertTrue("every piece moves on: $ends", ends.zipWithNext().all { (a, b) -> b > a } && ends.first() > start)
+        }
+    }
+
+    @Test
+    fun theUpWindowNearTheEndStaysInRange() {
+        val n = huge.length
+        assertEquals(n - 100, graphemeCut(huge, n - 3000, n - 100, up = true))
+    }
+
+    @Test
+    fun aTimelinePageNearTheEndOfTheLargestTextReachesItsEnd() {
+        val n = huge.length
+        assertEquals(n, pageEnd(huge, n - TEXT_PAGE_CHARS + 500)) // its cap would pass Int range
     }
 }

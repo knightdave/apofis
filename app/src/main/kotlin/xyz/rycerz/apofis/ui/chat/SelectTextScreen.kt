@@ -71,7 +71,7 @@ private fun Pieces(text: CharSequence) {
     var found by remember { mutableIntStateOf(1) }
     val listState = remember { LazyListState() } // not saved: see above
     fun end(i: Int): Int {
-        while (ends.size <= i) ends += (ends.lastOrNull() ?: 0).let { graphemeCut(text, it, it + PAGE_CHARS, up = true) }
+        while (ends.size <= i) ends += selectPieceEnd(text, ends.lastOrNull() ?: 0)
         return ends[i]
     }
     // The next piece once the last found one is on screen (laid out, not merely prefetched).
@@ -93,3 +93,7 @@ private class Source {
     var text: CharSequence? = null
     var version = 0
 }
+
+/** The end of the Select piece of [text] that starts at [start]: [PAGE_CHARS] on, at the end of [text] at most. */
+internal fun selectPieceEnd(text: CharSequence, start: Int): Int =
+    graphemeCut(text, start, start + minOf(PAGE_CHARS, text.length - start), up = true) // never past Int range

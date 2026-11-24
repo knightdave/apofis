@@ -58,7 +58,10 @@ import xyz.rycerz.apofis.ui.theme.wash
 /** The most characters one composable is given of a message (an expanded bubble, one piece of the Select view). */
 internal const val PAGE_CHARS = 8000
 
-/** How far past the cap a piece may run to finish the grapheme that straddles it ([graphemeCut] up). */
+/**
+ * How far past the cap a piece may run to finish the grapheme that straddles it
+ * ([xyz.rycerz.apofis.ui.text.graphemeCut] up).
+ */
 internal const val GRAPHEME_SLACK = 1024
 
 // ---- what an action may act on
