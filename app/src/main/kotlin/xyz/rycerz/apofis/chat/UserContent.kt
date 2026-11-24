@@ -10,7 +10,8 @@ private const val FILE_NAME = "api_"
 private const val PREFIX_HEX = 32
 private val MARKERS = setOf("[screenshot]", "[screenshot detail=low]", "[screenshot detail=high]", "[screenshot detail=auto]")
 private val MAX_MARKER_LINE = MARKERS.maxOf { it.length }
-private const val OTHER_BREAKS = "\r\u0085\u2028\u2029" // line terminators besides LF: never inside a server line
+// Line terminators besides LF, as Android's regular expressions count them: never inside a server line.
+private const val OTHER_BREAKS = "\r\u000B\u000C\u0085\u2028\u2029"
 
 /**
  * Splits [content] into its text and the server's image block at its very end (H2): a blank line, k hint lines, then

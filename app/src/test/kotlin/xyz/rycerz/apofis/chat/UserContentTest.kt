@@ -127,7 +127,8 @@ class UserContentTest {
 
     @Test
     fun lineTerminatorInsideAHintIsText() {
-        for (c in listOf("\r", "\u0085", "\u2028", "\u2029")) {
+        // The vertical tab and the form feed are line terminators to Android's patterns, not to the host JDK's.
+        for (c in listOf("\r", "\u000B", "\u000C", "\u0085", "\u2028", "\u2029")) {
             for (content in listOf("cap\n\n[Image attached: left${c}right]\n[screenshot]", "cap\n\n[Image attached at: /p${c}q/api_$a.jpg]\n[screenshot]")) {
                 assertEquals(plain(content), parseUserContent(content))
                 val items = buildTranscript(listOf(MessageDto(1, "user", null, content, null, null, null, null, 1.0, null)))
