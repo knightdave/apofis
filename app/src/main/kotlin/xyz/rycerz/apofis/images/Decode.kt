@@ -230,9 +230,10 @@ private suspend fun <T : Any> admit(
         delivered = true
         return value
     } finally {
+        // A slot still the caller's goes back first: abandoning allocates and must not be able to skip it.
+        if (slotHeld) copySlots.release()
         // Every exit that did not deliver abandons: timeout, cancellation, failure or any other throw.
         if (!delivered) request.abandon(worker)
-        if (slotHeld) copySlots.release()
     }
 }
 

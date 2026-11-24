@@ -563,7 +563,7 @@ class DecodeTest {
         assertEquals(20 to 20, exact.width to exact.height)
         assertEquals(1, calls.get())
         // One byte too many, with the writer still open and no end of file: the copy itself stops, not a later check.
-        assertTrue(n < 64 * 1024) // fits the pipe's buffer, so filling it cannot block
+        assertTrue("fixture $n bytes", n <= 512) // a write this small into an empty FIFO cannot block the test thread
         Stall("over", bytes)
         assertEquals(TOO_LARGE, within10s { decode(ImageInput.Content(uri("over")), limits = DecodeLimits(maxSourceBytes = n - 1), decoder = counting(calls)) }.reason())
         assertEquals(emptyList<String>(), temps())
@@ -578,8 +578,8 @@ class DecodeTest {
     @Test
     fun endlessStream() = runBlocking {
         // The cap plus one byte, then nothing: the writer stays open, so no end of file ever comes.
-        val cap = 16L * 1024
-        assertTrue(cap + 1 < 64 * 1024) // fits the pipe's buffer, so filling it cannot block
+        val cap = 31L
+        assertTrue(cap + 1 <= 512) // a write this small into an empty FIFO cannot block the test thread
         Stall("long", ByteArray((cap + 1).toInt()))
         val calls = AtomicInteger()
         val result = within10s { decode(ImageInput.Content(uri("long")), limits = DecodeLimits(maxSourceBytes = cap), decoder = counting(calls)) }
@@ -864,23 +864,23 @@ class DecodeTest {
         assertNull(System.getProperty("kotlinx.coroutines.io.parallelism"))
         val threads = maxOf(64, Runtime.getRuntime().availableProcessors())
         val started = CountDownLatch(threads)
-        val free = CountDownLatch(1)
-        releases += { free.countDown() }
-        val blockers = List(threads) {
-            CoroutineScope(Dispatchers.IO).launch {
-                started.countDown()
-                free.await(10, TimeUnit.SECONDS)
-            }
-        }
+        val hold = Hold() // an expiry fails the test instead of freeing a lane early
+        val blockers = mutableListOf<Job>()
         try {
+            repeat(threads) {
+                blockers += CoroutineScope(Dispatchers.IO).launch {
+                    started.countDown()
+                    hold.await()
+                }
+            }
             assertTrue(started.await(10, TimeUnit.SECONDS))
             val result = async(virtual) { decodeBounded(counted, ImageInput.Content(uri("x")), ImageLimits.VIEW_SIDE, true, DecodeLimits(), real) }
             step(20_000)
             assertEquals(UNREADABLE, within10s { result.await() }.reason())
         } finally {
-            free.countDown()
+            hold.release()
+            within10s { blockers.joinAll() }
         }
-        within10s { blockers.joinAll() }
         within10s { workers().joinAll() }
         assertEquals(0, lookups.get())
         assertEquals(0, opens("x"))
