@@ -571,7 +571,7 @@ class NotificationsRowTest {
     @Test
     fun beforeTheFirstReadTheRowIsNeutral() {
         val resolving = CompletableDeferred<Unit>()
-        themed { NotificationsSetting({ await(resolving); registrar }, { testPush }, notifyPrefs, uiCommands) }
+        themed { NotificationsSetting({ runBlocking { resolving.await() }; registrar }, { testPush }, notifyPrefs, uiCommands) }
         rule.waitForIdle()
         rule.onNodeWithText(text(R.string.settings_notifications)).assertIsDisplayed().assert(SemanticsMatcher.keyNotDefined(SemanticsActions.OnClick))
         assertTrue("no Off placeholder", rule.onAllNodes(hasText(text(R.string.settings_notif_off), substring = true)).fetchSemanticsNodes().isEmpty())
