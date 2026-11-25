@@ -44,6 +44,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -683,22 +685,33 @@ class ChatViewModelTest {
     @Test
     fun refreshDuringOpenIsNotLost() = runTest {
         addSession(onServer = true, stale = true)
-        val arrived = CountDownLatch(1)
-        val release = latch()
+        val fetches = AtomicInteger()
+        val arrived = List(2) { CompletableDeferred<Unit>() }
+        val release = List(2) { latch() }
         routes[MESSAGES] = {
-            arrived.countDown()
-            if (!release.await(10, TimeUnit.SECONDS)) latchTimeouts.incrementAndGet()
-            MockResponse.Builder().code(500).build() // the row stays stale
+            val n = fetches.getAndIncrement()
+            if (n < 2) {
+                arrived[n].complete(Unit)
+                if (!release[n].await(10, TimeUnit.SECONDS)) latchTimeouts.incrementAndGet()
+            }
+            MockResponse.Builder().code(500).build() // the row stays stale, so every check fetches
         }
+        suspend fun arrival(n: Int) = withContext(Dispatchers.Default) { withTimeout(10_000) { arrived[n].await() } }
         val vm = vm()
-        withContext(Dispatchers.IO) { assertTrue(arrived.await(10, TimeUnit.SECONDS)) } // the first open's fetch is held
-        routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
-        vm.onOpened() // a trigger while the fetch is held (a refresh would wait for the lock the sync holds)
-        release.countDown()
+        arrival(0) // the first open's fetch is held
+        val first = vm.opening!!
+        repeat(3) { vm.onOpened() } // triggers while it is held (a refresh would wait for the lock the sync holds)
+        assertSame(first, vm.opening)
+        release[0].countDown()
 
-        awaitTrue { requests.count { it.target.startsWith(MESSAGES) } == 2 } // followed with no further trigger
-        awaitTrue { vm.opening?.isActive == false }
-        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) }) // one conflated check, not a loop
+        arrival(1) // one follow-up with no further trigger, itself held
+        val second = vm.opening!!
+        assertNotSame(first, second)
+        release[1].countDown()
+        withContext(Dispatchers.Default) { withTimeout(10_000) { second.join() } }
+        // The completion handler has run before join returns: a re-open of its own would have replaced the job.
+        assertSame(second, vm.opening)
+        assertEquals(2, fetches.get()) // one conflated check, not one per trigger and not a loop
     }
 
     @Test
@@ -882,22 +895,6 @@ class ChatViewModelTest {
         // A turn of another run is not this run's turn either.
         val other = listOf(turn("u1", run = "older"), reply("r2", "old answer"))
         assertEquals(listOf("u1", "r2", "live"), LiveMerger().merge(other, liveReply("new")).map { it.key })
-    }
-
-    @Test
-    fun storedTurnWinsAfterTerminalRun() {
-        val transcript = listOf(user("u1"), turn("u3"), reply("r4", "saved"))
-        fun merged(status: String, items: List<ChatItem> = transcript, run: String = "run") =
-            LiveMerger().merge(items, LiveReply(run, status, "streamed", emptyList(), null, Connection.LIVE))
-        // Ended (stopped is stored as cancelled) with its turn synced: the stored turn, the reply under the live item's key.
-        for (status in listOf("completed", "failed", "cancelled", "interrupted")) assertEquals(status, transcript, merged(status))
-        assertEquals("saved", (merged("cancelled").last() as AssistantReply).text)
-        // Controls: still running; ended but its reply not synced; ended but another run's turn.
-        assertEquals("streamed", (merged("running").last() as AssistantReply).text)
-        assertEquals("streamed", (merged("completed", transcript.take(2)).last() as AssistantReply).text)
-        val other = merged("completed", run = "other")
-        assertEquals(listOf("u1", "u3", "r4", "live"), other.map { it.key })
-        assertEquals("streamed", (other.last() as AssistantReply).text)
     }
 
     @Test

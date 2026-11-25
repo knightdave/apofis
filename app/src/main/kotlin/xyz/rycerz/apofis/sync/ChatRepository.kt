@@ -135,7 +135,7 @@ class ChatRepository(
 
     /** [onCached] gets every cached chat's key once the list is stored, still under the lock, so no chat is created meanwhile. */
     suspend fun refreshSessions(onCached: (Set<String>) -> Unit = {}): Unit = lock.withLock {
-        val listed = mutableListOf<SessionDto>()
+        val listed = LinkedHashMap<String, SessionDto>() // the first answer for each id seen in this refresh
         var offset = 0
         var evict = true
         for (pages in 1..MAX_PAGES + 1) {
@@ -143,12 +143,13 @@ class ChatRepository(
             if (!active()) return@withLock
             val page = api.listSessions(SESSION_PAGE, offset)
             if (page.hasMore && page.data.isEmpty()) throw ApiError.Protocol // the rest of the list would be lost
+            val seen = listed.size
+            page.data.forEach { listed.getOrPut(it.id) { it } }
             // A full page of ids already seen (200 or more pins fill every page): stop, and keep every unlisted chat.
-            if (page.data.size >= SESSION_PAGE && listed.mapTo(HashSet()) { it.id }.containsAll(page.data.map { it.id })) {
+            if (page.data.size >= SESSION_PAGE && listed.size == seen) {
                 evict = false
                 break
             }
-            listed += page.data
             // Hermes pages a recency window of SESSION_PAGE rows and appends the pinned chats outside it to every page,
             // and its has_more ignores pins inside the window. So step by the window, and stop only at a page that
             // cannot have been a full window (fewer rows, pins included): a list stopped early would evict real chats.
@@ -169,7 +170,7 @@ class ChatRepository(
                 hidden += dto.toEntity(row).copy(hidden = true)
             }
         }
-        listed.distinctBy { it.id }.forEach { take(it, cachedFor(it)) }
+        listed.values.forEach { take(it, cachedFor(it)) }
         val listedKeys = (visible + hidden).mapTo(HashSet()) { it.key }
         val unlisted = cached.filter { it.existsOnServer && it.key !in listedKeys }
         // The list never returns archived chats, so each one known locally is read by id. A chat the DAO keeps

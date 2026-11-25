@@ -18,6 +18,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -65,6 +67,7 @@ import xyz.rycerz.apofis.share.ShareIntent
 import xyz.rycerz.apofis.share.readShare
 import xyz.rycerz.apofis.sync.ChatRepository
 import xyz.rycerz.apofis.sync.SendQueue
+import xyz.rycerz.apofis.ui.drawer.DrawerRow
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
 
 // Every canary holds "cnry", so one search also catches a canary cut short or joined with other text.
@@ -78,7 +81,9 @@ private const val AUTHORITY = "cnry.authority-7e3"
 private const val PATH = "cnry-path-1a8"
 private const val URI = "content://$AUTHORITY/$PATH"
 private const val FILE = "cnry-file-9d5.jpg"
-private const val SERVER = "cnry-server-0c3" // text in the server's error answers
+private const val SERVER_CODE = "cnry_server_0c3" // a code the client keeps ([a-z0-9_]{1,64})
+private const val SERVER_TEXT = "cnry-server-msg-0c3" // free text in the server's error answers
+private const val KEY = "cnry-key-7b1"
 
 /**
  * What a user typed or a server sent never reaches a log. (a) A census pins the exact text of every log line in the
@@ -98,7 +103,8 @@ class LogPrivacyTest {
     private lateinit var db: AppDatabase
     private lateinit var connected: Connected
     private lateinit var follower: RunFollower
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val uncaught = CopyOnWriteArrayList<Throwable>()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e -> uncaught += e })
     private val routes = ConcurrentHashMap<String, (RecordedRequest) -> MockResponse>()
     private val requests = CopyOnWriteArrayList<RecordedRequest>()
     private val store = ViewModelStore()
@@ -106,30 +112,60 @@ class LogPrivacyTest {
     private val jpeg = "cnry-image-bytes".encodeToByteArray()
     private val digest = MessageDigest.getInstance("SHA-256").digest(jpeg).joinToString("") { "%02x".format(it) }
 
+    /**
+     * Every reference to the logger in every shipping source set, as text: a call from the start of its line to its
+     * closing parenthesis (whitespace collapsed, so a call split over lines is pinned whole), and any other reference
+     * (an aliased or member import, a callable reference, a qualified name) as the rest of its line. The plain import
+     * of android.util.Log is the only reference left out. Kotlin's print functions, stack traces, the standard streams
+     * and a wildcard import of android.util are never allowed. This pins the sinks, not what callers pass into them.
+     */
     @Test
     fun everyLogLineIsKnown() {
-        val call = Regex("""\bLog\.(v|d|i|w|e|wtf|println)\(""")
-        val root = File("src/main/kotlin/xyz/rycerz/apofis")
-        val lines = root.walk().filter { it.isFile && it.extension == "kt" }.flatMap { f ->
-            f.readLines().filter { call.containsMatchIn(it) }.map { "${f.relativeTo(root).invariantSeparatorsPath}: ${it.trim()}" }
-        }.sorted().toList()
+        val src = File("src")
+        val plainImport = Regex("""(?m)^[ \t]*import[ \t]+android\.util\.Log[ \t]*$""")
+        val logger = Regex("""\bLog\b""")
+        val otherSinks = Regex("""\bprint(ln)?\s*\(|::\s*print(ln)?\b|printStackTrace|System\s*\.\s*(out|err)\b|import\s+android\s*\.\s*util\s*\.\s*\*""")
+        val found = src.listFiles()!!.filter { it.isDirectory && !it.name.startsWith("test") && !it.name.startsWith("androidTest") }
+            .flatMap { set -> set.walk().filter { it.isFile && it.extension in setOf("kt", "java") }.toList() }
+            .flatMap { f ->
+                val path = f.relativeTo(src).invariantSeparatorsPath
+                val text = plainImport.replace(f.readText(), "")
+                logger.findAll(text).map { "$path: ${reference(text, it.range.first)}" }.toList() +
+                    otherSinks.findAll(text).map { "$path: ${it.value}" }.toList()
+            }.sorted()
         // Only class names, enum names, counts and literals are interpolated; reason, what and cause are literals of
-        // their callers (read when this list was written; the census pins the lines, not those callers).
+        // their callers (read when this list was written).
         val known = listOf(
-            "ApofisApp.kt: Thread { runCatching { recoverPush(this, pushSink) }.onFailure { Log.w(\"Apofis\", \"Push recovery failed: \${it.javaClass.name}\") } }.start()",
-            "AppContainer.kt: if (erased && !runCatching { cachePrefs.edit().remove(SWITCH_MARKER).commit() }.getOrDefault(false)) Log.w(TAG, \"Switch mark not removed\")",
-            "AppContainer.kt: private fun logFailure(e: Throwable) = Log.w(TAG, \"Background task failed: \${e.javaClass.name}\")",
-            "push/PushReceiver.kt: Log.w(TAG, \"PushReceiver: event lost, \$what\")",
-            "push/PushReceiver.kt: Log.w(TAG, \"PushReceiver: event not handled: \${e.javaClass.name}\")",
-            "push/PushReceiver.kt: if (!claimed && !finished) Log.w(TAG, \"PushReceiver: event lost, late\")",
-            "push/PushRegistrar.kt: Log.w(TAG, \"Push not published: \$reason\")",
-            "push/PushRegistrar.kt: private fun logFailure(e: Throwable) = Log.w(TAG, \"Push step failed: \${e.javaClass.name}\")",
-            "push/WakeWorker.kt: Log.i(\"ApofisWake\", \"cause=\$cause runs=\$runs settled=\$settled failed=\$failed outcome=\${result?.name ?: \"none\"}\")",
-            "share/ShareIntake.kt: if (BuildConfig.DEBUG) Log.i(\"ApofisShare\", \"image \${reason.name}\") // the reason only: no URI, size or digest",
+            "main/kotlin/xyz/rycerz/apofis/ApofisApp.kt: Thread { runCatching { recoverPush(this, pushSink) }.onFailure { Log.w(\"Apofis\", \"Push recovery failed: \${it.javaClass.name}\")",
+            "main/kotlin/xyz/rycerz/apofis/AppContainer.kt: if (erased && !runCatching { cachePrefs.edit().remove(SWITCH_MARKER).commit() }.getOrDefault(false)) Log.w(TAG, \"Switch mark not removed\")",
+            "main/kotlin/xyz/rycerz/apofis/AppContainer.kt: private fun logFailure(e: Throwable) = Log.w(TAG, \"Background task failed: \${e.javaClass.name}\")",
+            "main/kotlin/xyz/rycerz/apofis/push/PushReceiver.kt: Log.w(TAG, \"PushReceiver: event lost, \$what\")",
+            "main/kotlin/xyz/rycerz/apofis/push/PushReceiver.kt: Log.w(TAG, \"PushReceiver: event not handled: \${e.javaClass.name}\")",
+            "main/kotlin/xyz/rycerz/apofis/push/PushReceiver.kt: if (!claimed && !finished) Log.w(TAG, \"PushReceiver: event lost, late\")",
+            "main/kotlin/xyz/rycerz/apofis/push/PushRegistrar.kt: Log.w(TAG, \"Push not published: \$reason\")",
+            "main/kotlin/xyz/rycerz/apofis/push/PushRegistrar.kt: private fun logFailure(e: Throwable) = Log.w(TAG, \"Push step failed: \${e.javaClass.name}\")",
+            "main/kotlin/xyz/rycerz/apofis/push/WakeWorker.kt: Log.i(\"ApofisWake\", \"cause=\$cause runs=\$runs settled=\$settled failed=\$failed outcome=\${result?.name ?: \"none\"}\")",
+            "main/kotlin/xyz/rycerz/apofis/share/ShareIntake.kt: if (BuildConfig.DEBUG) Log.i(\"ApofisShare\", \"image \${reason.name}\")",
         )
-        assertEquals(known.joinToString("\n"), lines.joinToString("\n"))
-        val otherSinks = Regex("""printStackTrace|println\(|System\.(out|err)""")
-        assertEquals(emptyList<File>(), root.walk().filter { it.isFile && it.extension == "kt" && otherSinks.containsMatchIn(it.readText()) }.toList())
+        assertEquals(known.joinToString("\n"), found.joinToString("\n"))
+    }
+
+    /** The reference to the logger at [at] in [text]: see [everyLogLineIsKnown]. */
+    private fun reference(text: String, at: Int): String {
+        val prefix = text.substring(text.lastIndexOf('\n', at - 1) + 1, at).trimStart()
+        val call = Regex("""Log\s*\.\s*\w+\s*\(""").find(text, at)?.takeIf { it.range.first == at }
+        val end = if (call != null) {
+            var depth = 1
+            var i = call.range.last + 1
+            while (i < text.length && depth > 0) {
+                if (text[i] == '(') depth++ else if (text[i] == ')') depth--
+                i++
+            }
+            i
+        } else {
+            text.indexOf('\n', at).let { if (it < 0) text.length else it }
+        }
+        return (prefix + text.substring(at, end)).replace(Regex("""\s+"""), " ")
     }
 
     @Before
@@ -155,14 +191,14 @@ class LogPrivacyTest {
         }
         server.start()
         db = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).allowMainThreadQueries().build()
-        val api = HermesApi(server.url("/").toString(), "secret-key")
+        val api = HermesApi(server.url("/").toString(), KEY)
         lateinit var f: RunFollower
         val image = { d: String -> jpeg.takeIf { d == digest } }
         val queue = SendQueue(api, db, { s, r -> f.onRunStarted(s, r) }, System::currentTimeMillis, readImage = image, imageSize = { d -> image(d)?.size?.toLong() })
         val repo = ChatRepository(api, db, System::currentTimeMillis, queue)
         f = RunFollower(api, db, repo, scope, delayMs = { delay(minOf(it, 20L)) })
         follower = f
-        connected = Connected(Credentials(server.url("/").toString(), "secret-key"), api, db, repo, queue, f, AtomicBoolean(true), scope)
+        connected = Connected(Credentials(server.url("/").toString(), KEY), api, db, repo, queue, f, AtomicBoolean(true), scope)
     }
 
     @After
@@ -179,7 +215,7 @@ class LogPrivacyTest {
     }
 
     private fun serverError() = MockResponse.Builder().code(500)
-        .body("""{"error":{"code":"$SERVER","message":"$SERVER $TEXT"}}""").addHeader("Content-Type", "application/json").build()
+        .body("""{"error":{"code":"$SERVER_CODE","message":"$SERVER_TEXT $TEXT"}}""").addHeader("Content-Type", "application/json").build()
 
     private suspend fun session(key: String) = db.sessionDao().upsert(
         SessionEntity(
@@ -193,15 +229,7 @@ class LogPrivacyTest {
         viewModelFactory { initializer { DrawerViewModel(connected, lastChat = lastChat, zone = { ZoneOffset.UTC }) } },
     ).get(DrawerViewModel::class).also { created += it }
 
-    private suspend fun until(what: String, condition: () -> Boolean) = withContext(Dispatchers.IO) {
-        repeat(1000) {
-            if (condition()) return@withContext
-            Thread.sleep(10)
-        }
-        throw AssertionError("timed out waiting for $what")
-    }
-
-    private fun sent(method: String, path: String) = requests.count { it.method == method && it.target.substringBefore('?') == path }
+    private suspend fun <T> await(what: suspend () -> T): T = withContext(Dispatchers.Default) { withTimeout(10_000) { what() } }
 
     @Test
     fun canariesNeverLogged() = runBlocking<Unit> {
@@ -229,20 +257,26 @@ class LogPrivacyTest {
         assertTrue(NoteKind.SHARE_IMAGES_FAILED in share.notes)
 
         // Leaving a temporary chat whose DELETE fails, then the drawer's Delete answered 500.
+        val deletes = mapOf(TEMP to CompletableDeferred<Unit>(), SID to CompletableDeferred<Unit>())
+        deletes.forEach { (key, asked) -> routes["DELETE /api/sessions/$key"] = { asked.complete(Unit); serverError() } }
         val vm = drawer(lastChat = TEMP)
-        withTimeout(60_000) { vm.selected.first { it == TEMP } }
+        await { vm.selected.first { it == TEMP } }
         vm.onSelect(SID)
-        until("the leave's DELETE") { sent("DELETE", "/api/sessions/$TEMP") > 0 }
-        withTimeout(60_000) { vm.leavesEnded() }
+        await { deletes.getValue(TEMP).await() } // the leave is in flight: it is listed as being left until it ends
+        await { vm.leavesEnded() }
+        await { vm.rows.first { rows -> rows.any { it is DrawerRow.Chat && it.key == SID } } }
         vm.onDeleteRequest(SID)
-        vm.confirmDelete(vm.prompt.value!!.token)
-        until("the Delete's answer") { sent("DELETE", "/api/sessions/$SID") > 0 && vm.busyActions() == 0 }
+        val token = await { vm.prompt.first { it?.key == SID } }!!.token
+        vm.confirmDelete(token)
+        await { deletes.getValue(SID).await() }
+        await { vm.prompt.first { it?.token == token && !it.busy && it.error != null } } // the Delete's failure is shown
         assertTrue(db.sessionDao().get(SID) != null && db.sessionDao().get(TEMP) != null) // both failed and stayed
 
         val logs = ShadowLog.getLogs()
-        val logged = logs.joinToString("\n") { "${it.tag} ${it.msg} ${it.throwable?.stackTraceToString()}" }
+        val logged = logs.joinToString("\n") { "${it.tag} ${it.msg} ${it.throwable?.stackTraceToString()}" } +
+            uncaught.joinToString("\n") { it.stackTraceToString() } // the fixture's scope collects what nothing caught
         assertTrue("the capture works: $logged", logs.any { it.tag == "ApofisShare" && it.msg == "image UNREADABLE" })
-        for (canary in listOf("cnry", TEXT, CAPTION, MODEL, TITLE, SID, TEMP, URI, FILE, SERVER, digest.take(16))) {
+        for (canary in listOf(TEXT, CAPTION, MODEL, TITLE, SID, TEMP, URI, FILE, SERVER_CODE, SERVER_TEXT, KEY, digest.take(16), "cnry")) {
             assertFalse("$canary logged", canary in logged)
         }
     }

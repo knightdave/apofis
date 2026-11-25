@@ -631,9 +631,6 @@ class ChatViewModel(
         }
 }
 
-// The run states that end a run; mirrors TERMINAL in run/RunFollower.kt.
-private val ENDED = setOf("completed", "failed", "cancelled", "interrupted")
-
 /**
  * Puts the live reply into the transcript. The run's turn starts at the user message that started it (the one whose
  * [UserMessage.runId] is the run's). While streaming, stored replies and notices after that message are the stored
@@ -648,7 +645,6 @@ internal class LiveMerger(private val now: () -> Double = { System.currentTimeMi
     private var stored: List<ChatItem> = emptyList() // stage 1: the stored items shown while streaming
     private var liveKey = "live"
     private var since = 0.0
-    private var synced = false // stage 1: the run's turn start is known and a stored reply follows it
 
     fun merge(transcript: List<ChatItem>, live: LiveReply?): List<ChatItem> {
         if (live == null) return transcript
@@ -661,16 +657,12 @@ internal class LiveMerger(private val now: () -> Double = { System.currentTimeMi
             if (start < 0) {
                 stored = transcript
                 liveKey = "live"
-                synced = false
             } else {
                 val after = transcript.subList(start + 1, transcript.size)
                 stored = transcript.subList(0, start + 1) + after.filterIsInstance<UserMessage>()
                 liveKey = after.firstOrNull { it is AssistantReply }?.key ?: "live"
-                synced = after.any { it is AssistantReply }
             }
         }
-        // An ended run whose turn is stored: the stored turn is shown as it is (its reply keeps the live item's key).
-        if (synced && live.status in ENDED) return transcript
         // Stage 2: the stored part as it is, then one item.
         if (live.connection == Connection.POLLING) return Joined(transcript, listOf(AssistantReply("live", emptyList(), "", since, live = true)))
         return Joined(stored, listOf(AssistantReply(liveKey, live.steps, live.text, since, live = true)))
