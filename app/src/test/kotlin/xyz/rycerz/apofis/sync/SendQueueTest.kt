@@ -670,6 +670,23 @@ class SendQueueTest {
         assertEquals("steered", rows("apofis-a").single().state)
     }
 
+    /** Issue 16 row 5: a send steers only the run its Steer button was drawn for; once that run ended it is queued, never steering another run. */
+    @Test
+    fun steerTargetEndedBeforeCommitQueues() = runTest {
+        addSession("apofis-a")
+        running("apofis-a", "run_2") // run_1, the one drawn, ended; another run of the chat runs now
+        queue.submit("apofis-a", "about the first reply", steerRun = "run_1")
+        val row = rows("apofis-a").single()
+        assertEquals("queued", row.state)
+        assertNull(row.runId)
+        assertEquals(0, server.requestCount) // the chat is busy: it starts after run_2
+
+        respond(fixture("steer_response.json"))
+        queue.submit("apofis-a", "about the second reply", steerRun = "run_2") // the drawn run still runs: steered
+        assertEquals("/v1/runs/run_2/steer", take().target)
+        assertEquals("steered", rows("apofis-a").single { it.text == "about the second reply" }.state)
+    }
+
     @Test
     fun steerNotFoundBecomesQueuedRunSend() = runTest {
         addSession("apofis-a")

@@ -104,6 +104,7 @@ import xyz.rycerz.apofis.api.ApprovalChoice
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import xyz.rycerz.apofis.chat.Command
 import xyz.rycerz.apofis.chat.ChatItem
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
@@ -304,7 +305,7 @@ fun ChatScreen(
                         onSend = {
                             // The holder decides at dispatch time.
                             // The list follows once the row is stored (the counter effect above), never here.
-                            val accepted = !input.loadFailed && callbacks.value.actions.onSendClick()
+                            val accepted = !input.loadFailed && callbacks.value.actions.onSendClick(input.runId) // the drawn run: what Steer steers
                             if (accepted) linkFailed = false
                             accepted
                         },
@@ -756,6 +757,8 @@ internal class Gate(private val covered: () -> Boolean) {
 internal class CoveredActions(private val actions: () -> ChatActions, private val gate: Gate) : ChatActions {
     override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
     override fun onSendClick(): Boolean = gate.passOr(false) { actions().onSendClick() } // covered: not accepted, nothing called
+    override fun onSendClick(steerRun: String?): Boolean = gate.passOr(false) { actions().onSendClick(steerRun) }
+    override fun onCommand(command: Command): Boolean = gate.passOr(false) { actions().onCommand(command) }
     override fun onStopClick(runId: String) = gate.pass { actions().onStopClick(runId) }
     override fun onRetry(idempotencyKey: String) = gate.pass { actions().onRetry(idempotencyKey) }
     override fun onConfirmRetry(idempotencyKey: String) = actions().onConfirmRetry(idempotencyKey)

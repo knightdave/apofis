@@ -41,6 +41,7 @@ class ChatGateTest {
             java.lang.Long.TYPE -> 0L
             java.lang.Boolean.TYPE -> false
             ApprovalChoice::class.java -> ApprovalChoice.ONCE
+            xyz.rycerz.apofis.chat.Command::class.java -> xyz.rycerz.apofis.chat.Command.STOP
             List::class.java -> emptyList<Any>()
             else -> null
         }

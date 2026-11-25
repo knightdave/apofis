@@ -59,6 +59,7 @@ object SendError {
     const val PROTOCOL = "protocol"
     const val HTTP_ERROR = "http_error"
     const val IMAGE_MISSING = "image_missing" // a file of its images is gone or changed: nothing was sent for it
+    const val STEER_NOT_DELIVERED = "steer_not_delivered" // a /steer whose run ended or refused it: not sent, never a run send
 }
 
 /** Thrown by [SendQueue.submit] for a send over [MAX_ROW_BYTES] or, expanded, over MAX_BODY_BYTES: nothing was stored. */
@@ -136,17 +137,28 @@ class SendQueue(
     internal var beforeRetryWrite: suspend () -> Unit = {}
 
     /** Stores [text] as a queued send for [sessionKey]; returns its idempotency key. */
-    suspend fun enqueue(sessionKey: String, text: String): String = store(sessionKey, text, steer = false).idempotencyKey
+    suspend fun enqueue(sessionKey: String, text: String): String = checkNotNull(store(sessionKey, text, steer = false)).idempotencyKey
 
     /**
      * For ChatRepository.send: stores [text] and the digests [images] (see [store]), as a steer of the session's running
      * run when there is one and no images, then delivers it (see [deliverStored]), else drains. A hidden session fails
      * locally; an unknown session or a missing image file throws IllegalArgumentException; a body too large to send
-     * throws [SendTooLarge].
+     * throws [SendTooLarge]. [steerRun]: the run the Steer button was drawn for, steered only while it runs (else the
+     * send is queued, never steering another run); null steers any running run of the session. [steerOnly] (/steer)
+     * stores nothing and returns without calling [onStored] when there is no such run, and its row is never sent as a
+     * run. Without [steer] the send is always queued.
      */
-    internal suspend fun submit(sessionKey: String, text: String, onStored: (String) -> Unit = {}, images: List<String> = emptyList()) {
+    internal suspend fun submit(
+        sessionKey: String,
+        text: String,
+        onStored: (String) -> Unit = {},
+        images: List<String> = emptyList(),
+        steerRun: String? = null,
+        steerOnly: Boolean = false,
+        steer: Boolean = true,
+    ) {
         // Contract: a throw here means nothing was stored, so the caller may offer the text again.
-        val row = store(sessionKey, text, steer = true, images)
+        val row = store(sessionKey, text, steer, images, steerRun, steerOnly) ?: return
         onStored(row.idempotencyKey) // committed with its worker armed: from here the row is the message
         if (row.state == PendingState.FAILED) return
         try {
@@ -166,7 +178,14 @@ class SendQueue(
      * started at once cannot find the queue empty and end before the row is in it. With [steer], a session with a
      * running run gets a steer of that run, stored as such before any request (not yet attempted).
      */
-    private suspend fun store(sessionKey: String, text: String, steer: Boolean, images: List<String> = emptyList()): PendingSendEntity {
+    private suspend fun store(
+        sessionKey: String,
+        text: String,
+        steer: Boolean,
+        images: List<String> = emptyList(),
+        steerRun: String? = null,
+        steerOnly: Boolean = false,
+    ): PendingSendEntity? {
         require(images.size <= MAX_IMAGES) { "too many images" } // before the copy: a huge list is never walked
         val digests = images.toList() // the caller's list may change while this suspends
         withContext(Dispatchers.IO) { admit(text, digests) }
@@ -174,7 +193,7 @@ class SendQueue(
             schedule()
             db.withTransaction {
                 ensureOpen()
-                insert(sessionKey, text, steer, digests)
+                insert(sessionKey, text, steer, digests, steerRun, steerOnly) // null: a steer-only send with no run, nothing stored
             }
         }
     }
@@ -292,7 +311,7 @@ class SendQueue(
             val old = expired(send)
             val unsafe = send.attempted && (uncertain || old)
             if (unsafe && !confirmedDuplicateRisk) return RetryResult.NEEDS_CONFIRMATION
-            val queued = send.copy(state = PendingState.QUEUED, error = null, runId = null)
+            val queued = send.copy(state = PendingState.QUEUED, error = null, runId = null, steerOnly = false) // a /steer retried is a message
             beforeRetryWrite()
             // Armed before the write, under drainLock: a worker it starts waits for this lock and then sees the row.
             schedule()
@@ -312,11 +331,25 @@ class SendQueue(
     }
 
     /** In the transaction that checked the session, so a concurrent delete or refresh cannot leave an orphan row. */
-    private suspend fun insert(sessionKey: String, text: String, steer: Boolean, images: List<String>): PendingSendEntity {
+    private suspend fun insert(
+        sessionKey: String,
+        text: String,
+        steer: Boolean,
+        images: List<String>,
+        steerRun: String?,
+        steerOnly: Boolean,
+    ): PendingSendEntity? {
         require(!isReservedId(sessionKey)) { "reserved session id" }
         val session = requireNotNull(db.sessionDao().get(sessionKey)) { "unknown session" }
-        // A message with images never steers: it waits behind the running reply (decision 5).
-        val run = if (steer && images.isEmpty()) db.activeRunDao().forSession(sessionKey)?.takeIf { it.status == "running" } else null
+        val runs = db.activeRunDao()
+        // A message with images never steers: it waits behind the running reply (decision 5). A named run that ended
+        // falls back to the queue, not to another run of the chat.
+        val run = if (steer && images.isEmpty()) {
+            (if (steerRun != null) runs.get(steerRun)?.takeIf { it.sessionKey == sessionKey } else runs.forSession(sessionKey))?.takeIf { it.status == "running" }
+        } else {
+            null
+        }
+        if (steerOnly && run == null) return null
         val row = PendingSendEntity(
             idempotencyKey = UUID.randomUUID().toString(), sessionKey = sessionKey, text = text,
             requestBody = buildRunBody(session.currentId, text, images, session.choice()), createdAt = now(), state = PendingState.QUEUED,
@@ -324,7 +357,7 @@ class SendQueue(
         ).let {
             when {
                 session.hidden -> it.copy(state = PendingState.FAILED, error = SendError.SESSION_UNAVAILABLE)
-                run != null -> it.copy(state = PendingState.STEERING, runId = run.runId)
+                run != null -> it.copy(state = PendingState.STEERING, runId = run.runId, steerOnly = steerOnly)
                 else -> it
             }
         }
@@ -336,7 +369,8 @@ class SendQueue(
      * Under both locks: delivers the stored send [idempotencyKey]. A queued one is left for a drain (true). A steer not
      * yet attempted goes to the run it was stored for, after the chat is checked again under this lock: a chat hidden
      * meanwhile fails locally; one being deleted waits (a later drain delivers it if the delete fails); a run that no
-     * longer runs here makes it a queued run send. Anything else (gone, started, attempted) is left as it is.
+     * longer runs here makes it a queued run send, or fails a steer-only one ([SendError.STEER_NOT_DELIVERED]). Anything
+     * else (gone, started, attempted) is left as it is.
      */
     private suspend fun deliverStored(idempotencyKey: String): Boolean {
         ensureOpen()
@@ -351,8 +385,10 @@ class SendQueue(
         if (isBeingDeleted(session.key)) return false
         // A row with images never steers (decision 5): like a steer whose run ended, it becomes a queued run send.
         val run = row.runId?.takeIf { row.images.isEmpty() }?.let { db.activeRunDao().get(it) }?.takeIf { it.sessionKey == row.sessionKey && it.status == "running" }
-            ?: return pendingDao.update(row.copy(state = PendingState.QUEUED, runId = null)) == 1
-        return steer(row.copy(runId = run.runId))
+        if (run != null) return steer(row.copy(runId = run.runId))
+        if (!row.steerOnly) return pendingDao.update(row.copy(state = PendingState.QUEUED, runId = null)) == 1
+        fail(row, SendError.STEER_NOT_DELIVERED)
+        return false
     }
 
     /**
@@ -383,7 +419,10 @@ class SendQueue(
             // A failed steer drops its run id, so cleanup of the run's rows cannot delete the undelivered text.
             val failed = sent.copy(state = PendingState.FAILED, runId = null)
             when {
-                // The run is gone or no longer steerable: the text was not delivered, so send it as a new turn.
+                // The run is gone or no longer steerable: the text was not delivered. A steer-only row fails unattempted.
+                (e == ApiError.NotFound || e is ApiError.Conflict) && row.steerOnly ->
+                    pendingDao.update(failed.copy(error = SendError.STEER_NOT_DELIVERED, attempted = false))
+                // Any other steer is sent as a new turn.
                 e == ApiError.NotFound || e is ApiError.Conflict ->
                     return@withContext pendingDao.update(row.copy(state = PendingState.QUEUED, runId = null, attempted = false)) == 1
                 refused(e) -> {
