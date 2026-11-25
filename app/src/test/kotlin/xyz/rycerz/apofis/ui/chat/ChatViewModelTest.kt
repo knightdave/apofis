@@ -681,6 +681,27 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun refreshDuringOpenIsNotLost() = runTest {
+        addSession(onServer = true, stale = true)
+        val arrived = CountDownLatch(1)
+        val release = latch()
+        routes[MESSAGES] = {
+            arrived.countDown()
+            if (!release.await(10, TimeUnit.SECONDS)) latchTimeouts.incrementAndGet()
+            MockResponse.Builder().code(500).build() // the row stays stale
+        }
+        val vm = vm()
+        withContext(Dispatchers.IO) { assertTrue(arrived.await(10, TimeUnit.SECONDS)) } // the first open's fetch is held
+        routes[MESSAGES] = json("""{"error":{"code":"boom"}}""", 500)
+        vm.onOpened() // a trigger while the fetch is held (a refresh would wait for the lock the sync holds)
+        release.countDown()
+
+        awaitTrue { requests.count { it.target.startsWith(MESSAGES) } == 2 } // followed with no further trigger
+        awaitTrue { vm.opening?.isActive == false }
+        assertEquals(2, requests.count { it.target.startsWith(MESSAGES) }) // one conflated check, not a loop
+    }
+
+    @Test
     fun sendIsSingleFlightAndTakesTheCurrentDraft() = runTest {
         addSession()
         val vm = vm()
@@ -861,6 +882,22 @@ class ChatViewModelTest {
         // A turn of another run is not this run's turn either.
         val other = listOf(turn("u1", run = "older"), reply("r2", "old answer"))
         assertEquals(listOf("u1", "r2", "live"), LiveMerger().merge(other, liveReply("new")).map { it.key })
+    }
+
+    @Test
+    fun storedTurnWinsAfterTerminalRun() {
+        val transcript = listOf(user("u1"), turn("u3"), reply("r4", "saved"))
+        fun merged(status: String, items: List<ChatItem> = transcript, run: String = "run") =
+            LiveMerger().merge(items, LiveReply(run, status, "streamed", emptyList(), null, Connection.LIVE))
+        // Ended (stopped is stored as cancelled) with its turn synced: the stored turn, the reply under the live item's key.
+        for (status in listOf("completed", "failed", "cancelled", "interrupted")) assertEquals(status, transcript, merged(status))
+        assertEquals("saved", (merged("cancelled").last() as AssistantReply).text)
+        // Controls: still running; ended but its reply not synced; ended but another run's turn.
+        assertEquals("streamed", (merged("running").last() as AssistantReply).text)
+        assertEquals("streamed", (merged("completed", transcript.take(2)).last() as AssistantReply).text)
+        val other = merged("completed", run = "other")
+        assertEquals(listOf("u1", "u3", "r4", "live"), other.map { it.key })
+        assertEquals("streamed", (other.last() as AssistantReply).text)
     }
 
     @Test

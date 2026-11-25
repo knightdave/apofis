@@ -23,6 +23,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -123,7 +124,17 @@ class Connected internal constructor(
     internal suspend fun resume() {
         liveFollower.resumeAll()
         scope.launch { sendQueue.drain() } // may outlast a stop: the follower's closed gate then attaches no stream
-        scope.launch { refreshQuietly(liveRepo, composer) } // other clients may have changed chats meanwhile
+        refresh() // other clients may have changed chats meanwhile
+    }
+
+    // One refresh at a time per connection; asks made while one runs fold into one more after it.
+    private val asks = Channel<Unit>(Channel.CONFLATED)
+    private val collector by lazy { scope.launch { for (ask in asks) refreshQuietly(liveRepo, composer) } }
+
+    /** Asks for a quiet session refresh in the connection's scope (on return to the foreground, after a run). */
+    internal fun refresh() {
+        collector
+        asks.trySend(Unit)
     }
 
     internal fun pause() = liveFollower.pauseAll()
@@ -647,6 +658,7 @@ class AppContainer(
         // Cycle: the queue needs a RunStarter (the follower), the follower needs the repository, the repository the
         // queue. The queue only calls the starter after a send, by which time the follower exists.
         lateinit var follower: RunFollower
+        lateinit var connected: Connected // set before the follower can finish a run: it calls back only after following one
         // The follower's own gate refuses a stream while the app is stopped; the run stays stored for the next start.
         val starter = RunStarter { session, run -> if (open.get()) follower.onRunStarted(session, run) }
         val queue = SendQueue(
@@ -658,7 +670,7 @@ class AppContainer(
         follower = RunFollower(api, db, repo, runScope, onRunFinished = {
             if (open.get()) {
                 queue.drain()
-                runScope.launch { refreshQuietly(repo, composer) } // not on the follower's own, non-cancellable path
+                connected.refresh() // not on the follower's own, non-cancellable path
             }
         }, active = open::get, onNotice = notifier, onControlsCleared = { key, run, ended ->
             notifier.clearNeedsAnswer(key, run, generation, ended)
@@ -666,7 +678,7 @@ class AppContainer(
         return Connected(c, api, db, repo, queue, follower, open, runScope, composer, generation, imageStore, {
             startup.join() // the start-up sweep of decode temps finishes before the first conversion makes one
             convertImage(it)
-        })
+        }).also { connected = it }
     }
 }
 

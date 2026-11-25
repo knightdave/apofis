@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis.sync
 
 import androidx.room.withTransaction
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -9,6 +10,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -128,18 +130,24 @@ class ChatRepository(
                 if (started.isNotEmpty()) items = items.map { if (it is UserMessage && it.key in started) it.copy(runId = started[it.key]) else it }
                 emit(items + unsent.map { it.toItem() })
             }
-        }.distinctUntilChanged()
+        }.distinctUntilChanged().flowOn(Dispatchers.Default) // mapped off the collector's (main) thread
     }
 
     /** [onCached] gets every cached chat's key once the list is stored, still under the lock, so no chat is created meanwhile. */
     suspend fun refreshSessions(onCached: (Set<String>) -> Unit = {}): Unit = lock.withLock {
         val listed = mutableListOf<SessionDto>()
         var offset = 0
+        var evict = true
         for (pages in 1..MAX_PAGES + 1) {
             if (pages > MAX_PAGES) throw ApiError.Protocol
             if (!active()) return@withLock
             val page = api.listSessions(SESSION_PAGE, offset)
             if (page.hasMore && page.data.isEmpty()) throw ApiError.Protocol // the rest of the list would be lost
+            // A full page of ids already seen (200 or more pins fill every page): stop, and keep every unlisted chat.
+            if (page.data.size >= SESSION_PAGE && listed.mapTo(HashSet()) { it.id }.containsAll(page.data.map { it.id })) {
+                evict = false
+                break
+            }
             listed += page.data
             // Hermes pages a recency window of SESSION_PAGE rows and appends the pinned chats outside it to every page,
             // and its has_more ignores pins inside the window. So step by the window, and stop only at a page that
@@ -180,7 +188,8 @@ class ChatRepository(
         }
         db.withTransaction {
             if (!active()) return@withTransaction
-            sessionDao.replaceServerSessions(visible.distinctBy { it.key })
+            val rows = visible.distinctBy { it.key }
+            if (evict) sessionDao.replaceServerSessions(rows) else sessionDao.upsertAll(rows)
             // A hidden chat survives only while the DAO keeps it for unsent work; its transcript goes at once.
             for (row in hidden) {
                 if (sessionDao.get(row.key) == null) continue

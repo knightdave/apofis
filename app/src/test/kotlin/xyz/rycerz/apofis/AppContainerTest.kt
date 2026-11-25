@@ -17,6 +17,9 @@ import java.io.IOException
 import java.security.GeneralSecurityException
 import javax.crypto.KeyGenerator
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -24,6 +27,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -255,6 +259,42 @@ class AppContainerTest {
         } finally {
             container.onStop()
             container.awaitLifecycle()
+            server.close()
+        }
+    }
+
+    @Test
+    fun refreshesCoalesce() = runTest {
+        val lists = AtomicInteger()
+        val arrived = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        val server = MockWebServer().apply {
+            dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    if (request.method != "GET" || request.url.encodedPath != "/api/sessions") return MockResponse.Builder().code(404).build()
+                    if (lists.incrementAndGet() == 1) {
+                        arrived.countDown()
+                        gate.await(10, TimeUnit.SECONDS)
+                    }
+                    return MockResponse.Builder().code(200).body("""{"object":"list","data":[],"has_more":false}""")
+                        .addHeader("Content-Type", "application/json").build()
+                }
+            }
+            start()
+        }
+        try {
+            container.connect(Credentials(server.url("/").toString(), "k")) // no onStart: its resume would ask once more
+            val c = container.connected()!!
+            c.refresh()
+            withContext(Dispatchers.IO) { assertTrue(arrived.await(10, TimeUnit.SECONDS)) } // the first list read is held
+            repeat(3) { c.refresh() } // a foreground return and two finished runs meanwhile
+            gate.countDown()
+            withContext(Dispatchers.Default) { withTimeout(10_000) { c.repo.refreshed.first { it == 2L } } }
+            // The lock is fair: a refresh already waiting for it (one per ask, without the coalescing) runs before this.
+            withRepositoryLock { }
+            assertEquals(2, lists.get())
+        } finally {
+            gate.countDown()
             server.close()
         }
     }
