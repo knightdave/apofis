@@ -198,7 +198,7 @@ fun ChatScreen(
         BottomInput(
             state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
             state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed, enterToSend, expanded, state.sessionKey,
-            state.status == StatusLine.LOAD_FAILED, state.images, state.choice.model,
+            state.status == StatusLine.LOAD_FAILED, state.images, state.choice.model.takeIf { Command.MODEL in paletteMatches(state.draft) },
         ),
     )
     // One gate for everything the chat can do: while the drawer covers it, a press that was already down (another
@@ -745,7 +745,9 @@ private data class BottomInput(
     val sessionKey: String,
     val loadFailed: Boolean,
     val images: List<DraftImage>,
-    val model: String?, // the chat's model choice, shown on the palette's /model row
+    // The chat's model choice for the palette's /model row, only while the draft shows that row: a choice made
+    // otherwise recomposes nothing here.
+    val model: String?,
 )
 
 /** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it; with firstLoad (the skeleton). */
