@@ -59,7 +59,7 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly revealScrollsFirstAndJudgesProgressByWhatIsShown
   anObservationFinishingAfterTheDeadlineDoesNotCount anEvidenceFailureInsideTheDeadlineWaitEscapes settingsRowValueIsAWholeSegment
   leaveNeedsEveryDeletedIdProvedThisRuns modelChoiceOutcomeNeedsItsEvidence storedImageRowIsReducedToItsStructure drawerPagesMergeOnTheirOverlap
-  quietWaitNamesItsStepOnly)
+  quietWaitNamesItsStepOnly aRunRecordAnsweredAfterTheLimitDoesNotCount)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
 # Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
 # tunnel. Gate 1's start no model run.
@@ -1484,9 +1484,14 @@ evaluate() {
   done
   [ -s "$dir/logcat.txt" ] || { log "  missing logcat.txt (logcat retrieval failed)"; bad=1; }
   # The device hides error dialogs (hide_error_dialogs): an error of the app is judged from the system's own lines.
-  if [ -s "$dir/logcat.txt" ] && app_error_logged "$dir/logcat.txt"; then
-    log "  FAILED: the system logged a crash or a not-responding of the app or its test process"
-    bad=1
+  if [ -s "$dir/logcat.txt" ]; then
+    m=0
+    app_error_logged "$dir/logcat.txt" || m=$?
+    case $m in
+      0) log "  FAILED: the system logged a crash or a not-responding of the app or its test process"; bad=1 ;;
+      1) ;;
+      *) log "  FAILED: the log could not be scanned for errors of the app"; bad=1 ;;
+    esac
   fi
   if [ "$mode" = m4 ]; then
     if share_log_ok "$dir/logcat.txt"; then log "  share log: exactly one ApofisShare image TOO_LARGE line"
@@ -1502,18 +1507,21 @@ evaluate() {
 # The app's processes, by the names the system logs: the app, the e2e test process, and any named process of either.
 APP_PROCS='xyz\.rycerz\.apofis(\.e2e)?(:[A-Za-z0-9_.]+)?'
 
-# app_error_logged <logcat>: true when the system logged a fatal exception ("Process: <name>, PID: <n>" of
-# AndroidRuntime) or a not-responding ("ANR in <name>" of ActivityManager) of one of the app's processes. Another app's
-# (the launcher's) does not count; a force-stop or a kill logs neither. Prints nothing.
+# app_error_logged <logcat>: 0 when the system logged a fatal exception ("Process: <name>, PID: <n>" of AndroidRuntime)
+# or a not-responding ("ANR in <name>" of ActivityManager) of one of the app's processes, 1 when it logged none, else
+# the log could not be read. Another app's (the launcher's) does not count; a force-stop or a kill logs neither. One
+# grep on the file, no pipe: its own status is the verdict (a pipe under pipefail turned an early match into "none").
+# adb's lines may end in a carriage return. Prints nothing.
 app_error_logged() {
-  tr -d '\r' <"$1" | grep -qE " E AndroidRuntime: Process: $APP_PROCS, PID: [0-9]+$| E ActivityManager: ANR in $APP_PROCS( |$)"
+  grep -qE " E AndroidRuntime: Process: $APP_PROCS, PID: [0-9]+"$'\r'"?\$| E ActivityManager: ANR in $APP_PROCS( |"$'\r'"?\$)" -- "$1"
 }
 
 # share_log_ok <logcat>: exactly one ApofisShare image line (one per refused image), and it names TOO_LARGE: the one
 # refusal --m4 expects, the 8001 x 8000 share's pixel cap. Prints nothing.
 share_log_ok() {
   local l
-  l=$(tr -d '\r' <"$1" | grep -E ' I ApofisShare: image [A-Z_]+$') || return 1
+  l=$(grep -E " I ApofisShare: image [A-Z_]+"$'\r'"?\$" -- "$1") || return 1 # one grep on the file, no pipe
+  l=${l%$'\r'}
   [ "$(grep -c . <<<"$l")" = 1 ] && [[ $l == *' image TOO_LARGE' ]]
 }
 

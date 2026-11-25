@@ -458,6 +458,19 @@ class HarnessSelfTest {
     }
 
     @Test
+    fun aRunRecordAnsweredAfterTheLimitDoesNotCount() {
+        val id = "run_0123456789abcdef0123456789abcdef"
+        val done = JSONObject().put("run_id", id).put("status", "completed")
+        val running = JSONObject().put("run_id", id).put("status", "running")
+        assertEquals("a terminal answer at the limit counts", SendEnd.Run(id, done), decideRunRead(id, done, 1_000, 1_000, 300_000))
+        assertEquals("a terminal answer after the limit is no proof", SendEnd.Unknown("no settled run within 300 s"), decideRunRead(id, done, 1_001, 1_000, 300_000))
+        assertNull("not terminal yet: read again", decideRunRead(id, running, 500, 1_000, 300_000))
+        assertNull("a transient failure: read again", decideRunRead(id, null, 500, 1_000, 300_000))
+        assertEquals(SendEnd.Unknown("the run record is invalid or not this send's"), decideRunRead(id, INVALID_RUN, 500, 1_000, 300_000))
+        assertEquals("a late transient failure ends it too", SendEnd.Unknown("no settled run within 300 s"), decideRunRead(id, null, 1_001, 1_000, 300_000))
+    }
+
+    @Test
     fun quietWaitNamesItsStepOnly() {
         val app = AppDriver()
         app.quiet = true

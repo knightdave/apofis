@@ -207,11 +207,12 @@ class M4E2eTest {
 
     /**
      * Opens the model sheet through the palette (its row tapped in the app's window by its own action) and taps [pick]
-     * (slug to model) or, null, Server default, inside the sheet only. The sheet's list is found once while its title
-     * shows and kept (none: a list that fits, searched as it is). With a pick, the sheet must first show loaded rows (a
-     * provider heading besides its title; the load-failed text fails at once). Rows are matched as rows: clickable, not a
-     * heading. A visible hit needs no scroll; otherwise the kept list is searched to both ends ([AppDriver.seek]); an
-     * exhausted bound is "inconclusive: list too long". Before returning, i.e. before any send: the sheet is gone (its
+     * (slug to model) or, null, Server default, inside the sheet only. With a pick, the sheet must first show loaded rows
+     * (a provider heading besides its title; the load-failed text fails at once): the sheet is shown empty before its
+     * options arrive, so nothing seen while it loads decides the search. Rows are matched as rows: clickable, not a
+     * heading. A visible hit needs no scroll; otherwise the loaded sheet's list is found (looked for again, bounded, when
+     * it is not scrollable at first; none: a list that fits, searched as it is), kept, and searched to both ends
+     * ([AppDriver.seek]); an exhausted bound is "inconclusive: list too long". Before returning, i.e. before any send: the sheet is gone (its
      * handle) and the chat's stored provider and model equal the pick field by field (both empty for Server default).
      */
     private fun chooseModel(key: String, pick: Pair<String, String>?) {
@@ -223,20 +224,29 @@ class M4E2eTest {
 
         app.setField(app.composerField() ?: fail("No composer"), "/m")
         app.paletteRow("model")
-        var list: AccessibilityNodeInfo? = null
-        app.waitFor("the model sheet", 10_000) {
-            val heading = sheet()?.let { s -> app.nodesIn(s) { it.isHeading && it.text?.toString() == title }.firstOrNull() } ?: return@waitFor false
-            list = generateSequence(heading) { it.parent }.firstOrNull { it.isScrollable }
-            true
-        }
+        app.waitFor("the model sheet", 10_000) { sheet()?.let { s -> app.nodesIn(s) { it.isHeading && it.text?.toString() == title } }.orEmpty().isNotEmpty() }
         app.waitFor("the model rows loaded", 20_000) {
             val s = sheet() ?: fail("The model sheet closed before the pick")
             if (app.nodesIn(s) { it.text?.toString() == app.str("model_load_failed") }.isNotEmpty()) fail("The model list failed to load")
             if (pick == null) rows(s, target).isNotEmpty() else app.nodesIn(s) { it.isHeading && it.text?.toString() != title }.isNotEmpty()
         }
         val shown = { sheet()?.let { s -> app.nodesIn(s) { it.isVisibleToUser && it.text != null }.map { "${it.text}@" + Rect().also(it::getBoundsInScreen) } }.orEmpty() }
-        val row = app.seek(list, 60, "list too long", "the model list is gone", shown) { sheet()?.let { s -> rows(s, target).firstOrNull() } }
-            ?: fail("The chosen row is not in the model sheet")
+        fun find() = sheet()?.let { s -> rows(s, target).firstOrNull() }
+        // The loaded sheet's scrollable list, above a provider heading or the Server default row; looked for again, up to
+        // 2 s, before concluding that the rows fit (a list that grew may report scrollable a moment later).
+        fun loadedList(): AccessibilityNodeInfo? = sheet()?.let { s ->
+            app.nodesIn(s) { (it.isHeading && it.text?.toString() != title) || rows(s, app.str("model_default")).contains(it) }
+                .firstNotNullOfOrNull { a -> generateSequence(a) { it.parent }.firstOrNull { it.isScrollable } }
+        }
+        val row = find()?.takeIf { it.isVisibleToUser } ?: run {
+            var list = loadedList()
+            val until = SystemClock.uptimeMillis() + 2_000
+            while (list == null && SystemClock.uptimeMillis() < until) {
+                SystemClock.sleep(200)
+                list = loadedList()
+            }
+            app.seek(list, 60, "list too long", "the model list is gone", shown, ::find)
+        } ?: fail("The chosen row is not in the model sheet")
         val button = app.clickableOf(row)?.takeIf { it.isEnabled } ?: fail("The chosen row is not an enabled button")
         if (!button.performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping the chosen row failed")
         app.log("tapped the chosen row") // never its name

@@ -1111,12 +1111,27 @@ lc "$T0 E ActivityManager: ANR in com.google.android.apps.nexuslauncher (com.goo
 check "app errors: the launcher's not-responding and other apps' crashes (a longer name too) are not the app's" '! app_error_logged "$t/lc.txt"'
 lc "$T0 I ApofisE2e: scenario starts" "$T0 I ApofisE2e: scenario ends"
 check "app errors: a clean log passes" '! app_error_logged "$t/lc.txt"'
+# A match on the FIRST line, then more than a pipe buffer (128 KiB here) of ordinary lines: the verdict must still see it.
+long_tail() { { printf '%s\r\n' "$@"; for i in $(seq 3000); do printf '%s I ApofisE2e: an ordinary line of the run, number %05d\r\n' "$T0" "$i"; done; } >"$t/long.txt"; }
+long_tail "$T0 E AndroidRuntime: Process: xyz.rycerz.apofis, PID: 1234"
+check "app errors: a crash on the first line of a log longer than 128 KiB is found (CRLF lines)" '[ "$(wc -c <"$t/long.txt")" -gt 131072 ] && app_error_logged "$t/long.txt"'
+long_tail "$T0 E ActivityManager: ANR in xyz.rycerz.apofis (xyz.rycerz.apofis/.MainActivity)"
+check "app errors: a not-responding on the first line of a log longer than 128 KiB is found" 'app_error_logged "$t/long.txt"'
+long_tail "$T0 I ApofisE2e: scenario starts"
+check "app errors: the same long log with no error passes" '! app_error_logged "$t/long.txt"'
+check "app errors: an unreadable log is not taken as clean" '! (app_error_logged "$t/no-such-log.txt"; [ "$?" = 1 ])'
+long_tail "$T0 I ApofisShare: image TOO_LARGE"
+check "share log: one TOO_LARGE line on the first line of a long log passes" 'share_log_ok "$t/long.txt"'
 check "app errors: the exported logcat takes the system's crash and not-responding lines" 'grep -q "adb logcat -d -v threadtime .* AndroidRuntime:E ActivityManager:E .\*:S." "$here/run-e2e.sh"'
 cp "$t/ev/instrument.txt" "$t/ev/instrument.keep"
 for m in "${M4_TESTS[@]}"; do echo "${m/\#/.} PASS"; done | instrument_for >"$t/ev/instrument.txt"
 printf '%s\n' "$S TOO_LARGE" "$T0 E AndroidRuntime: FATAL EXCEPTION: main" "$T0 E AndroidRuntime: Process: xyz.rycerz.apofis, PID: 1234" >"$t/ev/logcat.txt"
 rc=0; o=$( (mode=m4; evaluate "$t/ev") 2>&1) || rc=$?
 check "evaluate: every method passed but the app crashed: fails with the fixed message, no log text" '[ "$rc" = 1 ] && has "$o" "FAILED: the system logged a crash or a not-responding of the app" && lacks "$o" "FATAL" && lacks "$o" "PID"'
+long_tail "$T0 E ActivityManager: ANR in xyz.rycerz.apofis (xyz.rycerz.apofis/.MainActivity)" "$S TOO_LARGE"
+cp "$t/long.txt" "$t/ev/logcat.txt"
+rc=0; o=$( (mode=m4; evaluate "$t/ev") 2>&1) || rc=$?
+check "evaluate: every method passed, an app ANR first in a log longer than 128 KiB: fails" '[ "$rc" = 1 ] && has "$o" "FAILED: the system logged a crash or a not-responding of the app" && lacks "$o" "ANR in"'
 cp "$t/ev/instrument.keep" "$t/ev/instrument.txt"
 
 # The two authenticated reads keep only booleans. Stub bodies carry canaries; nothing of them may come out.

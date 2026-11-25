@@ -621,36 +621,35 @@ class AppDriver {
             if (id != null) {
                 if (!RUN_ID.matches(id)) return SendEnd.Unknown("a malformed run id")
                 // The body's session id; once its row is gone (settled first), the chat's id at that moment.
-                val r = readRun(id, session ?: chatRow(key)?.currentId ?: key)
-                when {
-                    r == null -> unreadable = true // a timeout, a dropped connection or a 5xx: read again while time is left
-                    r === INVALID -> return SendEnd.Unknown("the run record is invalid or not this send's")
-                    else -> {
-                        unreadable = false
-                        if (r.optString("status") in PushE2eTest.TERMINAL_RUN) return SendEnd.Run(id, r)
-                    }
-                }
+                val left = end - SystemClock.uptimeMillis()
+                if (left <= 0) break
+                val r = readRun(id, session ?: chatRow(key)?.currentId ?: key, left.toInt()) // its timeouts: the time left
+                decideRunRead(id, r, SystemClock.uptimeMillis(), end, timeoutMs)?.let { return it } // the clock read after the answer
+                unreadable = r == null // a timeout, a dropped connection or a 5xx: read again while time is left
             } else if (ids != null) {
                 when (query("SELECT state || '|' || attempted FROM PendingSendEntity WHERE sessionKey = '$key';")?.singleOrNull()) {
                     "failed|0" -> return SendEnd.NotAdmitted
                     "failed|1" -> return SendEnd.Unknown("the send failed after it may have reached the server")
                 }
             }
-            SystemClock.sleep(1_000)
+            SystemClock.sleep((end - SystemClock.uptimeMillis()).coerceIn(0, 1_000))
         }
-        return if (unreadable) SendEnd.RecordUnreadable else SendEnd.Unknown("no settled run within ${timeoutMs / 1000} s")
+        return if (unreadable) SendEnd.RecordUnreadable else SendEnd.Unknown(notSettled(timeoutMs))
     }
 
-    /** The record of run [id] if it is [session]'s; null on a transient failure; [INVALID] for any other answer. Never logged. */
-    private fun readRun(id: String, session: String): JSONObject? {
+    /**
+     * The record of run [id] if it is [session]'s; null on a transient failure; [INVALID_RUN] for any other answer.
+     * Its connect and read timeouts are [timeoutMs] at most. Never logged.
+     */
+    private fun readRun(id: String, session: String, timeoutMs: Int): JSONObject? {
         val (code, body) = try {
-            http("GET", "v1/runs/$id")
+            http("GET", "v1/runs/$id", timeoutMs)
         } catch (e: java.io.IOException) {
             return null
         }
         if (code >= 500) return null
         val r = if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null
-        return r?.takeIf { it.optString("run_id") == id && it.optString("session_id") == session } ?: INVALID
+        return r?.takeIf { it.optString("run_id") == id && it.optString("session_id") == session } ?: INVALID_RUN
     }
 
     /** Waits, bounded, until the phone itself has settled chat [key]: no run it follows and no pending send for it. */
@@ -806,7 +805,22 @@ sealed interface SendEnd {
 const val QUIET = "(not shown: fixed diagnostics)"
 
 /** [AppDriver]'s marker for a run record that answered but is not to be trusted. */
-private val INVALID = JSONObject()
+val INVALID_RUN = JSONObject()
+
+/** The reason given for a send whose run did not settle within [timeoutMs]. */
+fun notSettled(timeoutMs: Long) = "no settled run within ${timeoutMs / 1000} s"
+
+/**
+ * One read of run [id]'s record, decided: [record] answered at [answeredAt] never counts after [deadline] (the run did
+ * not settle in time, whatever the record says); within it, a terminal record is the send's end, an invalid one
+ * ([INVALID_RUN]) ends it unknown, and anything else (not terminal, or a transient failure: null) means read again.
+ */
+fun decideRunRead(id: String, record: JSONObject?, answeredAt: Long, deadline: Long, timeoutMs: Long): SendEnd? = when {
+    answeredAt > deadline -> SendEnd.Unknown(notSettled(timeoutMs))
+    record === INVALID_RUN -> SendEnd.Unknown("the run record is invalid or not this send's")
+    record != null && record.optString("status") in PushE2eTest.TERMINAL_RUN -> SendEnd.Run(id, record)
+    else -> null
+}
 
 /**
  * Every run id the phone recorded for chat [key]: the run it follows, its send's run id, and a settled finish (the
