@@ -31,12 +31,12 @@ import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.chat.ComposerNote
 import xyz.rycerz.apofis.chat.NoteKind
+import xyz.rycerz.apofis.sync.cleanTitle
 import xyz.rycerz.apofis.sync.isTemporaryKey
 import xyz.rycerz.apofis.sync.newSessionId
 
 private const val REFRESH_INTERVAL_MS = 30_000L
 private const val LEAVE_TIMEOUT_MS = 10_000L
-const val TITLE_MAX = 120
 
 enum class PromptKind { ACTIONS, RENAME, DELETE }
 
@@ -410,8 +410,7 @@ class DrawerViewModel(
     }
 
     override fun confirmRename(token: Long, title: String) {
-        val clean = title.trim().take(TITLE_MAX)
-        if (clean.isEmpty()) return
+        val clean = cleanTitle(title) ?: return
         act(token, PromptKind.RENAME) { repo.rename(it.key, clean) }
     }
 
