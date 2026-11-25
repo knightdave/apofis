@@ -117,7 +117,7 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
                 var menu by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf(false) }
                 Box {
                     ApofisIconButton(onClick = { chatGate { menu = true } }, contentDescription = stringResource(R.string.chat_approval_more), enabled = !answering) {
-                        Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp))
+                        Icon(painterResource(R.drawable.lucide_ellipsis_vertical), null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurface) // the card gives no content colour
                     }
                     // Marked once per showing, on the frame it shows, also one with no click (restored, or after answering).
                     if (menu && !answering) OverChat(gate.overlays)
