@@ -166,7 +166,8 @@ class Fake:
 
     def children_exited(self, wait: float) -> bool:
         """Every child pid published in a slot file that is still this fixture's child has exited (a child releases
-        its slot just before it exits)."""
+        its slot just before it exits). "Has exited" means "is no longer this fixture's child" (an exiting child's
+        cmdline is already empty): its stat may still show it alive for a moment, but it does no further I/O."""
         end = time.monotonic() + wait
         while True:
             pids = []

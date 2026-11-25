@@ -33,6 +33,8 @@ shell user. Tests:
   harness never approves anything: an approval block on screen fails the scenario without being touched.
 - `PushE2eTest` (Milestone 3, see "Push" below): `connectorLifecycle`, `hostilePushes` and `permissionAndTestPush` (no
   model run), and `pushWakesKilledApp` (one model run). `--full` never runs them: they need push provisioning.
+- `ShareE2eTest`, `M4E2eTest` and `ImageE2eTest` (Milestone 4, see "Milestone 4" below): sharing into the app,
+  temporary chats and the per-chat model choice. `--full` never runs them.
 
 ## The two hosts
 
@@ -66,8 +68,8 @@ shell user. Tests:
    whose device shell reads it and passes it to `am instrument -w -r -e apofisKey ...`. The key is never on a host
    command line, in an environment, in a file or in a long-lived shell variable on the emulator host. Every shell on
    either host that can receive key bytes runs with `ulimit -c 0` (checked) before the key is read.
-6. Always, also on failure or interrupt: pulls the device files and a filtered logcat (tags `ApofisE2e`, `ApofisWake`,
-   `TestRunner`, `AndroidRuntime`), reports the session journal (only exact lines, a complete file, with a count),
+6. Always, also on failure or interrupt: pulls the device files and a filtered logcat (tags `ApofisE2e`, `ApofisWake`, `ApofisShare`,
+   `TestRunner`, `AndroidRuntime`, errors of `ActivityManager`), reports the session journal (only exact lines, a complete file, with a count),
    stops the emulator and adb server (every stop and check under `timeout` with a kill fallback), deletes the AVD (the
    app's storage, the only place the key rests, goes with it). Only when every writer is gone, it stages a fixed
    allowlist in `.state/runs/<run-id>/export/`: `instrument.txt`, `results.txt` (one line per test result file),
@@ -127,9 +129,11 @@ way and still waits for its cleanup and checks.
 tools/emulator/run-e2e.sh --smoke                      # SmokeE2eTest and HarnessSelfTest, no model run
 tools/emulator/run-e2e.sh --scenario stopDuringRun     # one survival scenario, one model run
 tools/emulator/run-e2e.sh --test 'SmokeE2eTest#connectViaLoopback'
-tools/emulator/run-e2e.sh --full                       # every e2e test but PushE2eTest: about 7 model runs, 15 minutes
+tools/emulator/run-e2e.sh --full                       # every e2e test but PushE2eTest and the Milestone 4 classes: about 7 model runs, 15 minutes
 tools/emulator/run-e2e.sh --push                       # the push scenarios with a local fake ntfy, no model run
 tools/emulator/run-e2e.sh --push-model                 # pushWakesKilledApp, connectAndChat, replySurvivesProcessDeath
+tools/emulator/run-e2e.sh --m4                         # the Milestone 4 share and temporary chat scenarios: no live transport, no model run
+tools/emulator/run-e2e.sh --m4-model                   # imageSendConfirms, temporaryChatGoneAfterLeaving, modelChoiceReachesRun, replySurvivesProcessDeath
 tools/emulator/run-e2e-selftest.sh                     # the script's own safeguards, locally: no host, no key
 ```
 
@@ -161,8 +165,10 @@ contacts ntfy.sh or any other push host.
 | `--push` | `PushE2eTest` `connectorLifecycle`, `hostilePushes`, `permissionAndTestPush` | yes | 0 |
 | `--push-model` | `PushE2eTest#pushWakesKilledApp`, `SurvivalE2eTest#connectAndChat`, `SurvivalE2eTest#replySurvivesProcessDeath` | the push method | at most 3 |
 | `--test PushE2eTest#pushWakesKilledApp` | that method alone: gate 2 | the push method | at most 1 (reserves 1) |
-| `--test <Class#method>` | a push method or one of those three: as its row; any other test of the module: as before | per row | per row |
-| anything else (`--test PushE2eTest`, a suite name such as `--test push-model`, an unknown class, method or scenario, extra arguments) | refused before any action | | |
+| `--m4` | `ShareE2eTest#shareTextAndImageOpensNewChat`, `ShareE2eTest#pixelCapJustOverRefused`, `M4E2eTest#temporaryToggleMarks`, with no live transport (Milestone 4) | no | 0 |
+| `--m4-model` | `ImageE2eTest#imageSendConfirms`, `M4E2eTest#temporaryChatGoneAfterLeaving`, `M4E2eTest#modelChoiceReachesRun`, `SurvivalE2eTest#replySurvivesProcessDeath` (Milestone 4) | no | at most 4 |
+| `--test <Class#method>` | a push method or a method of `--push-model` or `--m4-model`: as its row, reserving 1; any other test of the module: as before | per row | per row |
+| anything else (`--test PushE2eTest`, `--test ImageE2eTest`, `--test M4E2eTest`, a suite name such as `--test push-model` or `--test m4-model`, an unknown class, method or scenario, extra arguments) | refused before any action | | |
 
 - **Identities.** Before anything else the build host mints one install id (a random UUID) per push scenario, the topic
   (`up` and 12 random letters and digits) and, once the tunnel port is known, a port free on both hosts. For each
@@ -205,9 +211,10 @@ contacts ntfy.sh or any other push host.
   do), then only for `source == "api_server"` and exactly the journaled title, `DELETE` and `GET` 404. An install with a
   missing export is not cleaned; nothing is ever deleted without an intent. Then every install is listed again: any
   record left fails the run with "push records may remain", naming it, without deleting it.
-- **The ledger.** `--push-model` and its `--test` selections first reserve their proved upper bounds (1 per method) in
-  `~/.local/state/apofis-e2e/model-budget-m3`, shared by every worktree and appended under `flock`
-  (`reserve <run id> <method> <bound>`), and refuse when the counted starts plus the new bounds would pass 8, the ledger
+- **The ledger.** Every model method's selection (`--push-model`, `--m4-model` and their `--test` selections) first
+  reserves its proved upper bound (1 per method) in `~/.local/state/apofis-e2e/model-budget-m4` (Milestone 4; Milestone
+  3's `model-budget-m3` is closed and stays untouched), shared by every worktree and appended under `flock`
+  (`reserve <run id> <method> <bound>`), and refuses when the counted starts plus the new bounds would pass 10, the ledger
   is unreadable, not exactly in its two line forms or torn, or a proposal repeats a run and method or one already
   reserved (one parser reads existing and proposed entries). A reservation belongs to the invocation that made it:
   only it may change it. Once the key was handed to the device the reservation stays at its bound whatever was
@@ -218,6 +225,81 @@ contacts ntfy.sh or any other push host.
   naming a test chat to the owner's ntfy endpoint.
 - **Logs.** The exported logcat adds the app's debug tag `ApofisWake` (one line per wake check: cause, runs, settled,
   failed, outcome; no ids).
+
+## Milestone 4
+
+| Invocation | Selects | Model starts (proved upper bound) |
+|---|---|---|
+| `--m4` | `ShareE2eTest#shareTextAndImageOpensNewChat`, `ShareE2eTest#pixelCapJustOverRefused`, `M4E2eTest#temporaryToggleMarks` | 0 |
+| `--m4-model` | `ImageE2eTest#imageSendConfirms`, `M4E2eTest#temporaryChatGoneAfterLeaving`, `M4E2eTest#modelChoiceReachesRun`, `SurvivalE2eTest#replySurvivesProcessDeath` | 4 (one message each, no steer) |
+| `--test M4E2eTest#modelPickIsReachable` | the model sheet through the slash palette: the alternative picked and stored, Server default restored, nothing sent | 0 (no reservation) |
+
+- **The budget.** At most 10 model starts in the whole milestone, across all worktrees and retries, reserved in
+  `~/.local/state/apofis-e2e/model-budget-m4` (see "The ledger" above): `--m4-model` and every single `--test` of a
+  model method, `SurvivalE2eTest#replySurvivesProcessDeath` included. Settlement is Milestone 3's rule: a reservation is
+  released only when the key never left the build host; once it was handed to the device it stays at its bound (a
+  crash, a 404 at counting, a refusal before admission and `modelChoiceReachesRun` whatever its outcome). Observed starts
+  come from the run's own log lines (the cleanup's session lines and each method's `ApofisE2e` lines), never from the
+  server. `--m4-model` is reserved once: when the ledger already holds a reservation (released or not) of any of its
+  methods, it is refused before any reservation. The check reads the ledger while this host's lock is held, which every
+  invocation by this user takes before it reserves, so no other invocation can reserve or release in between. Retries then go method by method with `--test <Class#method>`, in the
+  table's order (not enforced). During Milestone 4, `--full`, `--scenario <name>`, `--test SurvivalE2eTest` and `--test
+  SurvivalE2eTest#<another method>` are not to be used: they still start model runs (and print the hook warning) but are
+  outside the ledger, so their starts would not be counted.
+- **No live transport (`--m4`).** Each method clears the app's data, connects through the emulator's host alias (this
+  setup connect reaches the server), then turns airplane mode on and waits until the setting is on and the status line
+  says Offline before its first action. It never sends and makes no request of its own. Its end clears the app's data
+  (checked; it also stops the process) before airplane mode goes off, so nothing it did can reach the server on a
+  reconnect. On the build host `--m4` fails when the session journal holds any line at all.
+- **The share fixtures.** The e2e APK serves three generated PNGs from `FixtureImageProvider` (authority
+  `xyz.rycerz.apofis.e2e.fixtures`, not exported, `grantUriPermissions`): 640 x 480 for the caption shares, 8001 x 8000
+  (64,008,000 pixels, one row past the decoder's cap) and 8000 x 8000 (exactly the cap). They are solid 1-bit grayscale
+  PNGs of a few kilobytes, written by a streaming encoder, never through a Bitmap; `pixelCapJustOverRefused` first checks
+  through its own resolver that both large ones are within the byte cap and sized as named. The tests share them with
+  `ACTION_SEND` and the read grant in ClipData, started from the test process. No app manifest names the provider
+  (checked by the self-test), and the e2e APK's manifest is never merged into the app.
+- **The share log check.** After `--m4` the exported logcat (tag `ApofisShare`, the app's debug line per refused image)
+  must hold exactly one `ApofisShare: image <reason>` line, and its reason must be `TOO_LARGE`: the 8001 x 8000 share's.
+- **The two reads.** After `--m4` passes, the build host reads `GET /v1/toolsets` and `GET /api/model/options` with the
+  key, each reduced at once to fixed booleans: `image_gen_enabled` (an enabled toolset offers `image_generate`) and, for
+  `providers`, `model`, `provider`, `slug`, `models`, `capabilities`, `usage`, `limit` and `warning`, whether the answer
+  holds that key (at the top level or on a provider row). It logs only `<key>=true|false|unknown` (`unknown` for a
+  non-200 answer or a body that does not parse); no body, value or status is printed or kept.
+- **The model picker check.** `modelPickIsReachable` needs the slash palette (Task 8a-2), so it is in neither suite.
+  Run it once as `--test M4E2eTest#modelPickIsReachable` (no reservation) before the first run that includes
+  `modelChoiceReachesRun`: it opens the model sheet through the palette, picks the same alternative that method would,
+  proves the chat's stored choice, restores Server default the same way and sends nothing. Both methods use one picker
+  that proves the sheet gone and the stored choice before anything is sent. Both run with the driver's fixed
+  diagnostics on for their whole length (setup, picker, Send, every wait): a failure names its step only, never the
+  screen (the sheet lists model and provider names).
+- **The choice outcome.** `modelChoiceReachesRun` logs one of `proved`, `served differs`, `not proved: no runtime`,
+  `not proved: no alternative` (recorded results), or `not admitted: zero starts`, `unknown: run record unreadable`,
+  `unproved failure, starts unknown` (failures). `not admitted: zero starts` rests on the app's own mark: the app marks a
+  send as attempted before the request and clears the mark only on a definite refusal or a failure before the request
+  left; the request may have reached the server and been refused. No word claims a status code. A run record that cannot
+  be read is read again on a timeout, a dropped connection or a 5xx while time is left; an invalid or foreign record is
+  never trusted; the identity-checked session evidence (counts only) is logged whatever the record gave.
+- **Leaving a chat.** `imageSendConfirms` and `temporaryChatGoneAfterLeaving` leave their temporary chat only after
+  the phone itself has settled the run (no run it follows, no pending send for the chat) and then every id the app will
+  delete for it (its current id, its lineage and its key, as the app builds them) is journaled and proved this run's
+  by a GET of that id with this run's nonce in its title; one unproved id fails the method before the leave, and
+  nothing else runs between the proof and the tap. An id the server adds to that chat between the proof and the
+  phone's delete (the app's refresh after a finish can still write the row) is deleted without its own proof; a chat
+  of one short message gets no new id. After the leave, `temporaryChatGoneAfterLeaving` judges by the server's answers
+  for each id, the phone's own row for that key and the note in the next chat; it does not observe the drawer: that
+  the drawer draws only local rows is pinned by the app's unit tests.
+- **Errors of the app.** The device hides error dialogs (`hide_error_dialogs`, so a launcher not responding just after
+  boot cannot cover the app). The run therefore fails when the exported logcat holds the system's line for a fatal
+  exception (`AndroidRuntime`) or a not-responding (`ActivityManager`, `ANR in`) of the app or its test process, with a
+  fixed message and no log text. Another app's not-responding does not fail it; a force-stop or a kill (the survival
+  test's) logs neither.
+- **Temporary chats.** Their ids (`apofis-tmp-<uuid>`) are app ids for the journal and the cleanup. A journaled id that
+  answers 404 at cleanup counts as gone (the app deleted it): it passes the cleanup, which is not by itself a pass of
+  the scenario.
+- **What the exported logcat names.** By design it names this run's test texts (prompts, captions) and journaled
+  session ids: Task 13b needs the ids as proof of ownership. The harness's own new lines (the share check, the two
+  reads, the ledger and the refusals) name none of them, and never a model or provider (checked with canaries by the
+  self-test).
 
 ## Cleaning up by hand
 

@@ -21,7 +21,7 @@ const val POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS"
 const val OUT_DIR = "/data/local/tmp/apofis-e2e" // written as the shell user; run-e2e.sh pulls it
 const val SESSIONS = "$OUT_DIR/sessions.txt" // the session journal, created empty by run-e2e.sh before the tests run
 private const val TAG = "ApofisE2e"
-private val SESSION_ID = Regex("apofis-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+private val SESSION_ID = Regex("apofis-(tmp-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}") // apofis-tmp-: a temporary chat
 private val RUN_ID = Regex("run_[0-9a-f]{32}")
 private val SCENARIO = Regex("[A-Za-z]{1,40}")
 private val UUID = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -58,6 +58,13 @@ class AppDriver {
 
     /** The scenario now running, written into each journal line. */
     var scenario = "none"
+
+    /**
+     * Fixed diagnostics: while true, [dump] and [screen] (every failure text and log that shows the screen) give a fixed
+     * placeholder instead of the tree or its labels, so a failure names its step only. For the methods whose screens list
+     * model and provider names; set at their first statement, for their whole length.
+     */
+    var quiet = false
 
     /** A string of the app, by resource name: the tests find elements by what the user sees. */
     fun str(name: String, vararg format: Any): String =
@@ -162,6 +169,9 @@ class AppDriver {
         return if (out.lastOrNull() == "@@end") out.dropLast(1) else null
     }
 
+    /** The number of the app's pending sends (every chat). */
+    fun pendingCount(): Int = query("SELECT count(*) FROM PendingSendEntity;")?.singleOrNull()?.toIntOrNull() ?: fail("Could not count the pending sends")
+
     /** The app's active notification keys whose tag is [tag] (the app tags a chat's notification with its session key). */
     fun notificationsTagged(tag: String): List<String> = notifications().filter { it.split('|').getOrNull(3) == tag }
 
@@ -169,12 +179,28 @@ class AppDriver {
     fun pushPrefsRead(): String = shell("run-as $APP cat shared_prefs/push.xml")
 
     /** The server's status of run [runId], after checking it belongs to session [session]. */
-    fun runStatus(runId: String, session: String): String {
+    fun runStatus(runId: String, session: String): String = runRecord(runId, session).optString("status")
+
+    /** The server's record of run [runId], after checking it belongs to session [session]. Never logged. */
+    fun runRecord(runId: String, session: String): JSONObject {
         if (!RUN_ID.matches(runId) || !SESSION_ID.matches(session)) fail("Not a run or session id")
         val (code, body) = http("GET", "v1/runs/$runId")
         val r = if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null
         if (r?.optString("run_id") != runId || r.optString("session_id") != session) fail("GET run $runId answered $code without its session")
-        return r.optString("status")
+        return r
+    }
+
+    /** The server's model options (default model and provider, the providers and their models). Never logged. */
+    fun modelOptions(): JSONObject {
+        val (code, body) = http("GET", "api/model/options")
+        return (if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null) ?: fail("GET model options answered $code")
+    }
+
+    /** GET api/sessions/[id] within [timeoutMs] per phase: its HTTP code and the answer's error.code (null when none). Logs no body. */
+    fun sessionCode(id: String, timeoutMs: Int = 20_000): Pair<Int, String?> {
+        if (!SESSION_ID.matches(id)) fail("Not an app session id")
+        val (code, body) = http("GET", "api/sessions/$id", timeoutMs)
+        return code to runCatching { JSONObject(body).getJSONObject("error").getString("code") }.getOrNull()
     }
 
     /** The server title of session [id], after proving it is this run's (as [serverMessages] does). */
@@ -221,6 +247,32 @@ class AppDriver {
         else -> fail("Could not check /proc/$pid: $r")
     }
 
+    /**
+     * The state --m4 runs in, with no live transport: the app stopped and its data cleared (checked) before airplane mode
+     * goes off (an earlier test may have left it on), a fresh start connected through the emulator's host alias, then airplane mode, proved on by the
+     * setting and the status line. Returns the new chat's key. Nothing the app does after this reaches the server.
+     */
+    fun connectThenOffline(): String {
+        forceStop()
+        freshStart() // the checked clear, still offline when an earlier test left airplane mode on
+        airplane(false)
+        waitFor("airplane mode off", 10_000) { !airplaneOn() }
+        val key = connect(directUrl)
+        airplane(true)
+        waitFor("airplane mode on and the status line showing Offline", 30_000) { airplaneOn() && offline() }
+        return key
+    }
+
+    /** Ends that state: the app's data is cleared (checked; it also stops the process) before airplane mode goes off. */
+    fun clearThenOnline() {
+        val cleared = shell("pm clear $APP").trim()
+        if (cleared != "Success") {
+            forceStop()
+            fail("pm clear did not confirm: $cleared; airplane mode stays on")
+        }
+        airplane(false)
+    }
+
     fun airplane(on: Boolean) {
         shell("cmd connectivity airplane-mode ${if (on) "enable" else "disable"}")
         log("airplane mode ${if (on) "on" else "off"} requested")
@@ -231,6 +283,15 @@ class AppDriver {
         "1" -> true
         "0" -> false
         else -> fail("Unexpected airplane_mode_on: $v")
+    }
+
+    /** The status line (found by its tag) says Offline. */
+    fun offline(): Boolean = snapshot().let { t -> t.tagged("status.line").any { str("chat_status_offline") in t.texts(it) } }
+
+    /** The composer is back to Send: no run is going on. */
+    fun idle(): Boolean {
+        val t = snapshot()
+        return t.tagged("composer.send").any { str("chat_send") in t.descs(it) } && t.tagged("composer.stop").isEmpty()
     }
 
     // ---- reading the screen
@@ -273,7 +334,7 @@ class AppDriver {
     }
 
     /** The snapshot as lines for logcat when an assertion fails (text fields are left out: one may hold the key). */
-    fun dump(): String = snapshot().nodes.filterNot { it.editable }.joinToString("\n") {
+    fun dump(): String = if (quiet) QUIET else snapshot().nodes.filterNot { it.editable }.joinToString("\n") {
         "${it.id}<${it.parent} ${it.resId ?: ""} ${it.cls?.substringAfterLast('.')} [${it.left},${it.top},${it.right},${it.bottom}]" +
             "${if (it.clickable) " click" else ""}${if (it.heading) " heading" else ""}${if (it.liveRegion != 0) " live" else ""}" +
             " text=${it.text} desc=${it.desc} state=${it.state}"
@@ -285,7 +346,7 @@ class AppDriver {
     fun hasDesc(desc: String) = nodes { it.contentDescription?.toString() == desc }.isNotEmpty()
 
     /** Visible texts outside text fields (a field may hold the key), for failure messages. */
-    fun screen() = nodes { it.className != "android.widget.EditText" && !it.label().isNullOrEmpty() }.joinToString(" | ") { it.label()!! }
+    fun screen(): String = if (quiet) QUIET else nodes { it.className != "android.widget.EditText" && !it.label().isNullOrEmpty() }.joinToString(" | ") { it.label()!! }
 
     /**
      * Polls [condition] every half second, calling [meanwhile] each round; fails naming [what] after [timeoutMs].
@@ -303,6 +364,7 @@ class AppDriver {
             if (ok) return
             SystemClock.sleep(500)
         }
+        if (quiet) fail("Not seen within ${timeoutMs / 1000} s: $what") // the step only
         log("screen when \"$what\" timed out:\n${dump()}")
         fail("Not seen within ${timeoutMs / 1000} s: $what. Screen: ${screen()}")
     }
@@ -316,16 +378,89 @@ class AppDriver {
     }
 
     /** Clicks the clickable element showing [label] as its text or content description (or a child's text). */
-    fun click(label: String) {
-        // The labelled node itself or its nearest clickable ancestor (Compose may keep an icon's label on the icon).
-        fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? = if (n.isClickable) n else n.parent?.let(::clickableOf)
-        fun find() = nodes { it.label() == label }.firstNotNullOfOrNull { n -> clickableOf(n)?.takeIf { it.isEnabled } }
-        waitFor("an enabled button \"$label\"", 10_000) { find() != null }
-        val target = find() ?: fail("No enabled button \"$label\". Screen: ${screen()}")
+    fun click(label: String) = tap(label) { it == label }
+
+    /**
+     * Taps the command palette's row of [word] (a row tap runs the command; the draft is not sent), found only in the
+     * app's own windows, through the row's own click action: its label is "/word" or "word", or starts with either
+     * followed by a non-letter (the row's text merged with its description).
+     */
+    fun paletteRow(word: String) {
+        val row = Regex("/?${Regex.escape(word)}(\\P{L}.*)?", RegexOption.DOT_MATCHES_ALL)
+        fun find() = appRoots().flatMap { r -> nodesIn(r) { n -> n.label()?.let(row::matches) == true } }
+            .firstNotNullOfOrNull { n -> clickableOf(n)?.takeIf { it.isEnabled } }
+        waitFor("the palette row \"/$word\"", 10_000) { find() != null }
+        val target = find() ?: fail("No palette row \"/$word\"")
+        if (!target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping the palette row \"/$word\" failed")
+        log("tapped the palette row \"/$word\"")
+    }
+
+    /**
+     * Brings the node [find] returns into view: a visible hit needs no scroll; otherwise [list] (kept by the caller and
+     * refreshed before each scroll; null: a list that fits, searched as it is) is scrolled forward to its end, then
+     * backward to its start, looking after each scroll ([scrollStep] decides an end). Null when both ends were reached
+     * without it; fails "inconclusive: [tooLong]" when [bound] scrolls in one direction did not reach its end.
+     */
+    fun seek(list: AccessibilityNodeInfo?, bound: Int, tooLong: String, gone: String, shown: () -> Any, find: () -> AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        fun hit() = find()?.takeIf { it.isVisibleToUser }
+        hit()?.let { return it }
+        if (list == null) return null
+        for (action in listOf(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD, AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) {
+            var ended = false
+            for (i in 0 until bound) {
+                if (!scrollStep(list, action, gone, shown)) {
+                    ended = true
+                    break
+                }
+                hit()?.let { return it }
+            }
+            if (!ended) fail("inconclusive: $tooLong")
+        }
+        return hit()
+    }
+
+    /**
+     * One scroll of [list]: true once what [shown] returns changed (waited for, up to 2 s, since the tree follows a
+     * scroll later); false at that direction's end (the scroll refused, or nothing changed within the wait). Fails
+     * "inconclusive: [gone]" when the kept list node cannot be refreshed.
+     */
+    fun scrollStep(list: AccessibilityNodeInfo, action: Int, gone: String, shown: () -> Any): Boolean {
+        if (!list.refresh()) fail("inconclusive: $gone")
+        val before = shown()
+        if (!list.performAction(action)) return false
+        device.waitForIdle()
+        val end = SystemClock.uptimeMillis() + 2_000
+        while (true) {
+            if (shown() != before) return true
+            if (SystemClock.uptimeMillis() >= end) return false
+            SystemClock.sleep(200)
+        }
+    }
+
+    /** The node itself or its nearest clickable ancestor (Compose may keep an icon's label on the icon). */
+    fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? = if (n.isClickable) n else n.parent?.let(::clickableOf)
+
+    /** The nodes under [root] (itself included) that [match]. */
+    fun nodesIn(root: AccessibilityNodeInfo, match: (AccessibilityNodeInfo) -> Boolean): List<AccessibilityNodeInfo> {
+        val found = mutableListOf<AccessibilityNodeInfo>()
+        fun walk(node: AccessibilityNodeInfo?) {
+            node ?: return
+            if (match(node)) found += node
+            for (i in 0 until node.childCount) walk(node.getChild(i))
+        }
+        walk(root)
+        return found
+    }
+
+    /** Taps the first enabled element whose label [matches], within 10 s; [name] is what the log and a failure say. */
+    private fun tap(name: String, matches: (String) -> Boolean) {
+        fun find() = nodes { n -> n.label()?.let(matches) == true }.firstNotNullOfOrNull { n -> clickableOf(n)?.takeIf { it.isEnabled } }
+        waitFor("an enabled button \"$name\"", 10_000) { find() != null }
+        val target = find() ?: fail("No enabled button \"$name\". Screen: ${screen()}")
         val bounds = Rect().also(target::getBoundsInScreen)
-        log("click \"$label\": ${target.className} $bounds")
+        log("click \"$name\": ${target.className} $bounds")
         // A real tap at the element's centre (UI Automator injects it); the element was found by its label above.
-        if (!device.click(bounds.centerX(), bounds.centerY())) fail("Tapping \"$label\" failed")
+        if (!device.click(bounds.centerX(), bounds.centerY())) fail("Tapping \"$name\" failed")
     }
 
     /**
@@ -381,6 +516,25 @@ class AppDriver {
         return key
     }
 
+    /**
+     * The draft's image tiles in the composer (under its tag `chat.bottom`, so never a bubble's): each label, and whether
+     * the tile is decoded and actionable (the loading placeholder carries the same label but is not clickable).
+     */
+    fun composerImages(): List<Pair<String, Boolean>> {
+        val labels = (1..10).flatMap { n -> (1..n).map { str("chat_image", it, n) } }.toSet() + str("chat_image_processing") + str("chat_image_unavailable")
+        val bottom = nodes { it.viewIdResourceName == "chat.bottom" }.singleOrNull() ?: fail("No composer area (chat.bottom)")
+        return nodesIn(bottom) { it.contentDescription?.toString() in labels }.map { it.contentDescription.toString() to it.isClickable }
+    }
+
+    /** Every tile of the draft strip, whatever its state: each has its own Remove control (`chat_image_remove`). */
+    fun draftTiles(): Int {
+        val bottom = nodes { it.viewIdResourceName == "chat.bottom" }.singleOrNull() ?: fail("No composer area (chat.bottom)")
+        return nodesIn(bottom) { it.contentDescription?.toString() == str("chat_image_remove") }.size
+    }
+
+    /** The keys of every chat in the app's database. */
+    fun localKeys(): Set<String> = query("SELECT key FROM SessionEntity;")?.toSet() ?: fail("Could not read the app's chats")
+
     /** The chat's message field, by its tag (not "the only text field": the closed drawer's search field is one too). */
     fun composerField(): AccessibilityNodeInfo? = nodes { it.viewIdResourceName == "composer.field" && it.isEditable }.singleOrNull()
 
@@ -418,13 +572,114 @@ class AppDriver {
      * Writes the scenario's one completing journal line when it sent a message: "chat <scenario> <key> <ids>", the
      * chat's server ids (current first, then earlier ones), or "none" when the app never created it on the server. The
      * build host requires exactly one such line for every scenario with a send line. Call once, at the scenario's end.
+     * [ids]: the chat's ids as read before it was left (a left temporary chat has no row to read).
      */
-    fun journalSent() {
+    fun journalSent(ids: List<String>? = null) {
         val key = sentChat ?: return
         sentChat = null
-        val row = chatRow(key)
-        val ids = if (row?.onServer == true) (listOf(row.currentId) + row.lineage).distinct().joinToString(",") else "none"
-        journal("chat $scenario $key $ids")
+        val line = if (ids != null) {
+            if (ids.size !in 1..8 || !ids.all(SESSION_ID::matches)) fail("Not 1 to 8 app session ids")
+            ids.joinToString(",")
+        } else {
+            val row = chatRow(key)
+            if (row?.onServer == true) (listOf(row.currentId) + row.lineage).distinct().joinToString(",") else "none"
+        }
+        journal("chat $scenario $key $line")
+    }
+
+    /**
+     * Before leaving chat [key]: the exact ids the app deletes for it ([deleteTargets]), checked (1 to 8 app ids),
+     * journaled as the scenario's chat line, then each proved this run's by a GET of that very id ([ownedAnswer]). Fails
+     * unless every one is proved: the caller then does not leave. Logs each id with a fixed verdict only.
+     */
+    fun proveLeave(key: String): List<String> {
+        val row = chatRow(key)?.takeIf { it.onServer } ?: fail("The chat is not on the server")
+        val targets = deleteTargets(key, row.currentId, row.lineage)
+        if (targets.size !in 1..8 || !targets.all(SESSION_ID::matches)) fail("The ids the leave deletes are not 1 to 8 app ids")
+        journalSent(targets)
+        val proofs = targets.map { id -> http("GET", "api/sessions/$id").let { (code, body) -> ownedAnswer(id, code, body, nonce) } }
+        targets.zip(proofs).forEach { (id, ok) -> log("leave proof $id: ${if (ok) "this run's" else "not proved"}") }
+        if (!leaveAllowed(proofs)) fail("Not every id the leave deletes is proved this run's; not leaving")
+        return targets
+    }
+
+    /**
+     * How the one send of fresh chat [key] ended, within [timeoutMs]: from the phone's own records (the run it follows,
+     * its send's run id, or the finish it settled: [RUN_IDS]), then the server's session-matched record of that run once
+     * it is terminal; or the send's own failure. Never journals the run.
+     */
+    fun awaitSendEnd(key: String, timeoutMs: Long): SendEnd {
+        val end = SystemClock.uptimeMillis() + timeoutMs
+        var session: String? = null // the session id frozen into the send's own body, once read
+        var unreadable = false // the last read of the run's record failed transiently
+        while (SystemClock.uptimeMillis() < end) {
+            if (session == null) session = query("SELECT requestBody FROM PendingSendEntity WHERE sessionKey = '$key';")?.singleOrNull()
+                ?.let { runCatching { JSONObject(it).getString("session_id") }.getOrNull() }?.takeIf(SESSION_ID::matches)
+            val ids = query(RUN_IDS(key))?.distinct()
+            if (ids != null && ids.size > 1) return SendEnd.Unknown("more than one run id for the chat")
+            val id = ids?.singleOrNull()
+            if (id != null) {
+                if (!RUN_ID.matches(id)) return SendEnd.Unknown("a malformed run id")
+                // The body's session id; once its row is gone (settled first), the chat's id at that moment.
+                val left = end - SystemClock.uptimeMillis()
+                if (left <= 0) break
+                val r = readRun(id, session ?: chatRow(key)?.currentId ?: key, left.toInt()) // its timeouts: the time left
+                decideRunRead(id, r, SystemClock.uptimeMillis(), end, timeoutMs)?.let { return it } // the clock read after the answer
+                unreadable = r == null // a timeout, a dropped connection or a 5xx: read again while time is left
+            } else if (ids != null) {
+                when (query("SELECT state || '|' || attempted FROM PendingSendEntity WHERE sessionKey = '$key';")?.singleOrNull()) {
+                    "failed|0" -> return SendEnd.NotAdmitted
+                    "failed|1" -> return SendEnd.Unknown("the send failed after it may have reached the server")
+                }
+            }
+            SystemClock.sleep((end - SystemClock.uptimeMillis()).coerceIn(0, 1_000))
+        }
+        return if (unreadable) SendEnd.RecordUnreadable else SendEnd.Unknown(notSettled(timeoutMs))
+    }
+
+    /**
+     * The record of run [id] if it is [session]'s; null on a transient failure; [INVALID_RUN] for any other answer.
+     * Its connect and read timeouts are [timeoutMs] at most. Never logged.
+     */
+    private fun readRun(id: String, session: String, timeoutMs: Int): JSONObject? {
+        val (code, body) = try {
+            http("GET", "v1/runs/$id", timeoutMs)
+        } catch (e: java.io.IOException) {
+            return null
+        }
+        if (code >= 500) return null
+        val r = if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null
+        return r?.takeIf { it.optString("run_id") == id && it.optString("session_id") == session } ?: INVALID_RUN
+    }
+
+    /** Waits, bounded, until the phone itself has settled chat [key]: no run it follows and no pending send for it. */
+    fun awaitLocalSettlement(key: String, timeoutMs: Long = 60_000) {
+        if (!SESSION_ID.matches(key)) fail("Not an app session id")
+        waitFor("the phone's own settlement of the chat", timeoutMs) {
+            query("SELECT (SELECT count(*) FROM ActiveRunEntity WHERE sessionKey = '$key') + (SELECT count(*) FROM PendingSendEntity WHERE sessionKey = '$key');")?.singleOrNull() == "0"
+        }
+    }
+
+    /** Whether the app's database has no row for chat [key], by the checked query: an unreadable answer fails, never "no row". */
+    fun chatGone(key: String): Boolean {
+        if (!SESSION_ID.matches(key)) fail("Not an app session id")
+        return when (query("SELECT count(*) FROM SessionEntity WHERE key = '$key';")?.singleOrNull()) {
+            "0" -> true
+            "1" -> false
+            else -> fail("Could not read the app's row of the chat")
+        }
+    }
+
+    /**
+     * The digest of the one JPEG in the app's image store: its name, the SHA-256 of its bytes, checked by hashing it.
+     * Fails unless exactly one is stored.
+     */
+    fun stagedImage(): String {
+        val names = shell("run-as $APP ls files/images").lines().map(String::trim).filter { Regex("[0-9a-f]{64}\\.jpg").matches(it) }
+        val name = names.singleOrNull() ?: fail("Expected one stored image, found ${names.size}")
+        val digest = name.removeSuffix(".jpg")
+        if (shell("run-as $APP sha256sum files/images/$name").trim().substringBefore(' ') != digest) fail("The stored image does not hash to its name")
+        return digest
     }
 
     /** Journals the id of the run the app is following for chat [sessionKey] (exactly one), with that chat's id. */
@@ -516,11 +771,11 @@ class AppDriver {
         return (0 until rows.length()).map(rows::getJSONObject)
     }
 
-    private fun http(method: String, path: String): Pair<Int, String> {
+    private fun http(method: String, path: String, timeoutMs: Int = 20_000): Pair<Int, String> {
         val c = URL(url.trimEnd('/') + "/" + path).openConnection() as HttpURLConnection
         c.requestMethod = method
-        c.connectTimeout = 10_000
-        c.readTimeout = 20_000
+        c.connectTimeout = minOf(10_000, timeoutMs).coerceAtLeast(1)
+        c.readTimeout = timeoutMs.coerceAtLeast(1)
         c.setRequestProperty("Authorization", "Bearer $key")
         return try {
             val code = c.responseCode
@@ -530,6 +785,65 @@ class AppDriver {
         }
     }
 }
+
+/** How a send ended ([AppDriver.awaitSendEnd]). */
+sealed interface SendEnd {
+    /** The run the phone recorded for the send, terminal on the server, its record session-matched. */
+    data class Run(val id: String, val record: JSONObject) : SendEnd
+
+    /** Failed and never attempted: the app's own flag says no run request of it may have reached the server. */
+    object NotAdmitted : SendEnd
+
+    /** The phone holds the run's id, but every read of its record failed transiently until the time was up. */
+    object RecordUnreadable : SendEnd
+
+    /** Anything else; [why] is a fixed phrase. */
+    data class Unknown(val why: String) : SendEnd
+}
+
+/** The placeholder [AppDriver.quiet] puts where the screen would be. */
+const val QUIET = "(not shown: fixed diagnostics)"
+
+/** [AppDriver]'s marker for a run record that answered but is not to be trusted. */
+val INVALID_RUN = JSONObject()
+
+/** The reason given for a send whose run did not settle within [timeoutMs]. */
+fun notSettled(timeoutMs: Long) = "no settled run within ${timeoutMs / 1000} s"
+
+/**
+ * One read of run [id]'s record, decided: [record] answered at [answeredAt] never counts after [deadline] (the run did
+ * not settle in time, whatever the record says); within it, a terminal record is the send's end, an invalid one
+ * ([INVALID_RUN]) ends it unknown, and anything else (not terminal, or a transient failure: null) means read again.
+ */
+fun decideRunRead(id: String, record: JSONObject?, answeredAt: Long, deadline: Long, timeoutMs: Long): SendEnd? = when {
+    answeredAt > deadline -> SendEnd.Unknown(notSettled(timeoutMs))
+    record === INVALID_RUN -> SendEnd.Unknown("the run record is invalid or not this send's")
+    record != null && record.optString("status") in PushE2eTest.TERMINAL_RUN -> SendEnd.Run(id, record)
+    else -> null
+}
+
+/**
+ * Every run id the phone recorded for chat [key]: the run it follows, its send's run id, and a settled finish (the
+ * outbox row written with the settlement, then the notice state it moves to). Read only.
+ */
+fun RUN_IDS(key: String): String {
+    require(SESSION_ID.matches(key)) { "Not an app session id" }
+    return "SELECT runId FROM ActiveRunEntity WHERE sessionKey = '$key' UNION SELECT runId FROM PendingSendEntity WHERE sessionKey = '$key' " +
+        "AND runId IS NOT NULL UNION SELECT runId FROM NoticeOutboxEntity WHERE sessionKey = '$key' UNION SELECT runId FROM NoticeStateEntity WHERE sessionKey = '$key';"
+}
+
+/** The server ids the app deletes for chat [key] (ChatRepository.deleteTargets): current, lineage newest first, the key last. */
+fun deleteTargets(key: String, currentId: String, lineage: List<String>): List<String> =
+    (listOf(currentId) + lineage.asReversed()).filter { it != key }.distinct() + key
+
+/** A GET of session [id] answered [code] with [body]: this run's only when it names [id], an app id, with [nonce] in its title. */
+fun ownedAnswer(id: String, code: Int, body: String, nonce: String): Boolean =
+    code == 200 && runCatching { JSONObject(body).getJSONObject("session") }.getOrNull()?.let { s ->
+        s.optString("id") == id && id.startsWith("apofis-") && s.optString("title").contains(nonce)
+    } == true
+
+/** A leave may start only when every id it deletes was proved this run's. */
+fun leaveAllowed(proofs: List<Boolean>): Boolean = proofs.isNotEmpty() && proofs.all { it }
 
 /** Saves a screenshot when a test fails and writes every test's own result file. */
 class Evidence(private val app: AppDriver) : TestWatcher() {
