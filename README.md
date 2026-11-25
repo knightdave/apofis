@@ -4,6 +4,19 @@ Apofis is a native Android client (Kotlin, Jetpack Compose) for the Hermes Agent
 
 Apofis is an unofficial project. It is not affiliated with, endorsed by or connected to Hermes Agent or Kelivo.
 
+## What works
+
+- Chat with your Hermes agent, with replies streamed as they arrive.
+- Steer a running reply with a new message, and queue messages while a reply runs.
+- Send photos with a message.
+- Share text and images into the app from other apps, with a confirmation before anything is sent.
+- Slash commands from the composer.
+- A model choice per chat.
+- Temporary chats.
+- Notifications through ntfy.
+
+Images that Hermes itself produces show as a link tile or a file path, not inline.
+
 ## Requirements
 
 - An Android phone running Android 12 (API 31) or newer.
@@ -19,6 +32,16 @@ Install and update with [Obtainium](https://github.com/ImranR98/Obtainium):
 APKs are published on the [Releases](https://github.com/knightdave/apofis/releases) page. Every push to `main` triggers a pre-release build (`0.1.0-pre.N`, tag `pre-N`); normal releases are signed tags `v*`.
 
 Once 0.1.0 is published, and before checking for the update, open the app's settings in Obtainium, turn off "Include prereleases" and turn on "Verify the 'latest' tag", so Obtainium follows normal releases only. A phone that runs a pre-release with a higher versionCode than 0.1.0 cannot install 0.1.0 over it; it gets the next normal release instead.
+
+## Temporary chats left on the server
+
+Leaving a temporary chat deletes it on the server. To see whether any are still listed, run this read-only listing on the Hermes host, in a subshell:
+
+```sh
+( out=$(hermes sessions list --source api_server --limit 100000 2>&1) || { echo "listing failed: unknown"; exit 1; }; case "$out" in *"to see more"*) echo "listing truncated: unknown"; exit 1;; esac; ids=$(printf '%s\n' "$out" | awk '$NF ~ /^apofis-tmp-[0-9a-f-]+$/ {print $NF; n=1} END {exit !n}'); case $? in 0) printf '%s\n' "$ids";; 1) echo "none listed";; *) echo "listing failed: unknown"; exit 1;; esac )
+```
+
+It prints the ids of temporary chats still listed under their app id, `none listed`, `listing truncated: unknown` (the CLI's own notice that the list was cut off, checked before the ids are filtered) or `listing failed: unknown`. A truncated or failed listing is unknown, never a pass. It filters on the id field only and counts the temporary chats of every phone. It misses rows the list does not show and every row whose id does not start with `apofis-tmp-` (a compressed chat is listed under an id like `20261122_101500_ab12cd`). "Not listed" never means erased. Nothing here deletes anything.
 
 ## Verify a release
 
