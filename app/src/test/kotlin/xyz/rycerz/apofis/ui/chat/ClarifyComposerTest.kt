@@ -44,6 +44,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
@@ -57,7 +58,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -144,8 +144,7 @@ class ClarifyComposerTest {
     private val stores = CopyOnWriteArrayList<ViewModelStore>()
     private val chats = CopyOnWriteArrayList<ChatViewModel>()
     private val holds = CopyOnWriteArrayList<CompletableFuture<() -> MockResponse>>()
-    private val timedOut = AtomicBoolean(false)
-    @Volatile private var closing = false // set first in tearDown: a handler it releases is no timeout
+    private val timedOut = AtomicBoolean(false) // sticky: set only by a wait that really ran out, never by a release
 
     @Volatile private var pendingJson = "" // what the status read lists as pending_controls
     private val frames = LinkedBlockingQueue<String>() // the next event stream's frames
@@ -181,7 +180,7 @@ class ClarifyComposerTest {
 
     @After
     fun tearDown() {
-        closing = true
+        // Releases what still waits: a completed hold and a frame are answers, not timeouts.
         holds.forEach { it.complete { MockResponse.Builder().code(500).build() } }
         repeat(4) { frames.put("id: ${seq.incrementAndGet()}\ndata: {\"event\":\"run.completed\",\"seq\":${seq.get()}}\n\n") }
         val jobs = chats.map { it.viewModelScope.coroutineContext.job }
@@ -229,7 +228,7 @@ class ClarifyComposerTest {
         routes["GET /v1/runs/$RUN/events"] = {
             // Waits for the frame the test releases. Watchdog: after 60 s the route answers an empty stream (the follower
             // reconnects) and the test is marked failed, asserted at teardown.
-            val next = frames.poll(60, TimeUnit.SECONDS) ?: "".also { if (!closing) timedOut.set(true) }
+            val next = frames.poll(60, TimeUnit.SECONDS) ?: "".also { timedOut.set(true) }
             MockResponse.Builder().body(": open\n\n$next").addHeader("Content-Type", "text/event-stream").build()
         }
         follower.resumeAll()
@@ -251,7 +250,7 @@ class ClarifyComposerTest {
      */
     private fun holdClarify(): CompletableFuture<() -> MockResponse> {
         val f = CompletableFuture<() -> MockResponse>().also { holds += it }
-        onClarify = { runCatching { f.get(60, TimeUnit.SECONDS) }.getOrElse { if (!closing) timedOut.set(true); { MockResponse.Builder().code(500).build() } }() }
+        onClarify = { runCatching { f.get(60, TimeUnit.SECONDS) }.getOrElse { if (it is TimeoutException) timedOut.set(true); { MockResponse.Builder().code(500).build() } }() }
         return f
     }
 
@@ -882,21 +881,16 @@ class ClarifyComposerTest {
         assertEquals("my draft", composer().draft)
     }
 
-    /** A new view model's first state shows the held answer, never the draft. */
+    /**
+     * A new view model shows the held answer, never the draft. Read right after it is built: its initial value, or its
+     * first combined state when Room was faster. Both must show the answer, so the read is not told apart (switching
+     * Main to pause it would race the first view model's own work).
+     */
     @Test
     fun newViewModelStartsOnTheAnswer() = runBlocking<Unit> {
         val vm = answering(before = { draft("my draft"); photo() })
         vm.type("Downloads")
-        // Main paused while the second view model is built: its state is the literal initial value, nothing collected yet.
-        val paused = StandardTestDispatcher()
-        Dispatchers.setMain(paused)
-        val next = try {
-            vm().state.value
-        } finally {
-            Dispatchers.setMain(UnconfinedTestDispatcher())
-            paused.scheduler.advanceUntilIdle() // then its queued work runs
-        }
-        assertFalse(next.loaded)
+        val next = vm().state.value
         assertEquals(ComposerMode.ANSWER, next.composer)
         assertEquals("Downloads", next.draft)
         assertTrue(next.images.isEmpty())

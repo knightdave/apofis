@@ -15,7 +15,8 @@ import xyz.rycerz.apofis.images.ImageLimits
 import xyz.rycerz.apofis.sync.SendTooLarge
 
 /**
- * What the composer of one chat shows. [draft] is the text field: only user edits and a send taking it change it.
+ * What the composer of one chat shows. [draft] is the text field: user edits, a send taking it, a put back and a
+ * command's clear change it.
  * While [sending], the field keeps the text being sent and takes no edits; it empties in the step that records the
  * text as stored.
  * [revision] changes with every change to [draft] that is not a user edit; an edit made on an older revision is

@@ -175,7 +175,7 @@ private const val CHOICE_LINES = 3
 
 /** The choices drawn for a clarify: blank labels dropped; none when more than [MAX_CHOICES] remain (free text only). */
 internal fun shownChoices(choices: List<String>): List<String> =
-    choices.asSequence().filter { it.isNotBlank() }.take(MAX_CHOICES + 1).toList().takeIf { it.size <= MAX_CHOICES }.orEmpty() // stops at the fifth
+    choices.asSequence().filter { it.isNotBlank() }.take(MAX_CHOICES + 1).toList().takeIf { it.size <= MAX_CHOICES }.orEmpty() // stops at the fifth non-blank label
 
 /** A request of a kind this version does not know: said plainly, with nothing that could grant anything. */
 @Composable
