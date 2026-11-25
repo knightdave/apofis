@@ -153,4 +153,32 @@ class BottomSharesTest {
         assertEquals(0, short.strip)
         assertEquals(bottomShares(needed - 1, 112, 60, false, false, null, d) { minOf(it, one) }, short)
     }
+
+    /** The slash palette gets space after the strip, so it is the first piece to give way; it may be cut partway, never beyond half the band. */
+    @Test
+    fun thePaletteGetsSpaceLast() {
+        val d = Density(2f, 1f).bottomDims(style)
+        val one = d.field(1)
+        val strip = 2 * (88 + 8 + 11)
+        val palette = 9 * 96 / 2 + 4 // 4.5 rows of 48 dp and two 1 dp borders
+        val withStrip = bottomShares(1520, 112, 60, false, false, null, d, strip) { minOf(it, one) }
+        val roomy = bottomShares(1520, 112, 60, false, false, null, d, strip, palette) { minOf(it, one) }
+        assertEquals(palette, roomy.palette)
+        assertEquals(withStrip.copy(transcript = withStrip.transcript - palette, palette = palette), roomy)
+        assertEquals(1520, roomy.bar + roomy.notes + roomy.palette + roomy.composer + roomy.transcript)
+        // Short of room: the palette is cut first, partway, while the strip and everything else keep their shares.
+        val needed = withStrip.bar + withStrip.notes + withStrip.composer + 2 * 64
+        for (extra in listOf(0, 1, palette / 2, palette - 1)) {
+            val s = bottomShares(needed + extra, 112, 60, false, false, null, d, strip, palette) { minOf(it, one) }
+            assertEquals("extra $extra", extra, s.palette)
+            assertEquals("extra $extra", bottomShares(needed + extra, 112, 60, false, false, null, d, strip) { minOf(it, one) }, s.copy(palette = 0, transcript = s.transcript + extra))
+            assertEquals(needed + extra, s.bar + s.notes + s.palette + s.composer + s.transcript)
+        }
+        // Never beyond half the band.
+        val tall = bottomShares(1520, 112, 60, false, false, null, d, strip, 2000) { minOf(it, one) }
+        assertEquals(760, tall.palette)
+        assertEquals(1520, tall.bar + tall.notes + tall.palette + tall.composer + tall.transcript)
+        // Without a palette: the old result.
+        assertEquals(withStrip, bottomShares(1520, 112, 60, false, false, null, d, strip, 0) { minOf(it, one) })
+    }
 }

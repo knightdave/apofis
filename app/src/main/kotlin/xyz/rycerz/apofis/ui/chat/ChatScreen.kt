@@ -49,6 +49,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.union
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalFocusManager
@@ -106,6 +107,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import xyz.rycerz.apofis.chat.Command
 import xyz.rycerz.apofis.chat.ChatItem
+import kotlin.math.ceil
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.api.ChatModel
@@ -192,11 +194,12 @@ fun ChatScreen(
     // token changes the transcript, never the header's or the composer's inputs (equal values notify nothing).
     val latest = rememberUpdatedState(state.forTranscript()) // typing changes nothing the transcript reads
     val barInput = rememberUpdatedState(ChatUiState(state.sessionKey, state.title, state.status, emptyList(), ComposerMode.SEND_DISABLED, "", state.host))
+    val matches = remember(state.draft) { scanPalette(state.draft) } // once per draft, never per streamed update
     val bottomInput = rememberUpdatedState(
         BottomInput(
             state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
             state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed, enterToSend, expanded, state.sessionKey,
-            state.status == StatusLine.LOAD_FAILED, state.images,
+            state.status == StatusLine.LOAD_FAILED, state.images, state.choice.model.takeIf { Command.MODEL in matches }, matches,
         ),
     )
     // One gate for everything the chat can do: while the drawer covers it, a press that was already down (another
@@ -237,7 +240,8 @@ fun ChatScreen(
     // The objects the slots use, read through a holder too: replacing the list state (and with it the follower), the
     // backdrop (the blur setting) or the link handler reaches the screen; equal identities notify nothing.
     val objects = rememberUpdatedState(Objects(listState, follow, backdrop, uriHandler))
-    // Read by the transcript slot only: the app passes a new lambda with every state, which must not reach the composer.
+    // Read by the transcript slot, and by the palette only inside a tap: the app passes a new lambda with every state,
+    // which must not reach the composer.
     val current = rememberUpdatedState(currentState)
     val drag = rememberUpdatedState(dragArea)
     val fontScale = rememberUpdatedState(chatFontScale) // read by the transcript slot only: never the header or the composer
@@ -275,6 +279,12 @@ fun ChatScreen(
             if (BuildConfig.DEBUG) SideEffect { ChromeProbe.bottomCompositions++ }
             val input = bottomInput.value
             val actions = callbacks.value.actions
+            val matches = if (input.expanded || input.sending || input.loadFailed) emptyList() else input.matches
+            val paletteRoom = remember { ExpandRoom() } // like the strip: composed only while the allocation gives it a share
+            val fieldFocus = remember { FocusRequester() } // a row run or filled from a keyboard leaves; the field takes focus
+            // Read at tap time: onCommand claims and clears the whole draft, so a tap acts only while the draft now is
+            // still the slash word the row was drawn for (the drawn draft without an owner's state, as in tests).
+            val still = { c: Command -> c in scanPalette(current.value?.invoke()?.draft ?: input.draft) }
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -286,9 +296,9 @@ fun ChatScreen(
                     .imePadding() // max(keyboard, navigation bar), applied once
                     .onSizeChanged { bottomContent = it.height },
             ) {
-                // One allocation (bottomShares) for the bar, the notes, the composer's parts and the transcript, in the safe
-                // band between the status inset and the keyboard or navigation inset; each part is measured and placed with
-                // exactly its share, and the area reports what it occupies.
+                // One allocation (bottomShares) for the bar, the notes, the palette, the composer's parts and the transcript,
+                // in the safe band between the status inset and the keyboard or navigation inset; each part is measured and
+                // placed with exactly its share, and the area reports what it occupies.
                 var look: ComposerLook? = null
                 Layout({
                     // Notes keep a backing of their own over scrolled text, and scroll inside their share when taller. The
@@ -320,17 +330,46 @@ fun ChatScreen(
                         attachEnabled = !input.sending && !input.loadFailed && input.sessionKey.isNotEmpty(),
                         onAttach = attach,
                         onRemoveImage = actions::onRemoveImage,
+                        focusRequester = fieldFocus,
                     )
+                    Box(Modifier.padding(horizontal = MARGIN_X)) {
+                        if (matches.isNotEmpty() && paletteRoom.state.value) {
+                            SlashPalette(
+                                matches,
+                                input.model ?: stringResource(R.string.model_default),
+                                onRun = { c -> if (still(c) && actions.onCommand(c)) fieldFocus.requestFocus() },
+                                onFill = { c ->
+                                    gate.pass {
+                                        if (still(c)) {
+                                            actions.onDraftChange("/${c.word} ", input.draftRevision)
+                                            fieldFocus.requestFocus()
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize().onPreviewKeyEvent { !paletteRoom.now }.semantics { traversalIndex = -2f },
+                            )
+                        }
+                    }
                 }) { measurables, constraints ->
                     val width = constraints.maxWidth
+                    val d = look!!.dims
+                    // The palette's natural height, computed (a removed palette has none to measure): at most 4.5 rows of
+                    // SheetRow's metrics (48 dp, or one bodyLarge line and 24 dp of padding) and its two 1 dp borders.
+                    val row = maxOf(d.target, ceil(d.line).toInt() + 24.dp.roundToPx())
+                    val natural = if (matches.isEmpty()) 0 else minOf(2 * matches.size, 9) * row / 2 + 2.dp.roundToPx()
                     val (shares, composer) = measureComposer(
                         measurables.subList(1, 7), look!!, width, available = constraints.maxHeight - statusTop, bar = barHeight,
-                        notes = measurables[0].maxIntrinsicHeight(width), unsent = input.unsent != null,
+                        notes = measurables[0].maxIntrinsicHeight(width), unsent = input.unsent != null, palette = natural,
                     )
+                    val shown = shares.palette > 0
+                    paletteRoom.now = shown
+                    if (paletteRoom.state.value != shown) paletteRoom.state.value = shown
                     val notes = measurables[0].measure(Constraints.fixed(width, shares.notes))
-                    layout(width, shares.notes + shares.composer) {
+                    val palette = measurables[7].measure(Constraints.fixed(width, shares.palette))
+                    layout(width, shares.notes + shares.palette + shares.composer) {
                         notes.place(0, 0)
-                        with(composer) { place(width, shares.notes) }
+                        if (shown) palette.place(0, shares.notes)
+                        with(composer) { place(width, shares.notes + shares.palette) }
                     }
                 }
             }
@@ -716,6 +755,10 @@ private data class BottomInput(
     val sessionKey: String,
     val loadFailed: Boolean,
     val images: List<DraftImage>,
+    // The chat's model choice for the palette's /model row, only while the draft shows that row: a choice made
+    // otherwise recomposes nothing here.
+    val model: String?,
+    val matches: List<Command>, // the palette's commands for the draft (see [scanPalette])
 )
 
 /** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it; with firstLoad (the skeleton). */
@@ -811,6 +854,7 @@ internal object ChromeProbe {
     var composerBackdropId = 0 // the backdrop the composer was last composed with
     var bodyCompositions = 0
     var skeletonCompositions = 0
+    var paletteScans = 0 // drafts matched against the commands
 }
 
 /**
