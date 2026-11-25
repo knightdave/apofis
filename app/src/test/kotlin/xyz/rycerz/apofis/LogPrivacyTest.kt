@@ -1,6 +1,7 @@
 package xyz.rycerz.apofis
 
 import android.app.Application
+import android.content.pm.ProviderInfo
 import android.net.Uri
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
@@ -10,6 +11,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
+import java.io.FileNotFoundException
 import java.security.MessageDigest
 import java.time.ZoneOffset
 import java.util.concurrent.ConcurrentHashMap
@@ -43,7 +45,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.shadows.ShadowLog
@@ -53,6 +57,7 @@ import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.images.Encoded
 import xyz.rycerz.apofis.images.ImageInput
+import xyz.rycerz.apofis.images.RouteProvider
 import xyz.rycerz.apofis.images.toUploadJpeg
 import xyz.rycerz.apofis.run.RunFollower
 import xyz.rycerz.apofis.settings.Credentials
@@ -69,7 +74,9 @@ private const val MODEL = "cnry-model-3c7"
 private const val TITLE = "cnry-title-2f4"
 private const val SID = "apofis-cnry-sid-4e9"
 private const val TEMP = "apofis-tmp-cnry-tmp-6b0"
-private const val URI = "content://cnry.authority-7e3/cnry-path-1a8"
+private const val AUTHORITY = "cnry.authority-7e3"
+private const val PATH = "cnry-path-1a8"
+private const val URI = "content://$AUTHORITY/$PATH"
 private const val FILE = "cnry-file-9d5.jpg"
 private const val SERVER = "cnry-server-0c3" // text in the server's error answers
 
@@ -128,6 +135,16 @@ class LogPrivacyTest {
     @Before
     fun setUp() {
         ShadowLog.clear()
+        // A content provider whose stream fails to open, with a canary in its exception.
+        val info = ProviderInfo().apply {
+            authority = AUTHORITY
+            packageName = "com.other"
+            name = RouteProvider::class.java.name
+            exported = true
+        }
+        Robolectric.buildContentProvider(RouteProvider::class.java).create(info)
+        shadowOf(app.packageManager).addOrUpdateProvider(info)
+        RouteProvider.routes[PATH] = { throw FileNotFoundException("$PATH $TEXT") }
         Dispatchers.setMain(UnconfinedTestDispatcher())
         server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
@@ -158,6 +175,7 @@ class LogPrivacyTest {
         db.close()
         server.close()
         Dispatchers.resetMain()
+        RouteProvider.routes.remove(PATH)
     }
 
     private fun serverError() = MockResponse.Builder().code(500)
@@ -200,12 +218,12 @@ class LogPrivacyTest {
         val body = requests.first { it.target == "/v1/runs" }.body!!.utf8()
         assertTrue(TEXT in body && MODEL in body && SID in body) // the canaries went out
 
-        // Decoding a corrupt file and an unreadable URI.
+        // Decoding a corrupt file and a URI whose stream fails.
         val corrupt = File(app.cacheDir, FILE).apply { writeText("not an image $TEXT") }
         assertTrue(toUploadJpeg(app, ImageInput.Stored(corrupt)) is Encoded.Failed)
         assertTrue(toUploadJpeg(app, ImageInput.Content(Uri.parse(URI))) is Encoded.Failed)
 
-        // A share whose stream fails to open: its ApofisShare line is written.
+        // A share whose stream fails to open: its ApofisShare line is written, with the reason only.
         val share = readShare(app, ShareIntent.Images(listOf(Uri.parse(URI)), 0, CAPTION))
         assertEquals(CAPTION, share.text)
         assertTrue(NoteKind.SHARE_IMAGES_FAILED in share.notes)
@@ -223,7 +241,7 @@ class LogPrivacyTest {
 
         val logs = ShadowLog.getLogs()
         val logged = logs.joinToString("\n") { "${it.tag} ${it.msg} ${it.throwable?.stackTraceToString()}" }
-        assertTrue("the capture works: $logged", logs.any { it.tag == "ApofisShare" && it.msg.startsWith("image ") })
+        assertTrue("the capture works: $logged", logs.any { it.tag == "ApofisShare" && it.msg == "image UNREADABLE" })
         for (canary in listOf("cnry", TEXT, CAPTION, MODEL, TITLE, SID, TEMP, URI, FILE, SERVER, digest.take(16))) {
             assertFalse("$canary logged", canary in logged)
         }
