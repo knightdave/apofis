@@ -1,9 +1,5 @@
 package xyz.rycerz.apofis.ui.chat
 
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Text
 import androidx.compose.foundation.layout.Box
 import androidx.compose.ui.geometry.Offset
@@ -25,16 +21,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performSemanticsAction
-import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -99,13 +92,9 @@ class AnswerGuardTest {
         rule.mainClock.autoAdvance = false
     }
     private val approvals = ArrayList<Triple<String, Long, ApprovalChoice>>()
-    private val answers = ArrayList<Triple<String, Long, String>>()
     private val actions = object : ChatActions {
         override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) {
             approvals += Triple(requestId, executionGeneration, choice)
-        }
-        override fun onClarify(requestId: String, executionGeneration: Long, answer: String) {
-            answers += Triple(requestId, executionGeneration, answer)
         }
     }
 
@@ -116,7 +105,6 @@ class AnswerGuardTest {
         }
 
     private val approval = PendingControl("approval", "ctl_1", 1, "rm -rf ~/old", null)
-    private val clarify = PendingControl("clarify", "ctl_q", 4, null, "Which folder?")
     private val reply = AssistantReply("live", emptyList(), "Checking.", 0.0, live = true)
     private fun live(pending: PendingControl?) = LiveReply("run_1", "running", "Checking.", emptyList(), pending, Connection.LIVE)
 
@@ -137,20 +125,6 @@ class AnswerGuardTest {
     }
 
     private fun settle() = tick(16)
-
-    @Test
-    fun aClarifyAnswerTypedEarlyIsKeptAndSentOnceAfterTheInterval() {
-        // Injected input moves the clock on by itself (16 ms per event), so "early" and "late" keep a margin.
-        rule.setContent { Themed { Footer(clarify) } }
-        rule.onNodeWithText("Your answer").performTextInput("Downloads")
-        rule.onNodeWithContentDescription("Send answer").performClick() // too early: nothing, and nothing used up
-        tick(150)
-        rule.onNodeWithContentDescription("Send answer").performClick()
-        assertTrue("$answers", answers.isEmpty())
-        tick(200)
-        rule.onNodeWithContentDescription("Send answer").performClick() // the typed answer is still there
-        assertEquals(listOf(Triple("ctl_q", 4L, "Downloads")), answers)
-    }
 
     @Test
     fun theSameRequestShownAgainWaitsAgain() {
@@ -234,19 +208,6 @@ class AnswerGuardTest {
     }
 
     // ---- once the interval has passed, nothing else blocks an answer ----
-
-    @Test
-    @Config(qualifiers = "w640dp-h220dp-xhdpi")
-    fun inAShortWindowTheClarifySendGoesThrough() {
-        rule.setContent { Themed { Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) { Footer(clarify) } } }
-        rule.mainClock.autoAdvance = true // scrolling needs frames; the interval passes on the way
-        rule.onNodeWithText("Your answer").performScrollTo().performTextInput("Downloads") // the keyboard would be open
-        rule.onNodeWithContentDescription("Send answer").performScrollTo()
-        rule.mainClock.autoAdvance = false
-        tick(300)
-        rule.onNodeWithContentDescription("Send answer").performClick()
-        assertEquals(listOf(Triple("ctl_q", 4L, "Downloads")), answers)
-    }
 
     @Test
     @Config(qualifiers = "w320dp-h400dp-xhdpi")

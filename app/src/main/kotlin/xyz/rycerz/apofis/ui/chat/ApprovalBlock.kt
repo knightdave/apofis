@@ -1,7 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.compose.ui.platform.LocalDensity
-import xyz.rycerz.apofis.ui.theme.claimSideways
 import xyz.rycerz.apofis.ui.theme.sidewaysScroll
 import androidx.annotation.StringRes
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -18,6 +17,9 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
@@ -40,8 +42,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -59,6 +59,7 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -140,34 +141,41 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
     }
 }
 
-/** A question from Hermes, answered right here, by this block's own request id and generation. */
+/**
+ * A question from Hermes; the answer is typed in the composer. A single-choice question offers one button per choice,
+ * each answering with its exact label by this block's own request id and generation; a multi-select one is answered as
+ * free text only.
+ */
 @Composable
 internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onAnswer: (String, Long, String) -> Unit) {
     ControlCard(R.string.chat_clarify_title, changed) {
-        control.question?.let { Text(it, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface) }
-        var answer by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf("") }
-        val sendPress = remember { Press() }
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                answer,
-                { answer = it },
-                Modifier.weight(1f).claimSideways(),
-                placeholder = { Text(stringResource(R.string.chat_clarify_hint)) },
-                maxLines = 5,
-                enabled = !answering,
-                colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = ApofisTheme.colors.timelineOutline), // 3:1 on the card
-            )
-            ApofisIconButton(
-                onClick = { if (gate.accepts(sendPress)) onAnswer(control.requestId, control.executionGeneration, answer) },
-                contentDescription = stringResource(R.string.chat_clarify_send),
-                Modifier.pressStart(sendPress, gate),
-                enabled = !answering && answer.isNotBlank(),
-            ) {
-                Icon(painterResource(R.drawable.lucide_arrow_up), null, Modifier.size(20.dp))
+        // Read when it appears: the field below switches to answering it.
+        control.question?.let { Text(it, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface) }
+        val choices = remember(control.choices) { shownChoices(control.choices) }
+        if (choices.isNotEmpty()) {
+            Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (choice in choices) {
+                    if (control.multiSelect) {
+                        Text(choice, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = CHOICE_LINES, overflow = TextOverflow.Ellipsis)
+                    } else {
+                        Pill(choice, filled = false, enabled = !answering, gate, RoundedCornerShape(18.dp), CHOICE_LINES, vertical = 6.dp) {
+                            if (gate.accepts(it)) onAnswer(control.requestId, control.executionGeneration, choice) // the exact label
+                        }
+                    }
+                }
             }
         }
     }
 }
+
+/** The clarify tool's own limit on choices; a list longer than this is drawn as no choices at all. */
+internal const val MAX_CHOICES = 4
+
+private const val CHOICE_LINES = 3
+
+/** The choices drawn for a clarify: blank labels dropped; none when more than [MAX_CHOICES] remain (free text only). */
+internal fun shownChoices(choices: List<String>): List<String> =
+    choices.asSequence().filter { it.isNotBlank() }.take(MAX_CHOICES + 1).toList().takeIf { it.size <= MAX_CHOICES }.orEmpty() // stops at the fifth non-blank label
 
 /** A request of a kind this version does not know: said plainly, with nothing that could grant anything. */
 @Composable
@@ -218,17 +226,19 @@ private fun ControlCard(
 }
 
 /**
- * An answer button: a 36 dp pill (outlined, or [filled] in primary) centred in a 48 dp touch target, one node with
- * the wash and focus ring on the pill itself.
+ * An answer button: a pill at least 36 dp high (outlined, or [filled] in primary) centred in a touch target at least
+ * 48 dp wide and high, one node with the wash and focus ring on the pill itself. [shape], [maxLines] and [vertical]
+ * padding: a clarify choice is a rounded rectangle of at most three lines (one line looks like the approval's
+ * circle-ended pill); an approval keeps horizontal padding only.
  */
 @Composable
-private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerGate, onClick: (Press) -> Unit) {
+private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerGate, shape: Shape = CircleShape, maxLines: Int = Int.MAX_VALUE, vertical: Dp = 0.dp, onClick: (Press) -> Unit) {
     val source = remember { MutableInteractionSource() }
     val press = remember { Press() }
     val scheme = MaterialTheme.colorScheme
     Box(
         Modifier
-            .heightIn(min = 48.dp)
+            .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
             .pressStart(press, gate)
             .clickable(source, indication = null, enabled = enabled, role = Role.Button) { onClick(press) },
         contentAlignment = Alignment.Center,
@@ -237,12 +247,12 @@ private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerG
             Modifier
                 .heightIn(min = 36.dp)
                 .alpha(if (enabled) 1f else 0.38f)
-                .then(if (filled) Modifier.background(scheme.primary, CircleShape) else Modifier.border(1.dp, ApofisTheme.colors.hairlineStrong, CircleShape))
-                .wash(source, CircleShape, ring = if (filled) scheme.onPrimary else Color.Unspecified)
-                .padding(horizontal = 16.dp),
+                .then(if (filled) Modifier.background(scheme.primary, shape) else Modifier.border(1.dp, ApofisTheme.colors.hairlineStrong, shape))
+                .wash(source, shape, ring = if (filled) scheme.onPrimary else Color.Unspecified)
+                .padding(horizontal = 16.dp, vertical = vertical), // a choice's 6 dp: one line stays within the 36 dp minimum
             contentAlignment = Alignment.Center,
         ) {
-            Text(label, style = MaterialTheme.typography.labelLarge, color = if (filled) scheme.onPrimary else scheme.onSurface)
+            Text(label, style = MaterialTheme.typography.labelLarge, color = if (filled) scheme.onPrimary else scheme.onSurface, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -319,7 +329,7 @@ private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key
  * once the gesture ends, cancelled or not) and activation key downs (not repeats) and releases (cleared once the
  * release has been handled without a click, and all of them when the control loses focus).
  */
-private fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
+internal fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
     .pointerInput(press, gate) {
         awaitEachGesture {
             try {

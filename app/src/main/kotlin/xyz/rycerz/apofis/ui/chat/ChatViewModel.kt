@@ -35,11 +35,14 @@ import xyz.rycerz.apofis.api.ApiError
 import xyz.rycerz.apofis.api.ApprovalChoice
 import xyz.rycerz.apofis.api.ChatModel
 import xyz.rycerz.apofis.api.ModelOptions
+import xyz.rycerz.apofis.chat.Answer
+import xyz.rycerz.apofis.chat.AnswerSettle
 import xyz.rycerz.apofis.chat.AssistantReply
 import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Command
 import xyz.rycerz.apofis.chat.ComposerState
 import xyz.rycerz.apofis.chat.Parsed
+import xyz.rycerz.apofis.chat.Shown
 import xyz.rycerz.apofis.chat.parseCommand
 import xyz.rycerz.apofis.chat.ComposerNote
 import xyz.rycerz.apofis.chat.DraftImage
@@ -82,6 +85,7 @@ data class ChatUiState(
     val images: List<DraftImage> = emptyList(), // the draft's photos, in pick order
     val storedSends: Long = 0, // sends of this view model whose row was stored: the screen pins the list on each
     val storedKey: String? = null, // the idempotency key of the latest of them: the pin waits until the transcript shows it
+    val answer: Answer? = null, // the clarify answer the field shows instead of the draft (see [ComposerMode.ANSWER])
 )
 
 /** The reasoning sheet's levels: null is the server's default, "none" is Off; five of the server's eight (decision 19). */
@@ -108,8 +112,11 @@ data class AnswerNote(val result: AnswerResult, val successor: RequestRef? = nul
 
 enum class StatusLine { IDLE, WORKING, QUEUED, OFFLINE, UNREACHABLE, KEY_REJECTED, SERVER_ERROR, CHAT_GONE, LOAD_FAILED }
 
-/** SEND_AFTER: a run is live and the draft holds a ready photo; it is sent after the reply (a photo never steers). */
-enum class ComposerMode { SEND_DISABLED, SEND, STEER, STOP, SEND_AFTER }
+/**
+ * SEND_AFTER: a run is live and the draft holds a ready photo; it is sent after the reply (a photo never steers).
+ * ANSWER: the live run asks a clarify question; the field edits its answer and the draft waits.
+ */
+enum class ComposerMode { SEND_DISABLED, SEND, STEER, STOP, SEND_AFTER, ANSWER }
 
 /** Everything the chat screen can ask for; no-ops by default so previews and screenshots need no view model. */
 interface ChatActions {
@@ -125,8 +132,14 @@ interface ChatActions {
     /** [onSendClick] from the screen; [steerRun]: the run the Steer button was drawn for (a send steers only that run). */
     fun onSendClick(steerRun: String?): Boolean = onSendClick()
 
+    /** [onSendClick] for the field the screen drew: refused unless the holder is still on [drawnRevision]. */
+    fun onSendClick(steerRun: String?, drawnRevision: Long): Boolean = onSendClick(steerRun)
+
     /** A no-text command tapped in the palette: the same dispatch, claim, refusals and return value as [onSendClick]. */
     fun onCommand(command: Command): Boolean = false
+
+    /** [onCommand] for the field the screen drew ([drawnRevision], as for [onSendClick]). */
+    fun onCommand(command: Command, drawnRevision: Long): Boolean = onCommand(command)
     /** [runId]: the run the Stop button was drawn for. */
     fun onStopClick(runId: String) {}
     fun onRetry(idempotencyKey: String) {}
@@ -222,6 +235,10 @@ class ChatViewModel(
         // What sendWithImages would send: nothing while a photo is processing; text or a ready photo otherwise.
         val sendable = c.images.none { it.processing } && (d.isNotBlank() || c.images.any { it.digest != null })
         val photos = c.images.any { !it.failed }
+        val a = c.answer
+        // A displayed clarify takes a choice only while the field holds its own buffer, not being sent.
+        val asked = live?.pending?.takeIf { it.kind == "clarify" }
+        val choosable = asked != null && a != null && !a.sending && a.runId == live.runId && a.requestId == asked.requestId && a.generation == asked.executionGeneration
         ChatUiState(
             sessionKey = sessionKey,
             title = e.title,
@@ -237,19 +254,21 @@ class ChatViewModel(
             },
             items = items,
             composer = when {
+                a?.expired == true -> ComposerMode.SEND_DISABLED
+                a != null -> ComposerMode.ANSWER
                 live == null -> if (sendable) ComposerMode.SEND else ComposerMode.SEND_DISABLED
                 photos -> if (sendable) ComposerMode.SEND_AFTER else ComposerMode.STOP
                 d.isBlank() -> ComposerMode.STOP
                 else -> ComposerMode.STEER // a draft of text and only failed photos: the failed ones leave with it
             },
-            draft = d,
+            draft = a?.text ?: d,
             host = host,
             live = live,
             notes = l.notes,
-            answering = l.answering,
+            answering = l.answering || a?.sending == true || asked != null && !choosable,
             confirmRetry = l.confirmRetry,
             composerNote = c.note,
-            sending = c.sending,
+            sending = a?.sending ?: c.sending,
             confirmCancel = l.confirmCancel,
             unsent = c.unsent,
             confirmDiscard = c.unsent?.takeIf { it.id == l.confirmDiscard },
@@ -257,15 +276,21 @@ class ChatViewModel(
             choice = e.choice,
             sheet = l.sheet,
             firstLoad = l.firstLoad,
-            images = c.images,
+            images = if (a != null) emptyList() else c.images,
             storedSends = l.storedSends,
             storedKey = l.storedKey,
+            answer = a,
         )
     }.stateIn(
         viewModelScope,
         SharingStarted.Eagerly,
         composer.current(sessionKey).let {
-            ChatUiState(sessionKey, "", StatusLine.IDLE, emptyList(), ComposerMode.SEND_DISABLED, it.draft, host, sending = it.sending, unsent = it.unsent, draftRevision = it.revision, loaded = false, images = it.images)
+            val a = it.answer // as the combine shows it, so a new screen never shows the draft for a frame
+            ChatUiState(
+                sessionKey, "", StatusLine.IDLE, emptyList(), if (a != null && !a.expired) ComposerMode.ANSWER else ComposerMode.SEND_DISABLED,
+                a?.text ?: it.draft, host, answering = a?.sending == true, sending = a?.sending ?: it.sending, unsent = it.unsent,
+                draftRevision = it.revision, loaded = false, images = if (a != null) emptyList() else it.images, answer = a,
+            )
         },
     )
 
@@ -282,6 +307,27 @@ class ChatViewModel(
             combine(repo.refreshed, repo.session(sessionKey).map { it?.stale == true }.distinctUntilChanged()) { _, _ -> }
                 .collect { onOpened() }
         }
+        // The answer buffer follows the clarify request the live run displays.
+        viewModelScope.launch {
+            follower.live(sessionKey)
+                .map { l -> l?.pending?.takeIf { it.kind == "clarify" }?.let { Triple(l.runId, it.requestId, it.executionGeneration) } }
+                .distinctUntilChanged()
+                .collect { observe() }
+        }
+    }
+
+    /** The clarify request the live run displays now (read now, not from the flow's last value); null once closed. */
+    private fun shown(): Shown? {
+        if (!connected.isOpen) return null
+        val live = follower.live(sessionKey).value
+        val p = live?.pending?.takeIf { it.kind == "clarify" }
+        return Shown(live?.runId, p?.requestId, p?.executionGeneration ?: 0)
+    }
+
+    /** Tells the holder which clarify request the live run displays now; nothing once this connection is closed. */
+    private fun observe() {
+        val now = shown() ?: return
+        composer.showQuestion(sessionKey, now.runId, now.requestId, now.generation) { connected.isOpen }
     }
 
     /**
@@ -317,7 +363,13 @@ class ChatViewModel(
     }
 
     override fun onDraftChange(text: String, basedOnRevision: Long) {
-        composer.edit(sessionKey, text, basedOnRevision)
+        val a = composer.current(sessionKey).answer
+        if (a != null) {
+            composer.editAnswer(sessionKey, a.runId, a.requestId, a.generation, text, basedOnRevision)
+            observe() // an emptied expired answer has gone: the question displayed now gets its buffer
+        } else {
+            composer.edit(sessionKey, text, basedOnRevision)
+        }
         if (composer.current(sessionKey).note != null) composer.setNote(sessionKey, null) // any keystroke clears the note
     }
 
@@ -326,36 +378,53 @@ class ChatViewModel(
     private var commandInFlight: Pair<String, Long>? = null
 
     /** The live run this view model shows: what the screen draws its Steer and Stop for. */
+    // Without a drawn field (tests), the holder's revision now: nothing was drawn that could be stale.
     override fun onSendClick(): Boolean = onSendClick(state.value.live?.runId)
 
-    override fun onSendClick(steerRun: String?): Boolean = dispatch(steerRun)
+    override fun onSendClick(steerRun: String?): Boolean = dispatch(steerRun, composer.current(sessionKey).revision)
 
-    override fun onCommand(command: Command): Boolean = dispatch(state.value.live?.runId, command)
+    override fun onSendClick(steerRun: String?, drawnRevision: Long): Boolean = dispatch(steerRun, drawnRevision)
+
+    override fun onCommand(command: Command): Boolean = dispatch(state.value.live?.runId, composer.current(sessionKey).revision, command)
+
+    override fun onCommand(command: Command, drawnRevision: Long): Boolean = dispatch(state.value.live?.runId, drawnRevision, command)
 
     /**
      * The one submit path (button, IME action, hardware Enter, palette): reads the holder now and decides from the
      * claimed draft whether it is a message or a command line. A command line is never sent as text; a refusal sets
      * its note and keeps the draft's text and photos; a command that ran clears the draft only if it still holds the
      * claimed text at the claimed revision. [runId]: the run a steer or /stop is for. A cleared view model takes nothing.
+     * While the field shows an answer buffer, its text is what is parsed, and a message answers the displayed question.
+     * [drawnRevision]: the holder's revision the screen drew the field from. Every change of what the field shows that
+     * is not a user edit ticks it, so a submit drawn for one buffer never acts on another.
      */
-    private fun dispatch(runId: String?, tapped: Command? = null): Boolean {
+    private fun dispatch(runId: String?, drawnRevision: Long, tapped: Command? = null): Boolean {
         if (!viewModelScope.isActive) return false
         val claim = composer.current(sessionKey)
-        if (claim.sending) return false // the holder takes nothing while a send is being stored
-        val (command, text) = when (val parsed = tapped?.let { Parsed.Run(it, "") } ?: parseCommand(claim.draft)) {
-            Parsed.Message -> return send(runId)
+        if (claim.revision != drawnRevision) return false
+        val a = claim.answer
+        // The holder takes nothing while a send is being stored, nor from an answer being sent or expired.
+        if (if (a != null) a.sending || a.expired else claim.sending) return false
+        val shown = a?.text ?: claim.draft
+        val (command, text) = when (val parsed = tapped?.let { Parsed.Run(it, "") } ?: parseCommand(shown)) {
+            Parsed.Message -> return if (a == null) send(runId) else {
+                // The question displayed now, by its ids read at dispatch: the claim takes only that request's buffer.
+                val live = follower.live(sessionKey).value ?: return false
+                val p = live.pending?.takeIf { it.kind == "clarify" } ?: return false
+                answerClarify(live.runId, p.requestId, p.executionGeneration, choice = null)
+            }
             is Parsed.Unknown -> return refuse(NoteKind.CMD_UNKNOWN, "/${parsed.word}".takeCodePoints(32))
             is Parsed.Run -> parsed
         }
-        val claimed = claim.draft to claim.revision
+        val claimed = shown to claim.revision
         if (commandInFlight == claimed) return false
         when {
             !command.takesText && text.isNotBlank() -> return refuse(NoteKind.CMD_NO_TEXT, "/${command.word}")
             command.takesText && text.isBlank() -> return refuse(NoteKind.CMD_NEEDS_TEXT)
-            command == Command.STEER && claim.images.isNotEmpty() -> return refuse(NoteKind.CMD_STEER_NO_IMAGES)
+            command == Command.STEER && a == null && claim.images.isNotEmpty() -> return refuse(NoteKind.CMD_STEER_NO_IMAGES) // a draft's photos; an answer's are set aside
             (command == Command.STEER || command == Command.STOP) && runId == null -> return refuse(NoteKind.CMD_NOTHING_RUNNING)
             command == Command.STEER && state.value.live?.status != "running" -> return refuse(NoteKind.CMD_NOTHING_RUNNING)
-            command == Command.STEER || command == Command.QUEUE -> return send(runId, command) // stored like a message
+            command == Command.STEER || command == Command.QUEUE -> return if (a == null) send(runId, command) else storeAnswer(a, runId, command, text) // stored like a message
         }
         val title = if (command == Command.TITLE) cleanTitle(text) ?: return refuse(NoteKind.CMD_NEEDS_TEXT) else null
         commandInFlight = claimed
@@ -404,13 +473,11 @@ class ChatViewModel(
     }
 
     /**
-     * Clears the draft a command ran from, only if the holder still has [claim]'s text at its revision (a user edit keeps
-     * the revision, so the text is compared too). Called on the main thread, where user edits arrive too. Not through
-     * [onDraftChange], so a note set just before stays.
+     * Clears the line a command ran from, in one holder update, only if it still holds [claim]'s text at its revision (a
+     * user edit keeps the revision, so the text is compared too); the clear gives a fresh revision, so a second submit
+     * drawn from that line takes nothing. A note set just before stays.
      */
-    private fun clearIfClaimed(claim: ComposerState) {
-        if (composer.current(sessionKey).let { it.draft == claim.draft && it.revision == claim.revision }) composer.edit(sessionKey, "", claim.revision)
-    }
+    private fun clearIfClaimed(claim: ComposerState) = composer.clearCommand(sessionKey, claim.answer?.text ?: claim.draft, claim.revision)
 
     /**
      * A row of this view model's send, plain or by command, was stored with [key]: the screen pins the list once the
@@ -449,6 +516,74 @@ class ChatViewModel(
         return started != null
     }
 
+    /**
+     * Posts the answer to that clarify request: [choice] when a choice button gave it, else the buffer's text. Claimed by
+     * the holder for exactly those ids (false when it refused); the claim ends only in the job's finally, so leaving the
+     * chat does not cancel a post that may already have been taken. A question gone or changed expires the buffer;
+     * any other failure keeps it editable and shows on the status line.
+     */
+    private fun answerClarify(runId: String, requestId: String, generation: Long, choice: String?): Boolean {
+        if (!viewModelScope.isActive) return false // the claim would never settle
+        val text = composer.claimAnswer(sessionKey, runId, requestId, generation, choice) ?: return false
+        request {
+            var result = AnswerSettle.UNCLEAR
+            try {
+                withContext(NonCancellable) {
+                    result = try {
+                        if (follower.answerClarify(sessionKey, requestId, generation, text) == AnswerResult.SENT) AnswerSettle.SENT else AnswerSettle.EXPIRED
+                    } catch (_: ApiError.NotFound) {
+                        AnswerSettle.EXPIRED // the run is gone
+                    }
+                }
+            } finally {
+                composer.settleAnswer(sessionKey, runId, requestId, generation, result, ::shown)
+            }
+        }
+        return true
+    }
+
+    /**
+     * /queue or /steer typed as the answer: stores only [arg] (no photo: the draft's are set aside), claimed through the
+     * answer buffer like an answer. The buffer empties only once the row is stored (the question still waits for its
+     * answer); a failed store keeps the text.
+     */
+    private fun storeAnswer(a: Answer, runId: String?, command: Command, arg: String): Boolean {
+        if (!viewModelScope.isActive) return false
+        composer.claimAnswer(sessionKey, a.runId, a.requestId, a.generation) ?: return false
+        request {
+            var result = AnswerSettle.UNCLEAR
+            var note: ComposerNote? = null
+            try {
+                withContext(NonCancellable) {
+                    var storedKey: String? = null
+                    // Not settled here: a settle now would let a fresh buffer of the same ids be claimed before this job ends.
+                    val onStored = { key: String ->
+                        storedKey = key
+                        published(key)
+                        result = AnswerSettle.STORED
+                    }
+                    val returned = try {
+                        if (command == Command.QUEUE) {
+                            repo.queue(sessionKey, arg, emptyList(), onStored)
+                        } else {
+                            repo.send(sessionKey, arg, steerRun = runId, steerOnly = true, onStored = onStored)
+                        }
+                        true
+                    } catch (_: Exception) {
+                        false // nothing stored: the text stays in the field, with no note (as for a draft)
+                    }
+                    if (storedKey != null) local.update { it.copy(notes = emptyMap()) }
+                    // A steer that returned without a row: its run no longer runs.
+                    if (returned && storedKey == null && command == Command.STEER) note = ComposerNote(NoteKind.CMD_NOTHING_RUNNING)
+                }
+            } finally {
+                composer.settleAnswer(sessionKey, a.runId, a.requestId, a.generation, result, ::shown, note)
+            }
+        }
+        accepted.tryEmit(Unit)
+        return true
+    }
+
     override fun onStopClick(runId: String) = request { follower.stop(sessionKey, runId) }
 
     override fun onRetry(idempotencyKey: String) = request {
@@ -485,6 +620,7 @@ class ChatViewModel(
 
     override fun onConfirmDiscard(id: Long) {
         composer.discard(sessionKey, id)
+        observe()
         onDismissDiscard()
     }
 
@@ -510,9 +646,11 @@ class ChatViewModel(
     override fun onApproval(requestId: String, executionGeneration: Long, choice: ApprovalChoice) =
         answer(requestId, executionGeneration) { follower.answerApproval(sessionKey, requestId, executionGeneration, choice) }
 
+    /** A choice button: answers with its exact label, only while the live run still displays exactly that request. */
     override fun onClarify(requestId: String, executionGeneration: Long, answer: String) {
-        if (answer.isBlank()) return
-        answer(requestId, executionGeneration) { follower.answerClarify(sessionKey, requestId, executionGeneration, answer) }
+        val live = follower.live(sessionKey).value ?: return
+        if (live.pending?.let { it.kind == "clarify" && it.requestId == requestId && it.executionGeneration == executionGeneration } != true) return
+        answerClarify(live.runId, requestId, executionGeneration, choice = answer)
     }
 
     override fun onResolveUnknown() = request { follower.resolveUnknown(sessionKey) }
