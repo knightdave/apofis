@@ -27,9 +27,11 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Size
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -60,7 +62,8 @@ internal val TopFade = 24.dp
  * The transparent top bar over the list. Its bounds are the opaque part: the status bar and the row (at least
  * [TopBarHeight], taller with large text); a page-colored gradient continues [TopFade] below them and fades to clear,
  * so the title and the status line stay readable over scrolled text. No elevation, no scroll tint. Horizontal safe
- * insets (side navigation, cutouts) keep the controls clear of the edges.
+ * insets (side navigation, cutouts) keep the controls clear of the edges. The bar is no Surface, so it gives its two
+ * slots the page's content colour itself: without it their icons stay black on the dark bar.
  */
 @Composable
 internal fun ChatTopBar(
@@ -95,9 +98,11 @@ internal fun ChatTopBar(
                 .testTag("chat.topbar.row"),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            navigationIcon()
-            Box(Modifier.weight(1f)) { Title(state, onOpenConnection, onRetryLoad) }
-            actions()
+            CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onSurface) {
+                navigationIcon()
+                Box(Modifier.weight(1f)) { Title(state, onOpenConnection, onRetryLoad) }
+                actions()
+            }
         }
     }
 }
