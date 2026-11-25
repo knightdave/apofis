@@ -172,7 +172,7 @@ class LogPrivacyTest {
             "fun f(e: Throwable) = e.printStackTrace()",
             "fun f(title: String) = System.err.write(title.toByteArray())",
         )
-        flagged.forEach { assertTrue(it, censusEntries("control.kt", it).isNotEmpty()) }
+        assertEquals("controls not flagged", emptyList<String>(), flagged.filter { censusEntries("control.kt", it).isEmpty() })
         val plain = listOf(
             "import android.util.Log\nimport java.io.File\n\nclass A",
             "import android.util.Log // the logger\n\nprivate val x = 1",
