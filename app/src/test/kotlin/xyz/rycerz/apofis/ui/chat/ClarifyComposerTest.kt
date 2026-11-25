@@ -986,6 +986,7 @@ class ClarifyComposerTest {
         vm.awaitState { it.composer == ComposerMode.ANSWER }
         rule.setContent { Screen(vm, enterToSend) }
         draw { exists(answerButton) }
+        tick() // one frame drawn: input reaches what was composed
         return vm
     }
 
