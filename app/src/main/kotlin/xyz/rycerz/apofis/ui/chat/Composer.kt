@@ -71,7 +71,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.traversalIndex
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -196,9 +198,17 @@ internal fun ComposerParts(
     // Without blur the glass shows the content under it: a page backplate keeps text and icons at their contrast.
     val backplate = if (fillOnly) Modifier.background(scheme.surface, shape) else Modifier
     Box(Modifier.then(backplate).frostedGlass(backdrop, shape, colors.glassFill, colors.glassBorder)) // the card
+    // The holder's text with the field's own selection; a change the field did not make (a palette fill, Put back, another
+    // buffer) puts the cursor at the end. A send still takes the holder's text, and nothing reads the composing region.
+    var own by remember { mutableStateOf(TextFieldValue(draft, TextRange(draft.length))) }
+    val seen = remember { arrayOf(draft) } // not state: only the holder's last text
+    if (draft != seen[0]) {
+        seen[0] = draft
+        if (draft != own.text) own = TextFieldValue(draft, TextRange(draft.length))
+    }
     BasicTextField(
-        draft,
-        onDraftChange,
+        own.copy(text = draft),
+        { v -> own = v; if (v.text != draft) onDraftChange(v.text) },
         Modifier
             .fillMaxWidth()
             .semantics { traversalIndex = -1f } // read before the buttons
@@ -338,8 +348,9 @@ internal class ComposerPlacement(
 
 /**
  * Lays out the composer's parts in one [bottomShares] allocation: the bar, notes and transcript inputs come from the
- * caller ([bar] own height, [notes] natural height, [unsent]); [available] is the safe band. Returns the shares and the
- * placement; every part is measured with exactly its share (the field once, through the allocation).
+ * caller ([bar] own height, [notes] natural height, [unsent], the slash [palette] natural height); [available] is the
+ * safe band. Returns the shares and the placement; every part is measured with exactly its share (the field once,
+ * through the allocation).
  */
 internal fun MeasureScope.measureComposer(
     parts: List<Measurable>,
@@ -349,6 +360,7 @@ internal fun MeasureScope.measureComposer(
     bar: Int = 0,
     notes: Int = 0,
     unsent: Boolean = false,
+    palette: Int = 0,
 ): Pair<BottomShares, ComposerPlacement> {
     val d = look.dims
     val marginX = MARGIN_X.roundToPx()
@@ -360,7 +372,7 @@ internal fun MeasureScope.measureComposer(
     val fieldWidth = (inner - plus.width - maxOf(expandBox.width, buttons.width)).coerceAtLeast(0)
     var field: Placeable? = null
     val expansion = if (look.expanded) Expansion(look.progress.value, look.lines(), if (look.expandedHeight.isSpecified) look.expandedHeight.roundToPx() else Int.MAX_VALUE) else null
-    val s = bottomShares(available, bar, notes, unsent, look.wantsExpand, expansion, d, look.strip) { room ->
+    val s = bottomShares(available, bar, notes, unsent, look.wantsExpand, expansion, d, look.strip, palette) { room ->
         parts[1].measure(Constraints(fieldWidth, fieldWidth, 0, room)).also { field = it }.height // 1 to 5 lines (maxLines), scrolling inside
     }
     val f = field ?: parts[1].measure(Constraints.fixed(fieldWidth, s.field))
@@ -414,7 +426,7 @@ internal fun Composer(
     }
 }
 
-private val MARGIN_X = 12.dp
+internal val MARGIN_X = 12.dp // the card's side margin; the slash palette uses it too
 
 /**
  * The primary button: Send, Steer or Stop, one stable control (one focus target, one labelled node) whatever the mode.
