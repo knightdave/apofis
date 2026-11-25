@@ -21,6 +21,8 @@ import xyz.rycerz.apofis.sync.SendTooLarge
  * [revision] changes with every change to [draft] that is not a user edit; an edit made on an older revision is
  * dropped. [unsent] is text a send could not store, shown apart until the user puts it back or discards it.
  * [images] are the draft's photos in pick order; [note] is the one note of this chat, the newest set.
+ * [answer] is the answer to the clarify question displayed now: while it is set the field shows it and the draft's text
+ * and photos wait, untouched, until the question settles.
  */
 data class ComposerState(
     val draft: String = "",
@@ -29,7 +31,21 @@ data class ComposerState(
     val revision: Long = 0,
     val images: List<DraftImage> = emptyList(),
     val note: ComposerNote? = null,
+    val answer: Answer? = null,
 )
+
+/**
+ * The answer buffer of exactly one clarify request ([runId], [requestId], [generation]). [sending]: claimed and being
+ * posted; it takes no edits and only its own settle ends it. [expired]: the question went while the buffer held text
+ * that the unsent notice could not take; it stays in the field until the user empties it.
+ */
+data class Answer(val runId: String, val requestId: String, val generation: Long, val text: String, val expired: Boolean = false, val sending: Boolean = false)
+
+private fun Answer.owns(runId: String?, requestId: String?, generation: Long) =
+    this.runId == runId && this.requestId == requestId && this.generation == generation
+
+/** How an answer's post ended: [EXPIRED] the question was gone or changed, [UNCLEAR] anything else. */
+enum class AnswerSettle { SENT, EXPIRED, UNCLEAR }
 
 /** A draft photo: [digest] null while it is processing, then its file in the image store, or [failed]. */
 data class DraftImage(val id: Long, val digest: String?, val failed: Boolean = false) {
@@ -42,7 +58,7 @@ data class DraftImage(val id: Long, val digest: String?, val failed: Boolean = f
  */
 data class UnsentText(val id: Long, val text: String, val error: ComposeError, val images: List<String> = emptyList())
 
-enum class ComposeError { NOT_STORED }
+enum class ComposeError { NOT_STORED, ANSWER_EXPIRED }
 
 data class ComposerNote(val kind: NoteKind, val arg: String? = null)
 
@@ -52,7 +68,7 @@ enum class NoteKind {
     FAST_OFF, TEMPORARY_NOT_DELETED,
 }
 
-private fun ComposerState.idle() = draft.isEmpty() && !sending && unsent == null && images.isEmpty() && note == null
+private fun ComposerState.idle() = draft.isEmpty() && !sending && unsent == null && images.isEmpty() && note == null && answer == null
 
 /** Given to a send's store: [stored] says the text is durably accepted, so the field may empty now. */
 fun interface Stored {
@@ -113,6 +129,81 @@ class Composer(private val scope: CoroutineScope) {
     /** A user edit on the field drawn from [basedOnRevision]; dropped when the draft was changed otherwise since. */
     fun edit(sessionKey: String, text: String, basedOnRevision: Long) =
         change(sessionKey) { s, _ -> if (s.revision == basedOnRevision && !s.sending) s.copy(draft = text) else s }
+
+    /**
+     * A user edit of the answer buffer of that request, drawn from [basedOnRevision]; dropped when the buffer is another
+     * request's, is being sent, or changed otherwise since. An expired buffer emptied this way goes, so the draft returns.
+     */
+    fun editAnswer(sessionKey: String, runId: String, requestId: String, generation: Long, text: String, basedOnRevision: Long) =
+        change(sessionKey) { s, tick ->
+            val a = s.answer
+            when {
+                s.revision != basedOnRevision || a == null || !a.owns(runId, requestId, generation) || a.sending -> s
+                a.expired && text.isEmpty() -> s.copy(answer = null, revision = tick)
+                else -> s.copy(answer = a.copy(text = text))
+            }
+        }
+
+    /**
+     * Claims the answer buffer of exactly that request for one post: returns [choice] when given (the field is not
+     * changed), else the buffer's text when not blank; null, with nothing changed, when the buffer is another request's,
+     * is being sent or expired. Only [settleAnswer] ends the claim.
+     */
+    fun claimAnswer(sessionKey: String, runId: String, requestId: String, generation: Long, choice: String? = null): String? {
+        var text: String? = null
+        book.update { b ->
+            text = null
+            val a = b.entries[sessionKey]?.answer
+            if (sessionKey in b.gone || a == null || !a.owns(runId, requestId, generation) || a.sending || a.expired) return@update b
+            text = choice ?: a.text.takeIf { it.isNotBlank() } ?: return@update b
+            b.with(sessionKey) { s, tick -> s.copy(answer = a.copy(sending = true), revision = tick) }
+        }
+        return text
+    }
+
+    /**
+     * Ends the claim of that request's buffer, once: [AnswerSettle.SENT] clears it, [AnswerSettle.EXPIRED] expires it,
+     * [AnswerSettle.UNCLEAR] makes it editable again. The ids are the token: anything else (no such buffer being sent,
+     * a removed or cleared chat) changes nothing.
+     */
+    fun settleAnswer(sessionKey: String, runId: String, requestId: String, generation: Long, result: AnswerSettle) = book.update { b ->
+        val a = b.entries[sessionKey]?.answer
+        if (sessionKey in b.gone || a == null || !a.owns(runId, requestId, generation) || !a.sending) return@update b
+        b.with(sessionKey) { s, tick ->
+            when (result) {
+                AnswerSettle.SENT -> s.copy(answer = null, revision = tick)
+                AnswerSettle.EXPIRED -> s.copy(answer = a.copy(sending = false)).expire(tick)
+                AnswerSettle.UNCLEAR -> s.copy(answer = a.copy(sending = false), revision = tick)
+            }
+        }
+    }
+
+    /**
+     * The clarify request displayed now in the chat's live run (null [requestId]: none). A buffer being sent waits for
+     * its own settle; an expired one stays as it is. Any other buffer of another request is dropped when blank and
+     * expired otherwise; then, with no buffer left, the displayed request gets an empty one.
+     */
+    fun showQuestion(sessionKey: String, runId: String?, requestId: String?, generation: Long) = book.update { b ->
+        if (sessionKey in b.gone) return@update b
+        val a = b.entries[sessionKey]?.answer
+        if (a != null && (a.sending || a.expired || a.owns(runId, requestId, generation))) return@update b
+        val next = if (a == null) b else b.with(sessionKey) { s, tick -> s.expire(tick) }
+        if (runId == null || requestId == null || next.entries[sessionKey]?.answer != null) return@update next
+        next.with(sessionKey) { s, tick -> s.copy(answer = Answer(runId, requestId, generation, ""), revision = tick) }
+    }
+
+    /**
+     * The answer buffer's question is gone: a blank buffer goes; text moves to an empty unsent notice, or stays in the
+     * field marked expired when the notice holds something. Never joined to the draft or to other unsent text.
+     */
+    private fun ComposerState.expire(tick: Long): ComposerState {
+        val a = answer ?: return this
+        return when {
+            a.text.isBlank() -> copy(answer = null, revision = tick)
+            unsent == null -> copy(answer = null, unsent = UnsentText(tick, a.text, ComposeError.ANSWER_EXPIRED), revision = tick)
+            else -> copy(answer = a.copy(expired = true), revision = tick)
+        }
+    }
 
     /**
      * Sends the draft and its ready images with [store] unless a send of this chat is in flight (then null): [store] gets
@@ -228,11 +319,11 @@ class Composer(private val scope: CoroutineScope) {
 
     /**
      * Puts the unsent text back: the unsent text, then a newline and the draft when neither is blank; its photos go
-     * before the draft's.
+     * before the draft's. Refused while the field shows an answer buffer, which hides the draft.
      */
     fun putBack(sessionKey: String) = book.update { b ->
         val s = b.entries[sessionKey]
-        val unsent = s?.unsent?.takeIf { !s.sending && sessionKey !in b.gone } ?: return@update b // the field holds a send in flight
+        val unsent = s?.unsent?.takeIf { !s.sending && s.answer == null && sessionKey !in b.gone } ?: return@update b // the field holds a send in flight
         val images = unsent.images.mapIndexed { i, d -> DraftImage(b.counter + 1 + i, d) }
         b.copy(counter = b.counter + images.size).with(sessionKey) { _, tick ->
             val draft = when {
@@ -244,8 +335,13 @@ class Composer(private val scope: CoroutineScope) {
         }
     }
 
-    /** Discards the unsent entry [id], the one the user agreed to discard; any other entry stays. */
-    fun discard(sessionKey: String, id: Long) = change(sessionKey) { s, _ -> if (s.unsent?.id == id) s.copy(unsent = null) else s }
+    /**
+     * Discards the unsent entry [id], the one the user agreed to discard; any other entry stays. An expired answer
+     * waiting in the field moves into the notice it frees.
+     */
+    fun discard(sessionKey: String, id: Long) = change(sessionKey) { s, tick ->
+        if (s.unsent?.id != id) s else s.copy(unsent = null).let { if (it.answer?.expired == true) it.expire(tick) else it }
+    }
 
     /**
      * Moves the composer of [from] to [to] (a chat made temporary or ordinary): draft, photos, note and unsent text, on a

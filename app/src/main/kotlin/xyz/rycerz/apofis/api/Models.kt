@@ -76,6 +76,8 @@ data class PendingControl(
     @SerialName("execution_generation") val executionGeneration: Long,
     val command: String?,
     val question: String?,
+    val choices: List<String> = emptyList(), // a clarify's offered answers (approvals carry theirs too; unused there)
+    @SerialName("multi_select") val multiSelect: Boolean = false,
 )
 
 enum class ApprovalChoice { ONCE, SESSION, ALWAYS, DENY }

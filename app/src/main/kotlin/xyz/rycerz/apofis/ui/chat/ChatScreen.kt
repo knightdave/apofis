@@ -83,6 +83,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.UriHandler
 import xyz.rycerz.apofis.ui.theme.BackdropState
 import androidx.compose.ui.platform.testTag
@@ -111,6 +112,7 @@ import kotlin.math.ceil
 import kotlinx.coroutines.launch
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.api.ChatModel
+import xyz.rycerz.apofis.chat.Answer
 import xyz.rycerz.apofis.chat.ComposeError
 import xyz.rycerz.apofis.chat.ComposerNote
 import xyz.rycerz.apofis.chat.DraftImage
@@ -200,6 +202,7 @@ fun ChatScreen(
             state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
             state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed, enterToSend, expanded, state.sessionKey,
             state.status == StatusLine.LOAD_FAILED, state.images, state.choice.model.takeIf { Command.MODEL in matches }, matches,
+            state.answer,
         ),
     )
     // One gate for everything the chat can do: while the drawer covers it, a press that was already down (another
@@ -285,6 +288,10 @@ fun ChatScreen(
             // Read at tap time: onCommand claims and clears the whole draft, so a tap acts only while the draft now is
             // still the slash word the row was drawn for (the drawn draft without an owner's state, as in tests).
             val still = { c: Command -> c in scanPalette(current.value?.invoke()?.draft ?: input.draft) }
+            // Answering: the request the buffer belongs to, and its press rule from when the composer first showed it.
+            val asked = input.answer?.takeIf { input.mode == ComposerMode.ANSWER }?.let { Triple(it.runId, it.requestId, it.generation) }
+            val settle = LocalViewConfiguration.current.doubleTapTimeoutMillis
+            val answerGate = remember(asked) { asked?.let { AnswerGate({ answerClock.value() }, settle, overlays) } }
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -304,7 +311,8 @@ fun ChatScreen(
                     // Notes keep a backing of their own over scrolled text, and scroll inside their share when taller. The
                     // unsent entry comes first, so its row is the one the guaranteed share shows.
                     Column(Modifier.semantics { traversalIndex = -2f }.testTag("chat.notes").background(MaterialTheme.colorScheme.surface).verticalScroll(rememberScrollState())) {
-                        input.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent) }
+                        input.unsent?.let { UnsentNotice(it, actions::onPutBack, actions::onDiscardUnsent, putBackEnabled = input.answer == null) }
+                        if (input.answer?.expired == true) NoteLine(R.string.chat_unsent_answer_expired)
                         input.note?.let { ComposerNoteLine(it) }
                         if (input.linkFailed) NoteLine(R.string.settings_link_no_app, oneLine = true)
                     }
@@ -325,12 +333,17 @@ fun ChatScreen(
                         expanded = input.expanded,
                         onExpandedChange = { grow -> gate.pass { expandedIn.value = if (grow) input.sessionKey else null } }, // a user action of the covered layout
                         backdrop = objects.value.backdrop,
-                        subject = if (input.mode == ComposerMode.STOP || input.mode == ComposerMode.STEER || input.mode == ComposerMode.SEND_AFTER) input.runId else input.sessionKey,
+                        subject = when (input.mode) {
+                            ComposerMode.ANSWER -> asked
+                            ComposerMode.STOP, ComposerMode.STEER, ComposerMode.SEND_AFTER -> input.runId
+                            else -> input.sessionKey
+                        },
                         images = input.images,
-                        attachEnabled = !input.sending && !input.loadFailed && input.sessionKey.isNotEmpty(),
+                        attachEnabled = !input.sending && !input.loadFailed && input.sessionKey.isNotEmpty() && input.answer == null,
                         onAttach = attach,
                         onRemoveImage = actions::onRemoveImage,
                         focusRequester = fieldFocus,
+                        answerGate = answerGate,
                     )
                     Box(Modifier.padding(horizontal = MARGIN_X)) {
                         if (matches.isNotEmpty() && paletteRoom.state.value) {
@@ -674,11 +687,15 @@ private fun NoteLine(text: Int, oneLine: Boolean = false, arg: String? = null) {
     )
 }
 
-/** Text a send could not store: the reason, the start of the text, and Put back / Discard. */
+/**
+ * Text a send could not store, or an answer whose question expired: the reason, the start of the text, and Put back /
+ * Discard. Put back is disabled while [putBackEnabled] is false (the field shows an answer, the draft is set aside).
+ */
 @Composable
-private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: () -> Unit) {
+private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: () -> Unit, putBackEnabled: Boolean) {
     val reason = when (unsent.error) {
         ComposeError.NOT_STORED -> R.string.chat_unsent_not_stored
+        ComposeError.ANSWER_EXPIRED -> R.string.chat_unsent_answer_expired
     }
     Row(Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp).padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }) {
@@ -692,7 +709,7 @@ private fun UnsentNotice(unsent: UnsentText, onPutBack: () -> Unit, onDiscard: (
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        WashTextButton(R.string.chat_unsent_put_back, onPutBack)
+        WashTextButton(R.string.chat_unsent_put_back, onPutBack, enabled = putBackEnabled)
         WashTextButton(R.string.chat_unsent_discard, onDiscard)
     }
 }
@@ -710,9 +727,9 @@ private fun ConfirmDialog(title: Int, text: Int, quote: String, confirm: Int, di
 }
 
 @Composable
-private fun WashTextButton(label: Int, onClick: () -> Unit) {
+private fun WashTextButton(label: Int, onClick: () -> Unit, enabled: Boolean = true) {
     val source = remember { MutableInteractionSource() }
-    TextButton(onClick = onClick, Modifier.wash(source, ButtonDefaults.textShape), interactionSource = source) { Text(stringResource(label)) }
+    TextButton(onClick = onClick, Modifier.wash(source, ButtonDefaults.textShape), enabled = enabled, interactionSource = source) { Text(stringResource(label)) }
 }
 
 /**
@@ -759,11 +776,12 @@ private data class BottomInput(
     // otherwise recomposes nothing here.
     val model: String?,
     val matches: List<Command>, // the palette's commands for the draft (see [scanPalette])
+    val answer: Answer?, // the clarify answer the field shows (live or expired), null otherwise
 )
 
 /** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it; with firstLoad (the skeleton). */
 private fun ChatUiState.forTranscript() =
-    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null, images = emptyList(), storedSends = 0, storedKey = null)
+    copy(composer = ComposerMode.SEND_DISABLED, draft = "", composerNote = null, sending = false, unsent = null, confirmDiscard = null, draftRevision = 0, choice = ChatModel(), sheet = null, images = emptyList(), storedSends = 0, storedKey = null, answer = null)
 
 private data class BarCallbacks(
     val onOpenConnection: () -> Unit,

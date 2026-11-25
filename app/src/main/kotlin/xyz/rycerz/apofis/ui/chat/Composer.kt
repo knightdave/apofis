@@ -109,7 +109,7 @@ private val CARD_PADDING = 8.dp
 /** Whether the main button works: a send in flight ([busy]) blocks another send or steer, never Stop. Drawing only. */
 internal fun primaryEnabled(mode: ComposerMode, busy: Boolean) = when (mode) {
     ComposerMode.SEND_DISABLED -> false
-    ComposerMode.SEND, ComposerMode.STEER, ComposerMode.SEND_AFTER -> !busy
+    ComposerMode.SEND, ComposerMode.STEER, ComposerMode.SEND_AFTER, ComposerMode.ANSWER -> !busy
     ComposerMode.STOP -> true
 }
 
@@ -151,7 +151,7 @@ internal class ExpandRoom {
 
 /**
  * The composer's parts, in this order: the card's glass, the field, the expand button (an empty box when not shown),
- * the action row (Stop before the primary button while steering or sending after the reply), Plus (the photo picker,
+ * the action row (Stop before the primary button while steering, answering or sending after the reply), Plus (the photo picker,
  * [onAttach]; disabled unless [attachEnabled]) and the strip of draft [images] (an empty box when hidden; each photo
  * has a remove control, [onRemoveImage], disabled while [busy]). They are laid out by [placeComposer]
  * with the numbers of [bottomShares]: by [Composer] on its own, or by the chat screen's bottom area together with the
@@ -161,7 +161,8 @@ internal class ExpandRoom {
  * it took the draft; only then the composer collapses. The button, the IME action (only with [enterToSend]) and
  * hardware Enter (see [enterKey]) all go through it. [busy]: see [primaryEnabled]; the field also takes no edits then.
  * [subject]: what the primary action acts on (the run for Stop, Steer and Send after, the chat for Send); see [PrimaryButton].
- * [focusRequester] focuses the field.
+ * [focusRequester] focuses the field. [answerGate]: in [ComposerMode.ANSWER], the request's press rule ([AnswerGate]):
+ * the button counts a press only by it, and the IME action and hardware Enter are judged by it when they arrive.
  */
 @Composable
 internal fun ComposerParts(
@@ -184,6 +185,7 @@ internal fun ComposerParts(
     onAttach: () -> Unit = {},
     onRemoveImage: (Long) -> Unit = {},
     focusRequester: FocusRequester = remember { FocusRequester() },
+    answerGate: AnswerGate? = null,
 ): ComposerLook {
     if (BuildConfig.DEBUG) SideEffect { ChromeProbe.composerBackdropId = System.identityHashCode(backdrop) }
     val shape = RoundedCornerShape(20.dp)
@@ -194,7 +196,7 @@ internal fun ComposerParts(
     val dims = remember(density, style, transcript) { density.bottomDims(style, transcript) }
     val progress = remember { Animatable(if (expanded) 1f else 0f) } // 0 collapsed, 1 expanded
     LaunchedEffect(expanded) { if (expanded) progress.animateTo(1f, tween(Motion.COMPOSER_EXPAND, easing = EaseOutCubic)) else progress.snapTo(0f) }
-    val submit = { if (onSend()) onExpandedChange(false) }
+    val submit = { if ((answerGate?.accepts(Press()) ?: true) && onSend()) onExpandedChange(false) } // no press of its own: judged now
     var lines by remember { mutableIntStateOf(1) }
     val manyLines by remember { derivedStateOf { showsExpand(lines, expanded = false) } }
     val pad = with(density) { (dims.fieldPadding / 2f).toDp() }
@@ -203,7 +205,8 @@ internal fun ComposerParts(
     // Without blur the glass shows the content under it: a page backplate keeps text and icons at their contrast.
     val backplate = if (fillOnly) Modifier.background(scheme.surface, shape) else Modifier
     Box(Modifier.then(backplate).frostedGlass(backdrop, shape, colors.glassFill, colors.glassBorder)) // the card
-    DraftField(draft, onDraftChange, submit, busy, enterToSend, expanded, style, pad, focusRequester) { lines = it }
+    val hint = if (mode == ComposerMode.ANSWER) R.string.chat_clarify_hint else R.string.chat_message_hint
+    DraftField(draft, onDraftChange, submit, busy, enterToSend, expanded, style, pad, focusRequester, hint) { lines = it }
     val wantsExpand = expanded || manyLines
     val room = remember { ExpandRoom() }
     Box {
@@ -222,10 +225,10 @@ internal fun ComposerParts(
     }
     Row {
         // Keyed by the run it is drawn for: a press begun on one run is cancelled when another run is shown.
-        if (mode == ComposerMode.STEER || mode == ComposerMode.SEND_AFTER) key(subject) {
+        if (mode == ComposerMode.STEER || mode == ComposerMode.SEND_AFTER || mode == ComposerMode.ANSWER) key(subject) {
             RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
         }
-        PrimaryButton(mode, busy, subject, submit, onStop, clock)
+        PrimaryButton(mode, busy || mode == ComposerMode.ANSWER && draft.isBlank(), subject, submit, onStop, clock, answerGate)
     }
     ApofisIconButton(onClick = onAttach, contentDescription = stringResource(R.string.chat_attach), enabled = attachEnabled, visualSize = 24.dp) {
         Icon(painterResource(R.drawable.lucide_plus), null, Modifier.size(20.dp), tint = colors.muted)
@@ -267,6 +270,7 @@ private fun DraftField(
     style: TextStyle,
     pad: Dp,
     focusRequester: FocusRequester,
+    hint: Int,
     onLines: (Int) -> Unit,
 ) {
     var own by remember { mutableStateOf(TextFieldValue(draft, TextRange(draft.length))) }
@@ -304,7 +308,7 @@ private fun DraftField(
         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
         decorationBox = { inner ->
             Box(Modifier.padding(start = 4.dp, top = pad, bottom = pad)) {
-                if (draft.isEmpty()) Text(stringResource(R.string.chat_message_hint), style = MaterialTheme.typography.bodyLarge, color = ApofisTheme.colors.muted)
+                if (draft.isEmpty()) Text(stringResource(hint), style = MaterialTheme.typography.bodyLarge, color = ApofisTheme.colors.muted)
                 inner()
             }
         },
@@ -465,13 +469,15 @@ internal val MARGIN_X = 12.dp // the card's side margin; the slash palette uses 
  * chat for Send), and `downAt`, the latest press-down on the button (a pointer, an indirect pointer, the first key-down
  * of an activation key). A click from a pointer or a key counts only when its press came after the change; an
  * accessibility click, which has no press, runs the action shown when it arrives. No press is tracked beyond that, so
- * a lost release or a cancelled pointer can never block a later press.
+ * a lost release or a cancelled pointer can never block a later press. With [answerGate] (Answer), a click counts only
+ * when the gate also accepts the press that produced it.
  */
 @Composable
-private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, submit: () -> Unit, onStop: () -> Unit, clock: () -> Long) {
+private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, submit: () -> Unit, onStop: () -> Unit, clock: () -> Long, answerGate: AnswerGate?) {
     val action = if (mode == ComposerMode.SEND_DISABLED) ComposerMode.SEND else mode
     val changedAt = remember(action, subject) { clock() }
     val downAt = remember { longArrayOf(Long.MIN_VALUE) }
+    val press = remember { Press() }
     val now = rememberUpdatedState(clock)
     val stop = mode == ComposerMode.STOP
     val enabled = primaryEnabled(mode, busy)
@@ -480,6 +486,7 @@ private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, subm
         ComposerMode.STEER -> R.string.chat_steer
         ComposerMode.STOP -> R.string.chat_stop
         ComposerMode.SEND_AFTER -> R.string.chat_send_after
+        ComposerMode.ANSWER -> R.string.chat_answer
         else -> R.string.chat_send
     }
     val label = stringResource(labelId)
@@ -504,8 +511,9 @@ private fun PrimaryButton(mode: ComposerMode, busy: Boolean, subject: Any?, subm
                 false
             }
             // The accessibility click: no press of its own, so it runs what is shown now.
-            .then(if (enabled) Modifier.semantics { onClick(label) { run(); true } } else Modifier),
-        onClick = { if (downAt[0] > changedAt) run() }, // every physical activation
+            .then(if (enabled) Modifier.semantics { onClick(label) { run(); true } } else Modifier)
+            .then(if (answerGate != null) Modifier.pressStart(press, answerGate) else Modifier),
+        onClick = { if (downAt[0] > changedAt && answerGate?.accepts(press) != false) run() }, // every physical activation
     )
 }
 

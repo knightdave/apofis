@@ -47,7 +47,6 @@ import androidx.compose.ui.test.getBoundsInRoot
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasScrollAction
-import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isFocused
@@ -64,7 +63,6 @@ import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performSemanticsAction
-import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.test.withKeyDown
@@ -171,7 +169,6 @@ class DrawerUiTest {
     }
 
     private val approval = PendingControl("approval", "ctl_1", 1, "rm -rf ~/old", null)
-    private val clarify = PendingControl("clarify", "ctl_q", 4, null, "Which folder?")
 
     private val approvals = ArrayList<ApprovalChoice>()
     private var sends = 0
@@ -469,25 +466,10 @@ class DrawerUiTest {
         assertOpen()
     }
 
-    /** A drag that starts on an editable field (the clarify answer in the chat, the search in the drawer) never moves the drawer. */
+    /** A drag that starts on an editable field (the search in the drawer) never moves the drawer. */
     @Test
     fun editableFieldsKeepTheirDrags() {
-        shownChat = withPending(clarify)
         show()
-        val answer = rule.onNode(hasSetTextAction() and !hasTestTag("composer.field"))
-        answer.performTextInput("Downloads")
-        frames(2)
-        drag(0.6f * panel, 6, answer) // quick
-        shutFor(30)
-        answer.performTouchInput {
-            down(center)
-            advanceEventTime(viewConfiguration.longPressTimeoutMillis + 100) // a selection drag
-            repeat(20) { moveBy(Offset(10f, 0f)) }
-        }
-        shutFor(3)
-        up(answer)
-        shutFor(30)
-        assertEquals("Downloads", answer.fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
         runCode { state.open() }
         settled()
         val search = rule.onNodeWithContentDescription("Search chats")
@@ -528,7 +510,7 @@ class DrawerUiTest {
         settled()
     }
 
-    /** Ownership is decided at the down: a 35 degree swipe on a scrolling code block, a scrolling table or either field never moves the drawer. */
+    /** Ownership is decided at the down: a 35 degree swipe on a scrolling code block, a scrolling table or the search field never moves the drawer. */
     @Test
     fun diagonalSwipesOnSidewaysOwnersLeaveTheDrawer() {
         shownChat = replyWith("Code:\n\n```\n$longLine\n```\n\n$wideTable")
@@ -536,9 +518,6 @@ class DrawerUiTest {
         diagonal(rule.onNodeWithText(longLine, substring = true), stays = true)
         diagonal(rule.onNodeWithText("a fairly long cell"), stays = true)
         assertClosed()
-        shownChat = withPending(clarify)
-        frames(3)
-        diagonal(rule.onNode(hasSetTextAction() and !hasTestTag("composer.field")), stays = true)
         runCode { state.open() }
         settled()
         diagonal(rule.onNodeWithContentDescription("Search chats"), toward = -1f, stays = true)
@@ -674,7 +653,7 @@ class DrawerUiTest {
     private fun centreOf(node: SemanticsNodeInteraction): Offset = node.fetchSemanticsNode().boundsInRoot.center
 
     /**
-     * One finger per gesture, with a claimed second finger (the clarify field, then a code row that scrolls): whatever
+     * One finger per gesture, with a claimed second finger (a code row that scrolls): whatever
      * the order and whether the lead lifts before or after the slop, the claimed finger never moves the drawer.
      */
     @Test
@@ -724,55 +703,6 @@ class DrawerUiTest {
             shutFor(30)
         }
         drag(0.6f * panel, 30) // an ordinary fresh drag
-        settled()
-        assertOpen()
-    }
-
-    /** The same with the clarify field as the claimed finger. */
-    @Test
-    fun aClaimedSecondFingerOnTheClarifyFieldNeverTakesTheDrawer() {
-        shownChat = withPending(clarify)
-        show()
-        frames(3)
-        val plainAt = centreOf(rule.onNodeWithText("Answer 1, long enough to wrap onto a second line of the chat screen.", substring = true))
-        val fieldAt = centreOf(rule.onNode(hasSetTextAction() and !hasTestTag("composer.field")))
-        val plain = { plainAt }
-        val claimed = { fieldAt }
-        rule.onRoot().performTouchInput {
-            down(0, plain())
-            down(1, claimed())
-            up(0)
-            repeat(10) { moveBy(1, Offset(4f, 0f)) }
-        }
-        shutFor(3)
-        rule.onRoot().performTouchInput { up(1) }
-        shutFor(30)
-        rule.onRoot().performTouchInput {
-            down(0, plain())
-            down(1, claimed())
-            repeat(5) { moveBy(0, Offset(20f, 0f), delayMillis = 100) } // slow: its release settles by position
-        }
-        frames()
-        assertTrue(state.fraction > 0f)
-        rule.onRoot().performTouchInput { up(0) }
-        settled()
-        assertClosed()
-        rule.onRoot().performTouchInput { repeat(10) { moveBy(1, Offset(20f, 0f)) } }
-        shutFor(3)
-        rule.onRoot().performTouchInput { up(1) }
-        shutFor(30)
-        rule.onRoot().performTouchInput {
-            down(1, claimed())
-            down(0, plain())
-            repeat(10) { moveBy(0, Offset(20f, 0f)) }
-        }
-        shutFor(3)
-        rule.onRoot().performTouchInput {
-            up(0)
-            up(1)
-        }
-        shutFor(30)
-        drag(0.6f * panel, 30)
         settled()
         assertOpen()
     }

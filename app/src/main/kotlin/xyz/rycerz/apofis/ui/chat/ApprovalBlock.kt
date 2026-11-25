@@ -1,7 +1,6 @@
 package xyz.rycerz.apofis.ui.chat
 
 import androidx.compose.ui.platform.LocalDensity
-import xyz.rycerz.apofis.ui.theme.claimSideways
 import xyz.rycerz.apofis.ui.theme.sidewaysScroll
 import androidx.annotation.StringRes
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -40,8 +39,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -140,30 +137,20 @@ internal fun ApprovalBlock(control: PendingControl, changed: Boolean, answering:
     }
 }
 
-/** A question from Hermes, answered right here, by this block's own request id and generation. */
+/**
+ * A question from Hermes; the answer is typed in the composer. A single-choice question offers one button per choice,
+ * each answering with its exact label by this block's own request id and generation; a multi-select one is answered as
+ * free text only.
+ */
 @Composable
 internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: Boolean, gate: AnswerGate, onAnswer: (String, Long, String) -> Unit) {
     ControlCard(R.string.chat_clarify_title, changed) {
         control.question?.let { Text(it, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface) }
-        var answer by rememberSaveable(control.requestId, control.executionGeneration) { mutableStateOf("") }
-        val sendPress = remember { Press() }
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                answer,
-                { answer = it },
-                Modifier.weight(1f).claimSideways(),
-                placeholder = { Text(stringResource(R.string.chat_clarify_hint)) },
-                maxLines = 5,
-                enabled = !answering,
-                colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = ApofisTheme.colors.timelineOutline), // 3:1 on the card
-            )
-            ApofisIconButton(
-                onClick = { if (gate.accepts(sendPress)) onAnswer(control.requestId, control.executionGeneration, answer) },
-                contentDescription = stringResource(R.string.chat_clarify_send),
-                Modifier.pressStart(sendPress, gate),
-                enabled = !answering && answer.isNotBlank(),
-            ) {
-                Icon(painterResource(R.drawable.lucide_arrow_up), null, Modifier.size(20.dp))
+        if (control.choices.isNotEmpty() && !control.multiSelect) {
+            Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (choice in control.choices) {
+                    Pill(choice, filled = false, enabled = !answering, gate) { if (gate.accepts(it)) onAnswer(control.requestId, control.executionGeneration, choice) }
+                }
             }
         }
     }
@@ -319,7 +306,7 @@ private val activationKeys = setOf(Key.Enter, Key.NumPadEnter, Key.Spacebar, Key
  * once the gesture ends, cancelled or not) and activation key downs (not repeats) and releases (cleared once the
  * release has been handled without a click, and all of them when the control loses focus).
  */
-private fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
+internal fun Modifier.pressStart(press: Press, gate: AnswerGate): Modifier = this
     .pointerInput(press, gate) {
         awaitEachGesture {
             try {
