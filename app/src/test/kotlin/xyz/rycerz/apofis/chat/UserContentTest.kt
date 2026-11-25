@@ -118,10 +118,12 @@ class UserContentTest {
             assertEquals(length, unknown.length)
             val content = "cap\n\n${hint(a)}\n$unknown\n[screenshot]\n[screenshot]"
             assertEquals(UserContent("cap", listOf(a, null)), parseUserContent(content))
-            val items = buildTranscript(listOf(MessageDto(1, "user", null, content, null, null, null, null, 1.0, null)))
-            assertEquals("cap", (items.single() as UserMessage).text)
-            assertEquals("cap", actionable(items, "u1")) // Copy
-            assertEquals("cap", actionable(items, "u1", fullMessage = true)) // Select and the full reader
+            for (kind in listOf("internal_notification", null)) { // a run's row, and a row of another surface
+                val items = buildTranscript(listOf(MessageDto(1, "user", kind, content, null, null, null, null, 1.0, null)))
+                assertEquals("cap", (items.single() as UserMessage).text)
+                assertEquals("cap", actionable(items, "u1")) // Copy
+                assertEquals("cap", actionable(items, "u1", fullMessage = true)) // Select and the full reader
+            }
         }
     }
 
@@ -131,8 +133,10 @@ class UserContentTest {
         for (c in listOf("\r", "\u000B", "\u000C", "\u0085", "\u2028", "\u2029")) {
             for (content in listOf("cap\n\n[Image attached: left${c}right]\n[screenshot]", "cap\n\n[Image attached at: /p${c}q/api_$a.jpg]\n[screenshot]")) {
                 assertEquals(plain(content), parseUserContent(content))
-                val items = buildTranscript(listOf(MessageDto(1, "user", null, content, null, null, null, null, 1.0, null)))
-                assertEquals(content, (items.single() as UserMessage).text)
+                for (kind in listOf("internal_notification", null)) {
+                    val items = buildTranscript(listOf(MessageDto(1, "user", kind, content, null, null, null, null, 1.0, null)))
+                    assertEquals(content, (items.single() as UserMessage).text)
+                }
             }
         }
     }

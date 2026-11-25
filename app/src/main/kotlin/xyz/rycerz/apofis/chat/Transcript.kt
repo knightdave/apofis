@@ -23,10 +23,16 @@ private const val STORED_PREVIEW = "apofis_preview" // the arguments preview of 
 fun userKey(id: Long) = "u$id"
 
 /**
- * Turns stored session rows (oldest first) into chat items. Linear in the number of rows. A plain user row shows its
+ * A user row that starts a turn, whose image block is parsed: no display kind (rows of other surfaces) or
+ * "internal_notification", which the server gives every user row of a run. A steer row is not one.
+ */
+fun MessageDto.startsTurn() = role == "user" && (displayKind == null || displayKind == "internal_notification")
+
+/**
+ * Turns stored session rows (oldest first) into chat items. Linear in the number of rows. A turn's user row shows its
  * parsed text and the digests [bindings] (message id to digests) holds for its id when its own hints are exactly
  * their first 32 hex, in order; otherwise one placeholder per parsed image. So a row that is not shortened never borrows
- * another row's photo. [cuts] holds each row's stored cut by index (dropped calls, shortened): a shortened plain user
+ * another row's photo. [cuts] holds each row's stored cut by index (dropped calls, shortened): a shortened turn user
  * row shows its stored content unparsed with the photos bound to its id, even when another row with that id holds them.
  */
 fun buildTranscript(
@@ -44,18 +50,18 @@ fun buildTranscript(
         val shortened = cut?.second == true
         when {
             row.role == "session_meta" || kind == "hidden" -> Unit
-            row.role == "user" && (kind == null || kind == "internal_notification" || kind == "steer") -> {
+            row.startsTurn() || row.role == "user" && kind == "steer" -> {
                 reply = null
                 waiting = HashMap() // fresh, since clear() keeps the peak capacity and costs that much per turn
-                val steered = kind == "steer"
-                items += if (kind == null && shortened) {
+                val turn = row.startsTurn()
+                items += if (turn && shortened) {
                     UserMessage(userKey(row.id), row.content, false, row.timestamp, images = bindings[row.id] ?: emptyList(), raw = row.content, shortened = true)
-                } else if (kind == null) {
+                } else if (turn) {
                     val parsed = parseUserContent(row.content)
                     val images = bindings[row.id]?.takeIf { d -> d.map { it.take(32) } == parsed.images } ?: parsed.images.map { null }
                     UserMessage(userKey(row.id), parsed.text, false, row.timestamp, images = images, raw = row.content)
                 } else {
-                    UserMessage(userKey(row.id), if (steered) unwrapSteer(row.content) else row.content, steered, row.timestamp, raw = row.content, shortened = shortened)
+                    UserMessage(userKey(row.id), unwrapSteer(row.content), true, row.timestamp, raw = row.content, shortened = shortened)
                 }
             }
             kind != null -> {

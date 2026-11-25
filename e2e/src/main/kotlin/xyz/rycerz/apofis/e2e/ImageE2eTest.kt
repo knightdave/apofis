@@ -65,7 +65,7 @@ class ImageE2eTest {
         val end = app.awaitSendEnd(key, 300_000)
         // The server's own record, read after the identity check and whatever the app confirmed: fixed facts only.
         val f = storedImageRow(app.serverMessages(key), caption, staged)
-        app.log("stored row: user rows ${f.userRows}, caption equal ${f.captionEqual}, suffix form ${f.suffixForm}, hints ${f.hints}, screenshots ${f.screenshots}, digest prefix matches the staged JPEG ${f.prefixMatches}")
+        app.log("stored row: user rows ${f.userRows}, caption equal ${f.captionEqual}, suffix form ${f.suffixForm}, hints ${f.hints}, screenshots ${f.screenshots}, digest prefix matches the staged JPEG ${f.prefixMatches}, kind internal_notification ${f.internalNotification}")
         if (end !is SendEnd.Run || end.record.optString("status") != "completed") fail("The run did not complete")
         if (f.userRows != 1 || !f.suffixForm || !f.prefixMatches) fail("The stored row is not the caption, a blank line, one hint naming the sent JPEG and one [screenshot] line")
 
@@ -113,8 +113,19 @@ class ImageE2eTest {
     }
 }
 
-/** The structure of the stored user row of an image send, as fixed facts (no text or path). */
-data class ImageRowFacts(val userRows: Int, val captionEqual: Boolean, val suffixForm: Boolean, val hints: Int, val screenshots: Int, val prefixMatches: Boolean)
+/**
+ * The structure of the stored user row of an image send, as fixed facts (no text or path). [internalNotification] is
+ * recorded only: the app reads the row the same way with that display kind or none.
+ */
+data class ImageRowFacts(
+    val userRows: Int,
+    val captionEqual: Boolean,
+    val suffixForm: Boolean,
+    val hints: Int,
+    val screenshots: Int,
+    val prefixMatches: Boolean,
+    val internalNotification: Boolean,
+)
 
 /**
  * [rows]' one user row against [caption] and the staged JPEG's [digest]: the caption, a blank line, then exactly one
@@ -123,11 +134,12 @@ data class ImageRowFacts(val userRows: Int, val captionEqual: Boolean, val suffi
 fun storedImageRow(rows: List<JSONObject>, caption: String, digest: String): ImageRowFacts {
     val users = rows.filter { it.str("role") == "user" }
     val content = users.singleOrNull()?.str("content").orEmpty()
+    val internalNotification = users.singleOrNull()?.str("display_kind") == "internal_notification"
     val captionEqual = content.startsWith("$caption\n\n")
     val lines = content.removePrefix("$caption\n\n").split('\n')
     val hint = Regex("\\[Image attached at: [^\\n\\]]*api_([0-9a-f]{32})\\.jpg]")
     val hints = lines.mapNotNull { hint.matchEntire(it)?.groupValues?.get(1) }
     val shots = lines.count { it == "[screenshot]" }
     val form = captionEqual && lines.size == 2 && hint.matches(lines[0]) && lines[1] == "[screenshot]"
-    return ImageRowFacts(users.size, captionEqual, form, hints.size, shots, hints.singleOrNull() == digest.take(32))
+    return ImageRowFacts(users.size, captionEqual, form, hints.size, shots, hints.singleOrNull() == digest.take(32), internalNotification)
 }

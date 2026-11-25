@@ -449,9 +449,14 @@ class HarnessSelfTest {
     @Test
     fun storedImageRowIsReducedToItsStructure() {
         val digest = "0123456789abcdef0123456789abcdef" + "f".repeat(32)
-        fun rows(content: String) = listOf(JSONObject().put("role", "user").put("content", content), JSONObject().put("role", "assistant").put("content", "ok"))
+        fun rows(content: String, kind: String? = null) = listOf(
+            JSONObject().put("role", "user").put("content", content).apply { if (kind != null) put("display_kind", kind) },
+            JSONObject().put("role", "assistant").put("content", "ok"),
+        )
         val good = "cap\n\n[Image attached at: /x/api_0123456789abcdef0123456789abcdef.jpg]\n[screenshot]"
-        assertEquals(ImageRowFacts(1, true, true, 1, 1, true), storedImageRow(rows(good), "cap", digest))
+        assertEquals(ImageRowFacts(1, true, true, 1, 1, true, false), storedImageRow(rows(good), "cap", digest))
+        assertEquals(ImageRowFacts(1, true, true, 1, 1, true, true), storedImageRow(rows(good, "internal_notification"), "cap", digest))
+        assertFalse(storedImageRow(rows(good, "steer"), "cap", digest).internalNotification)
         assertFalse(storedImageRow(rows(good.replace("0123456789abcdef0123", "aaaaaaaaaaaaaaaaaaaa")), "cap", digest).prefixMatches)
         assertFalse(storedImageRow(rows(good + "\n[screenshot]"), "cap", digest).suffixForm)
         assertFalse(storedImageRow(rows(good.replace("cap\n\n", "cap\n")), "cap", digest).captionEqual)

@@ -1214,6 +1214,55 @@ class ImageSendViewModelTest {
         assertEquals(ComposerMode.SEND_AFTER, vm.await { it.draft == "caption" }.composer)
     }
 
+    /**
+     * A photo sent and its run followed to the end, the stand-in server answering with the user row as the real one
+     * stores it for a run (kind "internal_notification"): the send is confirmed and bound, and the bubble shows the photo.
+     */
+    @Test
+    fun photoSendConfirmsAgainstARunsUserRow() {
+        addSession()
+        wait { db.sessionDao().upsert(db.sessionDao().get(KEY)!!.copy(existsOnServer = true)) } // the send starts the run directly
+        // Empty until the run's events are asked for: the chat's opening read can never see the turn before it is sent.
+        routes["/api/sessions/$KEY/messages"] = json("""{"object":"list","session_id":"$KEY","data":[]}""")
+        val vm = vm()
+        val d = readyPhoto()
+        vm.type("Look at this")
+        vm.await { it.composer == ComposerMode.SEND && it.draft == "Look at this" }
+        val content = "Look at this\n\n[Image attached at: /srv/hermes/cache/documents/native-inputs/$d/api_${d.take(32)}.jpg]\n[screenshot]"
+        routes["/v1/runs"] = json("""{"run_id":"$RUN","status":"started","replayed":false}""")
+        routes["/v1/runs/$RUN/events"] = {
+            // The events request follows the stored send and its active run: only now the server holds the finished turn.
+            val now = System.currentTimeMillis() / 1000.0 // the follower confirms a send only by a row from the last minute
+            routes["/api/sessions/$KEY/messages"] = json(
+                """{"object":"list","session_id":"$KEY","data":[""" +
+                    """{"id":10,"role":"user","display_kind":"internal_notification","content":${kotlinx.serialization.json.JsonPrimitive(content)},"timestamp":$now},""" +
+                    """{"id":11,"role":"assistant","content":"A cat.","timestamp":$now}]}""",
+            )
+            MockResponse.Builder().body(": open\n\nid: 0\ndata: {\"event\":\"run.completed\",\"seq\":0}\n\n")
+                .addHeader("Content-Type", "text/event-stream").build()
+        }
+        wait { follower.resumeAll() } // as at app start: the follower follows the runs it is told of
+        assertTrue(vm.onSendClick())
+
+        // Settled: the follower attached to the run and its active row is gone (removed in the settling transaction).
+        wait {
+            withContext(Dispatchers.IO) {
+                while (requests.none { it.target.startsWith("/v1/runs/$RUN/events") } || db.activeRunDao().get(RUN) != null) delay(10)
+            }
+        }
+        assertEquals(emptyList<String>(), wait { db.pendingSendDao().rows(KEY) }.map { "${it.state} ${it.error}" }) // confirmed, not unconfirmed
+        assertEquals(listOf(10L to d), wait { db.imageBindingDao().forSession(KEY) }.map { it.messageId to it.digests })
+        // The settled screen, not an earlier one: the run is over and the one user bubble already shows its bound photo.
+        val done = vm.await { s ->
+            s.live == null && s.items.any { it.key == "r11" } && s.items.filterIsInstance<UserMessage>().singleOrNull()?.images == listOf<String?>(d)
+        }
+        val bubble = done.items.filterIsInstance<UserMessage>().single() // no pending bubble beside it, so no Retry
+        assertEquals("u10", bubble.key)
+        assertEquals("Look at this", bubble.text)
+        assertEquals(SendState.SENT, bubble.state)
+        assertEquals(listOf<String?>(d), bubble.images)
+    }
+
     @Test
     fun imageDraftDuringRunIsLabelledAsQueued() {
         addSession()
@@ -1262,7 +1311,7 @@ class ImageRestartTest {
                     ),
                 )
                 val content = "Look\n\n[Image attached at: /home/h/.hermes/cache/native-inputs/api_${d.take(32)}.jpg]\n[screenshot]"
-                before.messageDao().insertAll(listOf(MessageEntity(KEY, 0, 7, "user", null, content, null, null, null, null, FIXED_NOW, null)))
+                before.messageDao().insertAll(listOf(MessageEntity(KEY, 0, 7, "user", "internal_notification", content, null, null, null, null, FIXED_NOW, null)))
                 before.imageBindingDao().upsert(ImageBindingEntity(KEY, 7, d))
             }
             before.close()

@@ -53,6 +53,35 @@ class TranscriptTest {
         assertEquals(UserMessage("u1", "hi", steered = false, timestamp = 1.0), items.single())
     }
 
+    private val runHex = "3f9a".repeat(16)
+
+    /** A user row as the server stores an image send made through its run API (observed live): the kind is not null. */
+    private val runRow = "Look at this\n\n[Image attached at: /srv/hermes/cache/documents/native-inputs/$runHex/api_${runHex.take(32)}.jpg]\n[screenshot]"
+
+    @Test
+    fun runRowWithAnImageIsParsed() {
+        for (kind in listOf("internal_notification", null)) { // a run's row, and a row of another surface
+            val unbound = buildTranscript(listOf(row(1, "user", runRow, displayKind = kind))).single() as UserMessage
+            assertEquals(UserMessage("u1", "Look at this", false, 1.0, images = listOf(null), raw = runRow), unbound)
+            val bound = buildTranscript(listOf(row(1, "user", runRow, displayKind = kind)), mapOf(1L to listOf(runHex))).single() as UserMessage
+            assertEquals(listOf(runHex), bound.images)
+            assertEquals("Look at this", bound.text)
+            // A stored cut is shown as stored, with the photos bound to its id.
+            val cut = buildTranscript(listOf(row(1, "user", "Look", displayKind = kind)), mapOf(1L to listOf(runHex)), listOf(0 to true)).single()
+            assertEquals(UserMessage("u1", "Look", false, 1.0, images = listOf(runHex), raw = "Look", shortened = true), cut)
+        }
+    }
+
+    @Test
+    fun imageBlockInsideASteerRowIsNotParsed() {
+        val body = "Look at this\n\n[Image attached at: /srv/hermes/cache/documents/native-inputs/$runHex/api_${runHex.take(32)}.jpg]\n[screenshot]"
+        val content = "[OUT-OF-BAND USER MESSAGE - sent while you were working]\n$body\n[/OUT-OF-BAND USER MESSAGE]"
+        val item = buildTranscript(listOf(row(1, "user", content, displayKind = "steer")), mapOf(1L to listOf(runHex))).single() as UserMessage
+        assertTrue(item.steered)
+        assertEquals(body, item.text) // unwrapped, the hint lines kept as text
+        assertEquals(emptyList<String?>(), item.images)
+    }
+
     @Test
     fun steerFixture() {
         val items = buildTranscript(rows("messages_steer.json"))

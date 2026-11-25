@@ -128,7 +128,7 @@ class ImageGcTest {
 
     private fun serveRows(key: String, vararg rows: Pair<Long, String>) {
         val data = rows.joinToString(",") { (id, content) ->
-            """{"id":$id,"role":"user","content":${kotlinx.serialization.json.JsonPrimitive(content)},"timestamp":1.0}"""
+            """{"id":$id,"role":"user","display_kind":"internal_notification","content":${kotlinx.serialization.json.JsonPrimitive(content)},"timestamp":1.0}"""
         }
         routes["GET /api/sessions/$key/messages"] = 200 to """{"object":"list","session_id":"$key","data":[$data]}"""
     }

@@ -1053,7 +1053,7 @@ class ChatRepositorySyncTest {
             listOf(
                 cutRow(1, "user", "a".repeat(450_000)),
                 cutRow(2, "assistant", "d".repeat(450_000), calls = cutCalls(Triple("c1", "terminal", "{}"))),
-                cutRow(3, "user", literal),
+                cutRow(3, "user", literal, kind = "internal_notification"),
                 cutRow(4, "user", "[OUT-OF-BAND USER MESSAGE]\n" + "s".repeat(450_000) + "\n[/OUT-OF-BAND USER MESSAGE]", kind = "steer"),
             ),
         ) { db, repo ->
@@ -1105,7 +1105,11 @@ class ChatRepositorySyncTest {
         val confirmed = mutableSetOf<String>()
         syncAndReopen(
             "cut-users.db",
-            listOf(cutRow(1, "user", text), cutRow(2, "user", bigCaption + cutBlock(cutD1)), cutRow(3, "user", caption + cutBlock(cutD2))),
+            listOf(
+                cutRow(1, "user", text),
+                cutRow(2, "user", bigCaption + cutBlock(cutD1), kind = "internal_notification"),
+                cutRow(3, "user", caption + cutBlock(cutD2), kind = "internal_notification"),
+            ),
             seed = { db ->
                 val dao = db.pendingSendDao()
                 dao.upsert(PendingSendEntity("k1", "apofis-a", text, "{}", 1_000L, "sending", "run_1", null))
@@ -1150,7 +1154,7 @@ class ChatRepositorySyncTest {
 
         awaitShown { items -> items.any { it.key == "pk" } }
         // The live sync during the run: no settlement, so the pending row stays sending beside its cut stored row.
-        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", caption + cutBlock(cutD1)), cutRow(2, "assistant", "Looking"))))
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", caption + cutBlock(cutD1), kind = "internal_notification"), cutRow(2, "assistant", "Looking"))))
         assertTrue(repo.syncMessages("apofis-a"))
         val last = awaitShown { items -> items.any { it is AssistantReply } }
 
@@ -1194,10 +1198,26 @@ class ChatRepositorySyncTest {
         db.imageBindingDao().upsert(ImageBindingEntity("apofis-a", 2, cutD1))
         // Two rows with one id: the short one supports the binding, the long one names another photo.
         val long = "p".repeat(399_990) + cutBlock(cutD2)
-        respond(rawMessages("apofis-a", listOf(cutRow(2, "user", "x" + cutBlock(cutD1)), cutRow(2, "user", long))))
+        respond(rawMessages("apofis-a", listOf(cutRow(2, "user", "x" + cutBlock(cutD1), kind = "internal_notification"), cutRow(2, "user", long, kind = "internal_notification"))))
         assertTrue(repo.syncMessages("apofis-a"))
         assertEquals(long.take(400_000), db.messageDao().rows("apofis-a")[1].content) // cut from its tail, not parsed
         assertEquals(mapOf(2L to cutD1), db.imageBindingDao().forSession("apofis-a").associate { it.messageId to it.digests })
+    }
+
+    /** The row the server stores for an image send through its run API, in its observed shape, over the bound and bound. */
+    @Test
+    fun boundRunRowOverTheBoundStoresItsParsedText() = runTest {
+        db.sessionDao().upsert(session("apofis-a"))
+        db.imageBindingDao().upsert(ImageBindingEntity("apofis-a", 1, cutD1))
+        val caption = "q".repeat(399_990)
+        val raw = caption + "\n\n[Image attached at: /srv/hermes/cache/documents/native-inputs/$cutD1/api_${cutD1.take(32)}.jpg]\n[screenshot]"
+        respond(rawMessages("apofis-a", listOf(cutRow(1, "user", raw, kind = "internal_notification"))))
+        assertTrue(repo.syncMessages("apofis-a"))
+        assertEquals(caption, db.messageDao().rows("apofis-a").single().content)
+        assertEquals(mapOf(1L to cutD1), db.imageBindingDao().forSession("apofis-a").associate { it.messageId to it.digests })
+        val shown = repo.transcript("apofis-a").first().filterIsInstance<UserMessage>().single()
+        assertEquals(caption, shown.text)
+        assertEquals(listOf(cutD1), shown.images)
     }
 
     @Test
@@ -1205,6 +1225,7 @@ class ChatRepositorySyncTest {
         db.sessionDao().upsert(session("apofis-a"))
         val caption = "q".repeat(399_990)
         val raw = caption + cutBlock(cutD1)
+        // A row with no kind (another surface) is cut the same way as a run's row.
         respond(rawMessages("apofis-a", listOf(cutRow(1, "user", raw))))
         assertTrue(repo.syncMessages("apofis-a"))
         assertEquals(raw.take(400_000), db.messageDao().rows("apofis-a").single().content) // no binding yet: the tail cut
