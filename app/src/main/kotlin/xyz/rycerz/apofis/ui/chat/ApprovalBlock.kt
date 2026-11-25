@@ -59,6 +59,7 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -157,7 +158,7 @@ internal fun ClarifyBlock(control: PendingControl, changed: Boolean, answering: 
                     if (control.multiSelect) {
                         Text(choice, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = CHOICE_LINES, overflow = TextOverflow.Ellipsis)
                     } else {
-                        Pill(choice, filled = false, enabled = !answering, gate, RoundedCornerShape(18.dp), CHOICE_LINES) {
+                        Pill(choice, filled = false, enabled = !answering, gate, RoundedCornerShape(18.dp), CHOICE_LINES, vertical = 6.dp) {
                             if (gate.accepts(it)) onAnswer(control.requestId, control.executionGeneration, choice) // the exact label
                         }
                     }
@@ -173,7 +174,8 @@ internal const val MAX_CHOICES = 4
 private const val CHOICE_LINES = 3
 
 /** The choices drawn for a clarify: blank labels dropped; none when more than [MAX_CHOICES] remain (free text only). */
-internal fun shownChoices(choices: List<String>): List<String> = choices.filter { it.isNotBlank() }.takeIf { it.size <= MAX_CHOICES }.orEmpty()
+internal fun shownChoices(choices: List<String>): List<String> =
+    choices.asSequence().filter { it.isNotBlank() }.take(MAX_CHOICES + 1).toList().takeIf { it.size <= MAX_CHOICES }.orEmpty() // stops at the fifth
 
 /** A request of a kind this version does not know: said plainly, with nothing that could grant anything. */
 @Composable
@@ -225,11 +227,12 @@ private fun ControlCard(
 
 /**
  * An answer button: a pill at least 36 dp high (outlined, or [filled] in primary) centred in a touch target at least
- * 48 dp wide and high, one node with the wash and focus ring on the pill itself. [shape] and [maxLines]: a clarify
- * choice is a rounded rectangle of at most three lines (one line looks like the approval's circle-ended pill).
+ * 48 dp wide and high, one node with the wash and focus ring on the pill itself. [shape], [maxLines] and [vertical]
+ * padding: a clarify choice is a rounded rectangle of at most three lines (one line looks like the approval's
+ * circle-ended pill); an approval keeps horizontal padding only.
  */
 @Composable
-private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerGate, shape: Shape = CircleShape, maxLines: Int = Int.MAX_VALUE, onClick: (Press) -> Unit) {
+private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerGate, shape: Shape = CircleShape, maxLines: Int = Int.MAX_VALUE, vertical: Dp = 0.dp, onClick: (Press) -> Unit) {
     val source = remember { MutableInteractionSource() }
     val press = remember { Press() }
     val scheme = MaterialTheme.colorScheme
@@ -246,7 +249,7 @@ private fun Pill(label: String, filled: Boolean, enabled: Boolean, gate: AnswerG
                 .alpha(if (enabled) 1f else 0.38f)
                 .then(if (filled) Modifier.background(scheme.primary, shape) else Modifier.border(1.dp, ApofisTheme.colors.hairlineStrong, shape))
                 .wash(source, shape, ring = if (filled) scheme.onPrimary else Color.Unspecified)
-                .padding(horizontal = 16.dp, vertical = 6.dp), // one line stays within the 36 dp minimum
+                .padding(horizontal = 16.dp, vertical = vertical), // a choice's 6 dp: one line stays within the 36 dp minimum
             contentAlignment = Alignment.Center,
         ) {
             Text(label, style = MaterialTheme.typography.labelLarge, color = if (filled) scheme.onPrimary else scheme.onSurface, maxLines = maxLines, overflow = TextOverflow.Ellipsis)

@@ -153,6 +153,23 @@ class Composer(private val scope: CoroutineScope) {
         }
 
     /**
+     * A command typed in the field ran: empties the line it ran from (the answer buffer when one is shown, else the
+     * draft) on a fresh revision, so a submit drawn from that line takes nothing afterwards. Only while the line still
+     * holds [text] at [revision] and is not being sent; anything else changes nothing. The note and photos stay. An
+     * expired answer emptied this way goes, as when the user empties it.
+     */
+    fun clearCommand(sessionKey: String, text: String, revision: Long) = book.update { b ->
+        val s = b.entries[sessionKey]
+        if (sessionKey in b.gone || s == null || s.revision != revision) return@update b
+        val a = s.answer
+        when {
+            a != null -> if (a.sending || a.text != text) b else b.with(sessionKey) { st, tick -> st.copy(answer = if (a.expired) null else a.copy(text = ""), revision = tick) }
+            s.sending || s.draft != text -> b
+            else -> b.with(sessionKey) { st, tick -> st.copy(draft = "", revision = tick) }
+        }
+    }
+
+    /**
      * Claims the answer buffer of exactly that request for one post: returns [choice] when given (the field is not
      * changed), else the buffer's text when not blank; null, with nothing changed, when the buffer is another request's,
      * is being sent or expired. Only [settleAnswer] ends the claim.

@@ -421,7 +421,7 @@ class ChatViewModel(
         when {
             !command.takesText && text.isNotBlank() -> return refuse(NoteKind.CMD_NO_TEXT, "/${command.word}")
             command.takesText && text.isBlank() -> return refuse(NoteKind.CMD_NEEDS_TEXT)
-            command == Command.STEER && a == null && claim.images.isNotEmpty() -> return refuse(NoteKind.CMD_STEER_NO_IMAGES) // set aside while answering
+            command == Command.STEER && a == null && claim.images.isNotEmpty() -> return refuse(NoteKind.CMD_STEER_NO_IMAGES) // a draft's photos; an answer's are set aside
             (command == Command.STEER || command == Command.STOP) && runId == null -> return refuse(NoteKind.CMD_NOTHING_RUNNING)
             command == Command.STEER && state.value.live?.status != "running" -> return refuse(NoteKind.CMD_NOTHING_RUNNING)
             command == Command.STEER || command == Command.QUEUE -> return if (a == null) send(runId, command) else storeAnswer(a, runId, command, text) // stored like a message
@@ -473,16 +473,11 @@ class ChatViewModel(
     }
 
     /**
-     * Clears the draft a command ran from, only if the holder still has [claim]'s text at its revision (a user edit keeps
-     * the revision, so the text is compared too). Called on the main thread, where user edits arrive too. Not through
-     * [onDraftChange], so a note set just before stays.
+     * Clears the line a command ran from, in one holder update, only if it still holds [claim]'s text at its revision (a
+     * user edit keeps the revision, so the text is compared too); the clear gives a fresh revision, so a second submit
+     * drawn from that line takes nothing. A note set just before stays.
      */
-    private fun clearIfClaimed(claim: ComposerState) {
-        val now = composer.current(sessionKey)
-        val a = now.answer
-        if ((a?.text ?: now.draft) != (claim.answer?.text ?: claim.draft) || now.revision != claim.revision) return
-        if (a != null) composer.editAnswer(sessionKey, a.runId, a.requestId, a.generation, "", claim.revision) else composer.edit(sessionKey, "", claim.revision)
-    }
+    private fun clearIfClaimed(claim: ComposerState) = composer.clearCommand(sessionKey, claim.answer?.text ?: claim.draft, claim.revision)
 
     /**
      * A row of this view model's send, plain or by command, was stored with [key]: the screen pins the list once the

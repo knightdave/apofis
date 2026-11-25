@@ -57,6 +57,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -144,6 +145,7 @@ class ClarifyComposerTest {
     private val chats = CopyOnWriteArrayList<ChatViewModel>()
     private val holds = CopyOnWriteArrayList<CompletableFuture<() -> MockResponse>>()
     private val timedOut = AtomicBoolean(false)
+    @Volatile private var closing = false // set first in tearDown: a handler it releases is no timeout
 
     @Volatile private var pendingJson = "" // what the status read lists as pending_controls
     private val frames = LinkedBlockingQueue<String>() // the next event stream's frames
@@ -179,6 +181,7 @@ class ClarifyComposerTest {
 
     @After
     fun tearDown() {
+        closing = true
         holds.forEach { it.complete { MockResponse.Builder().code(500).build() } }
         repeat(4) { frames.put("id: ${seq.incrementAndGet()}\ndata: {\"event\":\"run.completed\",\"seq\":${seq.get()}}\n\n") }
         val jobs = chats.map { it.viewModelScope.coroutineContext.job }
@@ -224,8 +227,9 @@ class ClarifyComposerTest {
             response(200, """{"object":"hermes.run","run_id":"$RUN","status":"running","session_id":"$KEY","admission_id":"adm_1","execution_generation":3,"output":"","pending_controls":[$pendingJson]}""")
         }
         routes["GET /v1/runs/$RUN/events"] = {
-            // Waits for the frame the test releases; a stall is a failure (a watchdog), never a quiet reconnect.
-            val next = frames.poll(10, TimeUnit.SECONDS) ?: "".also { timedOut.set(true) }
+            // Waits for the frame the test releases. Watchdog: after 60 s the route answers an empty stream (the follower
+            // reconnects) and the test is marked failed, asserted at teardown.
+            val next = frames.poll(60, TimeUnit.SECONDS) ?: "".also { if (!closing) timedOut.set(true) }
             MockResponse.Builder().body(": open\n\n$next").addHeader("Content-Type", "text/event-stream").build()
         }
         follower.resumeAll()
@@ -241,10 +245,13 @@ class ClarifyComposerTest {
         frames.put("id: $n\ndata: {\"event\":\"clarify.request\",\"seq\":$n}\n\n")
     }
 
-    /** The next clarify POST waits until the test completes the returned future with its response. */
+    /**
+     * The next clarify POST waits until the test completes the returned future with its response. Watchdog: after 60 s it
+     * answers 500 and the test is marked failed, asserted at teardown; teardown releases a hold still waiting with a 500.
+     */
     private fun holdClarify(): CompletableFuture<() -> MockResponse> {
         val f = CompletableFuture<() -> MockResponse>().also { holds += it }
-        onClarify = { runCatching { f.get(10, TimeUnit.SECONDS) }.getOrElse { timedOut.set(true); { MockResponse.Builder().code(500).build() } }() }
+        onClarify = { runCatching { f.get(60, TimeUnit.SECONDS) }.getOrElse { if (!closing) timedOut.set(true); { MockResponse.Builder().code(500).build() } }() }
         return f
     }
 
@@ -671,6 +678,37 @@ class ClarifyComposerTest {
         assertTrue(requests.none { it.method == "POST" })
     }
 
+    /** Astra R1: a command's clear ticks the revision, so a second submit drawn from the command line takes nothing. */
+    @Test
+    fun secondSubmitAfterACommandTakesNothing() = runBlocking<Unit> {
+        session()
+        val vm = vm()
+        draft("/fast")
+        photo()
+        val drawn = composer().revision
+        assertTrue(vm.ended { vm.onSendClick(null, drawn) })
+        until { composer().draft.isEmpty() }
+        assertEquals(ComposerNote(NoteKind.FAST_ON), composer().note) // the note set just before stays
+        assertFalse(vm.ended { vm.onSendClick(null, drawn) }) // the same drawing again, before a redraw
+        assertEquals(listOf(digest(1)), composer().images.map { it.digest })
+        assertTrue(rows().isEmpty())
+        assertTrue(requests.none { it.method == "POST" })
+    }
+
+    @Test
+    fun secondSubmitAfterACommandAnswerTakesNothing() = runBlocking<Unit> {
+        val vm = answering(before = { draft("my draft"); photo() })
+        vm.type("/fast")
+        val drawn = composer().revision
+        assertTrue(vm.ended { vm.onSendClick(RUN, drawn) })
+        until { composer().answer?.text?.isEmpty() == true }
+        assertFalse(vm.ended { vm.onSendClick(RUN, drawn) })
+        assertEquals("my draft", composer().draft)
+        assertEquals(listOf(digest(1)), composer().images.map { it.digest })
+        assertTrue(rows().isEmpty())
+        assertTrue(posts("/clarify").isEmpty())
+    }
+
     /** Astra I5 (a): after SENT, while the run still reports A, A stays closed; another question, or none, reopens it. */
     @Test
     fun sentQuestionStaysClosedUntilAnotherIsObserved() = runBlocking<Unit> {
@@ -695,6 +733,7 @@ class ClarifyComposerTest {
         vm.await { it.live?.pending == null }
         assertNull(composer().answer)
         assertNull(composer().unsent)
+        until { composer().closed == null } // the holder saw none, not only the live projection
         show(clarify()) // the same A again, after none: a buffer again
         assertEquals("", vm.await { it.answer != null }.answer?.text)
         show(clarify("q_b"))
@@ -848,7 +887,15 @@ class ClarifyComposerTest {
     fun newViewModelStartsOnTheAnswer() = runBlocking<Unit> {
         val vm = answering(before = { draft("my draft"); photo() })
         vm.type("Downloads")
-        val next = vm().state.value // before its transcript arrives: the initial value
+        // Main paused while the second view model is built: its state is the literal initial value, nothing collected yet.
+        val paused = StandardTestDispatcher()
+        Dispatchers.setMain(paused)
+        val next = try {
+            vm().state.value
+        } finally {
+            Dispatchers.setMain(UnconfinedTestDispatcher())
+            paused.scheduler.advanceUntilIdle() // then its queued work runs
+        }
         assertFalse(next.loaded)
         assertEquals(ComposerMode.ANSWER, next.composer)
         assertEquals("Downloads", next.draft)
@@ -1200,6 +1247,7 @@ class ClarifyComposerTest {
         nothingSent()
         vm.after { primary().performClick() }
         sentOnce("Desktop", request, generation, notice = "Downloads") // A's typed text expired when B replaced it
+        assertNull("B was taken, not expired into the occupied notice", composer().answer)
     }
 
     @Test
