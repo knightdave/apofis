@@ -82,6 +82,7 @@ import xyz.rycerz.apofis.Connected
 import xyz.rycerz.apofis.api.HermesApi
 import xyz.rycerz.apofis.api.PendingControl
 import xyz.rycerz.apofis.chat.Answer
+import xyz.rycerz.apofis.chat.AnswerSettle
 import xyz.rycerz.apofis.chat.ComposeError
 import xyz.rycerz.apofis.chat.Composer
 import xyz.rycerz.apofis.chat.UserMessage
@@ -509,6 +510,10 @@ class ClarifyComposerTest {
         vm.await { it.answer?.expired == true }
         vm.type("Deskto") // still an expired answer: edits apply
         assertEquals("Deskto", composer().answer?.text)
+        vm.type("/stop") // an expired answer runs no command either
+        assertFalse(vm.onSendClick())
+        assertTrue(posts("/stop").isEmpty())
+        assertEquals("/stop", composer().answer?.text)
         vm.type("")
         val s = vm.await { it.answer == null }
         assertEquals("keep me", s.draft)
@@ -524,15 +529,72 @@ class ClarifyComposerTest {
         run(clarify())
         vm.await { it.composer == ComposerMode.ANSWER }
         vm.type("Desktop")
-        show("")
-        vm.await { it.answer?.expired == true }
+        show(clarify("q_b")) // A expires into the field (the notice is full); B waits for it (ruling 10)
+        vm.await { it.answer?.expired == true && it.live?.pending?.requestId == "q_b" }
         vm.onDiscardUnsent()
         vm.onConfirmDiscard(vm.await { it.confirmDiscard != null }.confirmDiscard!!.id)
-        val s = vm.await { it.answer == null }
+        val s = vm.await { it.answer?.requestId == "q_b" }
         assertEquals("Desktop", s.unsent?.text)
         assertEquals(ComposeError.ANSWER_EXPIRED, s.unsent?.error)
         assertTrue(s.unsent!!.images.isEmpty())
-        assertEquals("keep me", s.draft)
+        assertEquals("", s.draft)
+        assertEquals(ComposerMode.ANSWER, s.composer)
+        assertEquals("keep me", composer().draft)
+    }
+
+    /** An expired answer is left exactly as it is while questions change: an edit drawn from it still applies. */
+    @Test
+    fun expiredAnswerKeepsItsRevisionAcrossQuestions() = runBlocking<Unit> {
+        session()
+        val vm = vm()
+        failedSend("lost words")
+        run(clarify())
+        vm.await { it.composer == ComposerMode.ANSWER }
+        vm.type("Downloads")
+        show(clarify("q_b"))
+        vm.await { it.answer?.expired == true && it.live?.pending?.requestId == "q_b" }
+        val drawn = composer().revision
+        show(clarify("q_c"))
+        vm.await { it.live?.pending?.requestId == "q_c" }
+        vm.onDraftChange("Downloads!", drawn)
+        assertEquals("Downloads!", composer().answer?.text)
+        assertEquals("q_a", composer().answer?.requestId)
+    }
+
+    /** A 404 expires the answer while its question still shows (the notice is full): a choice for it sends nothing. */
+    @Test
+    fun choiceOnAnswerExpiredBy404SendsNothing() = runBlocking<Unit> {
+        session()
+        val vm = vm()
+        failedSend("lost words")
+        run(clarify(choices = twoChoices))
+        vm.await { it.composer == ComposerMode.ANSWER }
+        vm.type("Downloads")
+        onClarify = json(404, """{"error":{"code":"run_not_found"}}""")
+        assertTrue(vm.ended { vm.onSendClick() })
+        val s = vm.await { it.answer?.expired == true }
+        assertEquals("q_a", s.live?.pending?.requestId)
+        vm.onClarify("q_a", 3, "Desktop")
+        assertFalse(vm.onSendClick())
+        assertFalse(composer().answer!!.sending)
+        assertEquals(1, posts("/clarify").size)
+    }
+
+    /** The ids are the settle's token: a settle for another request, or after a clear, leaves the buffer alone. */
+    @Test
+    fun settleActsOnlyOnItsOwnClaim() {
+        val c = connected.composer
+        c.showQuestion(KEY, RUN, "q_a", 3)
+        c.editAnswer(KEY, RUN, "q_a", 3, "Downloads", c.current(KEY).revision)
+        assertEquals("Downloads", c.claimAnswer(KEY, RUN, "q_a", 3))
+        c.settleAnswer(KEY, RUN, "q_b", 3, AnswerSettle.SENT)
+        c.settleAnswer(KEY, RUN, "q_a", 4, AnswerSettle.EXPIRED)
+        assertTrue(c.current(KEY).answer!!.sending)
+        c.clear()
+        c.showQuestion(KEY, RUN, "q_a", 3) // the same request, a fresh buffer that nobody claimed
+        c.editAnswer(KEY, RUN, "q_a", 3, "Desktop", c.current(KEY).revision)
+        c.settleAnswer(KEY, RUN, "q_a", 3, AnswerSettle.SENT) // the old send's result
+        assertEquals(Answer(RUN, "q_a", 3, "Desktop"), c.current(KEY).answer)
     }
 
     /** Ruling 2: /queue typed as the answer is stored through the answer's claim, with no photo of the set-aside draft. */
@@ -701,11 +763,14 @@ class ClarifyComposerTest {
 
     @Test
     fun putBackDisabledWhileAnswering() {
-        hosted(before = { runBlocking { failedSend("lost words") } })
+        val vm = hosted(before = { runBlocking { failedSend("lost words") } })
         rule.onNode(hasText("Put back") and hasClickAction()).assertIsNotEnabled()
         rule.onNode(hasText("Discard") and hasClickAction()).assertIsEnabled()
         rule.onNode(hasText("Put back") and hasClickAction()).performClick()
+        vm.onPutBack() // the holder refuses too
         assertEquals("lost words", composer().unsent?.text)
+        assertEquals("", composer().draft)
+        assertEquals("", composer().answer?.text)
     }
 
     @Test
@@ -772,6 +837,21 @@ class ClarifyComposerTest {
         nothingSent()
         primary().performClick() // a fresh press after the interval
         sentOnce("Downloads")
+    }
+
+    @Test
+    fun aReplacedRequestWaitsItsOwnInterval() {
+        val vm = hosted()
+        tick(1_000)
+        show(clarify("q_b"))
+        waitFor { vm.state.value.answer?.requestId == "q_b" }
+        vm.type("Desktop")
+        waitFor { fieldText() == "Desktop" }
+        primary().performClick() // B was shown a few frames ago: too early
+        nothingSent()
+        tick(400)
+        primary().performClick()
+        sentOnce("Desktop", request = "q_b")
     }
 
     @Test
