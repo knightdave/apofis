@@ -296,6 +296,71 @@ class ChatRepositorySyncTest {
     }
 
     @Test
+    fun twoHundredArchivedPinsCommit() = runTest {
+        responses.setFailFast(true) // a further list read gets a 404 instead of waiting
+        val pins = (0 until 200).map { sessionJson("apofis-pin$it", pinned = true, archived = true) }
+        // Hermes appends every pin outside the recency window to every page: with 200 pins every page is full.
+        respond(page(*pins.toTypedArray()))
+        respond(page(*pins.toTypedArray()))
+        repo.refreshSessions()
+        assertEquals(2, server.requestCount)
+        assertEquals(pins.indices.map { "apofis-pin$it" }.toSet(), repo.sessions(archived = true).first().map { it.key }.toSet())
+        assertEquals(1L, repo.refreshed.value)
+    }
+
+    @Test
+    fun allPinsFinalPageEvictsNothing() = runTest {
+        cachedWithHistory("apofis-gone") // deleted on another client; only an evicting refresh would remove it
+        responses.setFailFast(true)
+        val recent = (0 until 150).map { sessionJson("apofis-u$it") }
+        val pins = (0 until 200).map { sessionJson("apofis-pin$it", pinned = true) }
+        // The newest window: 150 unpinned rows and 50 pins, the other 150 pins appended. The next window: those 150
+        // pins with the first 50 appended, a full last page of rows already seen.
+        respond(page(*(recent + pins).toTypedArray()))
+        respond(page(*(pins.drop(50) + pins.take(50)).toTypedArray()))
+        repo.refreshSessions()
+        assertEquals(3, server.requestCount) // the history sync and two list reads
+        val keys = repo.sessions().first().map { it.key }.toSet()
+        assertTrue(keys.containsAll(recent.indices.map { "apofis-u$it" } + pins.indices.map { "apofis-pin$it" }))
+        assertTrue("apofis-gone" in keys)
+        assertTrue(db.messageDao().hasRows("apofis-gone"))
+    }
+
+    @Test
+    fun repeatedPinnedWindowThenMoreRowsKeepsUnseen() = runTest {
+        cachedWithHistory("apofis-u400") // older than both windows: listed only on a later page
+        responses.setFailFast(true)
+        val unpinned = (0 until 200).map { sessionJson("apofis-u$it") }
+        val pins = (0 until 200).map { sessionJson("apofis-pin$it", pinned = true) }
+        // The newest window holds 200 unpinned rows, the 200 older pins appended; the next window is exactly those
+        // pins, a full page with nothing new, though older unpinned rows follow (has_more counts only unpinned rows).
+        respond(page(*(unpinned + pins).toTypedArray(), hasMore = true))
+        respond(page(*pins.toTypedArray(), hasMore = false))
+        repo.refreshSessions()
+        assertEquals(3, server.requestCount) // the history sync and two list reads: paging stopped at the repeated page
+        assertNotNull(db.sessionDao().get("apofis-u400"))
+        assertTrue(db.messageDao().hasRows("apofis-u400"))
+        assertEquals(401, repo.sessions().first().size)
+    }
+
+    @Test
+    fun fullPageWithOneNewIdKeepsPaging() = runTest {
+        cachedWithHistory("apofis-gone") // deleted on another client: evicted by the normal end of the list
+        responses.setFailFast(true)
+        val pin = sessionJson("apofis-pin", pinned = true)
+        // Every page repeats the pin outside its window; a page with any new id is not a repeated page.
+        respond(page(*((0 until 200).map { sessionJson("apofis-u$it") } + pin).toTypedArray(), hasMore = true))
+        respond(page(*((200 until 400).map { sessionJson("apofis-u$it") } + pin).toTypedArray(), hasMore = true))
+        respond(page(sessionJson("apofis-u400"), hasMore = false))
+        repo.refreshSessions()
+        assertEquals(4, server.requestCount) // the history sync and three list reads
+        val keys = repo.sessions().first().map { it.key }.toSet()
+        assertEquals((0..400).map { "apofis-u$it" }.toSet() + "apofis-pin", keys)
+        assertNull(db.sessionDao().get("apofis-gone"))
+        assertFalse(db.messageDao().hasRows("apofis-gone"))
+    }
+
+    @Test
     fun archivedChatsSurviveRefresh() = runTest {
         val dao = db.sessionDao()
         dao.upsert(session("apofis-arch", archived = true))

@@ -17,13 +17,20 @@ import java.io.IOException
 import java.security.GeneralSecurityException
 import javax.crypto.KeyGenerator
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -255,6 +262,52 @@ class AppContainerTest {
         } finally {
             container.onStop()
             container.awaitLifecycle()
+            server.close()
+        }
+    }
+
+    /** The connection's pending refresh asks are all taken (read by reflection: the channel is private; a rename fails here). */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun asksTaken(c: Connected) = (Connected::class.java.getDeclaredField("asks").apply { isAccessible = true }.get(c) as Channel<*>).isEmpty
+
+    @Test
+    fun refreshesCoalesce() = runTest {
+        val lists = AtomicInteger()
+        val arrived = List(2) { CompletableDeferred<Unit>() }
+        val gates = List(2) { CountDownLatch(1) }
+        val expired = AtomicBoolean(false)
+        val server = MockWebServer().apply {
+            dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    if (request.method != "GET" || request.url.encodedPath != "/api/sessions") return MockResponse.Builder().code(404).build()
+                    val n = lists.getAndIncrement()
+                    if (n < 2) {
+                        arrived[n].complete(Unit)
+                        if (!gates[n].await(10, TimeUnit.SECONDS)) expired.set(true)
+                    }
+                    return MockResponse.Builder().code(200).body("""{"object":"list","data":[],"has_more":false}""")
+                        .addHeader("Content-Type", "application/json").build()
+                }
+            }
+            start()
+        }
+        suspend fun arrival(n: Int) = withContext(Dispatchers.Default) { withTimeout(10_000) { arrived[n].await() } }
+        try {
+            container.connect(Credentials(server.url("/").toString(), "k")) // no onStart: its resume would ask once more
+            val c = container.connected()!!
+            c.refresh()
+            arrival(0) // the first list read is held
+            repeat(3) { c.refresh() } // a foreground return and two finished runs meanwhile
+            gates[0].countDown()
+            arrival(1) // the worker took the one pending ask and is reading again, held
+            // Read while the second read is held: whatever was asked during the first read has been taken.
+            assertTrue("asks left over", asksTaken(c))
+            gates[1].countDown()
+            withContext(Dispatchers.Default) { withTimeout(10_000) { c.repo.refreshed.first { it == 2L } } }
+            assertEquals(2, lists.get())
+            assertFalse("a held list read was released by its timeout", expired.get())
+        } finally {
+            gates.forEach { it.countDown() }
             server.close()
         }
     }

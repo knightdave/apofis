@@ -273,6 +273,7 @@ class ChatViewModel(
     internal var opening: Job? = null // the running or last open; read by tests to wait for it
         private set
     private var fetch: Job? = null // the model sheet's request
+    @Volatile private var recheck = false // an open was asked for while one was running
 
     init {
         // One check now, again whenever the chat turns stale, and again after every completed session refresh (on return
@@ -294,7 +295,12 @@ class ChatViewModel(
      * model that ends without a failure clears that last failure as well, an open that fetches nothing included.
      */
     fun onOpened() {
-        if (opening?.isActive == true) return // one load at a time: the one running reads the newest state anyway
+        // One load at a time; a trigger during it asks for one more check when it ends (a cancelled load asks for none).
+        if (opening?.isActive == true) {
+            recheck = true
+            return
+        }
+        recheck = false
         opening = launchRequest {
             val session = repo.session(sessionKey).first()
             if (session == null || !session.existsOnServer) return@launchRequest
@@ -307,6 +313,7 @@ class ChatViewModel(
                 local.update { it.copy(firstLoad = false) } // single flight: no other open can have set it meanwhile
             }
         }
+        opening!!.invokeOnCompletion { cause -> if (cause == null && recheck) onOpened() }
     }
 
     override fun onDraftChange(text: String, basedOnRevision: Long) {

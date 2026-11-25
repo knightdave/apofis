@@ -11,6 +11,8 @@ import androidx.test.core.app.ApplicationProvider
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -19,6 +21,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
@@ -44,6 +47,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -97,6 +102,7 @@ class ChatViewModelTest {
     private val store = ViewModelStore()
     private val latches = mutableListOf<CountDownLatch>()
     private val latchTimeouts = AtomicInteger() // held streams served only because their wait timed out
+    private val executors = CopyOnWriteArrayList<ExecutorService>() // Main threads a test made; shut down after the view models end
 
     /** A gate for a held stream; every gate is opened in tearDown, so a failed test never blocks the next. */
     private fun latch() = CountDownLatch(1).also { latches += it }
@@ -142,6 +148,7 @@ class ChatViewModelTest {
         db.close()
         server.close()
         Dispatchers.resetMain()
+        executors.forEach { it.shutdown() }
         assertEquals("held streams that timed out", 0, latchTimeouts.get())
     }
 
@@ -678,6 +685,47 @@ class ChatViewModelTest {
 
         vm.await { it.items.any { i -> i.key == "r11" } }
         assertEquals(2, requests.count { it.target.startsWith(MESSAGES) })
+    }
+
+    /**
+     * Main is a thread of its own here (the fixture's Main is unconfined, which runs anything anywhere): the open's jobs
+     * and their completion callbacks run on it in order, so a task posted to it after a join runs after the callback.
+     */
+    @Test
+    fun refreshDuringOpenIsNotLost() = runTest {
+        val main = Executors.newSingleThreadExecutor { Thread(it, "main-like") }.also { executors += it }
+        Dispatchers.setMain(main.asCoroutineDispatcher())
+        addSession(onServer = true, stale = true)
+        val fetches = AtomicInteger()
+        val arrived = List(2) { CompletableDeferred<Unit>() }
+        val release = List(2) { latch() }
+        routes[MESSAGES] = {
+            val n = fetches.getAndIncrement()
+            if (n < 2) {
+                arrived[n].complete(Unit)
+                if (!release[n].await(10, TimeUnit.SECONDS)) latchTimeouts.incrementAndGet()
+            }
+            MockResponse.Builder().code(500).build() // the row stays stale, so every check fetches
+        }
+        suspend fun arrival(n: Int) = withContext(Dispatchers.Default) { withTimeout(10_000) { arrived[n].await() } }
+        suspend fun <T> onMain(block: () -> T): T = withContext(Dispatchers.Main) { block() }
+        val vm = vm()
+        arrival(0) // the first open's fetch is held
+        val first = onMain { vm.opening!! }
+        onMain { repeat(3) { vm.onOpened() } } // triggers while it is held (a refresh would wait for the lock the sync holds)
+        assertSame(first, onMain { vm.opening })
+        release[0].countDown()
+
+        arrival(1) // one follow-up with no further trigger, itself held; its callback was registered before it started
+        val second = onMain { vm.opening!! }
+        assertNotSame(first, second)
+        release[1].countDown()
+        withContext(Dispatchers.Default) { withTimeout(10_000) { second.join() } }
+        // A task on Main after the join runs after the completion callback: a re-open of its own would show here.
+        onMain {
+            assertSame(second, vm.opening)
+            assertEquals(2, fetches.get()) // one conflated check, not one per trigger and not a loop
+        }
     }
 
     @Test

@@ -473,6 +473,22 @@ class DrawerViewModelTest {
     }
 
     @Test
+    fun deletedArchivedSelectionReplaced() = runTest {
+        addSession("apofis-a", "Archived and open")
+        db.sessionDao().upsert(db.sessionDao().get("apofis-a")!!.copy(archived = true))
+        val vm = vm(lastChat = "apofis-a")
+        vm.selected.await { it == "apofis-a" }
+        routes["GET /api/sessions"] = listing() // the list never holds archived chats
+        routes["GET /api/sessions/apofis-a"] = { MockResponse.Builder().code(404).build() } // deleted on another client
+        // As the container refreshes, not through the drawer's own refresh, which reconciles after it anyway.
+        connected.repo.refreshSessions()
+        assertNull(db.sessionDao().get("apofis-a"))
+        val next = vm.selected.await { it != "apofis-a" }!!
+        assertFalse(db.sessionDao().get(next)!!.existsOnServer) // a new local chat
+        assertTrue(requests.none { it.method == "DELETE" }) // not a leave: no request for the old chat
+    }
+
+    @Test
     fun notificationTapSelectsOnlyWhileItsGraphIsCurrent() = runTest {
         addSession("apofis-a", "Open one")
         addSession("apofis-b", "Tapped")
