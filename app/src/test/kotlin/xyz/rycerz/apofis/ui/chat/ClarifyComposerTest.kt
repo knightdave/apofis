@@ -16,6 +16,7 @@ import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -1365,6 +1366,7 @@ class ClarifyComposerTest {
         draw { exists(hasText("A") and hasClickAction()) }
         val buttons = rule.onAllNodes(hasText("A") and hasClickAction()).fetchSemanticsNodes()
         assertEquals(2, buttons.size)
+        assertFalse("a blank choice drawn", exists(hasText("") and hasClickAction() and !hasSetTextAction()))
         val dp48 = with(rule.density) { 48.dp.toPx() }
         assertTrue(buttons.all { it.size.width >= dp48 && it.size.height >= dp48 })
         val long = (1..400).joinToString("\n") { "Line $it of a very long choice" }.take(8_000)
