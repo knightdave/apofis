@@ -36,7 +36,7 @@ class FixtureImageProvider : ContentProvider() {
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
         if (mode != "r") throw FileNotFoundException("read only")
-        val (w, h) = SIZES[uri.lastPathSegment] ?: throw FileNotFoundException("no such fixture")
+        val (w, h) = SIZES[uri.pathSegments.singleOrNull()] ?: throw FileNotFoundException("no such fixture") // exactly one segment
         val dir = context?.cacheDir ?: throw FileNotFoundException("no cache dir")
         val file = File(dir, "fixture-${w}x$h.png")
         synchronized(this) {

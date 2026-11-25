@@ -404,4 +404,61 @@ class HarnessSelfTest {
         assertFalse("ntfy" in missing.drop(1))
         assertTrue("ntfy" in segments(listOf("Notifications, ntfy")).drop(1))
     }
+
+    @Test
+    fun leaveNeedsEveryDeletedIdProvedThisRuns() {
+        val key = "apofis-0a1b2c3d-0000-4000-8000-000000000001"
+        val newer = "apofis-0a1b2c3d-0000-4000-8000-000000000002"
+        val older = "apofis-0a1b2c3d-0000-4000-8000-000000000003"
+        // Current, lineage newest first, the key (the root) once and last, even when the lineage lacks it.
+        assertEquals(listOf(newer, older, key), deleteTargets(key, newer, listOf(older)))
+        assertEquals(listOf(newer, key), deleteTargets(key, newer, listOf(key)))
+        fun answer(id: String, title: String) = """{"session":{"id":"$id","title":"$title"}}"""
+        val owned = ownedAnswer(key, 200, answer(key, "Test 0a1b2c3d-7"), "0a1b2c3d")
+        val foreign = ownedAnswer(older, 200, answer(older, "Someone else's chat"), "0a1b2c3d")
+        assertTrue(owned)
+        assertFalse(foreign)
+        assertFalse("one owned id and one foreign title: no leave", leaveAllowed(listOf(owned, foreign)))
+        assertTrue(leaveAllowed(listOf(owned, owned)))
+        assertFalse("nothing proved: no leave", leaveAllowed(emptyList()))
+        assertFalse("another id answered", ownedAnswer(key, 200, answer(newer, "Test 0a1b2c3d-7"), "0a1b2c3d"))
+        assertFalse("not found", ownedAnswer(key, 404, "", "0a1b2c3d"))
+    }
+
+    @Test
+    fun modelChoiceOutcomeNeedsItsEvidence() {
+        val pick = "prov" to "model-b"
+        fun run(status: String, runtime: String?) = SendEnd.Run(
+            "run_0123456789abcdef0123456789abcdef",
+            JSONObject().put("status", status).also { r -> runtime?.let { r.put("runtime", JSONObject(it)) } },
+        )
+        assertEquals("proved", choiceOutcome(run("completed", """{"provider":"prov","model":"model-b"}"""), pick).first)
+        assertEquals("served differs", choiceOutcome(run("completed", """{"provider":"prov","model":"model-a"}"""), pick).first)
+        assertEquals("blank runtime is no runtime", "not proved: no runtime", choiceOutcome(run("completed", """{"provider":"","model":""}"""), pick).first)
+        assertEquals("not proved: no runtime", choiceOutcome(run("completed", null), pick).first)
+        assertEquals("not proved: no alternative", choiceOutcome(run("completed", null), null).first)
+        assertEquals("unproved failure, starts unknown", choiceOutcome(run("failed", null), pick).first)
+        assertEquals("unproved failure, starts unknown", choiceOutcome(SendEnd.Unknown("x"), pick).first)
+        assertEquals("not admitted (never attempted): zero starts", choiceOutcome(SendEnd.NotAdmitted, pick).first)
+        val detail = choiceOutcome(run("completed", """{"provider":"prov","model":"model-a"}"""), pick).second
+        assertFalse("no name in the detail", "model-a" in detail || "model-b" in detail || "prov" in detail.replace("provider", ""))
+    }
+
+    @Test
+    fun storedImageRowIsReducedToItsStructure() {
+        val digest = "0123456789abcdef0123456789abcdef" + "f".repeat(32)
+        fun rows(content: String) = listOf(JSONObject().put("role", "user").put("content", content), JSONObject().put("role", "assistant").put("content", "ok"))
+        val good = "cap\n\n[Image attached at: /x/api_0123456789abcdef0123456789abcdef.jpg]\n[screenshot]"
+        assertEquals(ImageRowFacts(1, true, true, 1, 1, true), storedImageRow(rows(good), "cap", digest))
+        assertFalse(storedImageRow(rows(good.replace("0123456789abcdef0123", "aaaaaaaaaaaaaaaaaaaa")), "cap", digest).prefixMatches)
+        assertFalse(storedImageRow(rows(good + "\n[screenshot]"), "cap", digest).suffixForm)
+        assertFalse(storedImageRow(rows(good.replace("cap\n\n", "cap\n")), "cap", digest).captionEqual)
+    }
+
+    @Test
+    fun drawerPagesMergeOnTheirOverlap() {
+        assertEquals(listOf("a", "b", "c", "d"), mergePages(listOf("a", "b", "c"), listOf("b", "c", "d")))
+        assertEquals(listOf("a", "b", "c", "d"), mergePages(listOf("a", "b"), listOf("c", "d")))
+        assertEquals(listOf("a", "b"), mergePages(listOf("a", "b"), listOf("a", "b")))
+    }
 }

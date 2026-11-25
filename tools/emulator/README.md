@@ -232,6 +232,7 @@ contacts ntfy.sh or any other push host.
 |---|---|---|
 | `--m4` | `ShareE2eTest#shareTextAndImageOpensNewChat`, `ShareE2eTest#pixelCapJustOverRefused`, `M4E2eTest#temporaryToggleMarks` | 0 |
 | `--m4-model` | `ImageE2eTest#imageSendConfirms`, `M4E2eTest#temporaryChatGoneAfterLeaving`, `M4E2eTest#modelChoiceReachesRun`, `SurvivalE2eTest#replySurvivesProcessDeath` | 4 (one message each, no steer) |
+| `--test M4E2eTest#modelPickIsReachable` | the model sheet through the slash palette: the alternative picked and stored, Server default restored, nothing sent | 0 (no reservation) |
 
 - **The budget.** At most 10 model starts in the whole milestone, across all worktrees and retries, reserved in
   `~/.local/state/apofis-e2e/model-budget-m4` (see "The ledger" above): `--m4-model` and every single `--test` of a
@@ -240,7 +241,8 @@ contacts ntfy.sh or any other push host.
   crash, a 404 at counting, a refusal before admission and `modelChoiceReachesRun` whatever its outcome). Observed starts
   come from the run's own log lines (the cleanup's session lines and each method's `ApofisE2e` lines), never from the
   server. `--m4-model` is reserved once: when the ledger already holds a reservation (released or not) of any of its
-  methods, it is refused before any action. Retries then go method by method with `--test <Class#method>`, in the
+  methods, it is refused before any reservation. The check reads the ledger while this host's lock is held, which every
+  invocation by this user takes before it reserves, so no other invocation can reserve or release in between. Retries then go method by method with `--test <Class#method>`, in the
   table's order (not enforced). During Milestone 4, `--full`, `--scenario <name>`, `--test SurvivalE2eTest` and `--test
   SurvivalE2eTest#<another method>` are not to be used: they still start model runs (and print the hook warning) but are
   outside the ledger, so their starts would not be counted.
@@ -263,6 +265,16 @@ contacts ntfy.sh or any other push host.
   `providers`, `model`, `provider`, `slug`, `models`, `capabilities`, `usage`, `limit` and `warning`, whether the answer
   holds that key (at the top level or on a provider row). It logs only `<key>=true|false|unknown` (`unknown` for a
   non-200 answer or a body that does not parse); no body, value or status is printed or kept.
+- **The model picker check.** `modelPickIsReachable` needs the slash palette (Task 8a-2), so it is in neither suite.
+  Run it once as `--test M4E2eTest#modelPickIsReachable` (no reservation) before the first run that includes
+  `modelChoiceReachesRun`: it opens the model sheet through the palette, picks the same alternative that method would,
+  proves the chat's stored choice, restores Server default the same way and sends nothing. Both methods use one picker
+  that reports only fixed step names (the sheet lists model and provider names) and proves the sheet gone and the
+  stored choice before anything is sent.
+- **Leaving a chat.** `imageSendConfirms` and `temporaryChatGoneAfterLeaving` leave their temporary chat only after
+  every id the app will delete for it (its current id, its lineage and its key, as the app builds them) is journaled
+  and proved this run's by a GET of that id with this run's nonce in its title; one unproved id fails the method
+  before the leave.
 - **Temporary chats.** Their ids (`apofis-tmp-<uuid>`) are app ids for the journal and the cleanup. A journaled id that
   answers 404 at cleanup counts as gone (the app deleted it): it passes the cleanup, which is not by itself a pass of
   the scenario.

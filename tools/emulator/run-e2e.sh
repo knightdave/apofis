@@ -57,7 +57,8 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   distributorLogsOnlyKnownActionsFromTheApp
   quietDeliveriesNeedANewPushCheckThatTookNoRun wakePreconditionPassesTheStoredRunsSendingRowOnly
   pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly revealScrollsFirstAndJudgesProgressByWhatIsShown
-  anObservationFinishingAfterTheDeadlineDoesNotCount anEvidenceFailureInsideTheDeadlineWaitEscapes settingsRowValueIsAWholeSegment)
+  anObservationFinishingAfterTheDeadlineDoesNotCount anEvidenceFailureInsideTheDeadlineWaitEscapes settingsRowValueIsAWholeSegment
+  leaveNeedsEveryDeletedIdProvedThisRuns modelChoiceOutcomeNeedsItsEvidence storedImageRowIsReducedToItsStructure drawerPagesMergeOnTheirOverlap)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
 # Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
 # tunnel. Gate 1's start no model run.
@@ -828,7 +829,8 @@ select_tests() {
       esac
       [ -z "${MODEL_BOUND[$a]+x}" ] || models=("$a")
       case $a in SmokeE2eTest | SmokeE2eTest#* | HarnessSelfTest | HarnessSelfTest#* | PushE2eTest#connectorLifecycle | \
-        PushE2eTest#hostilePushes | PushE2eTest#permissionAndTestPush | ShareE2eTest | ShareE2eTest#* | M4E2eTest#temporaryToggleMarks) model_capable='' ;; esac ;;
+        PushE2eTest#hostilePushes | PushE2eTest#permissionAndTestPush | ShareE2eTest | ShareE2eTest#* | M4E2eTest#temporaryToggleMarks | \
+        M4E2eTest#modelPickIsReachable) model_capable='' ;; esac ;;
     *) return 1 ;;
   esac
   [[ $tests =~ ^[A-Za-z0-9_#-]+$ ]] # the strict token check, before any remote command is built from it
@@ -877,7 +879,7 @@ ledger_total() { ledger_check "$1"; }
 # is never reserved again, retries go method by method (--test).
 m4_mode_reserved() {
   local m
-  ledger_check "$LEDGER" >/dev/null || return 1
+  ledger_check "$LEDGER" >/dev/null && [ -f "$LEDGER" ] || return 1 # no ledger yet: nothing reserved
   for m in "${M4_MODEL[@]}"; do grep -qE "^reserve $RUNID_RE $m [0-9]+$" "$LEDGER" && return 0; done
   return 1
 }
@@ -1537,13 +1539,15 @@ main() {
   # The whole command line is checked before anything happens: one option, and its one argument where it takes one.
   [ "$#" = "$([ -n "$arg" ] && echo 2 || echo 1)" ] || die "bad arguments: one selection, with its one argument"
   select_tests "$mode" "$arg" || die "not a selection of this harness: ${1} ${arg}"
-  if [ "$mode" = m4-model ] && m4_mode_reserved; then
-    die "ledger: --m4-model was reserved before in $LEDGER; retry single methods with --test, in the table's order; nothing started"
-  fi
   no_core_dumps || die "could not disable core dumps"
   # The first action: this host's lock, before anything else is touched here or on the emulator host.
   exec 7>"${XDG_RUNTIME_DIR:-/tmp}/apofis-e2e.lock"
   flock -n 7 || die "another run-e2e.sh is active on this host"
+  # Under this lock, which every invocation by this user takes before it reserves: nothing can reserve or release
+  # between this check and this invocation's own reservation.
+  if [ "$mode" = m4-model ] && m4_mode_reserved; then
+    die "ledger: --m4-model was reserved before in $LEDGER; retry single methods with --test, in the table's order; nothing started"
+  fi
   cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
   run_id=$(date +%Y%m%d-%H%M%S)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')
   nonce=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')

@@ -44,24 +44,29 @@ class ShareE2eTest {
     fun shareTextAndImageOpensNewChat() {
         val draft = "Draft ${app.nonce} stays"
         app.setField(app.composerField() ?: fail("No composer"), draft)
-        app.waitFor("the draft in the composer", 10_000) { draft() == draft }
+        app.waitFor("the draft in the composer, no image", 10_000) { draft() == draft && app.composerImages().isEmpty() }
         val caption = "Shared ${app.nonce} caption"
         app.share(SMALL, caption)
         app.awaitShareSheet(caption, images = 1, failed = false, accept = true)
         app.cancelShare()
-        if (app.openChatKey() != chat || draft() != draft) fail("Cancel changed the open chat or its draft")
-        app.log("cancel kept the chat and its draft")
+        // The draft's text and its images, both unchanged: Cancel attached nothing.
+        if (app.openChatKey() != chat || draft() != draft || app.composerImages().isNotEmpty()) fail("Cancel changed the open chat, its draft or its images")
+        app.log("cancel kept the chat, its draft and its (no) images")
 
+        val before = app.localKeys()
         app.share(SMALL, caption)
         app.awaitShareSheet(caption, images = 1, failed = false, accept = true)
         app.click(app.str("share_accept"))
-        app.waitFor("a new chat holding the shared caption and one image", 15_000) {
-            app.snapshot().chatKey().let { it != null && it != chat } && draft() == caption && app.hasDesc(app.str("chat_image", 1, 1))
+        var key = ""
+        app.waitFor("a new chat holding the shared caption and one decoded image in its composer", 15_000) {
+            key = app.snapshot().chatKey().orEmpty()
+            key.isNotEmpty() && key !in before && draft() == caption && app.composerImages() == listOf(app.str("chat_image", 1, 1) to true)
         }
-        if (app.openChatKey().startsWith("apofis-tmp-")) fail("The share opened a temporary chat")
+        // New (not in the app before), ordinary, and only on the phone: no other chat's draft was replaced.
+        if (key.startsWith("apofis-tmp-") || app.chatRow(key)?.onServer != false) fail("The share did not open a new, ordinary, local-only chat")
         val pending = app.pendingCount()
         if (pending != 0) fail("The share left $pending pending sends")
-        app.log("accept opened a new ordinary chat with the shared draft; 0 pending sends")
+        app.log("accept opened a new ordinary local-only chat with the shared draft and its image; 0 pending sends")
     }
 
     @Test

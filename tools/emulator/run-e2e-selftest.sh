@@ -190,7 +190,9 @@ echo "$TMP1" >"$t/gone"
 sessions_case m4-model M4E2eTest.temporaryChatGoneAfterLeaving "send $TMP1 temporaryChatGoneAfterLeaving" "chat temporaryChatGoneAfterLeaving $TMP1 $TMP1"
 check "a journaled id already gone (404) at cleanup: one GET, nothing deleted, cleanup passes" '[ "$rc" = 0 ] && [ "$(cat "$t/server-calls")" = "GET api/sessions/$TMP1" ] && has "$o" "already gone"'
 rm -f "$t/gone"
-for m in ImageE2eTest.imageSendConfirms M4E2eTest.temporaryChatGoneAfterLeaving M4E2eTest.modelChoiceReachesRun; do
+for m in "${M4_MODEL[@]}"; do
+  [[ $m != SurvivalE2eTest#* ]] || continue # the survival method is under the older rule, tested above
+  m=${m/\#/.}
   sessions_case m4-model "$m"
   check "completeness: $m passed without send and chat lines: fails, no request" '[ "$rc" = 1 ] && has "$o" "may remain" && [ "$(requests)" = 0 ]'
 done
@@ -198,6 +200,8 @@ sessions_case m4 'ShareE2eTest.pixelCapJustOverRefused'
 check "--m4 with an empty journal: complete, passes, no request (control)" '[ "$rc" = 0 ] && [ "$(requests)" = 0 ]'
 sessions_case m4 'ShareE2eTest.pixelCapJustOverRefused' "send $K1 pixelCapJustOverRefused" "chat pixelCapJustOverRefused $K1 $K1"
 check "--m4 with any journal line (a request of its methods reached the server): fails" '[ "$rc" = 1 ] && has "$o" "--m4 runs with no live transport"'
+sessions_case m4 'ShareE2eTest.pixelCapJustOverRefused' "pushintent-missing pixelCapJustOverRefused"
+check "--m4 with a lone line that is no send (any line, not only a send): fails" '[ "$rc" = 1 ] && has "$o" "--m4 runs with no live transport"'
 sessions_case smoke ''
 check "nothing sent (smoke): complete and empty journal passes, no request" '[ "$rc" = 0 ] && has "$o" "complete and empty" && [ "$(requests)" = 0 ]'
 sessions_case smoke ''
@@ -967,6 +971,8 @@ check "selection: --m4-model reserves its four methods in the table's order" \
   'sel m4-model && [ "${models[*]}" = "ImageE2eTest#imageSendConfirms M4E2eTest#temporaryChatGoneAfterLeaving M4E2eTest#modelChoiceReachesRun SurvivalE2eTest#replySurvivesProcessDeath" ] && [ -n "$model_capable" ] && [ "$(instrument_filter m4-model)" = "-e class $PKG.ImageE2eTest#imageSendConfirms,$PKG.M4E2eTest#temporaryChatGoneAfterLeaving,$PKG.M4E2eTest#modelChoiceReachesRun,$PKG.SurvivalE2eTest#replySurvivesProcessDeath" ]'
 check "selection: a single M4 model method reserves its bound; the 0-start ones and ShareE2eTest reserve nothing and warn not" \
   '(for m in "${M4_MODEL[@]}"; do sel test "$m" && [ "${models[*]}" = "$m" ] && [ -n "$model_capable" ] || exit 1; done; for m in "${M4_TESTS[@]}" ShareE2eTest; do sel test "$m" && [ "${#models[@]}" = 0 ] && [ -z "$model_capable" ] || exit 1; done)'
+check "selection: --test M4E2eTest#modelPickIsReachable (zero starts) reserves nothing, warns not, and is in neither suite" \
+  'sel test M4E2eTest#modelPickIsReachable && [ "${#models[@]}" = 0 ] && [ -z "$model_capable" ] && [ "$(instrument_filter "$tests")" = "-e class $PKG.M4E2eTest#modelPickIsReachable" ] && [[ " ${M4_TESTS[*]} ${M4_MODEL[*]} " != *modelPickIsReachable* ]]'
 check "selection: --test SurvivalE2eTest#replySurvivesProcessDeath reserves in the Milestone 4 ledger" \
   'sel test SurvivalE2eTest#replySurvivesProcessDeath && [ "${models[*]}" = SurvivalE2eTest#replySurvivesProcessDeath ] && [ "${LEDGER##*/}" = model-budget-m4 ]'
 # shellcheck disable=SC2329 # the emulator host's argument check, stopped right after it
@@ -986,15 +992,17 @@ for m in "${M4_MODEL[@]}"; do b4+=("$m=${MODEL_BOUND[$m]}"); done
 check "ledger: --m4-model's four bounds fit when 6 are counted, and are refused (nothing appended) when 7 are" \
   'ledger_reserve "$t/l4a" "$LEDGER_LIMIT" $R1 X#y=6 && ledger_reserve "$t/l4a" "$LEDGER_LIMIT" $R2 "${b4[@]}" && [ "$(ledger_total "$t/l4a")" = 10 ] &&
    ledger_reserve "$t/l4b" "$LEDGER_LIMIT" $R1 X#y=7 && ! ledger_reserve "$t/l4b" "$LEDGER_LIMIT" $R2 "${b4[@]}" && [ "$(ledger_total "$t/l4b")" = 7 ] && ! grep -q $R2 "$t/l4b"'
-# A whole-mode retry is refused before any side effect, also after a released reservation; single methods are not.
-m4_main() { # <ledger> <arguments...>: main, the first step after the checks stubbed to stop
+# A whole-mode retry is refused under the build host's lock, before any reservation; single methods are not. main runs
+# with a private lock directory and stops at its first step after the lock and the check (the cd into the repository).
+mkdir -p "$t/xdg"
+m4_main() { # <ledger> <arguments...>
   local l=$1
   shift
   # shellcheck disable=SC2329
-  rc=0; o=$( (LEDGER=$l arg='' mode=''; no_core_dumps() { echo "PASSED THE CHECKS"; return 1; }; main "$@") 2>&1) || rc=$?
+  rc=0; o=$( (LEDGER=$l arg='' mode='' XDG_RUNTIME_DIR=$t/xdg; cd() { if [ "${FUNCNAME[1]}" = main ]; then echo "PASSED THE CHECKS"; exit 1; fi; builtin cd "$@"; }; main "$@") 2>&1) || rc=$?
 }
 m4_main "$t/l4none" --m4-model
-check "whole mode: --m4-model with no earlier reservation passes the checks (control)" 'has "$o" "PASSED THE CHECKS" && [ ! -e "$t/l4none" ]'
+check "whole mode: --m4-model with no ledger yet passes the checks, without an error line (control)" 'has "$o" "PASSED THE CHECKS" && [ ! -e "$t/l4none" ] && lacks "$o" "No such file"'
 printf 'reserve %s PushE2eTest#pushWakesKilledApp 1\n' $R1 >"$t/l4m3"
 m4_main "$t/l4m3" --m4-model
 check "whole mode: a reservation of another mode's method does not refuse --m4-model" 'has "$o" "PASSED THE CHECKS"'
@@ -1009,28 +1017,54 @@ m4_main "$t/l4r" --test SurvivalE2eTest#replySurvivesProcessDeath
 check "whole mode: a single-method retry is not refused by it" 'has "$o" "PASSED THE CHECKS"'
 m4_main "$t/l4r" --m4
 check "whole mode: --m4 (no model method) is not refused by it" 'has "$o" "PASSED THE CHECKS"'
+m4_main "$t/l4r" --test M4E2eTest#modelPickIsReachable
+check "whole mode: the zero-start picker check is not refused by it" 'has "$o" "PASSED THE CHECKS"'
+# The interleaving of review I1: invocation B holds the build host's lock, reserves one overlapping method and releases
+# it; A, started meanwhile, stops at the lock (it never read the ledger: its ledger refusal is absent), and A again
+# after B is gone is refused on B's released reservation. The ledger holds B's two lines and nothing of A.
+mkfifo "$t/lheld" "$t/lrel"
+(
+  flock 7
+  ledger_reserve "$t/l4race" "$LEDGER_LIMIT" $R3 SurvivalE2eTest#replySurvivesProcessDeath=1
+  echo held >"$t/lheld"
+  read -r _ <"$t/lrel"
+  ledger_release "$t/l4race" $R3 SurvivalE2eTest#replySurvivesProcessDeath
+) 7>"$t/xdg/apofis-e2e.lock" &
+lholder=$!
+read -r _ <"$t/lheld"
+m4_main "$t/l4race" --m4-model
+race_first=$o
+echo go >"$t/lrel"
+wait "$lholder"
+m4_main "$t/l4race" --m4-model
+check "whole mode: an invocation that reserves and releases an overlapping method meanwhile: A stops at the lock, then is refused; nothing of A appended" \
+  'has "$race_first" "another run-e2e.sh is active" && lacks "$race_first" "retry single methods" && [ "$rc" != 0 ] && has "$o" "retry single methods" &&
+   [ "$(cat "$t/l4race")" = "$(printf "reserve %s SurvivalE2eTest#replySurvivesProcessDeath 1\nobserved %s SurvivalE2eTest#replySurvivesProcessDeath 0" $R3 $R3)" ]'
 
 # Settlement: once the key was handed to the device, a crash, a 404 at counting and a refusal before admission all
-# leave the reservation at its bound, settled by the one observe_starts.
-mkdir -p "$E2E_OUT/settle"
-printf 'M4E2eTest.modelChoiceReachesRun PASS\n' >"$E2E_OUT/settle/results.txt"
-instrument_for <"$E2E_OUT/settle/results.txt" >"$E2E_OUT/settle/instrument.txt"
+# leave the reservation of this very run id at its bound; observe_starts itself succeeds, twice, and writes nothing.
+RS=20261124-100000-0000
+mkdir -p "$E2E_OUT/$RS"
+printf 'M4E2eTest.modelChoiceReachesRun PASS\n' >"$E2E_OUT/$RS/results.txt"
+instrument_for <"$E2E_OUT/$RS/results.txt" >"$E2E_OUT/$RS/instrument.txt"
 # shellcheck disable=SC2329
 hermes() { echo 404; }
 for c in crash 404 refused; do
-  LEDGER=$t/l4-$c owned=() mode=m4-model key_sent_local=1 published=1 run_id=settle sessions_state=ok journal=()
+  LEDGER=$t/l4-$c owned=() mode=m4-model key_sent_local=1 published=1 run_id=$RS sessions_state=ok journal=()
   case $c in
     crash) sessions_state=unknown ;;
     404) journal=("send $TMP1 modelChoiceReachesRun" "chat modelChoiceReachesRun $TMP1 $TMP1") ;;
-    refused) journal=("send $K1 modelChoiceReachesRun" "chat modelChoiceReachesRun $K1 none") ;; # a 400: the chat exists only on the phone
+    refused) journal=("send $K1 modelChoiceReachesRun" "chat modelChoiceReachesRun $K1 none") ;; # the chat exists only on the phone
   esac
-  ledger_reserve "$LEDGER" "$LEDGER_LIMIT" 20261124-100000-0000 "${b4[@]}" && owned=("${M4_MODEL[@]}")
-  (check_sessions; observe_starts; observe_starts) >"$t/settle.out" 2>&1 || true
-  check "ledger: after a $c with the key handed over, every reservation stays at its bound (4 of 10), no observation line" \
-    '[ "$(ledger_total "$LEDGER")" = 4 ] && ! grep -q "^observed" "$LEDGER" && has "$(cat "$t/settle.out")" "4 of 10 model starts counted for Milestone 4"'
+  ledger_reserve "$LEDGER" "$LEDGER_LIMIT" "$RS" "${b4[@]}" && owned=("${M4_MODEL[@]}")
+  (check_sessions) >/dev/null 2>&1 || true # its own verdict is checked elsewhere
+  settle_rc=0
+  (observe_starts && observe_starts) >"$t/settle.out" 2>&1 || settle_rc=$?
+  check "ledger: after a $c with the key handed over, this run's reservations stay at their bound (4 of 10); settlement succeeds and writes nothing" \
+    '[ "$settle_rc" = 0 ] && [ "$(ledger_total "$LEDGER")" = 4 ] && [ "$(grep -c "^reserve $RS " "$LEDGER")" = 4 ] && ! grep -q "^observed" "$LEDGER" && has "$(cat "$t/settle.out")" "4 of 10 model starts counted for Milestone 4"'
 done
 unset -f hermes
-remove_tree "$E2E_OUT/settle"
+remove_tree "$E2E_OUT/$RS"
 LEDGER=$HOME/.local/state/apofis-e2e/model-budget-m4 owned=() key_sent_local='' sessions_state='' journal=() published='' mode=smoke
 
 # The share log check: exactly one ApofisShare image line, and it names TOO_LARGE.
