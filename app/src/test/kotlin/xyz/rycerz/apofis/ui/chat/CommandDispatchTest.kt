@@ -262,16 +262,16 @@ class CommandDispatchTest {
         return result
     }
 
-    /** Every state [ChatViewModel.state] shows from now on, in order. */
-    private fun ChatViewModel.states() = CopyOnWriteArrayList<ChatUiState>().also { seen -> scope.launch(Dispatchers.Unconfined) { state.collect { seen += it } } }
-
-    /** After the claim, no state shows the field released before the stored key was published. */
-    private fun List<ChatUiState>.publishedBeforeRelease(key: String) {
-        val claimed = indexOfFirst { it.sending }
-        assertTrue("the holder claimed it", claimed >= 0)
-        val released = drop(claimed).filter { !it.sending }
-        assertTrue("the claim was released", released.isNotEmpty())
-        assertTrue("released before the key was published: $released", released.all { it.storedSends == 1L && it.storedKey == key })
+    /**
+     * Sends the draft with its store HELD until [ChatViewModel.state] shows the holder's claim (the claimed state stays
+     * current while the store waits, so this observes it rather than sampling it), then lets the store run to its end.
+     */
+    private suspend fun ChatViewModel.claimObservedThenStored() {
+        storeGate = CompletableDeferred()
+        assertTrue(onSendClick())
+        await { it.sending } // the claim, observed
+        storeGate!!.complete(Unit)
+        settled()
     }
 
     private fun composer(key: String = KEY) = connected.composer.current(key)
@@ -379,17 +379,23 @@ class CommandDispatchTest {
         assertTrue(isTemporaryKey(tmp))
         val b = vm(tmp) { first.newChat() }
         b.type("/new", tmp)
-        assertTrue(b.onSendClick())
-        val next = first.selected.await { it != tmp }!!
+        val (ranB, newChatB) = first.launchedBy { b.onSendClick() }
+        assertTrue(ranB)
+        withContext(Dispatchers.Default) { withTimeout(60_000) { newChatB.joinAll() } }
+        val next = first.selected.value!!
+        assertNotEquals(tmp, next)
         assertFalse(isTemporaryKey(next))
-        until { db.sessionDao().get(tmp) == null }
+        until { db.sessionDao().get(tmp) == null } // the leave runs in a job of its own, started by New chat: its final state
 
         // From a chat with messages: a new ordinary chat; the old one stays.
         db.messageDao().insertAll(listOf(MessageEntity(next, 0, 1, "user", null, "hello", null, null, null, null, 1.0, null)))
         val c = vm(next) { first.newChat() }
         c.type("/new", next)
-        assertTrue(c.onSendClick())
-        val third = first.selected.await { it != next }!!
+        val (ranC, newChatC) = first.launchedBy { c.onSendClick() }
+        assertTrue(ranC)
+        withContext(Dispatchers.Default) { withTimeout(60_000) { newChatC.joinAll() } } // ended: a late request would be counted
+        val third = first.selected.value!!
+        assertNotEquals(next, third)
         assertFalse(isTemporaryKey(third))
         assertEquals(setOf(next, third), db.sessionDao().all().map { it.key }.toSet())
         assertTrue(requests.none { it.method == "DELETE" || it.target.startsWith("/v1/runs") })
@@ -405,9 +411,8 @@ class CommandDispatchTest {
         val vm = vm()
         val accepted = vm.accepts()
         vm.await { it.live?.status == "running" }
-        val states = vm.states()
         vm.type("/steer  go left ")
-        assertTrue(vm.ended { vm.onSendClick() })
+        vm.claimObservedThenStored()
         val row = rows().single()
         assertEquals(PendingState.STEERED, row.state) // delivered inside the store, before the holder settled
         assertEquals("go left", row.text)
@@ -417,9 +422,8 @@ class CommandDispatchTest {
         assertTrue(steer.body!!.utf8().contains("go left"))
         assertFalse(steer.body!!.utf8().contains("/steer"))
         assertEquals("", composer().draft)
-        val done = vm.await { it.storedSends == 1L }
-        assertEquals(row.idempotencyKey, done.storedKey) // pinned like a send (ruling 1)
-        states.publishedBeforeRelease(row.idempotencyKey)
+        // The released state, from the same observer: the count and the key it pins on, like a send (ruling 1).
+        vm.await { !it.sending && it.draft.isEmpty() && it.storedSends == 1L && it.storedKey == row.idempotencyKey }
         assertEquals(1, accepted.get())
         assertTrue(lines().none { it == "POST /v1/runs" })
     }
@@ -531,16 +535,14 @@ class CommandDispatchTest {
         val vm = vm()
         val accepted = vm.accepts()
         vm.await { it.live != null }
-        val states = vm.states()
         vm.type("/queue later please")
-        assertTrue(vm.ended { vm.onSendClick() })
+        vm.claimObservedThenStored()
         val row = rows().single()
         assertEquals("later please", row.text)
         assertEquals(PendingState.QUEUED, row.state) // never a steer, though a run is running
         assertFalse(row.steerOnly)
         assertFalse(row.requestBody.contains("/queue"))
-        vm.await { it.draft.isEmpty() && it.storedSends == 1L && it.storedKey == row.idempotencyKey }
-        states.publishedBeforeRelease(row.idempotencyKey)
+        vm.await { !it.sending && it.draft.isEmpty() && it.storedSends == 1L && it.storedKey == row.idempotencyKey }
         assertEquals(1, accepted.get())
         connected.sendQueue.drain() // a drain finds the chat busy: it starts after the running reply
         assertEquals(PendingState.QUEUED, rows().single().state)
@@ -659,24 +661,37 @@ class CommandDispatchTest {
         assertEquals(2, requests.count { it.method == "PATCH" })
     }
 
-    /** Lens L13: /stop and /title answered 500 keep the draft and show the status line, not the title note. */
+    /** Lens L13: /stop answered 500 sent its request, keeps the draft, sets no note and shows the server error. */
     @Test
-    fun serverErrorsKeepTheDraft() = runBlocking<Unit> {
-        session(onServer = true)
+    fun stopServerErrorKeepsTheDraft() = runBlocking<Unit> {
+        session() // local only: opening it fetches nothing, so the status line can only change by the stop
         routes["POST /v1/runs/$RUN/stop"] = json(500, "{}")
-        routes["PATCH /api/sessions/$KEY"] = json(500, "{}")
         heldRun()
         val vm = vm()
-        vm.await { it.live != null }
+        assertEquals(StatusLine.WORKING, vm.await { it.live != null }.status)
         vm.type("/stop")
         assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(1, lines().count { it == "POST /v1/runs/$RUN/stop" })
         assertEquals("/stop", composer().draft)
+        assertNull(composer().note)
         vm.await { it.status == StatusLine.SERVER_ERROR }
+    }
+
+    /** Lens L13: /title answered 500 sent its PATCH, keeps the draft, sets no title note and shows its own server error. */
+    @Test
+    fun titleServerErrorKeepsTheDraft() = runBlocking<Unit> {
+        session(onServer = true)
+        routes["PATCH /api/sessions/$KEY"] = json(500, "{}")
+        val vm = vm()
+        until { lines().any { it.startsWith("GET /api/sessions/$KEY/messages") } } // the opening fetch arrived: a final fact
+        withContext(Dispatchers.Default) { withTimeout(60_000) { vm.opening!!.join() } } // and ended
+        assertEquals(StatusLine.IDLE, vm.await { it.loaded }.status)
         vm.type("/title Plans B")
         assertTrue(vm.ended { vm.onSendClick() })
+        assertEquals(1, lines().count { it == "PATCH /api/sessions/$KEY" })
         assertEquals("/title Plans B", composer().draft)
-        assertNull(composer().note)
-        assertEquals(StatusLine.SERVER_ERROR, vm.state.value.status)
+        assertNull(composer().note) // not CMD_TITLE_REFUSED
+        vm.await { it.status == StatusLine.SERVER_ERROR }
         assertEquals("Plans", db.sessionDao().get(KEY)!!.title)
     }
 
