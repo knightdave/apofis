@@ -979,6 +979,9 @@ check "selection: --test SurvivalE2eTest#replySurvivesProcessDeath reserves in t
 remote_args() { (no_core_dumps() { return 0; }; rdie() { echo "DIE $1"; exit 1; }; lock_owned() { echo PASSED; exit 0; }; remote "$1" 18642 20261124-120000-abcd 0a1b2c3d - - -); }
 check "remote: both suite names pass the emulator host's argument check, a bad one does not" '[ "$(remote_args m4)" = PASSED ] && [ "$(remote_args m4-model)" = PASSED ] && [ "$(remote_args "m4 x")" = "DIE args" ]'
 
+check "device setup: error dialogs of other apps are hidden before the tests (a launcher ANR dialog covered every test once)" \
+  'grep -q "adb shell .setprop log.tag.adbd S; settings put global hide_error_dialogs 1;" "$here/run-e2e.sh"'
+
 # The ids: a temporary chat's id is an app id; a push record or any other prefix is not, here and in AppDriver.
 kre=$(sed -nE 's/^private val SESSION_ID = Regex\("([^"]*)"\).*/\1/p' "$e2e/kotlin/xyz/rycerz/apofis/e2e/AppDriver.kt")
 U=0a1b2c3d-0000-4000-8000-000000000001

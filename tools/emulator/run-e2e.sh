@@ -423,7 +423,9 @@ in_shell() {
   rmsg booted
   # adbd logs every shell command line: silenced before anything else runs (the key never is on one, but still).
   # The session journal starts empty here: a missing journal at the end means it was lost, never "no sessions".
-  [ "$(adb shell 'setprop log.tag.adbd S; settings put global window_animation_scale 0; settings put global transition_animation_scale 0;
+  # hide_error_dialogs: another app's "not responding" dialog (the launcher, just after boot) would cover the app for the
+  # whole run; hidden, the system restarts that app instead. App crashes still reach the crash log the tests read.
+  [ "$(adb shell 'setprop log.tag.adbd S; settings put global hide_error_dialogs 1; settings put global window_animation_scale 0; settings put global transition_animation_scale 0;
     settings put global animator_duration_scale 0; settings put system screen_off_timeout 1800000;
     input keyevent 82; mkdir -p '"$DEVICE_OUT"' && : > '"$DEVICE_OUT/sessions.txt"' && [ -f '"$DEVICE_OUT/sessions.txt"' ] && echo ready' |
     tr -d '\r')" = ready ] || rdie device-failed
