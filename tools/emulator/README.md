@@ -69,7 +69,7 @@ shell user. Tests:
    command line, in an environment, in a file or in a long-lived shell variable on the emulator host. Every shell on
    either host that can receive key bytes runs with `ulimit -c 0` (checked) before the key is read.
 6. Always, also on failure or interrupt: pulls the device files and a filtered logcat (tags `ApofisE2e`, `ApofisWake`, `ApofisShare`,
-   `TestRunner`, `AndroidRuntime`), reports the session journal (only exact lines, a complete file, with a count),
+   `TestRunner`, `AndroidRuntime`, errors of `ActivityManager`), reports the session journal (only exact lines, a complete file, with a count),
    stops the emulator and adb server (every stop and check under `timeout` with a kill fallback), deletes the AVD (the
    app's storage, the only place the key rests, goes with it). Only when every writer is gone, it stages a fixed
    allowlist in `.state/runs/<run-id>/export/`: `instrument.txt`, `results.txt` (one line per test result file),
@@ -269,12 +269,30 @@ contacts ntfy.sh or any other push host.
   Run it once as `--test M4E2eTest#modelPickIsReachable` (no reservation) before the first run that includes
   `modelChoiceReachesRun`: it opens the model sheet through the palette, picks the same alternative that method would,
   proves the chat's stored choice, restores Server default the same way and sends nothing. Both methods use one picker
-  that reports only fixed step names (the sheet lists model and provider names) and proves the sheet gone and the
-  stored choice before anything is sent.
+  that proves the sheet gone and the stored choice before anything is sent. Both run with the driver's fixed
+  diagnostics on for their whole length (setup, picker, Send, every wait): a failure names its step only, never the
+  screen (the sheet lists model and provider names).
+- **The choice outcome.** `modelChoiceReachesRun` logs one of `proved`, `served differs`, `not proved: no runtime`,
+  `not proved: no alternative` (recorded results), or `not admitted: zero starts`, `unknown: run record unreadable`,
+  `unproved failure, starts unknown` (failures). `not admitted: zero starts` rests on the app's own mark: the app marks a
+  send as attempted before the request and clears the mark only on a definite refusal or a failure before the request
+  left; the request may have reached the server and been refused. No word claims a status code. A run record that cannot
+  be read is read again on a timeout, a dropped connection or a 5xx while time is left; an invalid or foreign record is
+  never trusted; the identity-checked session evidence (counts only) is logged whatever the record gave.
 - **Leaving a chat.** `imageSendConfirms` and `temporaryChatGoneAfterLeaving` leave their temporary chat only after
-  every id the app will delete for it (its current id, its lineage and its key, as the app builds them) is journaled
-  and proved this run's by a GET of that id with this run's nonce in its title; one unproved id fails the method
-  before the leave.
+  the phone itself has settled the run (no run it follows, no pending send for the chat) and then every id the app will
+  delete for it (its current id, its lineage and its key, as the app builds them) is journaled and proved this run's
+  by a GET of that id with this run's nonce in its title; one unproved id fails the method before the leave, and
+  nothing else runs between the proof and the tap. An id the server adds to that chat between the proof and the
+  phone's delete (the app's refresh after a finish can still write the row) is deleted without its own proof; a chat
+  of one short message gets no new id. After the leave, `temporaryChatGoneAfterLeaving` judges by the server's answers
+  for each id, the phone's own row for that key and the note in the next chat; it does not observe the drawer: that
+  the drawer draws only local rows is pinned by the app's unit tests.
+- **Errors of the app.** The device hides error dialogs (`hide_error_dialogs`, so a launcher not responding just after
+  boot cannot cover the app). The run therefore fails when the exported logcat holds the system's line for a fatal
+  exception (`AndroidRuntime`) or a not-responding (`ActivityManager`, `ANR in`) of the app or its test process, with a
+  fixed message and no log text. Another app's not-responding does not fail it; a force-stop or a kill (the survival
+  test's) logs neither.
 - **Temporary chats.** Their ids (`apofis-tmp-<uuid>`) are app ids for the journal and the cleanup. A journaled id that
   answers 404 at cleanup counts as gone (the app deleted it): it passes the cleanup, which is not by itself a pass of
   the scenario.

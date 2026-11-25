@@ -439,7 +439,9 @@ class HarnessSelfTest {
         assertEquals("not proved: no alternative", choiceOutcome(run("completed", null), null).first)
         assertEquals("unproved failure, starts unknown", choiceOutcome(run("failed", null), pick).first)
         assertEquals("unproved failure, starts unknown", choiceOutcome(SendEnd.Unknown("x"), pick).first)
-        assertEquals("not admitted (never attempted): zero starts", choiceOutcome(SendEnd.NotAdmitted, pick).first)
+        assertEquals("not admitted: zero starts", choiceOutcome(SendEnd.NotAdmitted, pick).first)
+        assertEquals("unknown: run record unreadable", choiceOutcome(SendEnd.RecordUnreadable, pick).first)
+        assertFalse("no word claims never attempted or a status code", CHOICE_WORDS.any { "never" in it || Regex("\\d{3}").containsMatchIn(it) })
         val detail = choiceOutcome(run("completed", """{"provider":"prov","model":"model-a"}"""), pick).second
         assertFalse("no name in the detail", "model-a" in detail || "model-b" in detail || "prov" in detail.replace("provider", ""))
     }
@@ -453,6 +455,16 @@ class HarnessSelfTest {
         assertFalse(storedImageRow(rows(good.replace("0123456789abcdef0123", "aaaaaaaaaaaaaaaaaaaa")), "cap", digest).prefixMatches)
         assertFalse(storedImageRow(rows(good + "\n[screenshot]"), "cap", digest).suffixForm)
         assertFalse(storedImageRow(rows(good.replace("cap\n\n", "cap\n")), "cap", digest).captionEqual)
+    }
+
+    @Test
+    fun quietWaitNamesItsStepOnly() {
+        val app = AppDriver()
+        app.quiet = true
+        val e = runCatching { app.waitFor("a step that never comes", 600) { false } }.exceptionOrNull()
+        assertEquals("Not seen within 0 s: a step that never comes", e?.message)
+        assertEquals(QUIET, app.screen())
+        assertEquals(QUIET, app.dump())
     }
 
     @Test

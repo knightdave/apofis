@@ -59,6 +59,13 @@ class AppDriver {
     /** The scenario now running, written into each journal line. */
     var scenario = "none"
 
+    /**
+     * Fixed diagnostics: while true, [dump] and [screen] (every failure text and log that shows the screen) give a fixed
+     * placeholder instead of the tree or its labels, so a failure names its step only. For the methods whose screens list
+     * model and provider names; set at their first statement, for their whole length.
+     */
+    var quiet = false
+
     /** A string of the app, by resource name: the tests find elements by what the user sees. */
     fun str(name: String, vararg format: Any): String =
         res.getString(res.getIdentifier(name, "string", APP).also { require(it != 0) { "No string $name in the app" } }, *format)
@@ -327,7 +334,7 @@ class AppDriver {
     }
 
     /** The snapshot as lines for logcat when an assertion fails (text fields are left out: one may hold the key). */
-    fun dump(): String = snapshot().nodes.filterNot { it.editable }.joinToString("\n") {
+    fun dump(): String = if (quiet) QUIET else snapshot().nodes.filterNot { it.editable }.joinToString("\n") {
         "${it.id}<${it.parent} ${it.resId ?: ""} ${it.cls?.substringAfterLast('.')} [${it.left},${it.top},${it.right},${it.bottom}]" +
             "${if (it.clickable) " click" else ""}${if (it.heading) " heading" else ""}${if (it.liveRegion != 0) " live" else ""}" +
             " text=${it.text} desc=${it.desc} state=${it.state}"
@@ -339,14 +346,13 @@ class AppDriver {
     fun hasDesc(desc: String) = nodes { it.contentDescription?.toString() == desc }.isNotEmpty()
 
     /** Visible texts outside text fields (a field may hold the key), for failure messages. */
-    fun screen() = nodes { it.className != "android.widget.EditText" && !it.label().isNullOrEmpty() }.joinToString(" | ") { it.label()!! }
+    fun screen(): String = if (quiet) QUIET else nodes { it.className != "android.widget.EditText" && !it.label().isNullOrEmpty() }.joinToString(" | ") { it.label()!! }
 
     /**
      * Polls [condition] every half second, calling [meanwhile] each round; fails naming [what] after [timeoutMs].
      * An AssertionError (a failed observation) ends the wait at once; other exceptions (stale nodes) count as "not yet".
-     * [dump] false: a timeout logs nothing and says only [what] (a screen that may list model or provider names).
      */
-    fun waitFor(what: String, timeoutMs: Long, meanwhile: () -> Unit = {}, dump: Boolean = true, condition: () -> Boolean) {
+    fun waitFor(what: String, timeoutMs: Long, meanwhile: () -> Unit = {}, condition: () -> Boolean) {
         val end = SystemClock.uptimeMillis() + timeoutMs
         while (SystemClock.uptimeMillis() < end) {
             meanwhile()
@@ -358,7 +364,7 @@ class AppDriver {
             if (ok) return
             SystemClock.sleep(500)
         }
-        if (!dump) fail("Not seen within ${timeoutMs / 1000} s: $what")
+        if (quiet) fail("Not seen within ${timeoutMs / 1000} s: $what") // the step only
         log("screen when \"$what\" timed out:\n${dump()}")
         fail("Not seen within ${timeoutMs / 1000} s: $what. Screen: ${screen()}")
     }
@@ -372,15 +378,63 @@ class AppDriver {
     }
 
     /** Clicks the clickable element showing [label] as its text or content description (or a child's text). */
-    fun click(label: String, dump: Boolean = true) = tap(label, dump) { it == label }
+    fun click(label: String) = tap(label) { it == label }
 
     /**
-     * Taps the command palette's row of [word] (a row tap runs the command; the draft is not sent): its label is "/word"
-     * or "word", or starts with either followed by a non-letter (the row's text merged with its description).
+     * Taps the command palette's row of [word] (a row tap runs the command; the draft is not sent), found only in the
+     * app's own windows, through the row's own click action: its label is "/word" or "word", or starts with either
+     * followed by a non-letter (the row's text merged with its description).
      */
-    fun paletteRow(word: String, dump: Boolean = true) {
+    fun paletteRow(word: String) {
         val row = Regex("/?${Regex.escape(word)}(\\P{L}.*)?", RegexOption.DOT_MATCHES_ALL)
-        tap("/$word", dump) { row.matches(it) }
+        fun find() = appRoots().flatMap { r -> nodesIn(r) { n -> n.label()?.let(row::matches) == true } }
+            .firstNotNullOfOrNull { n -> clickableOf(n)?.takeIf { it.isEnabled } }
+        waitFor("the palette row \"/$word\"", 10_000) { find() != null }
+        val target = find() ?: fail("No palette row \"/$word\"")
+        if (!target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) fail("Tapping the palette row \"/$word\" failed")
+        log("tapped the palette row \"/$word\"")
+    }
+
+    /**
+     * Brings the node [find] returns into view: a visible hit needs no scroll; otherwise [list] (kept by the caller and
+     * refreshed before each scroll; null: a list that fits, searched as it is) is scrolled forward to its end, then
+     * backward to its start, looking after each scroll ([scrollStep] decides an end). Null when both ends were reached
+     * without it; fails "inconclusive: [tooLong]" when [bound] scrolls in one direction did not reach its end.
+     */
+    fun seek(list: AccessibilityNodeInfo?, bound: Int, tooLong: String, gone: String, shown: () -> Any, find: () -> AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        fun hit() = find()?.takeIf { it.isVisibleToUser }
+        hit()?.let { return it }
+        if (list == null) return null
+        for (action in listOf(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD, AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) {
+            var ended = false
+            for (i in 0 until bound) {
+                if (!scrollStep(list, action, gone, shown)) {
+                    ended = true
+                    break
+                }
+                hit()?.let { return it }
+            }
+            if (!ended) fail("inconclusive: $tooLong")
+        }
+        return hit()
+    }
+
+    /**
+     * One scroll of [list]: true once what [shown] returns changed (waited for, up to 2 s, since the tree follows a
+     * scroll later); false at that direction's end (the scroll refused, or nothing changed within the wait). Fails
+     * "inconclusive: [gone]" when the kept list node cannot be refreshed.
+     */
+    fun scrollStep(list: AccessibilityNodeInfo, action: Int, gone: String, shown: () -> Any): Boolean {
+        if (!list.refresh()) fail("inconclusive: $gone")
+        val before = shown()
+        if (!list.performAction(action)) return false
+        device.waitForIdle()
+        val end = SystemClock.uptimeMillis() + 2_000
+        while (true) {
+            if (shown() != before) return true
+            if (SystemClock.uptimeMillis() >= end) return false
+            SystemClock.sleep(200)
+        }
     }
 
     /** The node itself or its nearest clickable ancestor (Compose may keep an icon's label on the icon). */
@@ -398,14 +452,11 @@ class AppDriver {
         return found
     }
 
-    /**
-     * Taps the first enabled element whose label [matches], within 10 s; [name] is what the log and a failure say.
-     * [dump] false: a failure names only [name], with no screen.
-     */
-    private fun tap(name: String, dump: Boolean, matches: (String) -> Boolean) {
+    /** Taps the first enabled element whose label [matches], within 10 s; [name] is what the log and a failure say. */
+    private fun tap(name: String, matches: (String) -> Boolean) {
         fun find() = nodes { n -> n.label()?.let(matches) == true }.firstNotNullOfOrNull { n -> clickableOf(n)?.takeIf { it.isEnabled } }
-        waitFor("an enabled button \"$name\"", 10_000, dump = dump) { find() != null }
-        val target = find() ?: fail(if (dump) "No enabled button \"$name\". Screen: ${screen()}" else "No enabled button \"$name\"")
+        waitFor("an enabled button \"$name\"", 10_000) { find() != null }
+        val target = find() ?: fail("No enabled button \"$name\". Screen: ${screen()}")
         val bounds = Rect().also(target::getBoundsInScreen)
         log("click \"$name\": ${target.className} $bounds")
         // A real tap at the element's centre (UI Automator injects it); the element was found by its label above.
@@ -470,9 +521,15 @@ class AppDriver {
      * the tile is decoded and actionable (the loading placeholder carries the same label but is not clickable).
      */
     fun composerImages(): List<Pair<String, Boolean>> {
-        val labels = (1..10).flatMap { n -> (1..n).map { str("chat_image", it, n) } }.toSet() + str("chat_image_processing")
+        val labels = (1..10).flatMap { n -> (1..n).map { str("chat_image", it, n) } }.toSet() + str("chat_image_processing") + str("chat_image_unavailable")
         val bottom = nodes { it.viewIdResourceName == "chat.bottom" }.singleOrNull() ?: fail("No composer area (chat.bottom)")
         return nodesIn(bottom) { it.contentDescription?.toString() in labels }.map { it.contentDescription.toString() to it.isClickable }
+    }
+
+    /** Every tile of the draft strip, whatever its state: each has its own Remove control (`chat_image_remove`). */
+    fun draftTiles(): Int {
+        val bottom = nodes { it.viewIdResourceName == "chat.bottom" }.singleOrNull() ?: fail("No composer area (chat.bottom)")
+        return nodesIn(bottom) { it.contentDescription?.toString() == str("chat_image_remove") }.size
     }
 
     /** The keys of every chat in the app's database. */
@@ -552,16 +609,27 @@ class AppDriver {
      * it is terminal; or the send's own failure. Never journals the run.
      */
     fun awaitSendEnd(key: String, timeoutMs: Long): SendEnd {
-        val session = chatRow(key)?.currentId ?: key
         val end = SystemClock.uptimeMillis() + timeoutMs
+        var session: String? = null // the session id frozen into the send's own body, once read
+        var unreadable = false // the last read of the run's record failed transiently
         while (SystemClock.uptimeMillis() < end) {
+            if (session == null) session = query("SELECT requestBody FROM PendingSendEntity WHERE sessionKey = '$key';")?.singleOrNull()
+                ?.let { runCatching { JSONObject(it).getString("session_id") }.getOrNull() }?.takeIf(SESSION_ID::matches)
             val ids = query(RUN_IDS(key))?.distinct()
             if (ids != null && ids.size > 1) return SendEnd.Unknown("more than one run id for the chat")
             val id = ids?.singleOrNull()
             if (id != null) {
                 if (!RUN_ID.matches(id)) return SendEnd.Unknown("a malformed run id")
-                val r = runRecord(id, session)
-                if (r.optString("status") in PushE2eTest.TERMINAL_RUN) return SendEnd.Run(id, r)
+                // The body's session id; once its row is gone (settled first), the chat's id at that moment.
+                val r = readRun(id, session ?: chatRow(key)?.currentId ?: key)
+                when {
+                    r == null -> unreadable = true // a timeout, a dropped connection or a 5xx: read again while time is left
+                    r === INVALID -> return SendEnd.Unknown("the run record is invalid or not this send's")
+                    else -> {
+                        unreadable = false
+                        if (r.optString("status") in PushE2eTest.TERMINAL_RUN) return SendEnd.Run(id, r)
+                    }
+                }
             } else if (ids != null) {
                 when (query("SELECT state || '|' || attempted FROM PendingSendEntity WHERE sessionKey = '$key';")?.singleOrNull()) {
                     "failed|0" -> return SendEnd.NotAdmitted
@@ -570,7 +638,37 @@ class AppDriver {
             }
             SystemClock.sleep(1_000)
         }
-        return SendEnd.Unknown("no settled run within ${timeoutMs / 1000} s")
+        return if (unreadable) SendEnd.RecordUnreadable else SendEnd.Unknown("no settled run within ${timeoutMs / 1000} s")
+    }
+
+    /** The record of run [id] if it is [session]'s; null on a transient failure; [INVALID] for any other answer. Never logged. */
+    private fun readRun(id: String, session: String): JSONObject? {
+        val (code, body) = try {
+            http("GET", "v1/runs/$id")
+        } catch (e: java.io.IOException) {
+            return null
+        }
+        if (code >= 500) return null
+        val r = if (code == 200) runCatching { JSONObject(body) }.getOrNull() else null
+        return r?.takeIf { it.optString("run_id") == id && it.optString("session_id") == session } ?: INVALID
+    }
+
+    /** Waits, bounded, until the phone itself has settled chat [key]: no run it follows and no pending send for it. */
+    fun awaitLocalSettlement(key: String, timeoutMs: Long = 60_000) {
+        if (!SESSION_ID.matches(key)) fail("Not an app session id")
+        waitFor("the phone's own settlement of the chat", timeoutMs) {
+            query("SELECT (SELECT count(*) FROM ActiveRunEntity WHERE sessionKey = '$key') + (SELECT count(*) FROM PendingSendEntity WHERE sessionKey = '$key');")?.singleOrNull() == "0"
+        }
+    }
+
+    /** Whether the app's database has no row for chat [key], by the checked query: an unreadable answer fails, never "no row". */
+    fun chatGone(key: String): Boolean {
+        if (!SESSION_ID.matches(key)) fail("Not an app session id")
+        return when (query("SELECT count(*) FROM SessionEntity WHERE key = '$key';")?.singleOrNull()) {
+            "0" -> true
+            "1" -> false
+            else -> fail("Could not read the app's row of the chat")
+        }
     }
 
     /**
@@ -697,9 +795,18 @@ sealed interface SendEnd {
     /** Failed and never attempted: the app's own flag says no run request of it may have reached the server. */
     object NotAdmitted : SendEnd
 
+    /** The phone holds the run's id, but every read of its record failed transiently until the time was up. */
+    object RecordUnreadable : SendEnd
+
     /** Anything else; [why] is a fixed phrase. */
     data class Unknown(val why: String) : SendEnd
 }
+
+/** The placeholder [AppDriver.quiet] puts where the screen would be. */
+const val QUIET = "(not shown: fixed diagnostics)"
+
+/** [AppDriver]'s marker for a run record that answered but is not to be trusted. */
+private val INVALID = JSONObject()
 
 /**
  * Every run id the phone recorded for chat [key]: the run it follows, its send's run id, and a settled finish (the

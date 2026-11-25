@@ -1098,6 +1098,27 @@ cp "$t/lc.txt" "$t/ev/logcat.txt"
 rc=0; o=$( (mode=m4; evaluate "$t/ev") 2>&1) || rc=$?
 check "evaluate --m4: a method missing: fails" '[ "$rc" = 1 ] && has "$o" "MISSING or not passed: ShareE2eTest#pixelCapJustOverRefused"'
 
+# The verdict on errors of the app from the system's own lines (the device hides error dialogs).
+T0='11-25 01:00:00.000  1234  1234'
+lc "$T0 E AndroidRuntime: FATAL EXCEPTION: main" "$T0 E AndroidRuntime: Process: xyz.rycerz.apofis, PID: 1234" "$T0 E AndroidRuntime: java.lang.IllegalStateException: boom"
+check "app errors: a crash of the app is found" 'app_error_logged "$t/lc.txt"'
+lc "$T0 E AndroidRuntime: FATAL EXCEPTION: Instr: androidx.test.runner.AndroidJUnitRunner" "$T0 E AndroidRuntime: Process: xyz.rycerz.apofis.e2e, PID: 1240"
+check "app errors: a crash of the test process is found" 'app_error_logged "$t/lc.txt"'
+lc "$T0 E ActivityManager: ANR in xyz.rycerz.apofis (xyz.rycerz.apofis/.MainActivity)" "$T0 E ActivityManager: PID: 1234"
+check "app errors: a not-responding of the app is found" 'app_error_logged "$t/lc.txt"'
+lc "$T0 E ActivityManager: ANR in com.google.android.apps.nexuslauncher (com.google.android.apps.nexuslauncher/.NexusLauncherActivity)" \
+  "$T0 E AndroidRuntime: Process: xyz.rycerz.apofisx, PID: 1300" "$T0 E AndroidRuntime: Process: com.example.other, PID: 1301"
+check "app errors: the launcher's not-responding and other apps' crashes (a longer name too) are not the app's" '! app_error_logged "$t/lc.txt"'
+lc "$T0 I ApofisE2e: scenario starts" "$T0 I ApofisE2e: scenario ends"
+check "app errors: a clean log passes" '! app_error_logged "$t/lc.txt"'
+check "app errors: the exported logcat takes the system's crash and not-responding lines" 'grep -q "adb logcat -d -v threadtime .* AndroidRuntime:E ActivityManager:E .\*:S." "$here/run-e2e.sh"'
+cp "$t/ev/instrument.txt" "$t/ev/instrument.keep"
+for m in "${M4_TESTS[@]}"; do echo "${m/\#/.} PASS"; done | instrument_for >"$t/ev/instrument.txt"
+printf '%s\n' "$S TOO_LARGE" "$T0 E AndroidRuntime: FATAL EXCEPTION: main" "$T0 E AndroidRuntime: Process: xyz.rycerz.apofis, PID: 1234" >"$t/ev/logcat.txt"
+rc=0; o=$( (mode=m4; evaluate "$t/ev") 2>&1) || rc=$?
+check "evaluate: every method passed but the app crashed: fails with the fixed message, no log text" '[ "$rc" = 1 ] && has "$o" "FAILED: the system logged a crash or a not-responding of the app" && lacks "$o" "FATAL" && lacks "$o" "PID"'
+cp "$t/ev/instrument.keep" "$t/ev/instrument.txt"
+
 # The two authenticated reads keep only booleans. Stub bodies carry canaries; nothing of them may come out.
 CANARIES=(canary-model-7f3a91 canary-provider-2b9c44 canary-caption-5d1e07 canary-title-88aa31 "apofis-tmp-$U" "$key")
 mkdir -p "$t/reads"

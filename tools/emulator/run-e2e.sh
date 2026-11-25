@@ -58,7 +58,8 @@ SELFTESTS=(approvalBlockIsDetectedByItsHeadingOnly replyIsTheItemRightAfterThePr
   quietDeliveriesNeedANewPushCheckThatTookNoRun wakePreconditionPassesTheStoredRunsSendingRowOnly
   pushProofNeedsOnePushSettlementAfterTheDelivery recordMatchesTheAppsOwnIntentExactly revealScrollsFirstAndJudgesProgressByWhatIsShown
   anObservationFinishingAfterTheDeadlineDoesNotCount anEvidenceFailureInsideTheDeadlineWaitEscapes settingsRowValueIsAWholeSegment
-  leaveNeedsEveryDeletedIdProvedThisRuns modelChoiceOutcomeNeedsItsEvidence storedImageRowIsReducedToItsStructure drawerPagesMergeOnTheirOverlap)
+  leaveNeedsEveryDeletedIdProvedThisRuns modelChoiceOutcomeNeedsItsEvidence storedImageRowIsReducedToItsStructure drawerPagesMergeOnTheirOverlap
+  quietWaitNamesItsStepOnly)
 EVIDENCE=(2-airplane-offline 5-offline-waiting) # interruption screenshots, required with their scenarios
 # Milestone 3. The push scenarios (PushE2eTest) get push provisioning: a host-minted install id each, a fake ntfy and its
 # tunnel. Gate 1's start no model run.
@@ -481,7 +482,7 @@ finish() {
   if [ -n "$booted" ]; then
     ADB_TIMEOUT=90 adb pull "$DEVICE_OUT" "$out/device" >/dev/null 2>&1
     pull_rc=$?
-    if ADB_TIMEOUT=60 adb logcat -d -v threadtime ApofisE2e:V ApofisWake:I ApofisShare:I TestRunner:V AndroidRuntime:E '*:S' >"$out/logcat.txt" 2>/dev/null &&
+    if ADB_TIMEOUT=60 adb logcat -d -v threadtime ApofisE2e:V ApofisWake:I ApofisShare:I TestRunner:V AndroidRuntime:E ActivityManager:E '*:S' >"$out/logcat.txt" 2>/dev/null &&
       [ -s "$out/logcat.txt" ]; then logcat_ok=1; else rmsg logcat-failed; rc=$CLEANUP_EXIT; fi
   fi
   report_sessions "$pull_rc"
@@ -1482,6 +1483,11 @@ evaluate() {
     esac
   done
   [ -s "$dir/logcat.txt" ] || { log "  missing logcat.txt (logcat retrieval failed)"; bad=1; }
+  # The device hides error dialogs (hide_error_dialogs): an error of the app is judged from the system's own lines.
+  if [ -s "$dir/logcat.txt" ] && app_error_logged "$dir/logcat.txt"; then
+    log "  FAILED: the system logged a crash or a not-responding of the app or its test process"
+    bad=1
+  fi
   if [ "$mode" = m4 ]; then
     if share_log_ok "$dir/logcat.txt"; then log "  share log: exactly one ApofisShare image TOO_LARGE line"
     else log "  FAILED: share log: not exactly one ApofisShare image line naming TOO_LARGE"; bad=1; fi
@@ -1491,6 +1497,16 @@ evaluate() {
     grep -A12 '^INSTRUMENTATION_STATUS: stack=' "$dir/instrument.txt" | head -60 >&2
     return 1
   fi
+}
+
+# The app's processes, by the names the system logs: the app, the e2e test process, and any named process of either.
+APP_PROCS='xyz\.rycerz\.apofis(\.e2e)?(:[A-Za-z0-9_.]+)?'
+
+# app_error_logged <logcat>: true when the system logged a fatal exception ("Process: <name>, PID: <n>" of
+# AndroidRuntime) or a not-responding ("ANR in <name>" of ActivityManager) of one of the app's processes. Another app's
+# (the launcher's) does not count; a force-stop or a kill logs neither. Prints nothing.
+app_error_logged() {
+  tr -d '\r' <"$1" | grep -qE " E AndroidRuntime: Process: $APP_PROCS, PID: [0-9]+$| E ActivityManager: ANR in $APP_PROCS( |$)"
 }
 
 # share_log_ok <logcat>: exactly one ApofisShare image line (one per refused image), and it names TOO_LARGE: the one

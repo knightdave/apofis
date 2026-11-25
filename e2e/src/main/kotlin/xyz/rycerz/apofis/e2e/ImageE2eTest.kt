@@ -69,43 +69,47 @@ class ImageE2eTest {
         if (end !is SendEnd.Run || end.record.optString("status") != "completed") fail("The run did not complete")
         if (f.userRows != 1 || !f.suffixForm || !f.prefixMatches) fail("The stored row is not the caption, a blank line, one hint naming the sent JPEG and one [screenshot] line")
 
-        // The app's side, each a separate requirement.
+        // The app's side, each a separate requirement, each waited for (bounded) while a correct app is still working.
+        app.waitFor("no pending send left for the chat", 60_000) {
+            app.query("SELECT count(*) FROM PendingSendEntity WHERE sessionKey = '$key';")?.singleOrNull() == "0"
+        }
         var bound: String? = null
         app.waitFor("the confirmed send's image in the app's database", 30_000) {
             bound = app.query("SELECT digests FROM ImageBindingEntity WHERE sessionKey = '$key';")?.singleOrNull()
             bound != null
         }
         if (bound != staged) fail("The confirmed send is not bound to the staged JPEG")
-        if (app.pendingCount() != 0) fail("A pending send is left")
-        val bubble = revealBubble(caption)
-        if (app.nodesIn(bubble) { it.contentDescription?.toString() == image && it.isClickable }.size != 1) fail("The bubble does not show one decoded image")
-        if (app.nodesIn(bubble) { it.text?.toString() == app.str("chat_retry") }.isNotEmpty()) fail("The bubble shows a failed state")
+        // The bubble, reacquired each time: one decoded, actionable image and no Retry. A loading placeholder (same label,
+        // not clickable) or a Retry is "not yet"; only the timeout fails.
+        app.waitFor("the bubble with its caption, one decoded image and no failed state", 60_000) {
+            val b = revealBubble(caption) ?: return@waitFor false
+            app.nodesIn(b) { it.contentDescription?.toString() == image && it.isClickable }.size == 1 &&
+                app.nodesIn(b) { it.text?.toString() == app.str("chat_retry") }.isEmpty()
+        }
         app.log("bubble: the caption, one decoded image, no failed state")
         app.log("server title starts with [Image attached: ${app.serverTitle(key).startsWith("[Image attached")}")
 
+        app.awaitLocalSettlement(key) // the phone has settled the run before the ids are read and proved
         app.proveLeave(key) // every id the leave deletes, journaled and proved this run's; else no leave
-        // Leaving deletes the temporary chat on the phone's side; the harness finds the ids gone (404) or deletes them.
-        app.click(app.str("drawer_new_chat"))
+        app.click(app.str("drawer_new_chat")) // nothing else between the proof and this tap
+        // The ids are journaled: the harness's cleanup later finds each gone (404) or proves and deletes it.
         app.waitFor("another chat open", 10_000) { app.snapshot().chatKey().let { it != null && it != key } }
     }
 
-    /** The one user item showing [caption], brought into view by scrolling the message list (a long reply can push it out). */
-    private fun revealBubble(caption: String): AccessibilityNodeInfo {
+    /**
+     * The one user item showing [caption], visible, brought into view through the transcript list (the largest scrollable
+     * node of the chat screen, outside the composer area): no tagged item is needed to find that list. Null when the list
+     * holds it nowhere or holds it more than once.
+     */
+    private fun revealBubble(caption: String): AccessibilityNodeInfo? {
         fun bubbles() = app.nodes { it.viewIdResourceName?.startsWith("user:") == true }.filter { n -> app.nodesIn(n) { it.text?.toString() == caption }.isNotEmpty() }
-        val anchor = app.nodes { it.viewIdResourceName?.let { id -> id.startsWith("user:") || id.startsWith("reply:") } == true }.firstOrNull()
-        val list = anchor?.let { a -> generateSequence(a) { it.parent }.firstOrNull { it.isScrollable } }
-        val (found, _) = revealIn(object : ScrollList<AccessibilityNodeInfo> {
-            override fun find() = bubbles().singleOrNull()
-            override fun visible(n: AccessibilityNodeInfo) = n.isVisibleToUser
-            override fun scroll(forward: Boolean): Boolean {
-                if (list == null || !list.refresh()) return false
-                val ok = list.performAction(if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
-                app.device.waitForIdle()
-                return ok
-            }
-            override fun shown(): Any = app.nodes { it.isVisibleToUser && it.text != null && !it.isEditable }.map { "${it.text}@" + Rect().also(it::getBoundsInScreen) }
-        })
-        return found ?: fail("The sent message is not shown once with its caption")
+        val screen = app.nodes { it.viewIdResourceName?.startsWith("chat.key:") == true }.singleOrNull() ?: return null
+        val bottom = app.nodes { it.viewIdResourceName == "chat.bottom" }.singleOrNull()?.let { Rect().also(it::getBoundsInScreen) }
+        fun area(n: AccessibilityNodeInfo) = Rect().also(n::getBoundsInScreen).let { it.width() * it.height() }
+        val list = app.nodesIn(screen) { n -> n.isScrollable && !n.isEditable && Rect().also(n::getBoundsInScreen).let { r -> bottom == null || !bottom.contains(r) } }
+            .maxByOrNull(::area)
+        val shown = { app.nodes { it.isVisibleToUser && it.text != null && !it.isEditable }.map { "${it.text}@" + Rect().also(it::getBoundsInScreen) } }
+        return app.seek(list, 40, "transcript too long", "the transcript list is gone", shown) { bubbles().singleOrNull() }
     }
 }
 

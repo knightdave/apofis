@@ -37,6 +37,9 @@ class ShareE2eTest {
         app.log("scenario ${name.methodName} ends")
     }
 
+    /** No tile in the draft strip, whatever its state: no Remove control and no image label of any state. */
+    private fun noTile() = app.draftTiles() == 0 && app.composerImages().isEmpty()
+
     /** The composer's text (the draft; never the key: the Connect screen is gone). */
     private fun draft() = app.composerField()?.text?.toString()
 
@@ -44,14 +47,14 @@ class ShareE2eTest {
     fun shareTextAndImageOpensNewChat() {
         val draft = "Draft ${app.nonce} stays"
         app.setField(app.composerField() ?: fail("No composer"), draft)
-        app.waitFor("the draft in the composer, no image", 10_000) { draft() == draft && app.composerImages().isEmpty() }
+        app.waitFor("the draft in the composer, no tile", 10_000) { draft() == draft && noTile() }
         val caption = "Shared ${app.nonce} caption"
         app.share(SMALL, caption)
         app.awaitShareSheet(caption, images = 1, failed = false, accept = true)
         app.cancelShare()
-        // The draft's text and its images, both unchanged: Cancel attached nothing.
-        if (app.openChatKey() != chat || draft() != draft || app.composerImages().isNotEmpty()) fail("Cancel changed the open chat, its draft or its images")
-        app.log("cancel kept the chat, its draft and its (no) images")
+        // The draft's text and its tiles, both unchanged: Cancel attached nothing, not even a failed or processing tile.
+        if (app.openChatKey() != chat || draft() != draft || !noTile()) fail("Cancel changed the open chat, its draft or its tiles")
+        app.log("cancel kept the chat, its draft and its (no) tiles")
 
         val before = app.localKeys()
         app.share(SMALL, caption)
@@ -60,7 +63,7 @@ class ShareE2eTest {
         var key = ""
         app.waitFor("a new chat holding the shared caption and one decoded image in its composer", 15_000) {
             key = app.snapshot().chatKey().orEmpty()
-            key.isNotEmpty() && key !in before && draft() == caption && app.composerImages() == listOf(app.str("chat_image", 1, 1) to true)
+            key.isNotEmpty() && key !in before && draft() == caption && app.composerImages() == listOf(app.str("chat_image", 1, 1) to true) && app.draftTiles() == 1
         }
         // New (not in the app before), ordinary, and only on the phone: no other chat's draft was replaced.
         if (key.startsWith("apofis-tmp-") || app.chatRow(key)?.onServer != false) fail("The share did not open a new, ordinary, local-only chat")
