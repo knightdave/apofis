@@ -64,8 +64,12 @@ class DeliveryMatchTest {
 
     private fun hint(digest: String) = "[Image attached at: /home/h/.hermes/cache/native-inputs/api_${digest.take(32)}.jpg]"
 
-    private fun row(id: Long, content: String, role: String = "user") =
-        buildJsonObject { put("id", id); put("role", role); put("content", content); put("timestamp", 1.0) }.toString()
+    /** A user row has the kind the server gives every user row of a run ("internal_notification") unless [kind] says otherwise. */
+    private fun row(id: Long, content: String, role: String = "user", kind: String? = if (role == "user") "internal_notification" else null) =
+        buildJsonObject {
+            put("id", id); put("role", role); put("content", content); put("timestamp", 1.0)
+            if (kind != null) put("display_kind", kind)
+        }.toString()
 
     private fun serve(vararg rows: String) {
         val body = """{"object":"list","session_id":"$KEY","data":[${rows.joinToString(",")}]}"""
@@ -91,10 +95,25 @@ class DeliveryMatchTest {
 
     private suspend fun bindings() = db.imageBindingDao().forSession(KEY).associate { it.messageId to it.digests }
 
+    /** The row the server stores for an image send through its run API, in its observed shape. */
+    @Test
+    fun runRowDeliversItsSend() = runTest {
+        seed("k", "Look at this", listOf(D1))
+        sync(row(1, "Look at this\n\n[Image attached at: /srv/hermes/cache/documents/native-inputs/$D1/api_${D1.take(32)}.jpg]\n[screenshot]"))
+
+        val item = shown().single() as UserMessage // delivered: the pending bubble is gone
+        assertEquals("u1", item.key)
+        assertEquals("Look at this", item.text)
+        assertEquals(RUN, item.runId)
+        assertEquals(listOf(D1), item.images)
+        assertEquals(mapOf(1L to D1), bindings())
+    }
+
     @Test
     fun imageMessageConfirmed() = runTest {
         seed("k", "look", listOf(D1, D2))
-        sync(row(1, "look\n\n${hint(D1)}\n${hint(D2)}\n[screenshot]\n[screenshot]"))
+        // A row with no kind (written by another surface) is read the same way.
+        sync(row(1, "look\n\n${hint(D1)}\n${hint(D2)}\n[screenshot]\n[screenshot]", kind = null))
 
         val item = shown().single() as UserMessage
         assertEquals("u1", item.key)
@@ -114,7 +133,7 @@ class DeliveryMatchTest {
     @Test
     fun prefixMismatch() = runTest {
         seed("k", "look", listOf(D1))
-        sync(row(1, "look\n\n${hint(D2)}\n[screenshot]"))
+        sync(row(1, "look\n\n${hint(D2)}\n[screenshot]", kind = null))
 
         assertEquals(listOf("u1", "pk"), shown().map { it.key })
         assertEquals(emptyMap<Long, String>(), bindings())
@@ -202,7 +221,7 @@ class DeliveryMatchTest {
 
     @Test
     fun settlementRefusesALineTerminatorInsideAHint() = runTest {
-        runEndsWith("cap", listOf(D1), row(10, "cap\n\n[Image attached: left\rright]\n[screenshot]"), row(11, "Hm.", role = "assistant"))
+        runEndsWith("cap", listOf(D1), row(10, "cap\n\n[Image attached: left\rright]\n[screenshot]", kind = null), row(11, "Hm.", role = "assistant"))
 
         val left = db.pendingSendDao().get("k")!! // the row is literal text, not an image block
         assertEquals("failed", left.state)

@@ -86,7 +86,8 @@ class ImageBindingTest {
     private fun block(vararg digests: String) =
         "\n\n" + digests.joinToString("\n") { hint(it) } + "\n" + digests.joinToString("\n") { "[screenshot]" }
 
-    private fun row(id: Long, content: String, role: String = "user", kind: String? = null) =
+    /** A user row has the kind the server gives every user row of a run ("internal_notification") unless [kind] says otherwise. */
+    private fun row(id: Long, content: String, role: String = "user", kind: String? = if (role == "user") "internal_notification" else null) =
         buildJsonObject {
             put("id", id); put("role", role); put("content", content); put("timestamp", 1.0)
             if (kind != null) put("display_kind", kind)
@@ -244,18 +245,31 @@ class ImageBindingTest {
         assertEquals(listOf(listOf(D1), listOf(null)), users().map { it.images })
     }
 
+    /** The row the server stores for an image send through its run API, in its observed shape: bound, and kept on the next sync. */
     @Test
-    fun parserRunsOnlyOnPlainUserRows() = runTest {
-        seed("k", "cap", listOf(D1))
-        val notification = "cap" + block(D1)
-        val steer = "[OUT-OF-BAND USER MESSAGE - sent while you were working]\ncap\n[/OUT-OF-BAND USER MESSAGE]" + block(D1)
-        sync(row(1, notification, kind = "internal_notification"), row(2, steer, kind = "steer"))
+    fun runRowIsBoundAndKept() = runTest {
+        seed("k", "Look at this", listOf(D1))
+        val run = row(1, "Look at this\n\n[Image attached at: /srv/hermes/cache/documents/native-inputs/$D1/api_${D1.take(32)}.jpg]\n[screenshot]")
+        runEnd(run, row(2, "A cat.", role = "assistant"))
+        assertEquals(mapOf(1L to D1), bindings())
+        sync(run, row(2, "A cat.", role = "assistant"))
+        assertEquals(mapOf(1L to D1), bindings())
+        restart()
+        val message = users().single()
+        assertEquals("Look at this", message.text)
+        assertEquals(listOf(D1), message.images)
+    }
 
-        assertEquals(listOf("u1", "u2", "pk"), shown().map { it.key }) // the pending bubble stays
-        val (shownNotification, shownSteer) = users()
-        assertEquals(notification, shownNotification.text)
+    @Test
+    fun parserNeverRunsOnSteerRows() = runTest {
+        seed("k", "cap", listOf(D1))
+        val steer = "[OUT-OF-BAND USER MESSAGE - sent while you were working]\ncap\n[/OUT-OF-BAND USER MESSAGE]" + block(D1)
+        sync(row(2, steer, kind = "steer"))
+
+        assertEquals(listOf("u2", "pk"), shown().map { it.key }) // the pending bubble stays
+        val shownSteer = users().first { it.key == "u2" }
         assertEquals(steer, shownSteer.text)
-        assertEquals(listOf(emptyList<String?>(), emptyList()), listOf(shownNotification.images, shownSteer.images))
+        assertEquals(emptyList<String?>(), shownSteer.images)
         assertEquals(emptyMap<Long, String>(), bindings())
     }
 
@@ -278,7 +292,7 @@ class ImageBindingTest {
     @Test
     fun unboundMarkerShowsPlaceholder() = runTest {
         seed("k", "other", emptyList())
-        sync(row(1, "a caption" + block(D1)))
+        sync(row(1, "a caption" + block(D1), kind = null)) // a row with no kind (another surface) is read the same way
 
         val message = users().first()
         assertEquals("a caption", message.text)
@@ -288,11 +302,13 @@ class ImageBindingTest {
 
     @Test
     fun bindingSurvivesRepeatedSync() = runTest {
+        // A row with no kind (another surface) is bound and kept the same way as a run's row.
+        val user = row(1, "cap" + block(D1), kind = null)
         seed("k", "cap", listOf(D1))
-        sync(row(1, "cap" + block(D1)))
-        sync(row(1, "cap" + block(D1)), row(2, "Looking", role = "assistant"))
-        runEnd(row(1, "cap" + block(D1)), row(2, "A cat.", role = "assistant"))
-        sync(row(1, "cap" + block(D1)), row(2, "A cat.", role = "assistant"))
+        sync(user)
+        sync(user, row(2, "Looking", role = "assistant"))
+        runEnd(user, row(2, "A cat.", role = "assistant"))
+        sync(user, row(2, "A cat.", role = "assistant"))
 
         assertEquals(mapOf(1L to D1), bindings())
         assertEquals(listOf(D1), users().single().images)

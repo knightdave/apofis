@@ -26,6 +26,7 @@ import xyz.rycerz.apofis.chat.SendState
 import xyz.rycerz.apofis.chat.UserMessage
 import xyz.rycerz.apofis.chat.buildTranscript
 import xyz.rycerz.apofis.chat.parseUserContent
+import xyz.rycerz.apofis.chat.startsTurn
 import xyz.rycerz.apofis.chat.userKey
 import xyz.rycerz.apofis.chat.fittingToolCalls
 import xyz.rycerz.apofis.chat.storedToolCalls
@@ -286,7 +287,7 @@ class ChatRepository(
 
     /**
      * In the sync transaction, on the fetched rows, before a run end settles anything (R13, R17). First drops every
-     * binding no fetched row with its id still supports (a plain user row whose own hints are exactly the bound digests'
+     * binding no fetched row with its id still supports (a turn's user row whose own hints are exactly the bound digests'
      * first 32 hex); a repeated id keeps it while any of its rows does, whatever their order. Then binds each image send
      * the rows confirm to its row, only when that match is unambiguous. A binding is never rebuilt from anything else.
      */
@@ -298,7 +299,7 @@ class ChatRepository(
             for (b in kept) {
                 val hints = b.digests.digestList().map { it.take(32) }
                 val holds = byId[b.messageId].orEmpty().any {
-                    it.role == "user" && it.displayKind == null && parseUserContent(it.content).images == hints
+                    it.startsTurn() && parseUserContent(it.content).images == hints
                 }
                 if (!holds) dao.delete(sessionKey, b.messageId)
             }
@@ -547,7 +548,7 @@ private fun delivers(p: PendingSendEntity, m: UserMessage): Boolean {
     if (m.shortened) return m.raw.isNotBlank() && p.text.trim().startsWith(m.raw.trim())
     val digests = p.images.digestList()
     if (digests.isEmpty()) return m.raw.trim() == p.text.trim()
-    if (m.images.size != digests.size) return false // also keeps out rows that never carry images (notifications)
+    if (m.images.size != digests.size) return false // also keeps out steer rows, whose image block is never parsed
     val content = parseUserContent(m.raw)
     return content.images.size == digests.size && content.text.trim() == p.text.trim() &&
         content.images.withIndex().all { (i, prefix) -> prefix == null || digests[i].startsWith(prefix) }
@@ -589,7 +590,7 @@ private const val STORED_ROW_CHARS = 400_000 // content + reasoning + calls of o
 
 /**
  * The row as stored: per-field cuts first, then the bound on content, reasoning and calls together. Over it, content
- * is kept first, then reasoning, then whole calls while they fit. A plain user row whose own hints are exactly its
+ * is kept first, then reasoning, then whole calls while they fit. A turn's user row whose own hints are exactly its
  * [bound] digests' first 32 hex stores its parsed text (the photos show through the binding); any other row is cut
  * from its tail. The cut is recorded in [MessageEntity.shortened] and [MessageEntity.droppedToolCalls].
  */
@@ -602,7 +603,7 @@ private fun MessageDto.toEntity(sessionKey: String, position: Int, bound: List<S
         timestamp = timestamp, finishReason = finishReason,
     )
     if (content.length.toLong() + (reasoning?.length ?: 0) + (calls?.length ?: 0) <= STORED_ROW_CHARS) return row
-    val parsed = if (role == "user" && displayKind == null && bound != null) parseUserContent(content) else null
+    val parsed = if (startsTurn() && bound != null) parseUserContent(content) else null
     val text = if (parsed != null && parsed.images == bound?.map { it.take(32) }) parsed.text else content
     val keptContent = text.cutTo(STORED_ROW_CHARS)
     val keptReasoning = reasoning?.cutTo(STORED_ROW_CHARS - keptContent.length)
