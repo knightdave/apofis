@@ -161,6 +161,7 @@ internal class ExpandRoom {
  * it took the draft; only then the composer collapses. The button, the IME action (only with [enterToSend]) and
  * hardware Enter (see [enterKey]) all go through it. [busy]: see [primaryEnabled]; the field also takes no edits then.
  * [subject]: what the primary action acts on (the run for Stop, Steer and Send after, the chat for Send); see [PrimaryButton].
+ * [stopRun]: the run [onStop] stops, which keys the Stop beside the primary button.
  * [focusRequester] focuses the field. [answerGate]: in [ComposerMode.ANSWER], the request's press rule ([AnswerGate]):
  * the button counts a press only by it, and the IME action and hardware Enter are judged by it when they arrive.
  */
@@ -179,6 +180,7 @@ internal fun ComposerParts(
     backdrop: BackdropState? = null,
     subject: Any? = null,
     transcript: Boolean = true,
+    stopRun: Any? = subject,
     clock: () -> Long = System::nanoTime,
     images: List<DraftImage> = emptyList(),
     attachEnabled: Boolean = true,
@@ -224,8 +226,8 @@ internal fun ComposerParts(
         }
     }
     Row {
-        // Keyed by the run it is drawn for: a press begun on one run is cancelled when another run is shown.
-        if (mode == ComposerMode.STEER || mode == ComposerMode.SEND_AFTER || mode == ComposerMode.ANSWER) key(subject) {
+        // Keyed by the run it stops ([stopRun]) and the subject: a press begun on one run is cancelled when another is shown.
+        if (mode == ComposerMode.STEER || mode == ComposerMode.SEND_AFTER || mode == ComposerMode.ANSWER) key(subject, stopRun) {
             RoundButton(R.drawable.lucide_square, R.string.chat_stop, enabled = true, filled = false, tag = STOP_TAG, onClick = onStop)
         }
         PrimaryButton(mode, busy || mode == ComposerMode.ANSWER && draft.isBlank(), subject, submit, onStop, clock, answerGate)

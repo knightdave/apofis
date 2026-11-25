@@ -42,6 +42,7 @@ import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Command
 import xyz.rycerz.apofis.chat.ComposerState
 import xyz.rycerz.apofis.chat.Parsed
+import xyz.rycerz.apofis.chat.Shown
 import xyz.rycerz.apofis.chat.parseCommand
 import xyz.rycerz.apofis.chat.ComposerNote
 import xyz.rycerz.apofis.chat.DraftImage
@@ -131,8 +132,14 @@ interface ChatActions {
     /** [onSendClick] from the screen; [steerRun]: the run the Steer button was drawn for (a send steers only that run). */
     fun onSendClick(steerRun: String?): Boolean = onSendClick()
 
+    /** [onSendClick] for the field the screen drew: refused unless the holder is still on [drawnRevision]. */
+    fun onSendClick(steerRun: String?, drawnRevision: Long): Boolean = onSendClick(steerRun)
+
     /** A no-text command tapped in the palette: the same dispatch, claim, refusals and return value as [onSendClick]. */
     fun onCommand(command: Command): Boolean = false
+
+    /** [onCommand] for the field the screen drew ([drawnRevision], as for [onSendClick]). */
+    fun onCommand(command: Command, drawnRevision: Long): Boolean = onCommand(command)
     /** [runId]: the run the Stop button was drawn for. */
     fun onStopClick(runId: String) {}
     fun onRetry(idempotencyKey: String) {}
@@ -229,6 +236,9 @@ class ChatViewModel(
         val sendable = c.images.none { it.processing } && (d.isNotBlank() || c.images.any { it.digest != null })
         val photos = c.images.any { !it.failed }
         val a = c.answer
+        // A displayed clarify takes a choice only while the field holds its own buffer, not being sent.
+        val asked = live?.pending?.takeIf { it.kind == "clarify" }
+        val choosable = asked != null && a != null && !a.sending && a.runId == live.runId && a.requestId == asked.requestId && a.generation == asked.executionGeneration
         ChatUiState(
             sessionKey = sessionKey,
             title = e.title,
@@ -255,7 +265,7 @@ class ChatViewModel(
             host = host,
             live = live,
             notes = l.notes,
-            answering = l.answering || a?.sending == true,
+            answering = l.answering || a?.sending == true || asked != null && !choosable,
             confirmRetry = l.confirmRetry,
             composerNote = c.note,
             sending = a?.sending ?: c.sending,
@@ -306,11 +316,18 @@ class ChatViewModel(
         }
     }
 
-    /** Tells the holder which clarify request the live run displays now (read now, not from the flow's last value). */
-    private fun observe() {
+    /** The clarify request the live run displays now (read now, not from the flow's last value); null once closed. */
+    private fun shown(): Shown? {
+        if (!connected.isOpen) return null
         val live = follower.live(sessionKey).value
         val p = live?.pending?.takeIf { it.kind == "clarify" }
-        composer.showQuestion(sessionKey, live?.runId, p?.requestId, p?.executionGeneration ?: 0)
+        return Shown(live?.runId, p?.requestId, p?.executionGeneration ?: 0)
+    }
+
+    /** Tells the holder which clarify request the live run displays now; nothing once this connection is closed. */
+    private fun observe() {
+        val now = shown() ?: return
+        composer.showQuestion(sessionKey, now.runId, now.requestId, now.generation) { connected.isOpen }
     }
 
     /**
@@ -361,11 +378,16 @@ class ChatViewModel(
     private var commandInFlight: Pair<String, Long>? = null
 
     /** The live run this view model shows: what the screen draws its Steer and Stop for. */
+    // Without a drawn field (tests), the holder's revision now: nothing was drawn that could be stale.
     override fun onSendClick(): Boolean = onSendClick(state.value.live?.runId)
 
-    override fun onSendClick(steerRun: String?): Boolean = dispatch(steerRun)
+    override fun onSendClick(steerRun: String?): Boolean = dispatch(steerRun, composer.current(sessionKey).revision)
 
-    override fun onCommand(command: Command): Boolean = dispatch(state.value.live?.runId, command)
+    override fun onSendClick(steerRun: String?, drawnRevision: Long): Boolean = dispatch(steerRun, drawnRevision)
+
+    override fun onCommand(command: Command): Boolean = dispatch(state.value.live?.runId, composer.current(sessionKey).revision, command)
+
+    override fun onCommand(command: Command, drawnRevision: Long): Boolean = dispatch(state.value.live?.runId, drawnRevision, command)
 
     /**
      * The one submit path (button, IME action, hardware Enter, palette): reads the holder now and decides from the
@@ -373,10 +395,13 @@ class ChatViewModel(
      * its note and keeps the draft's text and photos; a command that ran clears the draft only if it still holds the
      * claimed text at the claimed revision. [runId]: the run a steer or /stop is for. A cleared view model takes nothing.
      * While the field shows an answer buffer, its text is what is parsed, and a message answers the displayed question.
+     * [drawnRevision]: the holder's revision the screen drew the field from. Every change of what the field shows that
+     * is not a user edit ticks it, so a submit drawn for one buffer never acts on another.
      */
-    private fun dispatch(runId: String?, tapped: Command? = null): Boolean {
+    private fun dispatch(runId: String?, drawnRevision: Long, tapped: Command? = null): Boolean {
         if (!viewModelScope.isActive) return false
         val claim = composer.current(sessionKey)
+        if (claim.revision != drawnRevision) return false
         val a = claim.answer
         // The holder takes nothing while a send is being stored, nor from an answer being sent or expired.
         if (if (a != null) a.sending || a.expired else claim.sending) return false
@@ -516,8 +541,7 @@ class ChatViewModel(
                     }
                 }
             } finally {
-                composer.settleAnswer(sessionKey, runId, requestId, generation, result)
-                observe()
+                composer.settleAnswer(sessionKey, runId, requestId, generation, result, ::shown)
             }
         }
         return true
@@ -525,13 +549,15 @@ class ChatViewModel(
 
     /**
      * /queue or /steer typed as the answer: stores only [arg] (no photo: the draft's are set aside), claimed through the
-     * answer buffer like an answer. The buffer clears only once the row is stored; a failed store keeps the text.
+     * answer buffer like an answer. The buffer empties only once the row is stored (the question still waits for its
+     * answer); a failed store keeps the text.
      */
     private fun storeAnswer(a: Answer, runId: String?, command: Command, arg: String): Boolean {
         if (!viewModelScope.isActive) return false
         composer.claimAnswer(sessionKey, a.runId, a.requestId, a.generation) ?: return false
         request {
             var result = AnswerSettle.UNCLEAR
+            var note: ComposerNote? = null
             try {
                 withContext(NonCancellable) {
                     var storedKey: String? = null
@@ -539,22 +565,24 @@ class ChatViewModel(
                     val onStored = { key: String ->
                         storedKey = key
                         published(key)
-                        result = AnswerSettle.SENT
+                        result = AnswerSettle.STORED
                     }
-                    try {
+                    val returned = try {
                         if (command == Command.QUEUE) {
                             repo.queue(sessionKey, arg, emptyList(), onStored)
                         } else {
                             repo.send(sessionKey, arg, steerRun = runId, steerOnly = true, onStored = onStored)
                         }
+                        true
                     } catch (_: Exception) {
-                        // nothing stored: the text stays in the field
+                        false // nothing stored: the text stays in the field, with no note (as for a draft)
                     }
-                    if (storedKey != null) local.update { it.copy(notes = emptyMap()) } else if (command == Command.STEER) composer.setNote(sessionKey, ComposerNote(NoteKind.CMD_NOTHING_RUNNING))
+                    if (storedKey != null) local.update { it.copy(notes = emptyMap()) }
+                    // A steer that returned without a row: its run no longer runs.
+                    if (returned && storedKey == null && command == Command.STEER) note = ComposerNote(NoteKind.CMD_NOTHING_RUNNING)
                 }
             } finally {
-                composer.settleAnswer(sessionKey, a.runId, a.requestId, a.generation, result)
-                observe()
+                composer.settleAnswer(sessionKey, a.runId, a.requestId, a.generation, result, ::shown, note)
             }
         }
         accepted.tryEmit(Unit)

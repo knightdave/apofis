@@ -22,7 +22,8 @@ import xyz.rycerz.apofis.sync.SendTooLarge
  * dropped. [unsent] is text a send could not store, shown apart until the user puts it back or discards it.
  * [images] are the draft's photos in pick order; [note] is the one note of this chat, the newest set.
  * [answer] is the answer to the clarify question displayed now: while it is set the field shows it and the draft's text
- * and photos wait, untouched, until the question settles.
+ * and photos wait, untouched, until the question settles. [closed]: the question whose answer was sent or expired; it
+ * gets no new buffer while the live run still reports it (until another question, or none, is observed).
  */
 data class ComposerState(
     val draft: String = "",
@@ -32,6 +33,7 @@ data class ComposerState(
     val images: List<DraftImage> = emptyList(),
     val note: ComposerNote? = null,
     val answer: Answer? = null,
+    val closed: Shown? = null,
 )
 
 /**
@@ -44,8 +46,14 @@ data class Answer(val runId: String, val requestId: String, val generation: Long
 private fun Answer.owns(runId: String?, requestId: String?, generation: Long) =
     this.runId == runId && this.requestId == requestId && this.generation == generation
 
-/** How an answer's post ended: [EXPIRED] the question was gone or changed, [UNCLEAR] anything else. */
-enum class AnswerSettle { SENT, EXPIRED, UNCLEAR }
+/** The clarify request a live run displays ([requestId] null: none). */
+data class Shown(val runId: String?, val requestId: String?, val generation: Long)
+
+/**
+ * How an answer's claim ended: [EXPIRED] the question was gone or changed, [UNCLEAR] anything else. [STORED]: a /queue
+ * or /steer typed in the field was stored; it did not answer the question, whose buffer is emptied and kept.
+ */
+enum class AnswerSettle { SENT, EXPIRED, UNCLEAR, STORED }
 
 /** A draft photo: [digest] null while it is processing, then its file in the image store, or [failed]. */
 data class DraftImage(val id: Long, val digest: String?, val failed: Boolean = false) {
@@ -68,7 +76,7 @@ enum class NoteKind {
     FAST_OFF, TEMPORARY_NOT_DELETED,
 }
 
-private fun ComposerState.idle() = draft.isEmpty() && !sending && unsent == null && images.isEmpty() && note == null && answer == null
+private fun ComposerState.idle() = draft.isEmpty() && !sending && unsent == null && images.isEmpty() && note == null && answer == null && closed == null
 
 /** Given to a send's store: [stored] says the text is durably accepted, so the field may empty now. */
 fun interface Stored {
@@ -162,34 +170,60 @@ class Composer(private val scope: CoroutineScope) {
     }
 
     /**
-     * Ends the claim of that request's buffer, once: [AnswerSettle.SENT] clears it, [AnswerSettle.EXPIRED] expires it,
-     * [AnswerSettle.UNCLEAR] makes it editable again. The ids are the token: anything else (no such buffer being sent,
-     * a removed or cleared chat) changes nothing.
+     * Ends the claim of that request's buffer, once, and in the same step takes up the question [shown] reads as
+     * displayed now (null: not known, the connection is closed; then the settle alone applies). [AnswerSettle.SENT]
+     * clears the buffer and [AnswerSettle.EXPIRED] expires it, both closing that question; [AnswerSettle.UNCLEAR] makes
+     * it editable again; [AnswerSettle.STORED] empties and unlocks it. [note] is set with it. The ids are the token:
+     * anything else (no such buffer being sent, a removed or cleared chat) changes nothing.
      */
-    fun settleAnswer(sessionKey: String, runId: String, requestId: String, generation: Long, result: AnswerSettle) = book.update { b ->
+    fun settleAnswer(
+        sessionKey: String, runId: String, requestId: String, generation: Long, result: AnswerSettle,
+        shown: () -> Shown?, note: ComposerNote? = null,
+    ) = book.update { b ->
         val a = b.entries[sessionKey]?.answer
         if (sessionKey in b.gone || a == null || !a.owns(runId, requestId, generation) || !a.sending) return@update b
+        val now = shown()
         b.with(sessionKey) { s, tick ->
-            when (result) {
-                AnswerSettle.SENT -> s.copy(answer = null, revision = tick)
-                AnswerSettle.EXPIRED -> s.copy(answer = a.copy(sending = false)).expire(tick)
+            val closed = Shown(runId, requestId, generation)
+            val settled = when (result) {
+                AnswerSettle.SENT -> s.copy(answer = null, closed = closed, revision = tick)
+                AnswerSettle.EXPIRED -> s.copy(answer = a.copy(sending = false), closed = closed).expire(tick)
                 AnswerSettle.UNCLEAR -> s.copy(answer = a.copy(sending = false), revision = tick)
-            }
+                AnswerSettle.STORED -> s.copy(answer = a.copy(text = "", sending = false), revision = tick)
+            }.let { if (note != null) it.copy(note = note) else it }
+            if (now == null) settled else settled.observed(now, tick)
         }
     }
 
     /**
-     * The clarify request displayed now in the chat's live run (null [requestId]: none). A buffer being sent waits for
-     * its own settle; an expired one stays as it is. Any other buffer of another request is dropped when blank and
-     * expired otherwise; then, with no buffer left, the displayed request gets an empty one.
+     * The clarify request displayed now in the chat's live run (null [requestId]: none), applied only while [live] (read
+     * inside the update, like [addImages]'s): an observation of a closed connection changes nothing. See [observed].
      */
-    fun showQuestion(sessionKey: String, runId: String?, requestId: String?, generation: Long) = book.update { b ->
-        if (sessionKey in b.gone) return@update b
-        val a = b.entries[sessionKey]?.answer
-        if (a != null && (a.sending || a.expired || a.owns(runId, requestId, generation))) return@update b
-        val next = if (a == null) b else b.with(sessionKey) { s, tick -> s.expire(tick) }
-        if (runId == null || requestId == null || next.entries[sessionKey]?.answer != null) return@update next
-        next.with(sessionKey) { s, tick -> s.copy(answer = Answer(runId, requestId, generation, ""), revision = tick) }
+    fun showQuestion(sessionKey: String, runId: String?, requestId: String?, generation: Long, live: () -> Boolean = { true }) = book.update { b ->
+        if (sessionKey in b.gone || !live()) return@update b
+        val s = b.of(sessionKey)
+        val next = (s ?: ComposerState(revision = b.counter + 1)).observed(Shown(runId, requestId, generation), b.counter + 1)
+        if (next == s || s == null && next.idle()) b else b.with(sessionKey) { _, _ -> next }
+    }
+
+    /**
+     * The question [shown] is displayed now. Another question, or none, forgets [ComposerState.closed]. A buffer being
+     * sent waits for its own settle; an expired one stays as it is. Any other buffer of another request is dropped when
+     * blank and expired otherwise; then, with no buffer left, the displayed request gets an empty one, unless it is the
+     * closed question.
+     */
+    private fun ComposerState.observed(shown: Shown, tick: Long): ComposerState {
+        var s = if (closed != null && closed != shown) copy(closed = null) else this
+        val a = s.answer
+        if (a != null) {
+            if (a.sending || a.expired || a.owns(shown.runId, shown.requestId, shown.generation)) return s
+            s = s.expire(tick)
+            if (s.answer != null) return s
+        }
+        val runId = shown.runId ?: return s
+        val requestId = shown.requestId ?: return s
+        if (s.closed == shown) return s
+        return s.copy(answer = Answer(runId, requestId, shown.generation, ""), revision = tick)
     }
 
     /**

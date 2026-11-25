@@ -323,7 +323,7 @@ fun ChatScreen(
                         onSend = {
                             // The holder decides at dispatch time.
                             // The list follows once the row is stored (the counter effect above), never here.
-                            val accepted = !input.loadFailed && callbacks.value.actions.onSendClick(input.runId) // the drawn run: what Steer steers
+                            val accepted = !input.loadFailed && callbacks.value.actions.onSendClick(input.runId, input.draftRevision) // the drawn run and field
                             if (accepted) linkFailed = false
                             accepted
                         },
@@ -333,6 +333,7 @@ fun ChatScreen(
                         expanded = input.expanded,
                         onExpandedChange = { grow -> gate.pass { expandedIn.value = if (grow) input.sessionKey else null } }, // a user action of the covered layout
                         backdrop = objects.value.backdrop,
+                        stopRun = input.runId, // what onStop stops: Stop is keyed by it
                         subject = when (input.mode) {
                             ComposerMode.ANSWER -> asked
                             ComposerMode.STOP, ComposerMode.STEER, ComposerMode.SEND_AFTER -> input.runId
@@ -350,7 +351,7 @@ fun ChatScreen(
                             SlashPalette(
                                 matches,
                                 input.model ?: stringResource(R.string.model_default),
-                                onRun = { c -> if (still(c) && actions.onCommand(c)) fieldFocus.requestFocus() },
+                                onRun = { c -> if (still(c) && actions.onCommand(c, input.draftRevision)) fieldFocus.requestFocus() },
                                 onFill = { c ->
                                     gate.pass {
                                         if (still(c)) {
@@ -819,7 +820,9 @@ internal class CoveredActions(private val actions: () -> ChatActions, private va
     override fun onDraftChange(text: String, basedOnRevision: Long) = actions().onDraftChange(text, basedOnRevision)
     override fun onSendClick(): Boolean = gate.passOr(false) { actions().onSendClick() } // covered: not accepted, nothing called
     override fun onSendClick(steerRun: String?): Boolean = gate.passOr(false) { actions().onSendClick(steerRun) }
+    override fun onSendClick(steerRun: String?, drawnRevision: Long): Boolean = gate.passOr(false) { actions().onSendClick(steerRun, drawnRevision) }
     override fun onCommand(command: Command): Boolean = gate.passOr(false) { actions().onCommand(command) }
+    override fun onCommand(command: Command, drawnRevision: Long): Boolean = gate.passOr(false) { actions().onCommand(command, drawnRevision) }
     override fun onStopClick(runId: String) = gate.pass { actions().onStopClick(runId) }
     override fun onRetry(idempotencyKey: String) = gate.pass { actions().onRetry(idempotencyKey) }
     override fun onConfirmRetry(idempotencyKey: String) = actions().onConfirmRetry(idempotencyKey)
