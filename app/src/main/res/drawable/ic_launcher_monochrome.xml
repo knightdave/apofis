@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- An asteroid with a short trail, drawn inside the 66dp adaptive icon safe zone. -->
+<!-- The themed (monochrome) launcher icon: an asteroid with a short trail, inside the 66dp safe zone. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
