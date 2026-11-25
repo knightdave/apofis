@@ -1010,6 +1010,47 @@ class ComposerViewTest {
         scope.cancel()
     }
 
+    /**
+     * Two keyboard edits in one UI turn that end on the drawn text (a word deleted and composed again): both reach the
+     * holder. (A pair that returns to exactly the drawn value, cursor and no composing region included, never reaches the
+     * field's callback: BasicTextField drops a value equal to the one it was given.)
+     */
+    @Test
+    fun twoEditsInOneTurnBackToTheDrawnTextAreBothKept() {
+        showWithHolder("see the word")
+        field().performClick()
+        field().performTextInputSelection(TextRange(12))
+        rule.waitForIdle()
+        val ic = connection()
+        rule.runOnUiThread {
+            ic.deleteSurroundingText(4, 0)
+            ic.setComposingText("word", 1)
+        }
+        rule.waitForIdle()
+        assertEquals("see the word", holder.current(ui.sessionKey).draft)
+        assertEquals("see the word", shownText())
+        scope.cancel()
+    }
+
+    /** The same two edits with Enter right after them, in one UI turn: the drawn text is what is sent. */
+    @Test
+    fun twoEditsBackToTheDrawnTextThenEnterSendsTheDrawnText() {
+        showWithHolder("see the word")
+        field().performClick()
+        field().performTextInputSelection(TextRange(12))
+        rule.waitForIdle()
+        val ic = connection()
+        rule.runOnUiThread {
+            ic.deleteSurroundingText(4, 0)
+            ic.setComposingText("word", 1)
+            composeView().dispatchKeyEvent(key(NativeKeyEvent.ACTION_DOWN))
+            composeView().dispatchKeyEvent(key(NativeKeyEvent.ACTION_UP))
+        }
+        rule.waitForIdle()
+        assertEquals(listOf("see the word"), stores)
+        scope.cancel()
+    }
+
     @Test
     fun backCollapsesBeforeLeaving() {
         ui = ui.copy(draft = "one\ntwo\nthree")

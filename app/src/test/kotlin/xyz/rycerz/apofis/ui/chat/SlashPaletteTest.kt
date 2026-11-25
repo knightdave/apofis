@@ -1,5 +1,8 @@
 package xyz.rycerz.apofis.ui.chat
 
+import android.view.HapticFeedbackConstants
+import android.view.View
+import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -8,6 +11,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.input.InputMode
+import androidx.compose.ui.input.InputModeManager
+import androidx.compose.ui.platform.LocalInputModeManager
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.assertIsNotFocused
+import androidx.compose.ui.test.performTextInputSelection
+import androidx.compose.ui.test.requestFocus
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsFocused
@@ -57,6 +68,7 @@ import xyz.rycerz.apofis.ui.theme.Haptics
 import xyz.rycerz.apofis.ui.theme.LocalHaptics
 import xyz.rycerz.apofis.ui.theme.ViewHaptics
 import xyz.rycerz.apofis.chat.Composer as DraftHolder
+import android.view.KeyEvent as NativeKeyEvent
 
 private val history: List<ChatItem> = (1..20).flatMap {
     listOf(UserMessage("u$it", "Question $it", steered = false, timestamp = FIXED_NOW), AssistantReply("a$it", emptyList(), "Answer $it", FIXED_NOW))
@@ -120,6 +132,7 @@ class SlashPaletteTest {
     private var current by mutableStateOf<(() -> ChatUiState)?>(null)
     private var covered = false
     private var haptics: Haptics? = null
+    private lateinit var inputMode: InputModeManager
 
     private fun frames(n: Int = 1) = repeat(n) {
         Snapshot.sendApplyNotifications()
@@ -131,6 +144,7 @@ class SlashPaletteTest {
         rule.mainClock.autoAdvance = false
         rule.setContent {
             ApofisTheme(ThemeMode.LIGHT, dynamicColor = false, pureBlack = false, reduceMotion = true, blur = false) {
+                inputMode = LocalInputModeManager.current
                 val screen = @Composable {
                     ChatScreen(ui, actions, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY, currentState = current, coveredNow = { covered })
                 }
@@ -153,6 +167,37 @@ class SlashPaletteTest {
     private val palette = hasTestTag("chat.palette")
     private val field get() = rule.onNode(hasTestTag(FIELD_TAG))
 
+    private fun composeView(): View = (rule.activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as ViewGroup).getChildAt(0)
+
+    /** A hardware key pressed and released through the view, in one UI turn: it goes to the focused node. */
+    private fun press(code: Int) = rule.runOnUiThread {
+        composeView().dispatchKeyEvent(NativeKeyEvent(0L, 0L, NativeKeyEvent.ACTION_DOWN, code, 0, 0))
+        composeView().dispatchKeyEvent(NativeKeyEvent(0L, 0L, NativeKeyEvent.ACTION_UP, code, 0, 0))
+    }
+
+    /** The real draft holder behind the screen, copied into [ui] after every edit as the view model's state does. */
+    private fun holderActions(start: String, commands: MutableList<Command> = ArrayList()): Pair<DraftHolder, CoroutineScope> {
+        val scope = CoroutineScope(Job() + Dispatchers.Unconfined)
+        val holder = DraftHolder(scope)
+        holder.edit("k", start, holder.current("k").revision)
+        fun synced() = holder.current("k").let { ui.copy(draft = it.draft, draftRevision = it.revision) }
+        actions = object : ChatActions {
+            override fun onDraftChange(text: String, basedOnRevision: Long) {
+                holder.edit("k", text, basedOnRevision)
+                ui = synced()
+            }
+
+            override fun onCommand(command: Command): Boolean {
+                commands += command
+                holder.edit("k", "", holder.current("k").revision) // the dispatch clears the claimed text
+                ui = synced()
+                return true
+            }
+        }
+        ui = synced()
+        return holder to scope
+    }
+
     @Test
     fun noArgTapRuns() {
         host(state("/st"))
@@ -168,6 +213,16 @@ class SlashPaletteTest {
         tap(row("stop"))
         assertEquals(listOf(Command.STOP), recorder.commands)
         assertTrue(recorder.edits.isEmpty())
+
+        // The draft at tap time matches another command only: nothing; one that still matches this one: it runs.
+        current = { ui.copy(draft = "/n") }
+        frames(3)
+        tap(row("stop"))
+        assertEquals(listOf(Command.STOP), recorder.commands)
+        current = { ui.copy(draft = "/s") }
+        frames(3)
+        tap(row("stop"))
+        assertEquals(listOf(Command.STOP, Command.STOP), recorder.commands)
     }
 
     @Test
@@ -210,6 +265,7 @@ class SlashPaletteTest {
         frames(5)
         tap(row("queue"))
         assertEquals("/queue ", holder.current("k").draft)
+        assertEquals("a filled command has no matches", 0, count(palette))
         field.performTextInput("x") // no selection set: the cursor is after the space
         frames(5)
         assertEquals("/queue x", holder.current("k").draft)
@@ -236,6 +292,8 @@ class SlashPaletteTest {
         host(state("/"))
         val rowHeight = bounds(row("new")).height
         val height = bounds(palette).height
+        val order = rule.onNode(palette, useUnmergedTree = true).fetchSemanticsNode().config[SemanticsProperties.TraversalIndex]
+        assertEquals("read with the notes and the strip, before the field", -2f, order)
         assertEquals("four and a half rows and the two 1 dp borders", 4.5f * rowHeight + 4f, height, 1f)
         rule.onNode(row("fast")).assertIsNotDisplayed()
         rule.mainClock.autoAdvance = true // the scroll action runs on clock frames
@@ -260,6 +318,9 @@ class SlashPaletteTest {
         ui = ui.copy(draft = "/", sending = true)
         frames(5)
         assertEquals("a draft of just a slash being stored: no palette", 0, count(palette))
+        ui = ui.copy(draft = "/st", sending = false, status = StatusLine.LOAD_FAILED)
+        frames(5)
+        assertEquals("a chat that failed to load: no palette", 0, count(palette))
     }
 
     /** A 480 dp window: the palette takes at most half the band, gives way to the rest, and comes back with the room. */
@@ -270,6 +331,8 @@ class SlashPaletteTest {
         insets(top = 48)
         val natural = bounds(palette).height
         val oneRow = bounds(hasTestTag(FIELD_TAG)).height
+        insets(top = 48, ime = 80) // a 40 dp keyboard: 416 dp of band, 216 dp left after the rest, 218 dp natural
+        assertEquals("half the band", 416f, bounds(palette).height, 0.5f)
         insets(top = 48, ime = 400) // 24 dp status, 200 dp keyboard: 256 dp of safe band
         val bar = rule.onNode(hasTestTag("chat.topbar.row"), useUnmergedTree = true).fetchSemanticsNode()
         assertTrue("the bar is placed whole: ${bar.boundsInRoot}", bar.layoutInfo.isPlaced && bar.boundsInRoot.top >= 48f)
@@ -277,7 +340,6 @@ class SlashPaletteTest {
         assertTrue("Send keeps 48 dp", bounds(hasTestTag(SEND_TAG)).height >= 96f - 0.5f)
         val p = bounds(palette)
         assertTrue("the palette shrank: $p of $natural", p.height in 1f..natural - 1f)
-        assertTrue("at most half the band", p.height <= 256f)
         assertTrue("above the field", p.bottom <= bounds(hasTestTag(FIELD_TAG)).top)
         assertTrue("above the keyboard", bounds(hasTestTag(SEND_TAG)).bottom <= 960f - 400f + 0.5f)
 
@@ -316,11 +378,157 @@ class SlashPaletteTest {
         haptics = ViewHaptics({ calls += it; true }, { true })
         host(state("/st"))
         tap(row("stop"))
-        assertEquals(1, calls.size)
+        assertEquals("one selection feedback", listOf(HapticFeedbackConstants.CLOCK_TICK), calls)
         ui = ui.copy(draft = "/q")
         frames(5)
         tap(row("queue"))
-        assertEquals(2, calls.size)
+        assertEquals(listOf(HapticFeedbackConstants.CLOCK_TICK, HapticFeedbackConstants.CLOCK_TICK), calls)
+    }
+
+    /** The field keeps its own cursor across its own edits: "ab", cursor at 1, then "x" and "y" give "axyb". */
+    @Test
+    fun ownCursorKeptAcrossOwnEdits() {
+        val (holder, scope) = holderActions("ab")
+        host(ui)
+        field.performClick()
+        frames(5)
+        field.performTextInputSelection(TextRange(1))
+        frames(2)
+        field.performTextInput("x")
+        frames(5)
+        field.performTextInput("y") // no new selection
+        frames(5)
+        assertEquals("axyb", holder.current("k").draft)
+        scope.cancel()
+    }
+
+    /** Moving the cursor recomposes the field only: neither the rest of the bottom area nor the transcript. */
+    @Test
+    fun selectionChangeRecomposesOnlyTheField() {
+        host(state("hello world"))
+        field.performClick()
+        frames(5)
+        val bottom = ChromeProbe.bottomCompositions
+        val body = ChromeProbe.bodyCompositions
+        for (i in 0..5) {
+            field.performTextInputSelection(TextRange(i))
+            frames(2)
+        }
+        assertEquals(TextRange(5), field.fetchSemanticsNode().config[SemanticsProperties.TextSelectionRange])
+        assertEquals("the bottom area", bottom, ChromeProbe.bottomCompositions)
+        assertEquals("the transcript", body, ChromeProbe.bodyCompositions)
+        assertTrue("a selection is not an edit", recorder.edits.isEmpty())
+    }
+
+    /** A row run or filled from a hardware keyboard gives focus back to the field, so the next keys type there. */
+    @Test
+    fun keyActivatedRowsReturnFocusToTheField() {
+        val commands = ArrayList<Command>()
+        val (holder, scope) = holderActions("/s", commands)
+        host(ui)
+        field.performClick()
+        frames(5)
+        rule.runOnUiThread { inputMode.requestInputMode(InputMode.Keyboard) }
+        frames(2)
+        rule.onNode(row("stop")).requestFocus()
+        frames(2)
+        rule.onNode(row("stop")).assertIsFocused()
+        press(NativeKeyEvent.KEYCODE_ENTER)
+        frames(5)
+        assertEquals(listOf(Command.STOP), commands)
+        assertEquals(0, count(palette))
+        field.assertIsFocused()
+
+        holder.edit("k", "/s", holder.current("k").revision)
+        ui = holder.current("k").let { ui.copy(draft = it.draft, draftRevision = it.revision) }
+        frames(5)
+        rule.onNode(row("steer")).requestFocus()
+        frames(2)
+        rule.onNode(row("steer")).assertIsFocused()
+        press(NativeKeyEvent.KEYCODE_ENTER)
+        frames(5)
+        assertEquals("/steer ", holder.current("k").draft)
+        assertEquals(0, count(palette))
+        field.assertIsFocused()
+        press(NativeKeyEvent.KEYCODE_X)
+        frames(5)
+        assertEquals("the next key types after the fill", "/steer x", holder.current("k").draft)
+        scope.cancel()
+    }
+
+    /** An expanded editor shows no palette, even for a draft that is a slash word. */
+    @Test
+    fun noPaletteWhileExpanded() {
+        host(state("one\ntwo\nthree"))
+        tap(hasContentDescription("Expand the editor"))
+        frames(10)
+        ui = ui.copy(draft = "/")
+        frames(5)
+        assertEquals(1, count(hasContentDescription("Collapse the editor")))
+        assertEquals(0, count(palette))
+    }
+
+    /**
+     * A key on a focused row in the frame its share becomes zero, before the palette is removed, runs nothing; when the
+     * room comes back the row does not get focus back.
+     */
+    @Test
+    @Config(qualifiers = "w360dp-h480dp-xhdpi")
+    fun keyOnARowWithoutRoomRunsNothing() {
+        host(state("/st"))
+        insets(top = 48)
+        rule.runOnUiThread { inputMode.requestInputMode(InputMode.Keyboard) }
+        frames(2)
+        rule.onNode(row("stop")).requestFocus()
+        frames(2)
+        rule.onNode(row("stop")).assertIsFocused()
+        rule.runOnUiThread { // a 256 dp keyboard: a 200 dp band, no room left for the palette
+            val i = WindowInsetsCompat.Builder()
+                .setInsets(WindowInsetsCompat.Type.ime(), Insets.of(0, 0, 0, 512)).setVisible(WindowInsetsCompat.Type.ime(), true)
+                .setInsets(WindowInsetsCompat.Type.statusBars(), Insets.of(0, 48, 0, 0))
+                .build()
+            ViewCompat.dispatchApplyWindowInsets(rule.activity.window.decorView, i)
+        }
+        var unplaced = false
+        for (f in 1..5) {
+            frames(1)
+            val nodes = rule.onAllNodes(palette, useUnmergedTree = true).fetchSemanticsNodes()
+            if (nodes.size == 1 && !nodes[0].layoutInfo.isPlaced) {
+                unplaced = true
+                break
+            }
+        }
+        assertTrue("a frame with the palette measured to nothing but still composed", unplaced)
+        press(NativeKeyEvent.KEYCODE_ENTER)
+        frames(5)
+        assertTrue(recorder.commands.isEmpty())
+        assertEquals(0, count(palette))
+        insets(top = 48, ime = 0)
+        assertEquals(1, count(row("stop")))
+        rule.onNode(row("stop")).assertIsNotFocused()
+    }
+
+    /** A draft is matched against the commands once when it changes, never per streamed update, and never when long. */
+    @Test
+    fun paletteScannedOncePerDraftAndNeverWhenLong() {
+        val live = LiveReply("run_1", "running", "Work", emptyList(), null, Connection.LIVE)
+        fun stream(from: Int) {
+            for (t in from until from + 5) {
+                val more = live.copy(text = "Work" + " more".repeat(t))
+                ui = ui.copy(live = more, items = withLive(history, more) { FIXED_NOW })
+                frames(2)
+            }
+        }
+        val start = ChromeProbe.paletteScans
+        host(state("/" + "A".repeat(99_999), ComposerMode.STOP, live))
+        stream(1)
+        assertEquals("a draft longer than any slash word is never matched", start, ChromeProbe.paletteScans)
+        ui = ui.copy(draft = "/")
+        frames(5)
+        assertEquals(1, count(row("new")))
+        val once = ChromeProbe.paletteScans
+        stream(6)
+        assertEquals("not per streamed update", once, ChromeProbe.paletteScans)
     }
 
     /** Streamed tokens never recompose the composer while the palette shows. */
@@ -341,7 +549,7 @@ class SlashPaletteTest {
     }
 }
 
-/** The palette's golden: every command (the half row of the cap shows) and a chosen model on the /model row. */
+/** The palette's golden: draft "/", the first four commands and the half row of /title (the 4.5-row cap); /model is below it. */
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [37], qualifiers = "w360dp-h760dp-xhdpi")
@@ -351,6 +559,6 @@ class SlashPaletteScreenshotTest {
 
     @Test
     fun slash_palette() = rule.shot("slash_palette") {
-        ChatScreen(state("/").copy(choice = ChatModel("hermes-large")), object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
+        ChatScreen(state("/"), object : ChatActions {}, onOpenConnection = {}, zone = ZoneOffset.UTC, today = FIXED_TODAY)
     }
 }

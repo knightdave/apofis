@@ -71,7 +71,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.traversalIndex
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.Constraints
@@ -158,6 +161,7 @@ internal class ExpandRoom {
  * it took the draft; only then the composer collapses. The button, the IME action (only with [enterToSend]) and
  * hardware Enter (see [enterKey]) all go through it. [busy]: see [primaryEnabled]; the field also takes no edits then.
  * [subject]: what the primary action acts on (the run for Stop, Steer and Send after, the chat for Send); see [PrimaryButton].
+ * [focusRequester] focuses the field.
  */
 @Composable
 internal fun ComposerParts(
@@ -179,6 +183,7 @@ internal fun ComposerParts(
     attachEnabled: Boolean = true,
     onAttach: () -> Unit = {},
     onRemoveImage: (Long) -> Unit = {},
+    focusRequester: FocusRequester = remember { FocusRequester() },
 ): ComposerLook {
     if (BuildConfig.DEBUG) SideEffect { ChromeProbe.composerBackdropId = System.identityHashCode(backdrop) }
     val shape = RoundedCornerShape(20.dp)
@@ -198,43 +203,7 @@ internal fun ComposerParts(
     // Without blur the glass shows the content under it: a page backplate keeps text and icons at their contrast.
     val backplate = if (fillOnly) Modifier.background(scheme.surface, shape) else Modifier
     Box(Modifier.then(backplate).frostedGlass(backdrop, shape, colors.glassFill, colors.glassBorder)) // the card
-    // The holder's text with the field's own selection; a change the field did not make (a palette fill, Put back, another
-    // buffer) puts the cursor at the end. A send still takes the holder's text, and nothing reads the composing region.
-    var own by remember { mutableStateOf(TextFieldValue(draft, TextRange(draft.length))) }
-    val seen = remember { arrayOf(draft) } // not state: only the holder's last text
-    if (draft != seen[0]) {
-        seen[0] = draft
-        if (draft != own.text) own = TextFieldValue(draft, TextRange(draft.length))
-    }
-    BasicTextField(
-        own.copy(text = draft),
-        { v -> own = v; if (v.text != draft) onDraftChange(v.text) },
-        Modifier
-            .fillMaxWidth()
-            .semantics { traversalIndex = -1f } // read before the buttons
-            .testTag(FIELD_TAG)
-            .onPreviewKeyEvent { e ->
-                val enter = e.key == Key.Enter || e.key == Key.NumPadEnter
-                when (enterKey(enterToSend, enter, e.type == KeyEventType.KeyDown, e.nativeKeyEvent.repeatCount, e.isShiftPressed)) {
-                    EnterKey.FIELD -> false
-                    EnterKey.SEND -> true.also { submit() }
-                    EnterKey.CONSUME -> true
-                }
-            },
-        readOnly = busy, // it shows the text being stored, which no keystroke may change
-        textStyle = style,
-        keyboardOptions = KeyboardOptions(imeAction = if (enterToSend) ImeAction.Send else ImeAction.Default),
-        keyboardActions = KeyboardActions(onSend = { if (enterToSend) submit() }),
-        maxLines = if (expanded) Int.MAX_VALUE else 5,
-        onTextLayout = { lines = it.lineCount },
-        cursorBrush = SolidColor(scheme.primary),
-        decorationBox = { inner ->
-            Box(Modifier.padding(start = 4.dp, top = pad, bottom = pad)) {
-                if (draft.isEmpty()) Text(stringResource(R.string.chat_message_hint), style = MaterialTheme.typography.bodyLarge, color = colors.muted)
-                inner()
-            }
-        },
-    )
+    DraftField(draft, onDraftChange, submit, busy, enterToSend, expanded, style, pad, focusRequester) { lines = it }
     val wantsExpand = expanded || manyLines
     val room = remember { ExpandRoom() }
     Box {
@@ -278,6 +247,68 @@ internal fun ComposerParts(
     }
     val strip = if (images.isEmpty()) 0 else with(density) { (REMOVE_RISE + DRAFT_THUMB + STRIP_GAP).roundToPx() }
     return ComposerLook(dims, expanded, wantsExpand, progress, { lines }, expandedHeight, room, strip, stripRoom)
+}
+
+/**
+ * The field: the holder's [draft] with the field's own selection, in a scope of its own, so moving the cursor recomposes
+ * the field only. A change the field did not make (a palette fill, Put back, another buffer) puts the cursor at the end.
+ * A send still takes the holder's text, and nothing reads the composing region. Every edit whose text differs from the
+ * drawn draft or from the field's previous value is passed on, so two edits in one frame that end on the drawn text
+ * both reach the holder; a change of the selection alone is not an edit.
+ */
+@Composable
+private fun DraftField(
+    draft: String,
+    onDraftChange: (String) -> Unit,
+    submit: () -> Unit,
+    busy: Boolean,
+    enterToSend: Boolean,
+    expanded: Boolean,
+    style: TextStyle,
+    pad: Dp,
+    focusRequester: FocusRequester,
+    onLines: (Int) -> Unit,
+) {
+    var own by remember { mutableStateOf(TextFieldValue(draft, TextRange(draft.length))) }
+    val seen = remember { arrayOf(draft) } // not state: only the holder's last text
+    if (draft != seen[0]) {
+        seen[0] = draft
+        if (draft != own.text) own = TextFieldValue(draft, TextRange(draft.length))
+    }
+    BasicTextField(
+        own.copy(text = draft),
+        { v ->
+            val was = own.text
+            own = v
+            if (v.text != draft || v.text != was) onDraftChange(v.text)
+        },
+        Modifier
+            .fillMaxWidth()
+            .focusRequester(focusRequester)
+            .semantics { traversalIndex = -1f } // read before the buttons
+            .testTag(FIELD_TAG)
+            .onPreviewKeyEvent { e ->
+                val enter = e.key == Key.Enter || e.key == Key.NumPadEnter
+                when (enterKey(enterToSend, enter, e.type == KeyEventType.KeyDown, e.nativeKeyEvent.repeatCount, e.isShiftPressed)) {
+                    EnterKey.FIELD -> false
+                    EnterKey.SEND -> true.also { submit() }
+                    EnterKey.CONSUME -> true
+                }
+            },
+        readOnly = busy, // it shows the text being stored, which no keystroke may change
+        textStyle = style,
+        keyboardOptions = KeyboardOptions(imeAction = if (enterToSend) ImeAction.Send else ImeAction.Default),
+        keyboardActions = KeyboardActions(onSend = { if (enterToSend) submit() }),
+        maxLines = if (expanded) Int.MAX_VALUE else 5,
+        onTextLayout = { onLines(it.lineCount) },
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        decorationBox = { inner ->
+            Box(Modifier.padding(start = 4.dp, top = pad, bottom = pad)) {
+                if (draft.isEmpty()) Text(stringResource(R.string.chat_message_hint), style = MaterialTheme.typography.bodyLarge, color = ApofisTheme.colors.muted)
+                inner()
+            }
+        },
+    )
 }
 
 private val DRAFT_THUMB = 88.dp

@@ -49,6 +49,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.union
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalFocusManager
@@ -105,7 +106,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import xyz.rycerz.apofis.chat.Command
-import xyz.rycerz.apofis.chat.paletteMatches
 import xyz.rycerz.apofis.chat.ChatItem
 import kotlin.math.ceil
 import kotlinx.coroutines.launch
@@ -194,11 +194,12 @@ fun ChatScreen(
     // token changes the transcript, never the header's or the composer's inputs (equal values notify nothing).
     val latest = rememberUpdatedState(state.forTranscript()) // typing changes nothing the transcript reads
     val barInput = rememberUpdatedState(ChatUiState(state.sessionKey, state.title, state.status, emptyList(), ComposerMode.SEND_DISABLED, "", state.host))
+    val matches = remember(state.draft) { scanPalette(state.draft) } // once per draft, never per streamed update
     val bottomInput = rememberUpdatedState(
         BottomInput(
             state.draft, state.draftRevision, if (state.status == StatusLine.LOAD_FAILED) ComposerMode.SEND_DISABLED else state.composer,
             state.sending, state.composerNote, state.unsent, state.live?.runId, linkFailed, enterToSend, expanded, state.sessionKey,
-            state.status == StatusLine.LOAD_FAILED, state.images, state.choice.model.takeIf { Command.MODEL in paletteMatches(state.draft) },
+            state.status == StatusLine.LOAD_FAILED, state.images, state.choice.model.takeIf { Command.MODEL in matches }, matches,
         ),
     )
     // One gate for everything the chat can do: while the drawer covers it, a press that was already down (another
@@ -278,11 +279,12 @@ fun ChatScreen(
             if (BuildConfig.DEBUG) SideEffect { ChromeProbe.bottomCompositions++ }
             val input = bottomInput.value
             val actions = callbacks.value.actions
-            val matches = if (input.expanded || input.sending || input.loadFailed) emptyList() else paletteMatches(input.draft)
+            val matches = if (input.expanded || input.sending || input.loadFailed) emptyList() else input.matches
             val paletteRoom = remember { ExpandRoom() } // like the strip: composed only while the allocation gives it a share
+            val fieldFocus = remember { FocusRequester() } // a row run or filled from a keyboard leaves; the field takes focus
             // Read at tap time: onCommand claims and clears the whole draft, so a tap acts only while the draft now is
             // still the slash word the row was drawn for (the drawn draft without an owner's state, as in tests).
-            val still = { c: Command -> c in paletteMatches(current.value?.invoke()?.draft ?: input.draft) }
+            val still = { c: Command -> c in scanPalette(current.value?.invoke()?.draft ?: input.draft) }
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -328,14 +330,22 @@ fun ChatScreen(
                         attachEnabled = !input.sending && !input.loadFailed && input.sessionKey.isNotEmpty(),
                         onAttach = attach,
                         onRemoveImage = actions::onRemoveImage,
+                        focusRequester = fieldFocus,
                     )
                     Box(Modifier.padding(horizontal = MARGIN_X)) {
                         if (matches.isNotEmpty() && paletteRoom.state.value) {
                             SlashPalette(
                                 matches,
                                 input.model ?: stringResource(R.string.model_default),
-                                onRun = { c -> if (still(c)) actions.onCommand(c) },
-                                onFill = { c -> gate.pass { if (still(c)) actions.onDraftChange("/${c.word} ", input.draftRevision) } },
+                                onRun = { c -> if (still(c) && actions.onCommand(c)) fieldFocus.requestFocus() },
+                                onFill = { c ->
+                                    gate.pass {
+                                        if (still(c)) {
+                                            actions.onDraftChange("/${c.word} ", input.draftRevision)
+                                            fieldFocus.requestFocus()
+                                        }
+                                    }
+                                },
                                 modifier = Modifier.fillMaxSize().onPreviewKeyEvent { !paletteRoom.now }.semantics { traversalIndex = -2f },
                             )
                         }
@@ -748,6 +758,7 @@ private data class BottomInput(
     // The chat's model choice for the palette's /model row, only while the draft shows that row: a choice made
     // otherwise recomposes nothing here.
     val model: String?,
+    val matches: List<Command>, // the palette's commands for the draft (see [scanPalette])
 )
 
 /** What the transcript reads: without the composer's fields or the choice sheets', so neither recomposes it; with firstLoad (the skeleton). */
@@ -843,6 +854,7 @@ internal object ChromeProbe {
     var composerBackdropId = 0 // the backdrop the composer was last composed with
     var bodyCompositions = 0
     var skeletonCompositions = 0
+    var paletteScans = 0 // drafts matched against the commands
 }
 
 /**

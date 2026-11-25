@@ -25,11 +25,23 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import xyz.rycerz.apofis.BuildConfig
 import xyz.rycerz.apofis.R
 import xyz.rycerz.apofis.chat.Command
+import xyz.rycerz.apofis.chat.paletteMatches
 import xyz.rycerz.apofis.ui.theme.ApofisTheme
 
 internal const val PALETTE_TAG = "chat.palette"
+
+/** A slash and the longest command word: a longer draft cannot be a palette draft. */
+internal val PALETTE_DRAFT_MAX = 1 + Command.entries.maxOf { it.word.length }
+
+/** [paletteMatches], without matching a draft longer than [PALETTE_DRAFT_MAX] at all. */
+internal fun scanPalette(draft: String): List<Command> {
+    if (draft.length > PALETTE_DRAFT_MAX) return emptyList()
+    if (BuildConfig.DEBUG) ChromeProbe.paletteScans++
+    return paletteMatches(draft)
+}
 
 /**
  * The slash palette: one row per command in [matches], its word and its description ([modelLabel] on the /model row). A
