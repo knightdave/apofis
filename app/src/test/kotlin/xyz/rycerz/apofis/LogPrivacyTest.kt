@@ -70,6 +70,14 @@ import xyz.rycerz.apofis.sync.SendQueue
 import xyz.rycerz.apofis.ui.drawer.DrawerRow
 import xyz.rycerz.apofis.ui.drawer.DrawerViewModel
 
+// A string literal (raw, plain or a character: group 1) or a comment. A template holding quotes splits into pieces,
+// which is enough to keep a comment marker inside a string from being taken for a comment.
+private val trivia = Regex("(\"{3}[\\s\\S]*?\"{3}|\"(?:\\\\.|[^\"\\\\\\n])*\"|'(?:\\\\.|[^'\\\\\\n])*')|//[^\\n]*|/\\*[\\s\\S]*?\\*/")
+
+// What follows a plain import once whitespace is removed: a modifier or a declaration keyword (never "as" or ".").
+private const val DECLARATION = "public|private|internal|protected|open|abstract|final|sealed|data|enum|inline|value|" +
+    "annotation|expect|actual|const|lateinit|suspend|tailrec|operator|infix|external|override|fun|class|interface|object|val|var|typealias"
+
 // Every canary holds "cnry", so one search also catches a canary cut short or joined with other text.
 private const val TEXT = "cnry-text-5d1"
 private const val CAPTION = "cnry-caption-8a2"
@@ -115,24 +123,20 @@ class LogPrivacyTest {
     /**
      * Every reference to the logger in every shipping source set, as text: a call from the start of its line to its
      * closing parenthesis (whitespace collapsed, so a call split over lines is pinned whole), and any other reference
-     * (an aliased or member import, a callable reference, a qualified name) as the rest of its line. The plain import
-     * of android.util.Log is the only reference left out. Kotlin's print functions, stack traces, the standard streams
-     * and a wildcard import of android.util are never allowed. This pins the sinks, not what callers pass into them.
+     * (an aliased or member import, a callable reference, a qualified name) as the rest of its line. Comments are
+     * removed first. The only reference left out is a plain import of android.util.Log, judged on the whole directive
+     * (whitespace, comments and string contents removed): it must be followed by the next directive or a declaration,
+     * so a member or alias continued on the next line is kept. Kotlin's print functions (also imported, aliased or
+     * not), stack traces, the standard streams and a wildcard import of android.util are never allowed. This pins the
+     * sinks, not what callers pass into them.
      */
     @Test
     fun everyLogLineIsKnown() {
         val src = File("src")
-        val plainImport = Regex("""(?m)^[ \t]*import[ \t]+android\.util\.Log[ \t]*$""")
-        val logger = Regex("""\bLog\b""")
-        val otherSinks = Regex("""\bprint(ln)?\s*\(|::\s*print(ln)?\b|printStackTrace|System\s*\.\s*(out|err)\b|import\s+android\s*\.\s*util\s*\.\s*\*""")
         val found = src.listFiles()!!.filter { it.isDirectory && !it.name.startsWith("test") && !it.name.startsWith("androidTest") }
             .flatMap { set -> set.walk().filter { it.isFile && it.extension in setOf("kt", "java") }.toList() }
-            .flatMap { f ->
-                val path = f.relativeTo(src).invariantSeparatorsPath
-                val text = plainImport.replace(f.readText(), "")
-                logger.findAll(text).map { "$path: ${reference(text, it.range.first)}" }.toList() +
-                    otherSinks.findAll(text).map { "$path: ${it.value}" }.toList()
-            }.sorted()
+            .flatMap { censusEntries(it.relativeTo(src).invariantSeparatorsPath, it.readText()) }
+            .sorted()
         // Only class names, enum names, counts and literals are interpolated; reason, what and cause are literals of
         // their callers (read when this list was written).
         val known = listOf(
@@ -148,6 +152,46 @@ class LogPrivacyTest {
             "main/kotlin/xyz/rycerz/apofis/share/ShareIntake.kt: if (BuildConfig.DEBUG) Log.i(\"ApofisShare\", \"image \${reason.name}\")",
         )
         assertEquals(known.joinToString("\n"), found.joinToString("\n"))
+    }
+
+    /** Scanner controls: each of these is flagged; a plain import, with or without a comment, is not. */
+    @Test
+    fun censusFlagsEveryOtherReference() {
+        val flagged = listOf(
+            "import android.util.Log\n    .w as warn\n\nfun recordTitle(title: String) { warn(\"Drawer\", title) }",
+            "import android.util.Log\n    as L\n\nfun f(title: String) { L.w(\"Drawer\", title) }",
+            "import android.util.Log /* plain */\n    .w as warn\n\nfun f(title: String) = warn(\"Drawer\", title)",
+            "import android.util.Log as L\nfun f(title: String) = L.w(\"Drawer\", title)",
+            "import android.util.Log\nfun f(title: String) = Log.w(\n    \"Drawer\",\n    \"title \$title\",\n)",
+            "import android.util.Log\nval warn = Log::w",
+            "fun f(title: String) = android.util.Log.w(\"Drawer\", title)",
+            "import android.util.*",
+            "import kotlin.io.println as emitLine\n\nfun f(title: String) { emitLine(title) }",
+            "import kotlin.io\n    .print as emit\n\nfun f(title: String) { emit(title) }",
+            "fun f(title: String) = print(title)",
+            "fun f(e: Throwable) = e.printStackTrace()",
+            "fun f(title: String) = System.err.write(title.toByteArray())",
+        )
+        flagged.forEach { assertTrue(it, censusEntries("control.kt", it).isNotEmpty()) }
+        val plain = listOf(
+            "import android.util.Log\nimport java.io.File\n\nclass A",
+            "import android.util.Log // the logger\n\nprivate val x = 1",
+            "import android.util.Log\n/* a comment */\nfun f() = \"Log in\".length", // the string still names Log: flagged below
+        )
+        assertEquals(emptyList<String>(), plain.take(2).flatMap { censusEntries("control.kt", it) })
+        assertEquals(1, censusEntries("control.kt", plain[2]).size) // only the string, not the import
+    }
+
+    /** The census entries of one source file, each prefixed with [path]: see [everyLogLineIsKnown]. */
+    private fun censusEntries(path: String, source: String): List<String> {
+        val text = trivia.replace(source) { if (it.groups[1] != null) it.value else " " } // comments out, strings kept
+        val flat = trivia.replace(source) { if (it.groups[1] != null) "\"\"" else " " }.replace(Regex("""\s+"""), "") // strings emptied too
+        val plain = Regex("""importandroid\.util\.Log(?=;|import|@|$|$DECLARATION)""").findAll(flat).count()
+        val refs = Regex("""\bLog\b""").findAll(text).map { reference(text, it.range.first).trim() }.toMutableList()
+        repeat(plain) { refs.remove("import android.util.Log") }
+        val sinks = Regex("""\bprint(ln)?\s*\(|::\s*print(ln)?\b|printStackTrace|System\s*\.\s*(out|err)\b""").findAll(text).map { it.value } +
+            Regex("""importandroid\.util\.\*|importkotlin\.io\.(print|println|\*)""").findAll(flat).map { it.value }
+        return (refs + sinks).map { "$path: $it" }
     }
 
     /** The reference to the logger at [at] in [text]: see [everyLogLineIsKnown]. */
@@ -231,6 +275,18 @@ class LogPrivacyTest {
 
     private suspend fun <T> await(what: suspend () -> T): T = withContext(Dispatchers.Default) { withTimeout(10_000) { what() } }
 
+    /**
+     * Returns once the connection's scope has no child left, cancelling nothing: a child's failure reaches the scope's
+     * handler before the child counts as complete, so it is collected by then.
+     */
+    private suspend fun connectionIdle() = await {
+        while (true) {
+            val children = scope.coroutineContext.job.children.toList()
+            if (children.isEmpty()) break
+            children.joinAll()
+        }
+    }
+
     @Test
     fun canariesNeverLogged() = runBlocking<Unit> {
         session(SID)
@@ -270,6 +326,7 @@ class LogPrivacyTest {
         vm.confirmDelete(token)
         await { deletes.getValue(SID).await() }
         await { vm.prompt.first { it?.token == token && !it.busy && it.error != null } } // the Delete's failure is shown
+        connectionIdle() // a failed delete or leave starts work in the connection's scope: read the sinks after it
         assertTrue(db.sessionDao().get(SID) != null && db.sessionDao().get(TEMP) != null) // both failed and stayed
 
         val logs = ShadowLog.getLogs()
