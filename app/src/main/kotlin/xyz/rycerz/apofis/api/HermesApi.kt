@@ -1,7 +1,9 @@
 package xyz.rycerz.apofis.api
 
 import java.io.IOException
+import java.math.BigInteger
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -11,6 +13,7 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
@@ -23,6 +26,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import xyz.rycerz.apofis.images.ImageFormat
+import xyz.rycerz.apofis.images.sniff
+import xyz.rycerz.apofis.media.AddonLimits
+import xyz.rycerz.apofis.media.AddonStatus
 
 /**
  * Client for the Hermes Agent API server. [baseUrl] may carry a path prefix.
@@ -146,6 +153,41 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
             put("execution_generation", executionGeneration)
         }
 
+    /** Whether the picture add-on is there, ready and compatible (spec 5.3). Never throws but for cancellation. */
+    suspend fun mediaPing(): MediaPing = try {
+        exchange(request(url("apofis-media/v1/ping")).build(), checked = false) { response ->
+            when {
+                response.code == 404 || response.code == 405 -> MediaPing(AddonStatus.NEEDED, null)
+                response.code != 200 -> MediaPing(AddonStatus.ERROR, null)
+                else -> pingOf(response.bytesAtMost(BODY_MAX))
+            }
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        MediaPing(AddonStatus.ERROR, null)
+    }
+
+    /**
+     * One picture by its add-on [path], a request field only. A 200 over [limits] is `Http(413, null)`, decided before
+     * the type; any other bad 200 is [ApiError.Protocol]; a non-200 is mapped here, never by [errorOf].
+     */
+    suspend fun mediaFile(path: String, limits: AddonLimits): MediaFile =
+        exchange(post(url("apofis-media/v1/file"), jsonBody { put("path", path) }), checked = false) { response ->
+            when (response.code) {
+                200 -> {
+                    if (response.body.contentLength() > limits.maxBytes) throw ApiError.Http(413, null)
+                    val bytes = response.bytesAtMost(limits.maxBytes.toLong())
+                    if (bytes.size > limits.maxBytes) throw ApiError.Http(413, null)
+                    val format = response.body.contentType()?.let { PICTURE_TYPES["${it.type}/${it.subtype}"] }
+                    if (format == null || sniff(bytes) != format || format !in limits.types) throw ApiError.Protocol
+                    MediaFile(bytes, format)
+                }
+                401 -> throw ApiError.Unauthorized
+                else -> throw ApiError.Http(response.code, response.bytesAtMost(BODY_MAX).takeIf { it.size <= BODY_MAX }?.let { codeOf(it.decodeToString()) })
+            }
+        }
+
     private suspend fun control(url: HttpUrl, body: JsonObjectBuilder.() -> Unit) {
         exchange(post(url, jsonBody(body))) { }
     }
@@ -174,6 +216,29 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
             segments.drop(1).forEach { addPathSegment(validId(it)) }
             query()
         }.build()
+
+    /** At most [limit] + 1 bytes of the body, so "over the limit" is known without reading the rest. */
+    private fun Response.bytesAtMost(limit: Long): ByteArray = body.source().run {
+        request(limit + 1)
+        buffer.readByteArray(minOf(buffer.size, limit + 1))
+    }
+
+    /** The ping mapping of spec 5.3 for a 200 body, in its order. */
+    private fun pingOf(body: ByteArray): MediaPing {
+        val error = MediaPing(AddonStatus.ERROR, null)
+        if (body.size > BODY_MAX) return error
+        val o = json.parseToJsonElement(body.decodeToString()) as? JsonObject ?: return error
+        fun string(key: String) = (o[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+        // A JSON integer: an unquoted literal without fraction or exponent, of any size; never a boolean or a string.
+        fun integer(key: String) = (o[key] as? JsonPrimitive)?.takeIf { !it.isString && integerFormat.matches(it.content) }?.content?.toBigInteger()
+        if (string("name") != "apofis-media") return error
+        val protocol = integer("protocol")
+        if (protocol != null && protocol > BigInteger.ONE) return MediaPing(AddonStatus.APP_OLD, null)
+        if (protocol != BigInteger.ONE || o["ready"] != JsonPrimitive(true)) return MediaPing(AddonStatus.NOT_READY, null)
+        val maxBytes = integer("max_bytes")?.takeIf { it.signum() > 0 } ?: return error
+        val types = (o["types"] as? JsonArray)?.map { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content ?: return error } ?: return error
+        return MediaPing(AddonStatus.READY, AddonLimits(maxBytes.min(MAX_PICTURE.toBigInteger()).toInt(), types.mapNotNull(OFFER_TYPES::get).toSet()))
+    }
 
     private fun request(url: HttpUrl) = Request.Builder().url(url).header("Authorization", "Bearer $apiKey")
 
@@ -241,6 +306,13 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
 
         private val JSON = "application/json".toMediaType()
         private val codeFormat = Regex("[a-z0-9_]{1,64}")
+        private val integerFormat = Regex("-?[0-9]+")
+
+        /** Ping bodies and error bodies are read to this many bytes plus one. */
+        private const val BODY_MAX = 4096L
+        private const val MAX_PICTURE = 10 * 1024 * 1024
+        private val OFFER_TYPES = mapOf("png" to ImageFormat.PNG, "jpeg" to ImageFormat.JPEG, "jpg" to ImageFormat.JPEG, "gif" to ImageFormat.GIF, "webp" to ImageFormat.WEBP)
+        private val PICTURE_TYPES = mapOf("image/png" to ImageFormat.PNG, "image/jpeg" to ImageFormat.JPEG, "image/gif" to ImageFormat.GIF, "image/webp" to ImageFormat.WEBP)
         internal val json = Json {
             ignoreUnknownKeys = true
             explicitNulls = false
@@ -256,3 +328,7 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         private fun JsonObject.toJsonRequestBody() = toString().toRequestBody(JSON)
     }
 }
+
+data class MediaPing(val status: AddonStatus, val limits: AddonLimits?)
+
+class MediaFile(val bytes: ByteArray, val format: ImageFormat)
