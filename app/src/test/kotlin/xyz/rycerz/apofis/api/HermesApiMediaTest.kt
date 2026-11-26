@@ -622,6 +622,23 @@ class HermesApiMediaTest {
         assertTrue(HermesApi.isJson(READY_BODY + " \n"))
         assertTrue(HermesApi.isJson("[] \n")) // whitespace after an empty container
         assertTrue(HermesApi.isJson("{\"x\":[] ,\"y\":{} }"))
+
+        val mustFail = listOf(
+            "{\"a\":tru}", "{\"a\":truex}", "{\"a\":nulL}", // a literal cut short, run on, or miscased
+            "{\"a\":\"abc", // the text ends inside a string
+            "{\"a\":\"x\\", // the text ends right after a backslash inside a string
+            "[1 2]", "{\"a\" 1}", "{a:1}", "{'a':1}", // a missing comma, a missing colon, unquoted and single-quoted names
+            "", " ", // no value
+            "[1,2", "{\"a\":[}", // unclosed and mismatched containers
+        )
+        val accepted = mustFail.filter { HermesApi.isJson(it) }
+        assertTrue("accepted: " + accepted.map { JsonPrimitive(it).toString() }, accepted.isEmpty())
+        val mustPass = listOf(
+            "1", "\"a\"", // a value that is not a container
+            " { \"a\" : 1 , \"b\" : [ ] } ", // whitespace before and after every token
+        )
+        val refused = mustPass.filter { !HermesApi.isJson(it) }
+        assertTrue("refused: " + refused.map { JsonPrimitive(it).toString() }, refused.isEmpty())
         assertTrue(HermesApi.isJson("[".repeat(DEPTH) + "]".repeat(DEPTH)))
         assertFalse(HermesApi.isJson("[".repeat(DEPTH + 1) + "]".repeat(DEPTH + 1)))
         assertFalse(HermesApi.isJson(extra("\"x\":" + "{\"a\":".repeat(DEPTH) + "1" + "}".repeat(DEPTH))))
