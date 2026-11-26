@@ -15,7 +15,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
@@ -237,13 +236,6 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         null
     }
 
-    /** True when every unquoted token of [e] is true, false, null or a JSON number: the tree reader keeps any bare word. */
-    private fun strict(e: JsonElement): Boolean = when (e) {
-        is JsonObject -> e.values.all(::strict)
-        is JsonArray -> e.all(::strict)
-        is JsonPrimitive -> e.isString || e.content == "true" || e.content == "false" || e.content == "null" || numberFormat.matches(e.content)
-    }
-
     /** At most [limit] + 1 bytes of the body, so "over the limit" is known without reading the rest. */
     private fun Response.bytesAtMost(limit: Long): ByteArray = body.source().run {
         request(limit + 1)
@@ -254,8 +246,8 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
     private fun pingOf(body: ByteArray): MediaPing {
         val error = MediaPing(AddonStatus.ERROR, null)
         if (body.size > BODY_MAX) return error
-        val tree = json.parseToJsonElement(body.utf8() ?: return error)
-        val o = tree.takeIf(::strict) as? JsonObject ?: return error
+        val text = body.utf8()?.takeIf(::isJson) ?: return error
+        val o = json.parseToJsonElement(text) as? JsonObject ?: return error
         fun string(key: String) = (o[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
         // A JSON integer: an unquoted literal without fraction or exponent, of any size; never a boolean or a string.
         fun integer(key: String) = (o[key] as? JsonPrimitive)?.takeIf { !it.isString && integerFormat.matches(it.content) }?.content?.toBigInteger()
@@ -336,10 +328,84 @@ class HermesApi(baseUrl: String, private val apiKey: String, client: OkHttpClien
         private val JSON = "application/json".toMediaType()
         private val codeFormat = Regex("[a-z0-9_]{1,64}")
         private val integerFormat = Regex("-?[0-9]+")
-        private val numberFormat = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
 
         /** Ping bodies and error bodies are read to this many bytes plus one. */
         private const val BODY_MAX = 4096L
+
+        /** The ping validator's nesting bound, the JSON library's own default (400 containers, the outer one counted). */
+        private const val MAX_DEPTH = 400
+
+        /**
+         * True when [s] is exactly one RFC 8259 JSON value, at most [MAX_DEPTH] containers deep. The tree reader alone is not
+         * enough: it keeps raw control characters in strings and names, and drops a bad value that a later member replaces.
+         * Internal, not private: the library also refuses trailing text and deeper nesting, so only a direct test sees those rules.
+         */
+        internal fun isJson(s: String): Boolean {
+            var i = 0
+            fun at(c: Char) = i < s.length && s[i] == c
+            fun eat(c: Char) = at(c).also { if (it) i++ }
+            fun ws() {
+                while (i < s.length && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++
+            }
+            fun digits(): Boolean {
+                val start = i
+                while (i < s.length && s[i] in '0'..'9') i++
+                return i > start
+            }
+            fun hex(c: Char) = c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F'
+            fun string(): Boolean {
+                if (!eat('"')) return false
+                while (i < s.length) {
+                    val c = s[i++]
+                    when {
+                        c == '"' -> return true
+                        c < ' ' -> return false
+                        c == '\\' -> when {
+                            eat('u') -> if (i + 4 <= s.length && (i until i + 4).all { hex(s[it]) }) i += 4 else return false
+                            i < s.length && s[i] in "\"\\/bfnrt" -> i++
+                            else -> return false
+                        }
+                    }
+                }
+                return false
+            }
+            fun number(): Boolean {
+                eat('-')
+                if (!eat('0') && !digits()) return false
+                if (eat('.') && !digits()) return false
+                if (eat('e') || eat('E')) {
+                    if (!eat('+')) eat('-')
+                    if (!digits()) return false
+                }
+                return true
+            }
+            fun literal(word: String) = s.startsWith(word, i).also { if (it) i += word.length }
+            fun value(depth: Int): Boolean {
+                ws()
+                val ok = when {
+                    at('{') || at('[') -> {
+                        if (depth >= MAX_DEPTH) return false
+                        val close = if (eat('{')) '}' else ']'.also { i++ }
+                        ws()
+                        if (eat(close)) return true.also { ws() }
+                        do {
+                            ws()
+                            if (close == '}' && !(string() && run { ws(); eat(':') })) return false
+                            if (!value(depth + 1)) return false
+                        } while (eat(','))
+                        eat(close)
+                    }
+                    at('"') -> string()
+                    at('t') -> literal("true")
+                    at('f') -> literal("false")
+                    at('n') -> literal("null")
+                    else -> number()
+                }
+                ws()
+                return ok
+            }
+            return value(0) && i == s.length
+        }
         private const val MAX_PICTURE = 10 * 1024 * 1024
         private val OFFER_TYPES = mapOf("png" to ImageFormat.PNG, "jpeg" to ImageFormat.JPEG, "jpg" to ImageFormat.JPEG, "gif" to ImageFormat.GIF, "webp" to ImageFormat.WEBP)
         private val PICTURE_TYPES = mapOf("image/png" to ImageFormat.PNG, "image/jpeg" to ImageFormat.JPEG, "image/gif" to ImageFormat.GIF, "image/webp" to ImageFormat.WEBP)

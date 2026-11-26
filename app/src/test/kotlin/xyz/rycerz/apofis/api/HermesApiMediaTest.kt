@@ -12,6 +12,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import mockwebserver3.MockResponse
@@ -136,7 +137,12 @@ class HermesApiMediaTest {
     private fun noRetry() = HermesApi(server.url("/").toString(), "secret-key", HermesApi.defaultClient().newBuilder().retryOnConnectionFailure(false).build())
 
     /** Offers [prefix], then [filler] up to [total] bytes; counts what is pulled and whether it was closed. */
-    private class RecordingSource(private val prefix: ByteArray, private val total: Long = 1L shl 20, private val filler: Byte = ' '.code.toByte()) : Source {
+    private class RecordingSource(
+        private val prefix: ByteArray,
+        private val total: Long = 1L shl 20,
+        private val filler: Byte = ' '.code.toByte(),
+        private val onClose: () -> Unit = {},
+    ) : Source {
         var pulled = 0L
         var closed = false
 
@@ -163,6 +169,7 @@ class HermesApiMediaTest {
 
         override fun close() {
             closed = true
+            onClose()
         }
     }
 
@@ -508,17 +515,32 @@ class HermesApiMediaTest {
         // An ISO box header with a huge size: sniff walks brands across the whole box when it gets the whole body.
         val cap = 4 shl 20
         val head = bytes(0x7F, 0xFF, 0xFF, 0xFF) + "ftypisom".encodeToByteArray()
-        val source = RecordingSource(head, total = cap - 16L, filler = 0)
-        val bean = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
-        var thread = 0L
-        var before = 0L
+        val bean = ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
+            ?: throw AssertionError("this JVM has no per-thread allocation counter")
+        assertTrue("per-thread allocation measurement is not supported", bean.isThreadAllocatedMemorySupported)
+        assertTrue("per-thread allocation measurement is not enabled", bean.isThreadAllocatedMemoryEnabled)
+        fun sample(): Long = bean.currentThreadAllocatedBytes
+        // Both samples on the reader thread: at the call (before the body is read) and at the close of the body,
+        // which runs after sniff and before the worker can be given other work.
+        var start = Long.MIN_VALUE
+        var end = Long.MIN_VALUE
+        var startThread: Thread? = null
+        var endThread: Thread? = null
+        val source = RecordingSource(head, total = cap - 16L, filler = 0) {
+            end = sample()
+            endThread = Thread.currentThread()
+        }
         val on = recorded(200, "image/png", source) {
-            thread = Thread.currentThread().id
-            before = bean.getThreadAllocatedBytes(thread)
+            startThread = Thread.currentThread()
+            start = sample()
         }
         assertEquals(ApiError.Protocol, fileError(AddonLimits(cap, REPLY_FORMATS), on))
+        assertTrue("no start sample", start != Long.MIN_VALUE && start != -1L)
+        assertTrue("no end sample", end != Long.MIN_VALUE && end != -1L)
+        assertTrue("the samples were taken on different threads", startThread === endThread)
+        assertTrue("the end sample $end is below the start sample $start", end >= start)
         // Reading the body allocates about twice its size; a brand walk over it allocates about twenty times.
-        val used = bean.getThreadAllocatedBytes(thread) - before
+        val used = end - start
         assertTrue("allocated $used for a body of $cap", used < 4L * cap)
     }
 
@@ -546,7 +568,59 @@ class HermesApiMediaTest {
         assertEquals(ApiError.Http(404, null), fileError())
     }
 
+    // ---- fix round 2 ----
+
+    private fun extra(member: String) = READY_BODY.dropLast(1) + ",$member}"
+
+    @Test
+    fun pingSyntaxIsChecked() = runTest {
+        val bad = listOf(
+            extra("\"note\":\"a\nb\""), // a raw line feed inside an ignored string
+            extra("\"x\":abc,\"x\":1"), // an invalid bare value that a later member of the same name replaces
+            extra("\"a\tb\":1"), // a raw tab inside a member name
+            extra("\"n\":\"\\q\""), // a bad escape
+            extra("\"n\":\"\\u12G4\""),
+            extra("\"n\":-"), extra("\"n\":1."), extra("\"n\":.5"), extra("\"n\":+1"), extra("\"n\":01"), extra("\"n\":1e"), extra("\"n\":NaN"),
+            extra("\"n\":True"), extra("'n':1"),
+            READY_BODY.dropLast(1) + ",}", // a trailing comma in an object
+            pingBody(types = """["png",]"""), // a trailing comma in an array
+            READY_BODY + "x", READY_BODY + "{}", // text after the value
+            "\uFEFF" + READY_BODY, // a byte order mark
+            "\u000B" + READY_BODY, // a vertical tab is not JSON whitespace
+            extra("\"x\":" + "[".repeat(DEPTH) + "]".repeat(DEPTH)), // one level above the bound
+        )
+        val notError = bad.filter { pingOf(it) != MediaPing(AddonStatus.ERROR, null) }
+        assertTrue("not ERROR: " + notError.map { JsonPrimitive(it).toString() }, notError.isEmpty())
+
+        val ready = MediaPing(AddonStatus.READY, AddonLimits(10485760, REPLY_FORMATS))
+        val good = listOf(
+            extra("\"note\":\"a\\nb\\t\\\"\\\\\\/\\b\\f\\r\\u12aF\""), // every escape, the line feed escaped
+            extra("\"x\":\"a\",\"x\":2"), // two valid members of one name
+            " \t\r\n" + READY_BODY + "\n ", // JSON whitespace around the value
+            extra("\"x\":" + "[".repeat(DEPTH - 1) + "]".repeat(DEPTH - 1)), // nesting at the bound
+            extra("\"n\":[-0,0.5,1e5,1E+5,2e-3,-12.5e10]"),
+        )
+        val notReady = good.filter { pingOf(it) != ready }
+        assertTrue("not READY: " + notReady.map { JsonPrimitive(it).toString() }, notReady.isEmpty())
+        // Valid duplicate members: the last value wins.
+        assertEquals(AddonLimits(1000, REPLY_FORMATS), pingOf(extra("\"max_bytes\":1000")).limits)
+    }
+
+    @Test
+    fun validatorRulesTheLibraryAlsoEnforces() {
+        // The JSON library refuses these too, so the ping alone cannot show that the validator does.
+        assertFalse(HermesApi.isJson(READY_BODY + "x"))
+        assertFalse(HermesApi.isJson(READY_BODY + "{}"))
+        assertTrue(HermesApi.isJson(READY_BODY + " \n"))
+        assertTrue(HermesApi.isJson("[".repeat(DEPTH) + "]".repeat(DEPTH)))
+        assertFalse(HermesApi.isJson("[".repeat(DEPTH + 1) + "]".repeat(DEPTH + 1)))
+        assertFalse(HermesApi.isJson(extra("\"x\":" + "{\"a\":".repeat(DEPTH) + "1" + "}".repeat(DEPTH))))
+    }
+
     private companion object {
+        /** The nesting bound of the ping validator: containers, the outer object counted. */
+        const val DEPTH = 400
+
         const val PATH = "/srv/out/chart.png"
         val READY_BODY = """{"name":"apofis-media","protocol":$APP_PROTOCOL,"ready":true,"max_bytes":10485760,"types":["png","jpeg","gif","webp"]}"""
         val small = AddonLimits(64, REPLY_FORMATS)
