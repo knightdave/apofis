@@ -472,9 +472,9 @@ class ReadTest(TempCase):
         (number, mine), = reused
         try:
             self.assertEqual(mine, number, "the OS did not hand back the released number")
-            self.assertEqual(result, (200, None, "image/png", PNG))
-            self.assertEqual(fds.closed.count(number), 1)
+            self.assertEqual(fds.closed.count(number), 1, "the released number was closed again")
             self.assertValid(mine)
+            self.assertEqual(result, (200, None, "image/png", PNG))
         finally:
             try:
                 real_close(mine)
@@ -497,9 +497,9 @@ class ReadTest(TempCase):
         (number, mine), = reused
         try:
             self.assertEqual(mine, number, "the OS did not hand back the released number")
-            self.assertEqual(result, (500, "internal", None, None))
-            self.assertEqual(fds.closed.count(number), 1)
+            self.assertEqual(fds.closed.count(number), 1, "the released number was closed again")
             self.assertValid(mine)
+            self.assertEqual(result, (500, "internal", None, None))
         finally:
             try:
                 real_close(mine)
