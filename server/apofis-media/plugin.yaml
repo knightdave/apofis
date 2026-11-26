@@ -1,0 +1,4 @@
+name: apofis-media
+version: 1.0.0
+description: Lets the Apofis app fetch pictures from this profile's picture folders with the API server key.
+kind: standalone
