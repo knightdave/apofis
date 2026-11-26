@@ -683,8 +683,17 @@ class RunTest(Base):
         self.run_verify()
         handler = self.sig.calls[0]
         self.assertIsInstance(handler, types.FunctionType)
-        self.assertIsNone(handler(signal.SIGINT, None))
-        self.assertIsNone(handler(signal.SIGINT, None))
+        for _ in range(2):
+            try:
+                self.assertIsNone(handler(signal.SIGINT, None))
+            except BaseException as e:  # a failure of this test, never an escape from the test process
+                self.fail("the handler raised %s" % type(e).__name__)
+
+    def test_parse_status_range(self):
+        for status, ok in ((99, False), (100, True), (401, True), (599, True), (600, False), (0, False)):
+            with self.subTest(status=status):
+                raw = b"HTTP/1.1 %03d X\r\nContent-Length: 2\r\n\r\n{}" % status
+                self.assertEqual(verify.parse(raw), (status, "", b"{}") if ok else None)
 
     def test_canaries_never_printed(self):
         def garbage(req):
