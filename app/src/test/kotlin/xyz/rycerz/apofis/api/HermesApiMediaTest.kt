@@ -1,5 +1,8 @@
 package xyz.rycerz.apofis.api
 
+import java.io.IOException
+import java.io.InterruptedIOException
+import java.lang.management.ManagementFactory
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
@@ -14,17 +17,21 @@ import kotlinx.serialization.json.jsonPrimitive
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.SocketEffect
+import okhttp3.Call
+import okhttp3.EventListener
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
 import okio.Buffer
+import okio.GzipSink
 import okio.Source
 import okio.Timeout
 import okio.buffer
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -33,6 +40,7 @@ import org.junit.Before
 import org.junit.Test
 import xyz.rycerz.apofis.images.ImageFormat
 import xyz.rycerz.apofis.images.REPLY_FORMATS
+import xyz.rycerz.apofis.media.APP_PROTOCOL
 import xyz.rycerz.apofis.media.AddonLimits
 import xyz.rycerz.apofis.media.AddonStatus
 
@@ -59,6 +67,39 @@ class HermesApiMediaTest {
         server.enqueue(builder.build())
     }
 
+    /** The next recorded request, waiting at most 10 s. */
+    private fun taken() = server.takeRequest(10, TimeUnit.SECONDS) ?: throw AssertionError("no request reached the server")
+
+    /** Raw bytes as a body, so a test can send what a string cannot hold. */
+    private fun respondBytes(code: Int, body: ByteArray, type: String, vararg headers: Pair<String, String>) {
+        val builder = MockResponse.Builder().code(code).addHeader("Content-Type", type).body(Buffer().write(body))
+        headers.forEach { (k, v) -> builder.addHeader(k, v) }
+        server.enqueue(builder.build())
+    }
+
+    private fun gzip(bytes: ByteArray) = Buffer().also { out -> GzipSink(out).buffer().use { it.write(bytes) } }.readByteArray()
+
+    /**
+     * A client with a short test-only deadline that records how the call failed, so a cancellation test ends within
+     * 10 s and can tell a cancel (a closed socket) from that deadline (an InterruptedIOException).
+     */
+    private class Cancelling {
+        @Volatile var failure: IOException? = null
+        val headers = CountDownLatch(1)
+        val client = HermesApi.defaultClient().newBuilder().callTimeout(5, TimeUnit.SECONDS)
+            .addNetworkInterceptor { chain -> chain.proceed(chain.request()).also { headers.countDown() } }
+            .eventListener(object : EventListener() {
+                override fun callFailed(call: Call, ioe: IOException) {
+                    failure = ioe
+                }
+            }).build()
+
+        fun assertCancelled() {
+            assertNotNull("the call did not fail", failure)
+            assertFalse("the deadline, not the cancel, ended the call: $failure", failure is InterruptedIOException)
+        }
+    }
+
     private fun picture(bytes: ByteArray, type: String?, chunked: Boolean = false, code: Int = 200) {
         val builder = MockResponse.Builder().code(code)
         if (type != null) builder.addHeader("Content-Type", type)
@@ -69,7 +110,7 @@ class HermesApiMediaTest {
     /** A JSON object from raw JSON field values; a null value leaves the field out. */
     private fun pingBody(
         name: String? = "\"apofis-media\"",
-        protocol: String? = "1",
+        protocol: String? = "$APP_PROTOCOL",
         ready: String? = "true",
         maxBytes: String? = "10485760",
         types: String? = """["png","jpeg","gif","webp"]""",
@@ -99,13 +140,23 @@ class HermesApiMediaTest {
         var pulled = 0L
         var closed = false
 
+        private val fill = ByteArray(8192) { filler }
+
         override fun read(sink: Buffer, byteCount: Long): Long {
             if (pulled >= total) return -1
-            val start = pulled
-            val n = minOf(byteCount, total - pulled).toInt()
-            sink.write(ByteArray(n) { i -> (start + i).let { at -> if (at < prefix.size) prefix[at.toInt()] else filler } })
-            pulled += n
-            return n.toLong()
+            val n = minOf(byteCount, total - pulled)
+            val end = pulled + n
+            while (pulled < end) {
+                if (pulled < prefix.size) {
+                    sink.writeByte(prefix[pulled.toInt()].toInt())
+                    pulled++
+                } else {
+                    val k = minOf(end - pulled, fill.size.toLong()).toInt()
+                    sink.write(fill, 0, k)
+                    pulled += k
+                }
+            }
+            return n
         }
 
         override fun timeout() = Timeout.NONE
@@ -115,16 +166,20 @@ class HermesApiMediaTest {
         }
     }
 
-    /** An API whose every answer is built in-process from [source]: no network, no socket, no name lookup. */
-    private fun recorded(code: Int, type: String?, source: RecordingSource, declared: Long = -1): HermesApi {
+    /**
+     * An API whose every answer is built in-process from [source]: the interceptor never proceeds, so no socket is
+     * opened. The base URL is still the test's own server. [onCall] runs on the thread that will read the body.
+     */
+    private fun recorded(code: Int, type: String?, source: RecordingSource, declared: Long = -1, onCall: () -> Unit = {}): HermesApi {
         val client = HermesApi.defaultClient().newBuilder().addInterceptor { chain ->
+            onCall()
             val builder = Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(code).message("test")
                 .body(source.buffer().asResponseBody(type?.toMediaType(), declared))
             if (type != null) builder.header("Content-Type", type)
             if (declared >= 0) builder.header("Content-Length", "$declared")
             builder.build()
         }.build()
-        return HermesApi("http://media.test/", "secret-key", client)
+        return HermesApi(server.url("/").toString(), "secret-key", client)
     }
 
     // ---- ping ----
@@ -140,6 +195,7 @@ class HermesApiMediaTest {
         assertEquals(MediaPing(AddonStatus.READY, AddonLimits(10485760, setOf(ImageFormat.PNG, ImageFormat.JPEG))), clamped)
         assertEquals(AddonLimits(10485760, REPLY_FORMATS), pingOf(pingBody(maxBytes = "1".repeat(25))).limits)
         assertEquals(AddonLimits(1000, REPLY_FORMATS), pingOf(pingBody(maxBytes = "1000")).limits)
+        assertEquals(AddonLimits(10485760, setOf(ImageFormat.JPEG)), pingOf(pingBody(types = """["jpg","PNG"]""")).limits)
     }
 
     @Test
@@ -178,19 +234,19 @@ class HermesApiMediaTest {
     @Test
     fun pingNameIsCheckedFirst() = runTest {
         for (name in listOf("\"other\"", null, "5")) {
-            assertEquals("$name", MediaPing(AddonStatus.ERROR, null), pingOf(pingBody(name = name, protocol = "2")))
+            assertEquals("$name", MediaPing(AddonStatus.ERROR, null), pingOf(pingBody(name = name, protocol = "${APP_PROTOCOL + 1}")))
         }
     }
 
     @Test
     fun pingNewerProtocolIsAppOld() = runTest {
-        assertEquals(MediaPing(AddonStatus.APP_OLD, null), pingOf(pingBody(protocol = "2", ready = "false")))
+        assertEquals(MediaPing(AddonStatus.APP_OLD, null), pingOf(pingBody(protocol = "${APP_PROTOCOL + 1}", ready = "false")))
         assertEquals(MediaPing(AddonStatus.APP_OLD, null), pingOf(pingBody(protocol = "9".repeat(25))))
     }
 
     @Test
     fun pingNotReady() = runTest {
-        for (protocol in listOf(null, "\"1\"", "1.0", "1e0", "0", "true")) {
+        for (protocol in listOf(null, "\"$APP_PROTOCOL\"", "$APP_PROTOCOL.0", "${APP_PROTOCOL}e0", "0", "true")) {
             assertEquals("protocol $protocol", MediaPing(AddonStatus.NOT_READY, null), pingOf(pingBody(protocol = protocol)))
         }
         for (ready in listOf("false", "\"true\"", "1", null)) {
@@ -212,22 +268,26 @@ class HermesApiMediaTest {
     @Test
     fun pingCancellationPropagates() = runBlocking {
         server.enqueue(MockResponse.Builder().onResponseStart(SocketEffect.Stall).build())
+        val cancelling = Cancelling()
+        val stalled = HermesApi(server.url("/").toString(), "secret-key", cancelling.client)
         var caught: Throwable? = null
         var result: MediaPing? = null
         val call = launch(Dispatchers.Default) {
-            try { result = api.mediaPing() } catch (e: Throwable) { caught = e }
+            try { result = stalled.mediaPing() } catch (e: Throwable) { caught = e }
         }
-        assertNotNull(server.takeRequest(10, TimeUnit.SECONDS))
+        taken()
         call.cancelAndJoin()
         assertNull(result)
         assertTrue("$caught", caught is CancellationException)
+        cancelling.assertCancelled()
     }
 
     @Test
     fun pingKeepsBasePrefix() = runTest {
         respond(200, READY_BODY)
         HermesApi(server.url("/prefix/").toString(), "secret-key").mediaPing()
-        val req = server.takeRequest()
+        val req = taken()
+        assertEquals("identity", req.headers["Accept-Encoding"])
         assertEquals("GET", req.method)
         assertEquals("/prefix/apofis-media/v1/ping", req.url.encodedPath)
         assertEquals("Bearer secret-key", req.headers["Authorization"])
@@ -241,7 +301,8 @@ class HermesApiMediaTest {
         val prefixed = HermesApi(server.url("/prefix/").toString(), "secret-key")
         repeat(2) { picture(PNG, "image/png") }
         prefixed.mediaFile(PATH, small)
-        val req = server.takeRequest()
+        val req = taken()
+        assertEquals("identity", req.headers["Accept-Encoding"])
         assertEquals("POST", req.method)
         assertEquals("/prefix/apofis-media/v1/file", req.url.encodedPath)
         assertEquals("Bearer secret-key", req.headers["Authorization"])
@@ -255,7 +316,7 @@ class HermesApiMediaTest {
 
         val odd = "/srv/out/a\"bé.png"
         prefixed.mediaFile(odd, small)
-        val body = server.takeRequest().body!!.utf8()
+        val body = taken().body!!.utf8()
         assertEquals("{\"path\":\"/srv/out/a\\\"bé.png\"}", body)
         assertEquals(odd, Json.parseToJsonElement(body).jsonObject["path"]!!.jsonPrimitive.content)
         assertEquals(2, server.requestCount)
@@ -269,7 +330,7 @@ class HermesApiMediaTest {
             Triple(GIF, "image/gif", ImageFormat.GIF),
             Triple(WEBP, "image/webp", ImageFormat.WEBP),
         )
-        for ((bytes, type, format) in cases) {
+        for ((bytes, type, format) in cases + Triple(PNG, "Image/PNG; foo=bar", ImageFormat.PNG)) {
             picture(bytes, type)
             val file = api.mediaFile(PATH, small)
             assertArrayEquals(type, bytes, file.bytes)
@@ -312,6 +373,7 @@ class HermesApiMediaTest {
         val source = RecordingSource(PNG)
         assertEquals(ApiError.Http(413, null), fileError(on = recorded(200, "image/png", source, declared = 65)))
         assertEquals(0L, source.pulled)
+        assertTrue(source.closed)
     }
 
     @Test
@@ -335,18 +397,18 @@ class HermesApiMediaTest {
     @Test
     fun fileCancellationPropagates() = runBlocking {
         server.enqueue(MockResponse.Builder().addHeader("Content-Type", "image/png").body(Buffer().write(PNG)).onResponseBody(SocketEffect.Stall).build())
-        val headers = CountDownLatch(1)
-        val client = HermesApi.defaultClient().newBuilder().addNetworkInterceptor { chain -> chain.proceed(chain.request()).also { headers.countDown() } }.build()
-        val watched = HermesApi(server.url("/").toString(), "secret-key", client)
+        val cancelling = Cancelling()
+        val watched = HermesApi(server.url("/").toString(), "secret-key", cancelling.client)
         var caught: Throwable? = null
         var result: MediaFile? = null
         val call = launch(Dispatchers.Default) {
             try { result = watched.mediaFile(PATH, small) } catch (e: Throwable) { caught = e }
         }
-        assertTrue(headers.await(10, TimeUnit.SECONDS))
+        assertTrue(cancelling.headers.await(10, TimeUnit.SECONDS))
         call.cancelAndJoin()
         assertNull(result)
         assertTrue("$caught", caught is CancellationException)
+        cancelling.assertCancelled()
     }
 
     @Test
@@ -400,9 +462,93 @@ class HermesApiMediaTest {
         assertEquals(2, server.requestCount)
     }
 
+    // ---- fix round 1 ----
+
+    @Test
+    fun pingEncodedIsError() = runTest {
+        respond(200, READY_BODY, "application/json", "Content-Encoding" to "br")
+        assertEquals(MediaPing(AddonStatus.ERROR, null), api.mediaPing())
+        respondBytes(200, gzip(READY_BODY.encodeToByteArray()), "application/json", "Content-Encoding" to "gzip")
+        assertEquals(MediaPing(AddonStatus.ERROR, null), api.mediaPing())
+        assertEquals("identity", taken().headers["Accept-Encoding"])
+    }
+
+    @Test
+    fun fileEncodedOverCapIs413() = runTest {
+        // A small picture whose gzip representation is over the cap: the declared (encoded) length decides.
+        val picture = PNG + kotlin.random.Random(7).nextBytes(40)
+        val encoded = gzip(picture)
+        assertTrue(picture.size <= 64 && encoded.size > 64)
+        respondBytes(200, encoded, "image/png", "Content-Encoding" to "gzip")
+        assertEquals(ApiError.Http(413, null), fileError())
+        assertEquals("identity", taken().headers["Accept-Encoding"])
+    }
+
+    @Test
+    fun fileEncodedAnswerIsRefused() = runTest {
+        respondBytes(200, PNG, "image/png", "Content-Encoding" to "br")
+        assertEquals(ApiError.Protocol, fileError())
+        respondBytes(200, gzip(PNG), "image/png", "Content-Encoding" to "gzip")
+        assertEquals(ApiError.Protocol, fileError())
+        respondBytes(200, PNG, "image/png", "Content-Encoding" to "identity")
+        assertArrayEquals(PNG, api.mediaFile(PATH, small).bytes)
+    }
+
+    @Test
+    fun fileEncodedErrorBodyHasNoCode() = runTest {
+        val body = """{"error":{"code":"file_unavailable"}}"""
+        respond(404, body, "application/json", "Content-Encoding" to "br")
+        assertEquals(ApiError.Http(404, null), fileError())
+        respondBytes(404, gzip(body.encodeToByteArray()), "application/json", "Content-Encoding" to "gzip")
+        assertEquals(ApiError.Http(404, null), fileError())
+    }
+
+    @Test
+    fun fileSniffGetsOnlyTheHead() = runTest {
+        // An ISO box header with a huge size: sniff walks brands across the whole box when it gets the whole body.
+        val cap = 4 shl 20
+        val head = bytes(0x7F, 0xFF, 0xFF, 0xFF) + "ftypisom".encodeToByteArray()
+        val source = RecordingSource(head, total = cap - 16L, filler = 0)
+        val bean = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        var thread = 0L
+        var before = 0L
+        val on = recorded(200, "image/png", source) {
+            thread = Thread.currentThread().id
+            before = bean.getThreadAllocatedBytes(thread)
+        }
+        assertEquals(ApiError.Protocol, fileError(AddonLimits(cap, REPLY_FORMATS), on))
+        // Reading the body allocates about twice its size; a brand walk over it allocates about twenty times.
+        val used = bean.getThreadAllocatedBytes(thread) - before
+        assertTrue("allocated $used for a body of $cap", used < 4L * cap)
+    }
+
+    @Test
+    fun pingRefusesMalformedJson() = runTest {
+        assertEquals(MediaPing(AddonStatus.ERROR, null), pingOf(pingBody(protocol = "0$APP_PROTOCOL")))
+        assertEquals(MediaPing(AddonStatus.ERROR, null), pingOf(pingBody(maxBytes = "0010")))
+        assertEquals(MediaPing(AddonStatus.ERROR, null), pingOf(READY_BODY.dropLast(1) + ""","extra":bogus}"""))
+        assertEquals(MediaPing(AddonStatus.ERROR, null), pingOf(READY_BODY.dropLast(1) + ""","extra":[1,{"a":007}]}"""))
+        val valid = READY_BODY.dropLast(1) + ""","extra":{"s":"text","n":-0.5e+3,"o":{"a":[true,false,null,0]}}}"""
+        assertEquals(MediaPing(AddonStatus.READY, AddonLimits(10485760, REPLY_FORMATS)), pingOf(valid))
+    }
+
+    @Test
+    fun pingRefusesInvalidUtf8() = runTest {
+        val body = READY_BODY.dropLast(1).encodeToByteArray() + ""","note":"""".encodeToByteArray() + bytes(0xFF) + """"}""".encodeToByteArray()
+        respondBytes(200, body, "application/json")
+        assertEquals(MediaPing(AddonStatus.ERROR, null), api.mediaPing())
+    }
+
+    @Test
+    fun fileErrorBodyInvalidUtf8HasNoCode() = runTest {
+        val body = """{"error":{"code":"file_unavailable","message":"""".encodeToByteArray() + bytes(0xC3, 0x28) + """"}}""".encodeToByteArray()
+        respondBytes(404, body, "application/json")
+        assertEquals(ApiError.Http(404, null), fileError())
+    }
+
     private companion object {
         const val PATH = "/srv/out/chart.png"
-        const val READY_BODY = """{"name":"apofis-media","protocol":1,"ready":true,"max_bytes":10485760,"types":["png","jpeg","gif","webp"]}"""
+        val READY_BODY = """{"name":"apofis-media","protocol":$APP_PROTOCOL,"ready":true,"max_bytes":10485760,"types":["png","jpeg","gif","webp"]}"""
         val small = AddonLimits(64, REPLY_FORMATS)
 
         fun bytes(vararg b: Int) = ByteArray(b.size) { b[it].toByte() }
