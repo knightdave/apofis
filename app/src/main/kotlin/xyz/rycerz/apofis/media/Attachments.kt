@@ -1,6 +1,5 @@
 package xyz.rycerz.apofis.media
 
-import xyz.rycerz.apofis.BuildConfig
 import xyz.rycerz.apofis.ui.chat.lf
 
 enum class AttachmentKind { PICTURE, FILE }
@@ -14,17 +13,21 @@ data class AttachmentScan(val attachments: List<Attachment>, val tagOnly: Boolea
  * picture paths in prose, in order of first appearance, at most [MAX_ATTACHMENTS]. Presentation only: it authorizes
  * nothing on the server.
  */
-fun scanAttachments(text: String): AttachmentScan {
+fun scanAttachments(text: String): AttachmentScan = scanNormalized(lf(text))
+
+/**
+ * [scanAttachments] on [t], whose line endings are already LF. Every read of the text goes through [t] and views taken
+ * with `subSequence`; a String is made only for a path that is kept.
+ */
+internal fun scanNormalized(t: CharSequence): AttachmentScan {
     val found = LinkedHashMap<String, AttachmentKind>()
     var fence = false
     var nonBlank = 0
     var tagAdded = false
-    val t = lf(text)
     var start = 0
     while (start <= t.length) { // line by line, so nothing after the 16th path is read; a final LF leaves an empty line
         val end = t.indexOf('\n', start).let { if (it < 0) t.length else it }
-        if (BuildConfig.DEBUG) attachmentScanSteps += end - start + 1
-        val line = t.substring(start, end)
+        val line = t.subSequence(start, end)
         start = end + 1
         if (line.any { !isWs(it) }) nonBlank++
         // 1. Fence, stripped as the block parser strips (Char.isWhitespace, which includes U+00A0).
@@ -43,8 +46,8 @@ fun scanAttachments(text: String): AttachmentScan {
         if (isQuoteOrShell(line, i)) continue
         // 5. Tag line: it owns the whole line, also when malformed.
         if (line.startsWith(TAG, i)) {
-            val c = tagCandidate(line.substring(i + TAG.length))
-            if (c != null && !c.contains(TAG)) kindOf(c, spaces = true)?.let { if (found.putIfAbsent(c, it) == null) tagAdded = true }
+            val c = tagCandidate(line.subSequence(i + TAG.length, line.length))
+            if (c != null && !c.contains(TAG)) kindOf(c, spaces = true)?.let { if (found.putIfAbsent(c.toString(), it) == null) tagAdded = true }
         } else {
             prose(line, i) { path -> found.putIfAbsent(path, AttachmentKind.PICTURE); found.size < MAX_ATTACHMENTS }
         }
@@ -53,9 +56,6 @@ fun scanAttachments(text: String): AttachmentScan {
     }
     return AttachmentScan(found.attachments(), nonBlank == 1 && tagAdded)
 }
-
-/** Characters read for lines, the backtick index and closer searches. Debug builds only, for the work-bound tests. */
-internal var attachmentScanSteps = 0L
 
 private const val MAX_ATTACHMENTS = 16
 private const val MAX_LINE = 4096
@@ -72,14 +72,14 @@ private fun isWs(c: Char) = c == ' ' || c == '\t'
 
 private fun isBoundary(c: Char) = isWs(c) || c == '|'
 
-private fun skipWs(s: String, from: Int): Int {
+private fun skipWs(s: CharSequence, from: Int): Int {
     var k = from
     while (k < s.length && isWs(s[k])) k++
     return k
 }
 
 /** Past one list marker at [i] (`-`, `*`, `+`, or one to nine digits then `.` or `)`) and the WS after it, else [i]. */
-private fun afterMarker(s: String, i: Int): Int {
+private fun afterMarker(s: CharSequence, i: Int): Int {
     var j = i
     if (j < s.length && s[j] in "-*+") {
         j++
@@ -92,7 +92,7 @@ private fun afterMarker(s: String, i: Int): Int {
 }
 
 /** Whether the line from [i] is a quote (`>`) or starts with a shell prompt (`$`, `user@host:~$ `). */
-private fun isQuoteOrShell(s: String, i: Int): Boolean {
+private fun isQuoteOrShell(s: CharSequence, i: Int): Boolean {
     if (s.startsWith(">", i) || (i == s.length - 1 && s[i] == '$')) return true
     var j = i
     while (j < s.length && !isWs(s[j])) j++
@@ -100,31 +100,31 @@ private fun isQuoteOrShell(s: String, i: Int): Boolean {
 }
 
 /** The tag's candidate path from [rest], the line after `MEDIA:`, or null when its quoted form is malformed. */
-private fun tagCandidate(rest: String): String? {
+private fun tagCandidate(rest: CharSequence): CharSequence? {
     var a = 0
     var b = rest.length
     while (a < b && isWs(rest[a])) a++
     while (b > a && isWs(rest[b - 1])) b--
-    val r = rest.substring(a, b)
+    val r = rest.subSequence(a, b)
     val q = r.firstOrNull()
-    if (q == '"' || q == '`') return if (r.length >= 2 && r.indexOf(q, 1) == r.length - 1) r.substring(1, r.length - 1) else null
-    return if (r.isNotEmpty() && r.last() in PUNCT) r.dropLast(1) else r
+    if (q == '"' || q == '`') return if (r.length >= 2 && r.indexOf(q, 1) == r.length - 1) r.subSequence(1, r.length - 1) else null
+    return if (r.isNotEmpty() && r.last() in PUNCT) r.subSequence(0, r.length - 1) else r
 }
 
 /** The kind of [p] when it passes the path test of spec 6.1, else null. U+0020 is allowed only when [spaces]. */
-private fun kindOf(p: String, spaces: Boolean): AttachmentKind? {
+private fun kindOf(p: CharSequence, spaces: Boolean): AttachmentKind? {
     if (p.length !in 2..MAX_PATH || p[0] != '/' || p[1] == '/') return null
     var k = 0
     while (k < p.length) {
-        val cp = p.codePointAt(k)
+        val cp = Character.codePointAt(p, k)
         if (refused(cp) && !(spaces && cp == ' '.code)) return null
         k += Character.charCount(cp)
     }
-    val name = p.substring(p.lastIndexOf('/') + 1)
+    val name = p.subSequence(p.lastIndexOf('/') + 1, p.length)
     val dot = name.lastIndexOf('.')
-    val suffix = name.substring(dot + 1)
+    val suffix = name.subSequence(dot + 1, name.length)
     if (dot < 1 || suffix.length !in 1..8 || !suffix.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' }) return null
-    return if (suffix.lowercase() in PICTURE_SUFFIXES) AttachmentKind.PICTURE else AttachmentKind.FILE
+    return if (suffix.toString().lowercase() in PICTURE_SUFFIXES) AttachmentKind.PICTURE else AttachmentKind.FILE
 }
 
 private fun refused(cp: Int): Boolean = when (cp) {
@@ -142,7 +142,7 @@ private fun refused(cp: Int): Boolean = when (cp) {
  * each bare PICTURE path and each whole-path span, in order, and returns false to stop. Linear: the backtick runs are
  * indexed once, and a quote or link search that finds no closer is remembered, so no later opener of that kind searches.
  */
-private fun prose(line: String, i: Int, add: (String) -> Boolean) {
+private fun prose(line: CharSequence, i: Int, add: (String) -> Boolean) {
     val m = StringBuilder(line.length - i)
     val spans = HashMap<Int, String>() // index in m of a whole-path span's MASK, to its path
     val closer = HashMap<Int, Int>() // start of a maximal backtick run, to the end of the next run of the same length
@@ -154,7 +154,6 @@ private fun prose(line: String, i: Int, add: (String) -> Boolean) {
         lastOfLength.put(e - k, k)?.let { closer[it] = e }
         k = e
     }
-    if (BuildConfig.DEBUG) attachmentScanSteps += line.length - i
     var noQuote = false
     var noSingle = false
     var noParen = false
@@ -162,33 +161,30 @@ private fun prose(line: String, i: Int, add: (String) -> Boolean) {
     while (p < line.length) {
         val c = line[p]
         var spanEnd = -1 // where a span ends, or -1 for plain text
-        var inner: String? = null // a code or quoted span's content
+        var inner: CharSequence? = null // a code or quoted span's content
         when {
             c == '`' -> {
                 val run = runEnd(line, p)
                 val close = closer[p]
                 if (close == null) { m.append(line, p, run); p = run; continue }
-                spanEnd = close; inner = line.substring(run, close - (run - p))
+                spanEnd = close; inner = line.subSequence(run, close - (run - p))
             }
             c == '"' && !noQuote -> {
                 val close = line.indexOf('"', p + 1)
-                if (BuildConfig.DEBUG) attachmentScanSteps += (if (close < 0) line.length else close) - p
-                if (close < 0) noQuote = true else { spanEnd = close + 1; inner = line.substring(p + 1, close) }
+                if (close < 0) noQuote = true else { spanEnd = close + 1; inner = line.subSequence(p + 1, close) }
             }
             c == '\'' && !noSingle && (p == 0 || isBoundary(line[p - 1]) || line[p - 1] == '(') -> {
                 var close = p + 1
                 while (close < line.length && !(line[close] == '\'' && (close + 1 == line.length || isBoundary(line[close + 1]) || line[close + 1] in PUNCT))) close++
-                if (BuildConfig.DEBUG) attachmentScanSteps += close - p
-                if (close == line.length) noSingle = true else { spanEnd = close + 1; inner = line.substring(p + 1, close) }
+                if (close == line.length) noSingle = true else { spanEnd = close + 1; inner = line.subSequence(p + 1, close) }
             }
             c == ']' && !noParen && line.startsWith("](", p) -> {
                 val close = line.indexOf(')', p + 2)
-                if (BuildConfig.DEBUG) attachmentScanSteps += (if (close < 0) line.length else close) - p
                 if (close < 0) noParen = true else spanEnd = close + 1 // a link target is never a whole-path span
             }
         }
         if (spanEnd < 0) { m.append(c); p++; continue }
-        if (inner != null && '|' !in inner && kindOf(inner, spaces = false) == AttachmentKind.PICTURE) spans[m.length] = inner
+        if (inner != null && '|' !in inner && kindOf(inner, spaces = false) == AttachmentKind.PICTURE) spans[m.length] = inner.toString()
         m.append(MASK)
         p = spanEnd
     }
@@ -205,7 +201,7 @@ private fun prose(line: String, i: Int, add: (String) -> Boolean) {
     }
 }
 
-private fun runEnd(s: String, from: Int): Int {
+private fun runEnd(s: CharSequence, from: Int): Int {
     var k = from
     while (k < s.length && s[k] == '`') k++
     return k

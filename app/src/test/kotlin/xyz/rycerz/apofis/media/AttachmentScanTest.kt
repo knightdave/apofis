@@ -14,11 +14,43 @@ class AttachmentScanTest {
 
     private fun check(text: String, expected: AttachmentScan) = assertEquals(text, expected, scanAttachments(text))
 
-    /** The scanner's work counter across [block]. */
-    private fun steps(block: () -> Unit): Long {
-        val before = attachmentScanSteps
-        block()
-        return attachmentScanSteps - before
+    /** What [Metered] saw: reads of the scanned text and the highest index read. */
+    private class Meter {
+        var reads = 0L
+        var highest = -1
+    }
+
+    /**
+     * The scanned text as a counting sequence: every `get` is one read, `toString` is charged the length it copies, and
+     * `subSequence` costs nothing but returns a view on the same [meter]. The scanner gets no other way to the text.
+     */
+    private class Metered(private val src: String, private val from: Int, override val length: Int, val meter: Meter) : CharSequence {
+        constructor(src: String) : this(src, 0, src.length, Meter())
+
+        override fun get(index: Int): Char {
+            if (index !in 0 until length) throw IndexOutOfBoundsException("$index of $length")
+            meter.reads++
+            meter.highest = maxOf(meter.highest, from + index)
+            return src[from + index]
+        }
+
+        override fun subSequence(startIndex: Int, endIndex: Int): CharSequence {
+            if (startIndex < 0 || endIndex > length || startIndex > endIndex) throw IndexOutOfBoundsException("$startIndex..$endIndex of $length")
+            return Metered(src, from + startIndex, endIndex - startIndex, meter)
+        }
+
+        override fun toString(): String {
+            meter.reads += length
+            if (length > 0) meter.highest = maxOf(meter.highest, from + length - 1)
+            return src.substring(from, from + length)
+        }
+    }
+
+    /** Scans [text] (already LF only) through a [Metered] view, checks the result and returns what the meter saw. */
+    private fun metered(text: String, expected: AttachmentScan): Meter {
+        val t = Metered(text)
+        assertEquals(text, expected, scanNormalized(t))
+        return t.meter
     }
 
     /** A line of exactly [length] UTF-16 units that ends with ` /srv/out/a.png`. */
@@ -216,8 +248,9 @@ class AttachmentScanTest {
         val text = (List(13) { line } + openers).joinToString("\n") + "\nand the last one is /srv/out/end.png"
         assertTrue(text.length > 50_000)
         assertTrue(text.split('\n').all { it.length <= 4096 })
-        val steps = steps { check(text, found(pic("/srv/out/end.png"))) }
-        assertTrue("$steps steps", steps <= 3L * text.length)
+        check(text, found(pic("/srv/out/end.png")))
+        val reads = metered(text, found(pic("/srv/out/end.png"))).reads
+        assertTrue("$reads reads", reads in text.length..8L * text.length) // fixed code: about 3.5 reads per unit
     }
 
     @Test
@@ -295,8 +328,9 @@ class AttachmentScanTest {
     fun mixedBacktickRunLengthsStayLinear() {
         val text = "x " + (1..60).joinToString(" ") { "`".repeat(it) } + " " + "y".repeat(2000) + " /srv/out/a.png"
         assertTrue(text.length <= 4096)
-        val steps = steps { check(text, found(pic("/srv/out/a.png"))) }
-        assertTrue("$steps steps", steps <= 3L * text.length)
+        check(text, found(pic("/srv/out/a.png")))
+        val reads = metered(text, found(pic("/srv/out/a.png"))).reads
+        assertTrue("$reads reads", reads in text.length..8L * text.length) // fixed code: about 3.5 reads per unit
     }
 
     @Test
@@ -304,8 +338,15 @@ class AttachmentScanTest {
         val paths = (1..16).map { "/srv/out/p${it.toString().padStart(2, '0')}.png" }
         val head = paths.joinToString("\n") { "MEDIA:$it" }
         val text = head + "\n" + "x\n".repeat(100_000)
-        val steps = steps { check(text, AttachmentScan(paths.map(::pic), false)) }
-        assertTrue("$steps steps", steps <= 2L * head.length)
+        check(text, AttachmentScan(paths.map(::pic), false))
+        val meter = metered(text, AttachmentScan(paths.map(::pic), false))
+        assertTrue("highest index read ${meter.highest}", meter.highest <= head.length) // head.length: the LF ending line 16
+        assertTrue("${meter.reads} reads", meter.reads in head.length..12L * head.length) // fixed code: about 5.5 per unit
+    }
+
+    @Test
+    fun wholePathSpanKeepsItsPlaceAmongBarePaths() {
+        check("See /srv/a.png and `/srv/b.png` then /srv/c.png", found(pic("/srv/a.png"), pic("/srv/b.png"), pic("/srv/c.png")))
     }
 
     @Test
