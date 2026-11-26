@@ -140,6 +140,13 @@ def default_answer(line, req):
 TIMEOUT = object()  # a recv slice that times out; it moves the clock by one slice
 
 
+class Late:
+    """A step whose data arrives only after the clock moved by `seconds` within the same slice."""
+
+    def __init__(self, seconds, data):
+        self.seconds, self.data = seconds, data
+
+
 class OnClose:
     """A step that runs when the connection is closed, after the answer was read."""
 
@@ -191,6 +198,9 @@ class Sock:
                 step()
                 self.net.clock.now += 0.25
                 raise TimeoutError()
+            if isinstance(step, Late):
+                self.net.clock.now += step.seconds
+                step = step.data
             chunk, rest = step[:n], step[n:]
             if rest:
                 self.steps.insert(0, rest)
@@ -211,9 +221,11 @@ class Net:
 
     def __init__(self, clock, answers=None):
         self.clock, self.answers, self.connects, self.requests, self.socks = clock, answers or {}, [], [], []
+        self.while_connecting = {}  # connection number -> what happens while that connect waits
 
     def create_connection(self, address, timeout=None):
         self.connects.append((address, timeout))
+        self.while_connecting.get(len(self.connects), lambda: None)()
         sock = Sock(self)
         self.socks.append(sock)
         return sock
@@ -231,12 +243,14 @@ class Sig:
     SIGINT = signal.SIGINT
 
     def __init__(self, current=previous_handler):
-        self.current, self.calls = current, []
+        self.current, self.calls, self.at_restore = current, [], False
 
     def getsignal(self, signum):
         return self.current
 
     def signal(self, signum, handler):
+        if self.at_restore and handler is previous_handler:
+            self.current(signal.SIGINT, None)  # a Ctrl-C the installed handler catches as restoration starts
         self.calls.append(handler)
         old, self.current = self.current, handler
         return old
@@ -362,7 +376,7 @@ class RunTest(Base):
         self.assertEqual((code, lines), (0, ALL_PASS))
         self.assertEqual(self.net.connects, [(ADDRESS, 10)] * 8)
         for sock in self.net.socks:
-            self.assertEqual(sock.timeouts, [0.25])
+            self.assertEqual(sock.timeouts, [10, 0.25])  # the send, then every receive slice
         self.assertIsInstance(self.sig.calls[0], types.FunctionType)
         self.assert_no_fixture()
 
@@ -551,6 +565,19 @@ class RunTest(Base):
                 if want == "V5 FAIL":
                     self.assertEqual(self.net.requests[4]["sock"].steps, [ping])  # never read
 
+    def test_idle_limit_on_a_data_slice(self):
+        for late, want in ((0.20, "V1 PASS"), (0.25, "V1 FAIL"), (0.30, "V1 FAIL")):  # 9.95, 10.00, 10.05 s
+            with self.subTest(late=late):
+                self.setUp()
+                code, lines = self.run_verify({1: [TIMEOUT] * 39 + [Late(late, AUTH)]})
+                self.assertEqual(lines[0], want)
+                if want == "V1 FAIL":
+                    self.assertEqual(lines[4:], ["V5 FAIL", "V6 FAIL", "V7 FAIL", "V8 FAIL", "V9 PASS"])
+                    self.assert_no_keyed_request()
+                    self.assertEqual(code, 1)
+                else:
+                    self.assertEqual((code, lines), (0, ALL_PASS))
+
     def test_deadline_during_a_trickled_body(self):
         raw = http(200, jbody(PING_OK))
         code, lines = self.run_verify({6: [raw[:20], TIMEOUT, TIMEOUT, raw[20:40], TIMEOUT, raw[40:]]}, deadline=0.5)
@@ -590,6 +617,76 @@ class RunTest(Base):
         self.assertEqual(self.net.lines(), [1, 2, 3, 4])
         self.assert_no_keyed_request()
         self.assert_no_fixture()
+
+    def test_no_send_after_connect_returns_late(self):
+        for case in ("interrupted while connecting", "deadline passed while connecting"):
+            with self.subTest(case=case):
+                self.setUp()
+                if case == "interrupted while connecting":
+                    self.net.while_connecting[5] = self.sig.interrupt
+                else:
+                    self.net.while_connecting[5] = lambda: setattr(self.clock, "now", self.clock.now + 60)
+                code, lines = self.run_verify()
+                self.assertEqual(self.net.lines(), [1, 2, 3, 4])  # no byte of the V5 request was sent
+                self.assertEqual(len(self.net.socks), 5)
+                self.assertEqual(self.net.socks[4].closed, 1)
+                v9 = "V9 FAIL" if case.startswith("interrupted") else "V9 PASS"
+                self.assertEqual(lines, PASS8[:4] + ["V5 FAIL", "V6 FAIL", "V7 FAIL", "V8 FAIL", v9])
+                self.assertEqual(code, 1)
+                self.assert_no_keyed_request()
+                self.assert_no_fixture()
+
+    def test_interrupt_as_the_handler_is_restored(self):
+        self.sig.at_restore = True
+        code, lines = self.run_verify()
+        self.assertEqual(lines, ALL_PASS)  # the nine lines stand
+        self.assertIs(self.sig.current, previous_handler)
+        self.assertEqual(code, 1)
+
+    def wrap_descriptors(self):
+        real_open, real_close, self.opened, self.closed = os.open, os.close, [], []
+
+        def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+            self.opened.append(real_open(path, flags, mode, dir_fd=dir_fd))
+            return self.opened[-1]
+
+        def fake_close(fd):
+            self.closed.append(fd)
+            return real_close(fd)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(os, "open", side_effect=fake_open))
+        stack.enter_context(mock.patch.object(os, "close", side_effect=fake_close))
+        return stack
+
+    def test_request_preparation_failure_is_a_setup_failure(self):
+        real_hex = secrets.token_hex
+
+        def draw(n=None):
+            if n == 32:  # the wrong key, drawn after the three fixture names
+                raise RuntimeError(EXC_CANARY)
+            return real_hex(n)
+        with self.wrap_descriptors(), mock.patch.object(secrets, "token_hex", side_effect=draw):
+            code, lines = self.run_verify()
+        self.assertEqual((code, lines), (1, ["FAIL setup"]))
+        self.assertEqual(self.net.connects, [])
+        self.assert_no_fixture()
+        self.assertEqual(len(self.opened), 5)
+        self.assertEqual(sorted(self.closed), sorted(self.opened))  # all five closed, each once
+
+    def test_cleanup_survives_an_escaping_error(self):
+        def broken_clock():
+            raise RuntimeError(EXC_CANARY)  # the first clock read comes after preparation, before V1
+        out = io.StringIO()
+        with self.wrap_descriptors(), \
+                mock.patch.object(verify, "time", types.SimpleNamespace(monotonic=broken_clock)):
+            with self.assertRaises(RuntimeError):
+                verify.run(ADDRESS, self.home, REAL_KEY, out, 60)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(self.net.connects, [])
+        self.assert_no_fixture()
+        self.assertEqual(len(self.opened), 5)
+        self.assertEqual(sorted(self.closed), sorted(self.opened))
+        self.assertIs(self.sig.current, previous_handler)
 
     def test_interrupt_during_setup(self):
         real_open = os.open

@@ -53,6 +53,10 @@ def _exchange(address, request, flag, end):
         return None
     sock = socket.create_connection(address, timeout=min(TIMEOUT_S, end - time.monotonic()))
     try:
+        left = end - time.monotonic()
+        if flag[0] or left <= 0:  # a connect that returned late is not permission to send
+            return None
+        sock.settimeout(min(TIMEOUT_S, left))
         sock.sendall(request)
         sock.settimeout(SLICE_S)
         data, last = b"", time.monotonic()
@@ -62,9 +66,11 @@ def _exchange(address, request, flag, end):
             except TimeoutError:
                 chunk = None
             now = time.monotonic()
+            if flag[0] or now >= end or now - last >= TIMEOUT_S:  # idle: measured from the previous byte
+                return None
             if chunk:
                 data, last = data + chunk, now
-            if flag[0] or now >= end or now - last >= TIMEOUT_S or len(data) > ANSWER_LIMIT:
+            if len(data) > ANSWER_LIMIT:
                 return None
             if chunk == b"":
                 return data
@@ -209,6 +215,8 @@ def _cleanup(fds, owned):
             os.close(fd)
         except Exception:  # never retried: the number may already belong to someone else
             closed = False
+    owned.clear()
+    fds.clear()  # each fixture and descriptor is handled exactly once
     return removed == 2 and closed
 
 
@@ -230,18 +238,18 @@ def run(address, home, key, out, deadline=DEADLINE_S):
     except ValueError:  # ... or not the main thread
         _write(out, "FAIL setup\n")
         return 1
-    fds, owned = [], []
+    fds, owned, results = [], [], []
     try:
         try:
-            paths = _setup(home, fds, owned)
+            checks = _checks(key, *_setup(home, fds, owned))  # preparation: the fixtures and every request
         except Exception:
-            paths = None
-        if paths is None or flag[0]:
+            checks = None
+        if checks is None or flag[0]:
             _cleanup(fds, owned)
             _write(out, "FAIL setup\n")
             return 1
-        end, printed, results = time.monotonic() + deadline, True, []
-        for n, (request, judge) in enumerate(_checks(key, *paths), 1):
+        end, printed = time.monotonic() + deadline, True
+        for n, (request, judge) in enumerate(checks, 1):
             passed = False
             if n <= 4 or results[:4] == [True] * 4:  # the real key only after four PASS lines written in full
                 try:
@@ -258,9 +266,11 @@ def run(address, home, key, out, deadline=DEADLINE_S):
             results.append(passed and printed)
         passed = _cleanup(fds, owned) and not flag[0]  # the flag is read once: a later Ctrl-C keeps this line
         printed = printed and _write(out, "V9 %s\n" % ("PASS" if passed else "FAIL"))
-        return 0 if printed and passed and all(results) and not flag[0] else 1
+        results.append(passed and printed)
     finally:
+        _cleanup(fds, owned)  # nothing left to do unless an error skipped the cleanup above
         signal.signal(signal.SIGINT, previous)
+    return 0 if len(results) == 9 and all(results) and not flag[0] else 1  # decided after the restore
 
 
 class _Parser(argparse.ArgumentParser):
