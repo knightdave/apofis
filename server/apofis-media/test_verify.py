@@ -551,7 +551,7 @@ class MainTest(Base):
         """main() with getpass and the production transport replaced by recorders."""
         self.prompts, self.transports = [], []
 
-        def prompt(text="Password: ", stream=None):
+        def prompt(text="", stream=None):
             self.prompts.append(text)
             if isinstance(key, BaseException):
                 raise key
@@ -607,6 +607,7 @@ class MainTest(Base):
             return REAL_KEY
         for key in (no_tty, KeyboardInterrupt(), EOFError()):
             with self.subTest(key=type(key).__name__):
+                mark.clear()
                 code, lines = self.call_main(["--port", "8642", "--home", self.home], key=key)
                 self.assertNotIn("read", mark)
                 self.assertEqual(lines, ["FAIL key"])
