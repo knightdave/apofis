@@ -153,10 +153,16 @@ class AppContainerTest {
         addSession("apofis-a")
         val digest = container.imageStore.put(byteArrayOf(1, 2, 3))!!
         db.agentFileDao().insert(AgentFileEntity("apofis-a", 1, "/srv/out/chart.png", digest))
+        container.startup.join()
+        // The collection that ends every switch drops orphaned bindings too, so look before it does: the switch's own
+        // delete must already have removed the row.
+        val seen = mutableListOf<List<String>>()
+        container.beforeImageRows = { seen += db.agentFileDao().digests() }
 
         container.connect(B)
 
-        assertEquals(emptyList<String>(), db.agentFileDao().digests()) // the row itself, not only the file
+        assertEquals(emptyList<String>(), seen.firstOrNull())
+        assertEquals(emptyList<String>(), db.agentFileDao().digests())
         assertNull(container.imageStore.file(digest))
     }
 
