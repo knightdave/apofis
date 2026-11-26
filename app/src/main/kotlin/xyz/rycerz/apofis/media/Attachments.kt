@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.media
 
+import xyz.rycerz.apofis.BuildConfig
 import xyz.rycerz.apofis.ui.chat.lf
 
 enum class AttachmentKind { PICTURE, FILE }
@@ -18,7 +19,13 @@ fun scanAttachments(text: String): AttachmentScan {
     var fence = false
     var nonBlank = 0
     var tagAdded = false
-    for (line in lf(text).split('\n')) {
+    val t = lf(text)
+    var start = 0
+    while (start <= t.length) { // line by line, so nothing after the 16th path is read; a final LF leaves an empty line
+        val end = t.indexOf('\n', start).let { if (it < 0) t.length else it }
+        if (BuildConfig.DEBUG) attachmentScanSteps += end - start + 1
+        val line = t.substring(start, end)
+        start = end + 1
         if (line.any { !isWs(it) }) nonBlank++
         // 1. Fence, stripped as the block parser strips (Char.isWhitespace, which includes U+00A0).
         val f = line.indexOfFirst { !it.isWhitespace() }.let { if (it < 0) line.length else it }
@@ -46,6 +53,9 @@ fun scanAttachments(text: String): AttachmentScan {
     }
     return AttachmentScan(found.attachments(), nonBlank == 1 && tagAdded)
 }
+
+/** Characters read for lines, the backtick index and closer searches. Debug builds only, for the work-bound tests. */
+internal var attachmentScanSteps = 0L
 
 private const val MAX_ATTACHMENTS = 16
 private const val MAX_LINE = 4096
@@ -129,13 +139,22 @@ private fun refused(cp: Int): Boolean = when (cp) {
 
 /**
  * Step 6: the line from [i] with each code, quoted and link span masked to one [MASK], split at WS and `|`. [add] gets
- * each bare PICTURE path and each whole-path span, in order, and returns false to stop. One walk: a search that finds
- * no closer is remembered, so no later opener of that kind searches again.
+ * each bare PICTURE path and each whole-path span, in order, and returns false to stop. Linear: the backtick runs are
+ * indexed once, and a quote or link search that finds no closer is remembered, so no later opener of that kind searches.
  */
 private fun prose(line: String, i: Int, add: (String) -> Boolean) {
     val m = StringBuilder(line.length - i)
     val spans = HashMap<Int, String>() // index in m of a whole-path span's MASK, to its path
-    val noCodeCloser = HashSet<Int>() // backtick run lengths with no later run of that length
+    val closer = HashMap<Int, Int>() // start of a maximal backtick run, to the end of the next run of the same length
+    val lastOfLength = HashMap<Int, Int>() // run length, to the start of the latest run of that length
+    var k = i
+    while (k < line.length) {
+        if (line[k] != '`') { k++; continue }
+        val e = runEnd(line, k)
+        lastOfLength.put(e - k, k)?.let { closer[it] = e }
+        k = e
+    }
+    if (BuildConfig.DEBUG) attachmentScanSteps += line.length - i
     var noQuote = false
     var noSingle = false
     var noParen = false
@@ -147,22 +166,24 @@ private fun prose(line: String, i: Int, add: (String) -> Boolean) {
         when {
             c == '`' -> {
                 val run = runEnd(line, p)
-                val n = run - p
-                val close = if (n in noCodeCloser) -1 else findRun(line, run, n)
-                if (close < 0) { noCodeCloser += n; m.append(line, p, run); p = run; continue }
-                spanEnd = close; inner = line.substring(run, close - n)
+                val close = closer[p]
+                if (close == null) { m.append(line, p, run); p = run; continue }
+                spanEnd = close; inner = line.substring(run, close - (run - p))
             }
             c == '"' && !noQuote -> {
                 val close = line.indexOf('"', p + 1)
+                if (BuildConfig.DEBUG) attachmentScanSteps += (if (close < 0) line.length else close) - p
                 if (close < 0) noQuote = true else { spanEnd = close + 1; inner = line.substring(p + 1, close) }
             }
             c == '\'' && !noSingle && (p == 0 || isBoundary(line[p - 1]) || line[p - 1] == '(') -> {
                 var close = p + 1
                 while (close < line.length && !(line[close] == '\'' && (close + 1 == line.length || isBoundary(line[close + 1]) || line[close + 1] in PUNCT))) close++
+                if (BuildConfig.DEBUG) attachmentScanSteps += close - p
                 if (close == line.length) noSingle = true else { spanEnd = close + 1; inner = line.substring(p + 1, close) }
             }
             c == ']' && !noParen && line.startsWith("](", p) -> {
                 val close = line.indexOf(')', p + 2)
+                if (BuildConfig.DEBUG) attachmentScanSteps += (if (close < 0) line.length else close) - p
                 if (close < 0) noParen = true else spanEnd = close + 1 // a link target is never a whole-path span
             }
         }
@@ -188,16 +209,4 @@ private fun runEnd(s: String, from: Int): Int {
     var k = from
     while (k < s.length && s[k] == '`') k++
     return k
-}
-
-/** The end of the first run of exactly [n] backticks at or after [from], or -1. */
-private fun findRun(s: String, from: Int, n: Int): Int {
-    var k = from
-    while (k < s.length) {
-        if (s[k] != '`') { k++; continue }
-        val e = runEnd(s, k)
-        if (e - k == n) return e
-        k = e
-    }
-    return -1
 }

@@ -14,6 +14,13 @@ class AttachmentScanTest {
 
     private fun check(text: String, expected: AttachmentScan) = assertEquals(text, expected, scanAttachments(text))
 
+    /** The scanner's work counter across [block]. */
+    private fun steps(block: () -> Unit): Long {
+        val before = attachmentScanSteps
+        block()
+        return attachmentScanSteps - before
+    }
+
     /** A line of exactly [length] UTF-16 units that ends with ` /srv/out/a.png`. */
     private fun longLine(length: Int) = "x".repeat(length - " /srv/out/a.png".length) + " /srv/out/a.png"
 
@@ -167,13 +174,15 @@ class AttachmentScanTest {
 
     @Test
     fun row26() {
-        check("/srv/out/a​.png", none)
+        val format = "/srv/out/a\u200B.png"
+        assertEquals(0x200B, format.codePointAt(10))
+        check(format, none)
         check("MEDIA:/srv/out/a.png\r\n", found(pic("/srv/out/a.png"), tagOnly = true))
     }
 
     @Test
     fun row27() {
-        val paths = (1..17).map { "/srv/out/p%02d.png".format(it) }
+        val paths = (1..17).map { "/srv/out/p${it.toString().padStart(2, '0')}.png" }
         check(paths.joinToString("\n") { "MEDIA:$it" }, AttachmentScan(paths.take(16).map(::pic), false))
     }
 
@@ -189,7 +198,11 @@ class AttachmentScanTest {
     fun row29() = check("MEDIA:/srv/out/a.png\rMEDIA:/srv/out/b.png", found(pic("/srv/out/a.png"), pic("/srv/out/b.png")))
 
     @Test
-    fun row30() = check(" ```\nMEDIA:/srv/out/a.png\n```\nMEDIA:/srv/out/b.png", found(pic("/srv/out/b.png")))
+    fun row30() {
+        val text = "\u00A0```\nMEDIA:/srv/out/a.png\n```\nMEDIA:/srv/out/b.png"
+        assertEquals(0x00A0, text.codePointAt(0))
+        check(text, found(pic("/srv/out/b.png")))
+    }
 
     @Test
     fun row31() = check("0. MEDIA:/srv/out/a.png", found(pic("/srv/out/a.png"), tagOnly = true))
@@ -198,10 +211,13 @@ class AttachmentScanTest {
     fun longProseRegression() {
         val words = "plain words of a long answer with nothing special in them at all "
         val line = words.repeat(4000 / words.length)
-        val text = List(13) { line }.joinToString("\n") + "\nand the last one is /srv/out/end.png"
+        // Lines of unmatched openers: each kind searches for a closer once per line, then is plain text.
+        val openers = listOf(" 'x", " \"x", " ](x", " `x").map { it.repeat(4000 / it.length) }
+        val text = (List(13) { line } + openers).joinToString("\n") + "\nand the last one is /srv/out/end.png"
         assertTrue(text.length > 50_000)
         assertTrue(text.split('\n').all { it.length <= 4096 })
-        check(text, found(pic("/srv/out/end.png")))
+        val steps = steps { check(text, found(pic("/srv/out/end.png"))) }
+        assertTrue("$steps steps", steps <= 3L * text.length)
     }
 
     @Test
@@ -219,7 +235,9 @@ class AttachmentScanTest {
 
     @Test
     fun nbspBeforeTagIsNotStripped() {
-        check(" MEDIA:/srv/out/a.png", none)
+        val text = "\u00A0MEDIA:/srv/out/a.png"
+        assertEquals(0x00A0, text.codePointAt(0))
+        check(text, none)
         check("MEDIA:/srv/out/a.png", found(pic("/srv/out/a.png"), tagOnly = true))
     }
 
@@ -240,7 +258,10 @@ class AttachmentScanTest {
 
     @Test
     fun loneSurrogateIsRefused() {
-        check("MEDIA:/srv/out/a\uD800.png", none)
+        val text = "MEDIA:/srv/out/a\uD800.png"
+        assertEquals(0xD800, text.codePointAt(16)) // unpaired: codePointAt returns the lone unit
+        assertTrue(Character.isSurrogate(text[16]) && !Character.isSurrogate(text[17]))
+        check(text, none)
         check("MEDIA:/srv/out/a.png", found(pic("/srv/out/a.png"), tagOnly = true))
     }
 
@@ -262,5 +283,129 @@ class AttachmentScanTest {
         check("![chart](data:image/png;base64,iVBORw0KGgo)", none)
         check("MEDIA:data:image/png;base64,iVBORw0KGgo", none)
         check("See /srv/out/chart.png here", found(pic("/srv/out/chart.png")))
+    }
+
+    @Test
+    fun codeSpanSkipsRunsOfOtherLengths() {
+        check("Run ``a ` /srv/a.png `` now", none)
+        check("Run ``a`` /srv/a.png now", found(pic("/srv/a.png")))
+    }
+
+    @Test
+    fun mixedBacktickRunLengthsStayLinear() {
+        val text = "x " + (1..60).joinToString(" ") { "`".repeat(it) } + " " + "y".repeat(2000) + " /srv/out/a.png"
+        assertTrue(text.length <= 4096)
+        val steps = steps { check(text, found(pic("/srv/out/a.png"))) }
+        assertTrue("$steps steps", steps <= 3L * text.length)
+    }
+
+    @Test
+    fun linesAfterTheSixteenthAttachmentAreNotRead() {
+        val paths = (1..16).map { "/srv/out/p${it.toString().padStart(2, '0')}.png" }
+        val head = paths.joinToString("\n") { "MEDIA:$it" }
+        val text = head + "\n" + "x\n".repeat(100_000)
+        val steps = steps { check(text, AttachmentScan(paths.map(::pic), false)) }
+        assertTrue("$steps steps", steps <= 2L * head.length)
+    }
+
+    @Test
+    fun stopAt16InsideOneProseLine() {
+        val paths = (1..17).map { "/srv/p$it.png" }
+        check(paths.joinToString(" "), AttachmentScan(paths.take(16).map(::pic), false))
+    }
+
+    @Test
+    fun shellPromptLimitIs64Utf16Units() {
+        check("a".repeat(63) + "\$ /srv/out/a.png", none)
+        check("a".repeat(64) + "\$ /srv/out/a.png", found(pic("/srv/out/a.png")))
+        val prompt = String(Character.toChars(0x1F600)).repeat(32) + "\$"
+        assertEquals(0x1F600, prompt.codePointAt(0))
+        assertEquals(65, prompt.length)
+        assertEquals(33, prompt.codePointCount(0, prompt.length))
+        check("$prompt /srv/out/a.png", found(pic("/srv/out/a.png")))
+    }
+
+    @Test
+    fun listMarkers() {
+        check("-MEDIA:/srv/a.png", none)
+        check("- - MEDIA:/srv/a.png", none)
+        for (marker in listOf("-", "*", "+", "1.", "2)")) check("$marker MEDIA:/srv/a.png", found(pic("/srv/a.png"), tagOnly = true))
+        check("-\t MEDIA:/srv/a.png", found(pic("/srv/a.png"), tagOnly = true))
+    }
+
+    @Test
+    fun digitMarkerHasOneToNineDigits() {
+        check("1234567890. MEDIA:/srv/a.png", none)
+        check("123456789. MEDIA:/srv/a.png", found(pic("/srv/a.png"), tagOnly = true))
+    }
+
+    @Test
+    fun backtickQuotedTag() {
+        check("MEDIA:`/srv/out/a`b.png`", none)
+        check("MEDIA:`/srv/out/my chart.png`", found(pic("/srv/out/my chart.png"), tagOnly = true))
+    }
+
+    @Test
+    fun tagDropsOnePunctAndTrailingWs() {
+        check("MEDIA:/srv/a.png..", none)
+        check("MEDIA:/srv/a.png. \t", found(pic("/srv/a.png"), tagOnly = true))
+    }
+
+    @Test
+    fun suffixIsCaseInsensitiveAndAsciiOnly() {
+        val text = "MEDIA:/srv/out/a.p\u00E9g"
+        assertEquals(0x00E9, text.codePointAt(text.length - 2))
+        check(text, none)
+        check("MEDIA:/srv/out/a.PnG", found(pic("/srv/out/a.PnG"), tagOnly = true))
+    }
+
+    @Test
+    fun allFivePictureSuffixes() {
+        check("/s/a.bmp", none)
+        val paths = listOf("/s/a.png", "/s/b.jpg", "/s/c.jpeg", "/s/d.gif", "/s/e.webp")
+        check(paths.joinToString(" "), AttachmentScan(paths.map(::pic), false))
+    }
+
+    @Test
+    fun pathLimitIs1024Units() {
+        val path = "/" + "a".repeat(1019) + ".png"
+        assertEquals(1024, path.length)
+        check(path.dropLast(4) + "a.png", none)
+        check(path, found(pic(path)))
+    }
+
+    @Test
+    fun emptyNameBeforeDotIsNoPath() {
+        check("/srv/out/.png", none)
+        check("/srv/out/a.png", found(pic("/srv/out/a.png")))
+    }
+
+    @Test
+    fun controlAndFillerCharactersAreRefused() {
+        val control = "MEDIA:/srv/a\u0001.png"
+        val filler = "MEDIA:/srv/a\u3164.png"
+        assertEquals(0x0001, control.codePointAt(12))
+        assertEquals(0x3164, filler.codePointAt(12))
+        check(control, none)
+        check(filler, none)
+        check("MEDIA:/srv/a.png", found(pic("/srv/a.png"), tagOnly = true))
+    }
+
+    @Test
+    fun singleQuoteOpensAfterParenthesis() {
+        check("(' /srv/a.png ' x", none)
+        check("( /srv/a.png ' x", found(pic("/srv/a.png")))
+    }
+
+    @Test
+    fun spanContentIsNotTrimmed() {
+        check("Saved as \" /srv/a.png\".", none)
+        check("Saved as \"/srv/a.png\".", found(pic("/srv/a.png")))
+    }
+
+    @Test
+    fun closerMayEndInWhitespace() {
+        check("```\n``` x\nMEDIA:/srv/a.png", none)
+        check("```\n```  \t\nMEDIA:/srv/a.png", found(pic("/srv/a.png")))
     }
 }
