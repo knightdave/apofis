@@ -294,4 +294,15 @@
     <string name="chat_tool_calls_not_stored">Wywołania narzędzi niezapisane na tym telefonie: %1$d</string>
     <string name="chat_reply_shortened">Skrócono na tym telefonie; pełny tekst jest na serwerze</string>
     <string name="licenses_apache">Licencja Apache 2.0</string>
+    <string name="attachment_image">Obraz: %1$s</string>
+    <string name="attachment_file">Plik: %1$s</string>
+    <string name="attachment_off">Na serwerze, nie widać go tutaj</string>
+    <string name="attachment_loading">Wczytywanie obrazu</string>
+    <string name="attachment_unavailable">Nie można pobrać pliku z folderów obrazów</string>
+    <string name="attachment_failed">Nie udało się wczytać</string>
+    <string name="attachment_too_large">Za duży, by go wczytać</string>
+    <string name="attachment_preview_too_large">Za duży na podgląd</string>
+    <string name="attachment_not_picture">To nie jest obsługiwany obraz</string>
+    <string name="attachment_open">Otwórz obraz</string>
+    <string name="attachment_copy_path">Kopiuj ścieżkę pliku</string>
 </resources>

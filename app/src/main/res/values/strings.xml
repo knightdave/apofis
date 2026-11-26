@@ -298,4 +298,15 @@
     <string name="chat_tool_calls_not_stored">Tool calls not stored on this phone: %1$d</string>
     <string name="chat_reply_shortened">Shortened on this phone; the full text is on the server</string>
     <string name="licenses_apache">Apache License 2.0</string>
+    <string name="attachment_image">Image: %1$s</string>
+    <string name="attachment_file">File: %1$s</string>
+    <string name="attachment_off">On the server, not shown here</string>
+    <string name="attachment_loading">Loading picture</string>
+    <string name="attachment_unavailable">Cannot fetch from the picture folders</string>
+    <string name="attachment_failed">Could not load</string>
+    <string name="attachment_too_large">Too large to load</string>
+    <string name="attachment_preview_too_large">Too large for a preview</string>
+    <string name="attachment_not_picture">Not a supported picture</string>
+    <string name="attachment_open">Open picture</string>
+    <string name="attachment_copy_path">Copy file path</string>
 </resources>

@@ -1,5 +1,6 @@
 package xyz.rycerz.apofis.media
 
+import kotlinx.coroutines.flow.Flow
 import xyz.rycerz.apofis.ui.chat.lf
 
 enum class AttachmentKind { PICTURE, FILE }
@@ -205,4 +206,25 @@ private fun runEnd(s: CharSequence, from: Int): Int {
     var k = from
     while (k < s.length && s[k] == '`') k++
     return k
+}
+
+sealed interface AttachmentState { // Off, Loading, Bound(digest: String), Unavailable, Failed, TooLarge, NotPicture
+    data object Off : AttachmentState
+    data object Loading : AttachmentState
+    data class Bound(val digest: String) : AttachmentState
+    data object Unavailable : AttachmentState
+    data object Failed : AttachmentState
+    data object TooLarge : AttachmentState
+    data object NotPicture : AttachmentState
+}
+
+interface Attachments {
+    fun state(replyKey: String, path: String): Flow<AttachmentState>
+    fun retry(replyKey: String, path: String)
+    /** The identity's current attempt generation. A caller reads it before any suspension and passes it to [repair]. */
+    fun generation(replyKey: String, path: String): Long
+    /** Removes the binding only if it still holds [digest] and [generation] is still the identity's current one. */
+    fun repair(replyKey: String, path: String, digest: String, generation: Long)
+    /** Spec 6.3's form: a repair against the generation current at this call. */
+    fun repair(replyKey: String, path: String, digest: String) = repair(replyKey, path, digest, generation(replyKey, path))
 }
