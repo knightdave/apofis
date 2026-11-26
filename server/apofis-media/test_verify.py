@@ -19,7 +19,6 @@ import socket
 import stat
 import struct
 import tempfile
-import threading
 import unittest
 import warnings
 from unittest import mock
@@ -776,7 +775,6 @@ class FixtureTest(Base):
                 raise KeyboardInterrupt()  # raised directly: no mask can defer it
         for case in ("after the checks", "after a setup failure"):
             with self.subTest(case=case):
-                answers = None
                 real_write = os.write
 
                 def write(fd, data):
@@ -787,7 +785,7 @@ class FixtureTest(Base):
                     stack.enter_context(self.wrap_lstat(interrupt))
                     if case == "after a setup failure":
                         stack.enter_context(mock.patch.object(os, "write", side_effect=write))
-                    code, lines = self.run_verify(Fake(answers))
+                    code, lines = self.run_verify(Fake())
                 if case == "after the checks":
                     self.assertEqual(lines, ["V%d PASS" % n for n in range(1, 9)] + ["V9 FAIL"])
                 else:
