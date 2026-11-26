@@ -468,12 +468,12 @@ class RunTest(Base):
     def test_read_budget_small_and_short_bodies(self):
         fake = Fake({5: lambda req: Resp(200, jbody(PING_OK), short=10)})
         code, lines = self.run_verify(fake)
-        self.assertEqual(lines[4], "V5 FAIL")
-        self.assertEqual(lines[5:], ["V6 PASS", "V7 PASS", "V8 PASS", "V9 PASS"])
         self.assertEqual(len(fake.responses), 8)
         for resp in fake.responses:  # small valid bodies and the short source alike
             self.assertTrue(resp.asked)
             self.assertLessEqual(sum(resp.asked), LIMIT + 1)
+        self.assertEqual(lines[4], "V5 FAIL")
+        self.assertEqual(lines[5:], ["V6 PASS", "V7 PASS", "V8 PASS", "V9 PASS"])
         self.assert_no_fixture()
 
     def test_negative_line_refuses_bad_framing_and_constants(self):
