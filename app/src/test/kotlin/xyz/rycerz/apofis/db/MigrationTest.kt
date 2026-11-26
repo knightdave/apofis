@@ -9,8 +9,12 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -278,6 +282,9 @@ class MigrationTest {
         }
     }
 
+    /** The first emission, bounded in real time: Room emits from its own threads, so a virtual clock would not do. */
+    private suspend fun <T> Flow<T>.firstWithin(): T = withContext(Dispatchers.Default) { withTimeout(10_000) { first() } }
+
     private val d1 = "a".repeat(64)
     private val d2 = "b".repeat(64)
 
@@ -319,7 +326,7 @@ class MigrationTest {
             val dao = db.sessionDao()
             assertEquals(session("apofis-a").copy(title = "Chat", messageCount = 1, model = "m1", provider = "p1", reasoning = "high", fast = true), dao.get("apofis-a"))
             assertEquals(session("apofis-n").copy(startedAt = 2.0, existsOnServer = false, createStarted = true), dao.get("apofis-n"))
-            assertEquals(emptyList<AgentFileEntity>(), db.agentFileDao().observe("apofis-a").first()) // the new table exists, empty
+            assertEquals(emptyList<AgentFileEntity>(), db.agentFileDao().observe("apofis-a").firstWithin()) // the new table exists, empty
             assertEquals(emptyList<String>(), db.agentFileDao().digests())
         } finally {
             db.close()
@@ -334,10 +341,10 @@ class MigrationTest {
             val dao = db.agentFileDao()
             val path = "/srv/out/chart.png"
             val one = AgentFileEntity("apofis-a", 1, path, d1)
-            val two = AgentFileEntity("apofis-a", 2, path, d2) // another reply naming the same path
+            val two = AgentFileEntity("apofis-a", 2, path, d1) // another reply naming the same picture, the same bytes
             dao.insert(one)
             dao.insert(two)
-            assertEquals(listOf(one, two), dao.observe("apofis-a").first())
+            assertEquals(listOf(one, two), dao.observe("apofis-a").firstWithin())
             assertEquals(one, dao.get("apofis-a", 1, path))
             assertEquals(two, dao.get("apofis-a", 2, path))
             dao.insert(one.copy(digest = "c".repeat(64)))
@@ -346,11 +353,13 @@ class MigrationTest {
             assertEquals(one, dao.get("apofis-a", 1, path))
             assertEquals(1, dao.deleteIf("apofis-a", 1, path, d1))
             assertNull(dao.get("apofis-a", 1, path))
-            assertEquals(listOf(d2), dao.digests())
-            dao.insert(AgentFileEntity("apofis-gone", 1, path, d1)) // no chat row
+            assertEquals(two, dao.get("apofis-a", 2, path)) // only the named reply's binding went
+            assertEquals(listOf(d1), dao.digests())
+            assertEquals(listOf(two), dao.observe("apofis-a").firstWithin())
+            dao.insert(AgentFileEntity("apofis-gone", 1, path, d2)) // no chat row
             dao.deleteOrphans()
-            assertEquals(listOf(d2), dao.digests())
-            assertEquals(listOf(two), dao.observe("apofis-a").first())
+            assertEquals(listOf(d1), dao.digests())
+            assertEquals(listOf(two), dao.observe("apofis-a").firstWithin())
         } finally {
             db.close()
         }

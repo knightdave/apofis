@@ -470,11 +470,16 @@ class ImageGcTest {
     @Test
     fun deletedChatAgentFilesGo() {
         session("apofis-x")
-        val d = file(1)
-        agentFile("apofis-x", 1, d)
+        session("apofis-y") // a live chat: its binding and file must survive
+        val gone = file(1)
+        val kept = file(2)
+        agentFile("apofis-x", 1, gone)
+        agentFile("apofis-y", 1, kept)
+        assertEquals(setOf(gone, kept), wait { db.agentFileDao().digests() }.toSet())
         deleteAnswers("apofis-x")
         deleteAndAwaitItsCollection("apofis-x")
-        assertEquals(emptyList<String>(), wait { db.agentFileDao().digests() })
-        assertFalse(exists(d))
+        assertEquals(listOf(kept), wait { db.agentFileDao().digests() })
+        assertFalse(exists(gone))
+        assertTrue(exists(kept))
     }
 }
