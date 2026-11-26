@@ -397,7 +397,7 @@ class RunTest(Base):
             "transfer encoding": http(401, body, headers=["Content-Length: %d" % n, "Transfer-Encoding: chunked"]),
             "chunked": http(401, b"%x\r\n" % n + body + b"\r\n0\r\n\r\n", headers=["Transfer-Encoding: chunked"]),
             "short body": http(401, body, headers=["Content-Length: %d" % (n + 40)]),
-            "bytes after the body": http(401, body) + b"\r\nextra",
+            "bytes after the body": http(401, body) + b"  \r\n",  # JSON alone would accept this tail
             "no end of headers": b"HTTP/1.1 401 X\r\nContent-Length: %d\r\n" % n,
             "bare line feeds": b"HTTP/1.1 401 X\nContent-Length: %d\n\n" % n + body,
             "bad header line": http(401, body, headers=["Content-Length: %d" % n, "no colon here"]),
@@ -476,9 +476,10 @@ class RunTest(Base):
     def test_interrupt_only_sets_the_flag(self):
         for at, times in ((2, 1), (6, 1), (6, 2)):
             with self.subTest(at=at, times=times):
-                fake, out = Fake(), WatchedOut()
+                fake, out, clock = Fake(), WatchedOut(), Clock()  # the clock never moves: only the flag stops
                 fake.answers[at] = interrupt_then(fake, out, times)
-                code, lines = self.run_verify(fake, out=out)
+                with mock.patch.object(verify, "time", types.SimpleNamespace(monotonic=clock.monotonic)):
+                    code, lines = self.run_verify(fake, out=out)
                 self.assertEqual(lines, PASS8[:at - 1] + ["V%d FAIL" % m for m in range(at, 10)])
                 self.assertEqual(code, 1)
                 self.assertEqual(fake.aborts, 1)
