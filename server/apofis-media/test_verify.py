@@ -9,6 +9,7 @@ import getpass
 import http.client
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -18,6 +19,7 @@ import socket
 import stat
 import struct
 import tempfile
+import threading
 import unittest
 import warnings
 from unittest import mock
@@ -72,11 +74,15 @@ def tearDownModule():
 class Resp:
     """A scripted answer. Records every size asked of its body and how many bytes it handed out."""
 
-    def __init__(self, status, body=b"", ctype="application/json", on_read=None):
+    def __init__(self, status, body=b"", ctype="application/json", on_read=None, length=None, short=None,
+                 on_close=None):
         self.status, self._body, self._ctype, self._on_read = status, body, ctype, on_read
+        self._length, self._short, self._on_close = length, short, on_close
         self._pos, self.asked, self.given = 0, [], 0
 
     def getheader(self, name, default=None):
+        if name.lower() == "content-length" and self._length is not None:
+            return str(self._length)
         return self._ctype if name.lower() == "content-type" else default
 
     def read(self, n=None):
@@ -84,13 +90,41 @@ class Resp:
         if self._on_read:
             self._on_read()
         end = len(self._body) if n is None or n < 0 else self._pos + n
+        if self._short:  # a source that hands out fewer bytes than asked
+            end = min(end, self._pos + self._short)
         chunk = self._body[self._pos:end]
         self._pos += len(chunk)
         self.given += len(chunk)
         return chunk
 
     def close(self):
-        pass
+        if self._on_close:
+            self._on_close()
+
+
+class MemSock:
+    """Stands in for a socket: http.client reads the whole answer from memory, nothing is opened."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def makefile(self, *a, **k):
+        return io.BytesIO(self.raw)
+
+
+def http_answer(status, body, length=None):
+    """A real http.client.HTTPResponse parsed from memory; `length` overrides the announced length."""
+    head = "HTTP/1.1 %d X\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % (
+        status, len(body) if length is None else length)
+    resp = http.client.HTTPResponse(MemSock(head.encode() + body))
+    resp.begin()
+    return resp
+
+
+def raiser(exc):
+    def go():
+        raise exc
+    return go
 
 
 def jbody(obj):
@@ -120,7 +154,7 @@ class Fake:
     line to a Resp factory taking the recorded request, or to an exception to raise."""
 
     def __init__(self, answers=None, log=None):
-        self.answers, self.log, self.requests = answers or {}, log, []
+        self.answers, self.log, self.requests, self.responses = answers or {}, log, [], []
 
     @staticmethod
     def line_of(path, headers, body):
@@ -144,7 +178,9 @@ class Fake:
         answer = self.answers.get(line)
         if isinstance(answer, BaseException):
             raise answer
-        return answer(req) if answer else self.default(line, req)
+        resp = answer(req) if answer else self.default(line, req)
+        self.responses.append(resp)
+        return resp
 
     @staticmethod
     def default(line, req):
@@ -164,6 +200,43 @@ def fire_deadline():
     signal.getsignal(signal.SIGALRM)(signal.SIGALRM, None)
 
 
+def blocked_now():
+    return {signal.SIGINT, signal.SIGALRM} & set(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+
+
+class SignalOut(io.StringIO):
+    """An output that sends itself a real signal while one exact line is being written."""
+
+    def __init__(self, sig, line):
+        super().__init__()
+        self.sig, self.line = sig, line
+
+    def write(self, text):
+        if text == self.line + "\n":
+            signal.raise_signal(self.sig)
+        return super().write(text)
+
+
+@contextlib.contextmanager
+def channels():
+    """Captures real stdout, stderr and every log record of any logger."""
+    got = {"stdout": io.StringIO(), "stderr": io.StringIO(), "log": []}
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            got["log"].append(self.format(record))
+    root, handler = logging.getLogger(), Keep(logging.DEBUG)
+    level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        with contextlib.redirect_stdout(got["stdout"]), contextlib.redirect_stderr(got["stderr"]):
+            yield got
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(level)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.home = self.tmpdir()
@@ -178,10 +251,19 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         return d
 
-    def run_verify(self, fake, home=None):
-        out = io.StringIO()
-        code = verify.run(fake, home or self.home, REAL_KEY, out)
+    def run_verify(self, fake, home=None, out=None):
+        out = io.StringIO() if out is None else out
+        try:
+            code = verify.run(fake, home or self.home, REAL_KEY, out)
+        except KeyboardInterrupt:  # a failure of this test, not of the whole process
+            self.fail("an interruption escaped run")
+        self.assertEqual(blocked_now(), set())  # no signal left blocked
         return code, out.getvalue().splitlines()
+
+    def assert_no_keyed_request(self, fake):
+        for r in fake.requests:
+            self.assertNotIn(REAL_KEY, r["headers"].get("Authorization", ""))
+            self.assertNotIn(REAL_KEY.encode(), r["body"] or b"")
 
     def assert_no_fixture(self, folder=None):
         self.assertEqual(os.listdir(folder or self.images), [])
@@ -282,12 +364,13 @@ class RunTest(Base):
     def test_v5_exact_types(self):
         cases = [("protocol", True), ("protocol", "1"), ("protocol", 1.0), ("ready", "true"), ("ready", 1),
                  ("max_bytes", 0), ("max_bytes", -1), ("max_bytes", True), ("types", "notpng"),
-                 ("types", ["jpeg"]), ("types", [1]), ("name", "apofis-other")]
+                 ("types", ["jpeg"]), ("types", [1]), ("types", ["png", 1]), ("name", "apofis-other")]
         for field, value in cases:
             with self.subTest(field=field, value=value):
                 body = dict(PING_OK, **{field: value})
                 code, lines = self.run_verify(Fake({5: lambda req: Resp(200, jbody(body))}))
                 self.assertEqual(lines[4], "V5 FAIL")
+                self.assertEqual(lines[5:], ["V6 PASS", "V7 PASS", "V8 PASS", "V9 PASS"])
                 self.assertNotEqual(code, 0)
 
     def test_proxy_error_page_fails(self):
@@ -299,10 +382,13 @@ class RunTest(Base):
                 self.assertNotEqual(code, 0)
 
     def test_oversized_bodies_fail_and_clean_up(self):
-        huge = b"a" * (1 << 20)
-        for n, ctype in ((5, "application/json"), (6, "image/png"), (7, "application/json")):
+        pad = "x" * (1 << 20)
+        png = verify.PNG + b"\0" * (1 << 20)  # the fixture's own bytes, padded past the limit
+        answers = {5: (200, jbody(dict(PING_OK, pad=pad)), "application/json"), 6: (200, png, "image/png"),
+                   7: (415, jbody({"error": {"code": "not_a_picture", "message": pad}}), "application/json")}
+        for n, (status, body, ctype) in answers.items():
             with self.subTest(line=n):
-                resp = Resp({5: 200, 6: 200, 7: 415}[n], huge, ctype)
+                resp = Resp(status, body, ctype)
                 code, lines = self.run_verify(Fake({n: lambda req: resp}))
                 self.assertEqual(lines[n - 1], "V%d FAIL" % n)
                 self.assertNotEqual(code, 0)
@@ -378,6 +464,101 @@ class RunTest(Base):
                     self.assertNotIn(canary, text)
                 self.assertEqual(len(lines), 9)
                 self.assert_fixed_lines(lines)
+
+
+    def test_read_budget_small_and_short_bodies(self):
+        fake = Fake({5: lambda req: Resp(200, jbody(PING_OK), short=10)})
+        code, lines = self.run_verify(fake)
+        self.assertEqual(lines[4], "V5 FAIL")
+        self.assertEqual(lines[5:], ["V6 PASS", "V7 PASS", "V8 PASS", "V9 PASS"])
+        self.assertEqual(len(fake.responses), 8)
+        for resp in fake.responses:  # small valid bodies and the short source alike
+            self.assertTrue(resp.asked)
+            self.assertLessEqual(sum(resp.asked), LIMIT + 1)
+        self.assert_no_fixture()
+
+    def test_negative_line_refuses_bad_framing_and_constants(self):
+        good = {"error": {"code": "gateway_auth_failed", "message": "fixed", "type": "gateway_auth_error"}}
+        body = jbody(good)
+        cases = {
+            "NaN": lambda req: Resp(401, body[:-1] + b', "x": NaN}'),
+            "Infinity": lambda req: Resp(401, body[:-1] + b', "x": Infinity}'),
+            "-Infinity": lambda req: Resp(401, body[:-1] + b', "x": -Infinity}'),
+            "short framing": lambda req: http_answer(401, body, length=len(body) + 40),
+            "announced over limit": lambda req: Resp(401, body, length=LIMIT + 1),
+        }
+        for n in (1, 3):
+            for case, answer in cases.items():
+                with self.subTest(line=n, case=case):
+                    fake = Fake({n: answer})
+                    code, lines = self.run_verify(fake)
+                    self.assertEqual(lines[n - 1], "V%d FAIL" % n)
+                    self.assertEqual(lines[4:8], ["V5 FAIL", "V6 FAIL", "V7 FAIL", "V8 FAIL"])
+                    self.assert_no_keyed_request(fake)
+                    self.assertTrue(set(fake.lines()) <= {1, 2, 3, 4})
+                    self.assertEqual(code, 1)
+                    self.assert_no_fixture()
+                    if case == "announced over limit":
+                        self.assertEqual(fake.responses[n - 1].asked, [])
+
+    def test_memory_backed_answers_pass(self):
+        body = jbody({"error": {"code": "gateway_auth_failed", "message": "fixed"}})
+        fake = Fake({n: (lambda req: http_answer(401, body)) for n in (1, 2, 3, 4)})
+        code, lines = self.run_verify(fake)
+        self.assertEqual((code, lines), (0, ALL_PASS))
+
+    def test_deadline_latched_when_swallowed(self):
+        def swallow(req):
+            try:
+                fire_deadline()
+            except BaseException:
+                pass
+            return Resp(200, file_bytes(path_of(req)), "image/png")
+        before = signal.getsignal(signal.SIGALRM)
+        fake = Fake({6: swallow})
+        code, lines = self.run_verify(fake)
+        self.assertEqual(fake.lines(), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(lines[5:], ["V6 FAIL", "V7 FAIL", "V8 FAIL", "V9 PASS"])
+        self.assertEqual(code, 1)
+        self.assertEqual(signal.getsignal(signal.SIGALRM), before)
+        self.assert_no_fixture()
+
+    def test_close_error_cannot_hide_deadline_or_interrupt(self):
+        before = signal.getsignal(signal.SIGALRM)
+        cases = {"deadline": (fire_deadline, ["V6 FAIL", "V7 FAIL", "V8 FAIL", "V9 PASS"]),
+                 "interrupt": (raiser(KeyboardInterrupt()), ["V6 FAIL", "V7 FAIL", "V8 FAIL", "V9 FAIL"])}
+        for case, (on_read, tail) in cases.items():
+            with self.subTest(case=case):
+                self.setitimer.reset_mock()
+
+                def answer(req):
+                    return Resp(200, file_bytes(path_of(req)), "image/png", on_read=on_read,
+                                on_close=raiser(OSError(EXC_CANARY)))
+                fake = Fake({6: answer})
+                code, lines = self.run_verify(fake)
+                self.assertEqual(fake.lines(), [1, 2, 3, 4, 5, 6])
+                self.assertEqual(lines[5:], tail)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.setitimer.call_args_list[-1], mock.call(signal.ITIMER_REAL, 0))
+                self.assertEqual(signal.getsignal(signal.SIGALRM), before)
+                self.assert_no_fixture()
+
+    def test_signal_at_publication(self):
+        passed = ["V%d PASS" % n for n in range(1, 9)]
+        cases = [
+            (signal.SIGALRM, "V5 PASS", passed[:5] + ["V6 FAIL", "V7 FAIL", "V8 FAIL", "V9 PASS"], [1, 2, 3, 4, 5]),
+            (signal.SIGALRM, "V8 PASS", ALL_PASS, list(range(1, 9))),
+            (signal.SIGINT, "V5 PASS", passed[:5] + ["V6 FAIL", "V7 FAIL", "V8 FAIL", "V9 FAIL"], [1, 2, 3, 4, 5]),
+            (signal.SIGINT, "V8 PASS", passed + ["V9 FAIL"], list(range(1, 9))),
+        ]
+        for sig, at, want, requested in cases:
+            with self.subTest(signal=sig.name, at=at):
+                fake = Fake()
+                code, lines = self.run_verify(fake, out=SignalOut(sig, at))
+                self.assertEqual(lines, want)
+                self.assertEqual(code, 0 if want == ALL_PASS else 1)
+                self.assertEqual(fake.lines(), requested)
+                self.assert_no_fixture()
 
 
 class FixtureTest(Base):
@@ -546,8 +727,116 @@ class FixtureTest(Base):
         self.assertFalse(os.path.exists(os.path.join(self.images, absent)))
 
 
+    def wrap_lstat(self, act):
+        """Wrap os.lstat: after each lstat by descriptor of an existing PNG fixture, call act(count)."""
+        real_lstat, count = os.lstat, []
+
+        def lstat(path, *a, dir_fd=None, **k):
+            st = real_lstat(path, *a, dir_fd=dir_fd, **k)
+            if dir_fd is not None and PNG_NAME.match(path):
+                count.append(path)
+                act(len(count))
+            return st
+        return mock.patch.object(os, "lstat", side_effect=lstat)
+
+    def test_interrupt_during_create_keeps_ownership(self):
+        for which in (1, 2):
+            with self.subTest(create=which):
+                real_open = os.open
+                made = []
+
+                def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+                    fd = real_open(path, flags, mode, dir_fd=dir_fd)
+                    if flags & os.O_EXCL:
+                        made.append(fd)
+                        if len(made) == which:
+                            signal.raise_signal(signal.SIGINT)  # right after the create, before its return
+                    return fd
+                fake = Fake()
+                with mock.patch.object(os, "open", side_effect=fake_open):
+                    code, lines = self.run_verify(fake)
+                self.assertEqual(lines, ["FAIL setup"])
+                self.assertEqual(code, 1)
+                self.assertEqual(fake.requests, [])
+                self.assert_no_fixture()
+
+    def test_interrupt_in_cleanup_step_is_deferred(self):
+        def interrupt(count):
+            if count == 1:
+                signal.raise_signal(signal.SIGINT)
+        with self.wrap_lstat(interrupt):
+            code, lines = self.run_verify(Fake())
+        self.assertEqual(lines, ALL_PASS)  # V9 is the real result; the interruption arrives after it
+        self.assertEqual(code, 1)
+        self.assert_no_fixture()
+
+    def test_cleanup_keeps_entry_until_handled(self):
+        def interrupt(count):
+            if count <= 2:
+                raise KeyboardInterrupt()  # raised directly: no mask can defer it
+        for case in ("after the checks", "after a setup failure"):
+            with self.subTest(case=case):
+                answers = None
+                real_write = os.write
+
+                def write(fd, data):
+                    if data == verify.TEXT:
+                        raise OSError(errno.ENOSPC, "second write")
+                    return real_write(fd, data)
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(self.wrap_lstat(interrupt))
+                    if case == "after a setup failure":
+                        stack.enter_context(mock.patch.object(os, "write", side_effect=write))
+                    code, lines = self.run_verify(Fake(answers))
+                if case == "after the checks":
+                    self.assertEqual(lines, ["V%d PASS" % n for n in range(1, 9)] + ["V9 FAIL"])
+                else:
+                    self.assertEqual(lines, ["FAIL setup"])
+                self.assertEqual(code, 1)
+                self.assert_no_fixture()
+
+    def test_fixture_close_error_fails_v9(self):
+        real_close = os.close
+        closed = []
+
+        def close(fd):
+            closed.append(fd)
+            real_close(fd)
+            if fd == self.creates[0]:
+                raise OSError(errno.EIO, EXC_CANARY)
+        with self.wrap_open(), mock.patch.object(os, "close", side_effect=close):
+            code, lines = self.run_verify(Fake())
+        self.assertEqual(lines, ["V%d PASS" % n for n in range(1, 9)] + ["V9 FAIL"])
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted(closed), sorted(self.opened))  # every descriptor closed, none twice
+        self.assertEqual(closed.count(self.creates[0]), 1)
+        self.assert_no_fixture()
+
+    def test_v8_name_checked_absent(self):
+        real_hex = secrets.token_hex
+        for case in ("same as the PNG fixture", "an existing entry"):
+            with self.subTest(case=case):
+                third = "a" * 32 if case == "same as the PNG fixture" else "c" * 32
+                hexes = iter(["a" * 32, "b" * 32, third])
+                taken = os.path.join(self.images, "apofis-verify-%s.png" % ("c" * 32))
+                if case == "an existing entry":
+                    os.symlink(os.path.join(self.home, "nowhere"), taken)  # dangling: only lstat sees it
+                fake = Fake()
+                with mock.patch.object(secrets, "token_hex",
+                                       side_effect=lambda n=None: next(hexes) if n == 16 else real_hex(n)):
+                    code, lines = self.run_verify(fake)
+                self.assertEqual(lines, ["FAIL setup"])
+                self.assertEqual(code, 1)
+                self.assertEqual(fake.requests, [])
+                if case == "an existing entry":
+                    self.assertEqual(os.listdir(self.images), [os.path.basename(taken)])
+                    self.assertTrue(os.path.islink(taken))
+                    os.unlink(taken)
+                self.assert_no_fixture()
+
+
 class MainTest(Base):
-    def call_main(self, argv, key=REAL_KEY):
+    def call_main(self, argv, key=REAL_KEY, answers=None):
         """main() with getpass and the production transport replaced by recorders."""
         self.prompts, self.transports = [], []
 
@@ -559,7 +848,7 @@ class MainTest(Base):
 
         def transport(host, port):
             self.transports.append((host, port))
-            return Fake()
+            return Fake(answers)
         out, errout = io.StringIO(), io.StringIO()
         with mock.patch.object(getpass, "getpass", side_effect=prompt), \
                 mock.patch.object(verify, "HttpTransport", side_effect=transport), \
@@ -633,10 +922,84 @@ class MainTest(Base):
         self.assertEqual(self.prompts, ["API key: "])
         self.assertEqual(code, 0)
 
-    def test_production_transport_settings(self):
-        made = []
+    def test_help_and_unresolvable_arguments_refused(self):
+        for argv in (["-h"], ["--help"], ["--port", "8642", "-h", "--home", self.home]):
+            with self.subTest(argv=argv):
+                code, lines = self.call_main(argv)
+                self.assertEqual((code, lines, self.stderr), (2, ["FAIL arguments"], ""))
+                self.assertEqual((self.prompts, self.transports), ([], []))
+        with mock.patch.object(os, "getcwd", side_effect=FileNotFoundError(errno.ENOENT, EXC_CANARY)):
+            code, lines = self.call_main(["--port", "8642", "--home", "relative-home"])
+        self.assertEqual((code, lines, self.stderr), (2, ["FAIL arguments"], ""))
+        self.assertEqual((self.prompts, self.transports), ([], []))
+
+    def test_pre_network_failure_classified(self):
+        def broken(host, port):
+            raise RuntimeError(EXC_CANARY)
+        out, errout = io.StringIO(), io.StringIO()
+        with mock.patch.object(getpass, "getpass", return_value=REAL_KEY), \
+                mock.patch.object(verify, "HttpTransport", side_effect=broken), contextlib.redirect_stderr(errout):
+            code = verify.main(["--port", "8642", "--home", self.home], out)
+        self.assertEqual((code, out.getvalue(), errout.getvalue()), (1, "FAIL setup\n", ""))
+        self.assert_no_fixture()
+
+    def test_bad_keys_refused(self):
+        for key in ("", "line\nbreak", "carriage\r", "nul\0", "tab\tkey", "kl\u00fcssel", "del\x7f"):
+            with self.subTest(key=repr(key)):
+                code, lines = self.call_main(["--port", "8642", "--home", self.home], key=key)
+                self.assertEqual((code, lines), (2, ["FAIL key"]))
+                self.assertEqual(self.transports, [])
+                self.assert_no_fixture()
+
+    def test_privacy_on_every_channel(self):
+        def garbage(req):
+            return Resp(200, (BODY_CANARY + " " + path_of(req)).encode(), "text/plain")
+        runs = [
+            ("passing", REAL_KEY, None, 0),
+            ("failing", REAL_KEY, {2: RuntimeError(EXC_CANARY + " " + self.home)}, 1),
+            ("failing late", REAL_KEY, {5: RuntimeError(EXC_CANARY), 6: garbage, 7: garbage,
+                                        8: lambda req: Resp(500, BODY_CANARY.encode())}, 1),
+            ("bad key", REAL_KEY + "\n" + EXC_CANARY, None, 2),
+        ]
+        for case, key, answers, want in runs:
+            with self.subTest(case=case):
+                self.prompts, self.transports = [], []
+                with channels() as got, mock.patch.object(getpass, "getpass", return_value=key), \
+                        mock.patch.object(verify, "HttpTransport", side_effect=lambda h, p: Fake(answers)):
+                    code = verify.main(["--port", "8642", "--home", self.home])
+                self.assertEqual(code, want)
+                lines = got["stdout"].getvalue().splitlines()
+                self.assertTrue(lines)
+                self.assert_fixed_lines(lines)
+                everything = "\n".join([got["stdout"].getvalue(), got["stderr"].getvalue()] + got["log"])
+                for canary in (REAL_KEY, self.home, BODY_CANARY, EXC_CANARY, "apofis-verify", "cache"):
+                    self.assertNotIn(canary, everything)
+                self.assert_no_fixture()
+
+    def test_production_transport_lifecycle(self):
+        made, events = [], []
+
+        class Answer:  # a persistent HTTP/1.1 answer: the connection keeps its socket
+            status, will_close = 200, False
+
+            def __init__(self, fail_close=False):
+                self.fail_close = fail_close
+
+            def getheader(self, name, default=None):
+                return "application/json" if name.lower() == "content-type" else default
+
+            def read(self, n):
+                events.append(("read", n))
+                return b"{}"
+
+            def close(self):
+                events.append("response closed")
+                if self.fail_close:
+                    raise OSError(EXC_CANARY)
 
         class Conn:
+            mode = "ok"
+
             def __init__(self, *a, **k):
                 self.args, self.kwargs, self.calls = a, k, []
                 made.append(self)
@@ -645,22 +1008,43 @@ class MainTest(Base):
                 self.calls.append((method, url, body, dict(headers or {})))
 
             def getresponse(self):
-                return "response"
+                if Conn.mode == "raise":
+                    raise OSError(EXC_CANARY)
+                return Answer(fail_close=Conn.mode == "fail close")
 
             def connect(self):
                 raise AssertionError("no connection may be opened")
 
             def close(self):
-                pass
+                events.append("connection closed")
+
         with mock.patch.object(http.client, "HTTPConnection", Conn):
             transport = verify.HttpTransport("127.0.0.1", 8642)
-            got = transport("GET", PING, {"Authorization": "Bearer x"}, None)
-        self.assertEqual(got, "response")
-        self.assertEqual(len(made), 1)
+            answer = transport("GET", PING, {"Authorization": "Bearer x"}, None)
+            self.assertEqual((answer.status, answer.getheader("Content-Type")), (200, "application/json"))
+            self.assertEqual(answer.read(LIMIT + 1), b"{}")
+            self.assertNotIn("connection closed", events)  # kept until the answer is consumed
+            answer.close()
+            self.assertEqual(events[-2:], ["response closed", "connection closed"])
+
+            events.clear()
+            Conn.mode = "fail close"
+            answer = transport("GET", PING, {}, None)
+            with self.assertRaises(OSError):
+                answer.close()
+            self.assertEqual(events, ["response closed", "connection closed"])
+
+            events.clear()
+            Conn.mode = "raise"
+            with self.assertRaises(OSError):
+                transport("GET", PING, {}, None)
+            self.assertEqual(events, ["connection closed"])
+        self.assertEqual(len(made), 3)
         self.assertEqual((made[0].args, made[0].kwargs), (("127.0.0.1", 8642), {"timeout": 10}))
         method, url, body, headers = made[0].calls[0]
         self.assertEqual((method, url, body), ("GET", PING, None))
         self.assertEqual(headers["Authorization"], "Bearer x")
+        self.assertEqual(headers["Connection"], "close")
 
 
 if __name__ == "__main__":
