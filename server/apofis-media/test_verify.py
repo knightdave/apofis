@@ -853,7 +853,10 @@ class MainTest(Base):
         with mock.patch.object(getpass, "getpass", side_effect=prompt), \
                 mock.patch.object(verify, "HttpTransport", side_effect=transport), \
                 contextlib.redirect_stderr(errout):
-            code = verify.main(argv, out)
+            try:
+                code = verify.main(argv, out)
+            except BaseException as e:  # a test failure, never an escape from the test process
+                self.fail("main raised %s" % type(e).__name__)
         self.stderr = errout.getvalue()
         return code, out.getvalue().splitlines()
 
@@ -1044,7 +1047,7 @@ class MainTest(Base):
         method, url, body, headers = made[0].calls[0]
         self.assertEqual((method, url, body), ("GET", PING, None))
         self.assertEqual(headers["Authorization"], "Bearer x")
-        self.assertEqual(headers["Connection"], "close")
+        self.assertEqual(headers.get("Connection"), "close")
 
 
 if __name__ == "__main__":
