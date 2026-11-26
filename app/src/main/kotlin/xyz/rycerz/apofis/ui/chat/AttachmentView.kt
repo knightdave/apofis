@@ -4,6 +4,7 @@ import androidx.annotation.StringRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -16,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.key
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -23,7 +25,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboard
@@ -52,13 +53,23 @@ import xyz.rycerz.apofis.ui.theme.ApofisTheme
 val LocalAttachments = staticCompositionLocalOf<Attachments?> { null }
 
 /**
- * The row of [attachment], named by stored [reply] (spec 6.2). A FILE never asks for a state. A PICTURE collects
- * `state()` while the row is composed (collecting is the demand) and shows the file tile of that state.
+ * The row of [attachment], named by stored [reply] (spec 6.2). Its lazy slot is keyed by index, so a refresh can put
+ * another path into it: everything inside (the state collection, the Copy note) belongs to one coordinator, reply and
+ * path, and starts afresh when one of them changes.
  */
 @Composable
 internal fun AttachmentView(reply: AssistantReply, attachment: Attachment) {
-    if (attachment.kind == AttachmentKind.FILE) return FileTile(attachment.path, status = null)
     val attachments = LocalAttachments.current
+    key(attachments, reply.key, attachment.path) { AttachmentTile(attachments, reply, attachment) }
+}
+
+/**
+ * A FILE never asks for a state. A PICTURE collects `state()` while the row is composed (collecting is the demand) and
+ * shows the file tile of that state.
+ */
+@Composable
+private fun AttachmentTile(attachments: Attachments?, reply: AssistantReply, attachment: Attachment) {
+    if (attachment.kind == AttachmentKind.FILE) return FileTile(attachment.path, status = null)
     val state = if (attachments == null) {
         AttachmentState.Off
     } else {
@@ -98,6 +109,7 @@ private fun FileTile(path: String, @StringRes status: Int?, onRetry: (() -> Unit
     val label = stringResource(R.string.attachment_file, name)
     Row(
         Modifier
+            .padding(horizontal = 20.dp, vertical = 4.dp) // the reply prose inset (TextBlock); stacked tiles stay apart
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(colors.codeFill)
@@ -116,18 +128,19 @@ private fun FileTile(path: String, @StringRes status: Int?, onRetry: (() -> Unit
                 overflow = TextOverflow.Ellipsis,
             )
             if (status != null) Text(stringResource(status), style = MaterialTheme.typography.bodySmall, color = colors.muted)
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            FlowRow { // wraps, so a narrow or large-text tile keeps every button reachable
                 SmallTextButton(R.string.attachment_copy_path, { gate { scope.launch { note = copyText(clipboard, path); taps++ } } })
                 if (onRetry != null) SmallTextButton(R.string.chat_retry, { gate(onRetry) })
-                note?.let {
-                    Text(
-                        stringResource(it.note),
-                        Modifier.padding(horizontal = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },
-                        style = MaterialTheme.typography.labelMedium,
-                        color = colors.muted,
-                        maxLines = 1,
-                    )
-                }
+            }
+            note?.let {
+                Text(
+                    stringResource(it.note),
+                    Modifier.padding(start = 12.dp, end = 8.dp, bottom = 8.dp).semantics { liveRegion = LiveRegionMode.Polite },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colors.muted,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }
