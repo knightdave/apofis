@@ -223,6 +223,8 @@ class FenceTest(TempCase):
     def test_other_home_refused(self):
         home, other = self.make_home(), self.make_home()
         p = write(os.path.join(other, "cache", "images", "a.png"), PNG)
+        # The same name in the real home: without the home compare the walk would serve this file.
+        write(os.path.join(home, "cache", "images", "a.png"), PNG + b"home")
         self.assertEqual(serve(p, home, resolving), NOT_FOUND)
 
     def test_prefix_sibling_refused(self):
@@ -233,6 +235,9 @@ class FenceTest(TempCase):
         g = write(os.path.join(home, "cache", "generated", "images2", "a.png"), PNG)
         self.assertEqual(serve(g, home, resolving), NOT_FOUND)
         s = write(os.path.join(parent, "hx", "cache", "images", "a.png"), PNG)
+        # The same name in the real home: without the home compare, or with a string prefix in its
+        # place, the walk would serve this file.
+        write(os.path.join(home, "cache", "images", "a.png"), PNG + b"home")
         self.assertEqual(serve(s, home, resolving), NOT_FOUND)
 
     def test_link_out_of_folders_refused(self):
@@ -533,23 +538,24 @@ class ReadTest(TempCase):
         home, p = self.picture("a.png", PNG)
         real_close = os.close
 
-        def interrupt(*a, **k):
-            raise KeyboardInterrupt
+        def cases(exc):
+            def interrupt(*a, **k):
+                raise exc
 
-        def close_then_interrupt(fd):
-            real_close(fd)
-            raise KeyboardInterrupt
-        # Closes: home, cache during the walk, then the leaf and images in the final cleanup.
-        for name, fds, patches in (
-                ("read interrupted", FdTracker(), [mock.patch.object(os, "read", interrupt)]),
-                ("final close interrupted", FdTracker(on_close=close_then_interrupt, close_at=2), [])):
-            with self.subTest(name):
+            def close_then_interrupt(fd):
+                real_close(fd)
+                raise exc
+            # Closes: home, cache during the walk, then the leaf and images in the final cleanup.
+            return (("read interrupted", FdTracker(), [mock.patch.object(os, "read", interrupt)]),
+                    ("final close interrupted", FdTracker(on_close=close_then_interrupt, close_at=2), []))
+        for exc, (name, fds, patches) in [(e, c) for e in (KeyboardInterrupt, SystemExit) for c in cases(e)]:
+            with self.subTest(name, exc=exc.__name__):
                 try:
                     with fds:
                         for patch in patches:
                             patch.start()
                         try:
-                            with self.assertRaises(KeyboardInterrupt):
+                            with self.assertRaises(exc):
                                 media_core.serve(p, home, resolving, CAP)
                         finally:
                             for patch in patches:
@@ -697,6 +703,10 @@ class BodyTest(unittest.TestCase):
     def test_extra_byte_400(self):
         body = body_of("/srv/out/chart.png")
         self.assertBad(body + b" ", length=str(len(body)))
+        # At the limit: 8,192 valid bytes, then one more after a short read, is still refused.
+        full = b'{"path":' + b" " * (8192 - len(body)) + body[8:]
+        self.assertEqual(len(full), 8192)
+        self.assertBad(full, length="8192", reader=Reader([full, b" "]))
 
     def test_reads_stop_at_8193(self):
         body = body_of("/srv/out/chart.png")
