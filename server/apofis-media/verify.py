@@ -14,24 +14,22 @@ import getpass
 import ipaddress
 import json
 import os
-import queue
 import re
 import secrets
 import signal
 import socket
 import sys
-import threading
 import time
 import warnings
 
 DEADLINE_S = 60  # one wall-clock deadline for the whole network phase, on the monotonic clock
-TIMEOUT_S = 10  # per socket operation
+TIMEOUT_S = 10  # the longest connect, and the longest wait without a received byte
+SLICE_S = 0.25  # one receive wait; the flag and the deadline are looked at between slices
 BODY_LIMIT = 64 * 1024  # ping, error and file bodies alike
 HEAD_LIMIT = 8 * 1024  # status line and header lines of one answer
 ANSWER_LIMIT = HEAD_LIMIT + 4 + BODY_LIMIT  # the transport reads at most this plus one byte
 PING = "/apofis-media/v1/ping"
 FILE = "/apofis-media/v1/file"
-AUTH_FAILED = "gateway_auth_failed"
 PNG = bytes.fromhex(  # a valid 1 by 1 grey PNG
     "89504e470d0a1a0a0000000d49484452000000010000000108000000003a7e9b55"
     "0000000a49444154789c636000000002000148afa4710000000049454e44ae426082")
@@ -48,35 +46,30 @@ def key_ok(key):
     return isinstance(key, str) and bool(key) and key.isascii() and key.isprintable()
 
 
-class SocketTransport:
-    """One TCP connection per request to a numeric loopback address: no proxy, no redirect, TIMEOUT_S per
-    socket operation. Returns the raw answer, read until the peer closes or ANSWER_LIMIT + 1 bytes are in.
-    close() aborts the request in flight."""
-
-    def __init__(self, host, port):
-        self.host, self.port, self.sock = host, port, None
-
-    def __call__(self, request):
-        sock = socket.create_connection((self.host, self.port), timeout=TIMEOUT_S)
-        self.sock = sock
-        try:
-            sock.sendall(request)
-            data = b""
-            while len(data) <= ANSWER_LIMIT:
+def _exchange(address, request, flag, end):
+    """The raw answer, read until the peer closes; None once the flag is set, the deadline passes, ten seconds
+    go by without a byte or the answer outgrows ANSWER_LIMIT. The socket never leaves this function."""
+    if flag[0] or time.monotonic() >= end:
+        return None
+    sock = socket.create_connection(address, timeout=min(TIMEOUT_S, end - time.monotonic()))
+    try:
+        sock.sendall(request)
+        sock.settimeout(SLICE_S)
+        data, last = b"", time.monotonic()
+        while True:
+            try:
                 chunk = sock.recv(ANSWER_LIMIT + 1 - len(data))
-                if not chunk:
-                    break
-                data += chunk
-            return data
-        finally:
-            self.sock = None
-            sock.close()
-
-    def close(self):
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)  # wakes the worker's recv; the worker closes the socket
-        except (AttributeError, OSError):  # no request in flight, or it just ended
-            pass
+            except TimeoutError:
+                chunk = None
+            now = time.monotonic()
+            if chunk:
+                data, last = data + chunk, now
+            if flag[0] or now >= end or now - last >= TIMEOUT_S or len(data) > ANSWER_LIMIT:
+                return None
+            if chunk == b"":
+                return data
+    finally:
+        sock.close()
 
 
 def _request(method, path, key=None, body=None):
@@ -89,14 +82,15 @@ def _request(method, path, key=None, body=None):
 
 
 def parse(raw):
-    """(status, content type, body) of one strictly framed answer, else None: a status line, header lines,
-    exactly one Content-Length of ASCII digits, no Transfer-Encoding, the body exactly that long."""
+    """(status, content type, body) of one strictly framed answer, else None: a status line with a status
+    from 100 to 599, header lines, exactly one Content-Length of ASCII digits, no Transfer-Encoding or
+    Content-Encoding, the body exactly that long."""
     head, sep, body = raw.partition(b"\r\n\r\n")
     if not sep or len(head) > HEAD_LIMIT:
         return None
     lines = head.split(b"\r\n")
     status = STATUS_LINE.fullmatch(lines[0])
-    if not status:
+    if not status or not 100 <= int(status.group(1)) <= 599:
         return None
     headers = {}
     for line in lines[1:]:
@@ -105,9 +99,8 @@ def parse(raw):
             return None
         headers.setdefault(name.lower(), []).append(value.strip(b" \t"))
     lengths = headers.get(b"content-length", [])
-    if b"transfer-encoding" in headers or len(lengths) != 1 or not lengths[0].isdigit():
-        return None
-    if int(lengths[0]) > BODY_LIMIT or len(body) != int(lengths[0]):
+    if (b"transfer-encoding" in headers or b"content-encoding" in headers or len(lengths) != 1
+            or not lengths[0].isdigit() or int(lengths[0]) > BODY_LIMIT or len(body) != int(lengths[0])):
         return None
     return int(status.group(1)), b", ".join(headers.get(b"content-type", [])).decode("ascii"), body
 
@@ -151,7 +144,7 @@ def _checks(key, png, text, absent):
         return _request("POST", FILE, k, json.dumps({"path": path}).encode("ascii"))
 
     def refused(a):
-        return _error_code(a, 401) == AUTH_FAILED
+        return _error_code(a, 401) == "gateway_auth_failed"
 
     return ((_request("GET", PING), refused), (_request("GET", PING, wrong), refused),
             (file(None, png), refused), (file(wrong, png), refused),
@@ -161,42 +154,15 @@ def _checks(key, png, text, absent):
             (file(key, absent), lambda a: _error_code(a, 404) == "file_unavailable"))
 
 
-def _worker(transport, checks, verdicts, stop):
-    """Runs the checks in order and queues each verdict. The real key goes out only after V1 to V4
-    passed, and nothing goes out once `stop` is set."""
-    results = []
-    for n, (request, judge) in enumerate(checks, 1):
-        passed = False
-        if not stop.is_set() and (n <= 4 or results[:4] == [True] * 4):
-            try:
-                answer = parse(transport(request))
-                passed = answer is not None and judge(answer) is True
-            except Exception:
-                pass
-        results.append(passed)
-        verdicts.put(passed)
-
-
-def _next(verdicts, interrupted, end):
-    """The next verdict, or None at the deadline or once interrupted."""
-    while not interrupted.is_set() and time.monotonic() < end:
-        try:
-            return verdicts.get(timeout=max(0.0, min(end - time.monotonic(), 0.05)))
-        except queue.Empty:
-            pass
-    return None
-
-
 def _write(out, text):
-    """True when the whole text was accepted. A writer may accept less; None means it took all."""
+    """True when the writer confirmed the whole text: each call must return a count from 1 to what is
+    left. Anything else (None, zero, too large, an exception) is a failed output."""
     while text:
         try:
             n = out.write(text)
         except Exception:
             return False
-        if n is None:
-            return True
-        if n <= 0:
+        if type(n) is not int or not 1 <= n <= len(text):
             return False
         text = text[n:]
     return True
@@ -246,47 +212,55 @@ def _cleanup(fds, owned):
     return removed == 2 and closed
 
 
-def run(transport, home, key, out, deadline=DEADLINE_S):
-    """The checks of spec section 4 through `transport(request_bytes) -> answer_bytes`; returns the exit
-    code. Nothing asynchronous can raise while it owns a file: Ctrl-C only sets a flag (the previous
-    handler is restored at the end), the requests go out from one worker thread, and this thread prints,
-    keeps the deadline and cleans up."""
+def run(address, home, key, out, deadline=DEADLINE_S):
+    """The checks of spec section 4 against the listener at `address`, a (host, port) pair; returns the
+    exit code. Single-threaded: check, decide, print. While it owns anything, Ctrl-C only sets a flag."""
     if not key_ok(key):
         _write(out, "FAIL key\n")
         return 2
-    interrupted, stop, verdicts = threading.Event(), threading.Event(), queue.Queue()
+    previous, flag = signal.getsignal(signal.SIGINT), [False]
+
+    def interrupt(signum, frame):  # one assignment: nothing else may run inside a signal handler here
+        flag[0] = True
+
     try:
-        old = signal.signal(signal.SIGINT, lambda signum, frame: interrupted.set())
-    except ValueError:  # not the main thread: go on without the handler
-        old = None
-    fds, owned, results, printed = [], [], [], True
+        if previous is None:  # a disposition Python could not put back
+            raise ValueError()
+        signal.signal(signal.SIGINT, interrupt)
+    except ValueError:  # ... or not the main thread
+        _write(out, "FAIL setup\n")
+        return 1
+    fds, owned = [], []
     try:
         try:
             paths = _setup(home, fds, owned)
-            threading.Thread(target=_worker, args=(transport, _checks(key, *paths), verdicts, stop),
-                             daemon=True).start()
         except Exception:
+            paths = None
+        if paths is None or flag[0]:
             _cleanup(fds, owned)
             _write(out, "FAIL setup\n")
             return 1
-        end = time.monotonic() + deadline
-        for n in range(1, 10):
-            if n < 9:
-                passed = _next(verdicts, interrupted, end) if printed and not stop.is_set() else None
-                if passed is None and not stop.is_set():  # the deadline, an interruption or a failed write
-                    stop.set()
+        end, printed, results = time.monotonic() + deadline, True, []
+        for n, (request, judge) in enumerate(_checks(key, *paths), 1):
+            passed = False
+            if n <= 4 or results[:4] == [True] * 4:  # the real key only after four PASS lines written in full
+                try:
+                    raw = _exchange(address, request, flag, end)
+                except Exception:
+                    raw = None
+                if raw is not None and not flag[0] and time.monotonic() < end:  # decided as it returned
                     try:
-                        getattr(transport, "close", lambda: None)()  # abort the request in flight
+                        answer = parse(raw)
+                        passed = answer is not None and judge(answer) is True
                     except Exception:
                         pass
-            else:
-                passed = _cleanup(fds, owned) and not interrupted.is_set()
-            results.append(passed is True)
-            printed = printed and _write(out, "V%d %s\n" % (n, "PASS" if passed is True else "FAIL"))
-        return 0 if printed and results == [True] * 9 and not interrupted.is_set() else 1
+            printed = printed and _write(out, "V%d %s\n" % (n, "PASS" if passed else "FAIL"))
+            results.append(passed and printed)
+        passed = _cleanup(fds, owned) and not flag[0]  # the flag is read once: a later Ctrl-C keeps this line
+        printed = printed and _write(out, "V9 %s\n" % ("PASS" if passed else "FAIL"))
+        return 0 if printed and passed and all(results) and not flag[0] else 1
     finally:
-        if old is not None:
-            signal.signal(signal.SIGINT, old)
+        signal.signal(signal.SIGINT, previous)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -308,30 +282,38 @@ def _arguments(argv):
     return args.host, args.port, os.path.abspath(home)
 
 
+class _Seen:
+    """The output, remembering whether anything was written to it."""
+
+    def __init__(self, out):
+        self.out, self.seen = out, False
+
+    def write(self, text):
+        self.seen = True
+        return self.out.write(text)
+
+
 def main(argv=None, out=None, deadline=DEADLINE_S):
-    out = sys.stdout if out is None else out
+    out = _Seen(sys.stdout if out is None else out)
     try:
-        host, port, home = _arguments(argv)
-    except (ValueError, OSError):  # a refused value, or a path that cannot be resolved
-        _write(out, "FAIL arguments\n")
-        return 2
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", getpass.GetPassWarning)  # never the echoed stdin fallback
-            key = getpass.getpass("API key: ")
-    except BaseException:  # no terminal, end of input or Ctrl-C
-        key = ""
-    if not key_ok(key):
-        _write(out, "FAIL key\n")
-        return 2
-    try:
-        transport = SocketTransport(host, port)
-    except BaseException:
-        _write(out, "FAIL setup\n")
-        return 1
-    try:
-        return run(transport, home, key, out, deadline)
-    except BaseException:  # Ctrl-C just before run's handler is installed or after it is restored
+        try:
+            host, port, home = _arguments(argv)
+        except (ValueError, OSError):  # a refused value, or a path that cannot be resolved
+            _write(out, "FAIL arguments\n")
+            return 2
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)  # never the echoed stdin fallback
+                key = getpass.getpass("API key: ")
+        except BaseException:  # no terminal, end of input or Ctrl-C
+            key = ""
+        if not key_ok(key):
+            _write(out, "FAIL key\n")
+            return 2
+        return run((host, port), home, key, out, deadline)
+    except BaseException:  # Ctrl-C outside run's handler window: nothing is owned there
+        if not out.seen:
+            _write(out, "FAIL setup\n")
         return 1
 
 
