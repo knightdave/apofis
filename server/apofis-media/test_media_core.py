@@ -16,35 +16,36 @@ import media_core
 from media_core import BodyRefused
 
 # --- egress guard -----------------------------------------------------------------------------------
-# Shape of server/apofis-push/test_apofis_push.py, without its loopback exception and with bind added:
-# these tests open no socket at all, so every call is a violation.
+# Shape of server/apofis-push/test_apofis_push.py, without its loopback exception and with bind, sends
+# and every name lookup added: these tests open no socket at all, so every call is a violation.
 
 VIOLATIONS: list = []
 _REAL = {}
-_GUARDED = ("connect", "connect_ex", "bind")
+_GUARDED_METHODS = ("connect", "connect_ex", "bind", "sendto", "sendmsg")
+_GUARDED_FUNCTIONS = ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr", "getnameinfo")
 
 
 def setUpModule():
-    """Deny every connect, bind and name lookup in this process, loopback included; a violation is
-    recorded and fails the suite in tearDownModule."""
-    for name in _GUARDED:
-        _REAL[name] = getattr(socket.socket, name)
-    _REAL["getaddrinfo"] = socket.getaddrinfo
-
+    """Deny every connect, bind, datagram send and name lookup in this process, loopback included; a
+    violation is recorded and fails the suite in tearDownModule."""
     def deny(kind):
         def blocked(*a, **k):
             VIOLATIONS.append(kind)
             raise PermissionError("network blocked by test guard: %s" % kind)
         return blocked
-    for name in _GUARDED:
+    for name in _GUARDED_METHODS:
+        _REAL[name] = getattr(socket.socket, name)
         setattr(socket.socket, name, deny(name))
-    socket.getaddrinfo = deny("getaddrinfo")
+    for name in _GUARDED_FUNCTIONS:
+        _REAL[name] = getattr(socket, name)
+        setattr(socket, name, deny(name))
 
 
 def tearDownModule():
-    for name in _GUARDED:
+    for name in _GUARDED_METHODS:
         setattr(socket.socket, name, _REAL[name])
-    socket.getaddrinfo = _REAL["getaddrinfo"]
+    for name in _GUARDED_FUNCTIONS:
+        setattr(socket, name, _REAL[name])
     if VIOLATIONS:
         raise AssertionError("network use attempted: %d" % len(VIOLATIONS))
 
@@ -60,6 +61,32 @@ WEBP = b"RIFF" + b"\x10\x00\x00\x00" + b"WEBP" + b"\x00" * 8
 NOT_FOUND = (404, "file_unavailable", None, None)
 INTERNAL = (500, "internal", None, None)
 INCOMPATIBLE = (503, "hermes_incompatible", None, None)
+INTERNAL_BODY = b'{"error":{"code":"internal","message":"The plugin hit an internal error."}}'
+
+
+class DiskReads:
+    """Wraps os.read for one serve call: records each request, hands out at most chunk bytes per call,
+    and records every request outside 1 to (cap + 1 - bytes already handed out)."""
+
+    def __init__(self, cap, chunk=7):
+        self.cap, self.chunk, self.calls, self.got, self.over = cap, chunk, [], 0, []
+        self._read = os.read
+
+    def read(self, fd, n):
+        self.calls.append(n)
+        if not 1 <= n <= self.cap + 1 - self.got:
+            self.over.append(n)
+        data = self._read(fd, min(n, self.chunk))
+        self.got += len(data)
+        return data
+
+    def __enter__(self):
+        self._patch = mock.patch.object(os, "read", self.read)
+        self._patch.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._patch.stop()
 
 
 def check_shape(result):
@@ -102,8 +129,9 @@ class TempCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d)
         return d
 
-    def make_home(self, generated=True):
-        home = self.tmpdir()
+    def make_home(self, generated=True, at=None):
+        """A home with the picture folders: a new temporary directory, or the new directory at."""
+        home = at or self.tmpdir()
         os.makedirs(os.path.join(home, "cache", "images"))
         if generated:
             os.makedirs(os.path.join(home, "cache", "generated", "images"))
@@ -111,13 +139,15 @@ class TempCase(unittest.TestCase):
 
 
 class FdTracker:
-    """Wraps os.open and os.close for one serve call. fail_at: index of the open call that raises.
+    """Wraps os.open and os.close for one serve call. fail_at: index of the open call that raises;
+    on_close runs in place of the close call with index close_at.
 
     A number may be handed out again after its close, so ownership is tracked per open: live holds the
     numbers opened and not yet closed; a close of a number that is not live is a stray close."""
 
-    def __init__(self, fail_at=None, on_close=None):
+    def __init__(self, fail_at=None, on_close=None, close_at=0):
         self.opened, self.closed, self.fail_at, self.on_close = [], [], fail_at, on_close
+        self.close_at = close_at
         self.live, self.stray = set(), []
         self._open, self._close = os.open, os.close
 
@@ -137,9 +167,8 @@ class FdTracker:
             self.live.remove(fd)
         else:
             self.stray.append(fd)
-        if self.on_close is not None:
-            hook, self.on_close = self.on_close, None
-            return hook(fd)
+        if self.on_close is not None and len(self.closed) - 1 == self.close_at:
+            return self.on_close(fd)
         return self._close(fd)
 
     def __enter__(self):
@@ -197,14 +226,13 @@ class FenceTest(TempCase):
         self.assertEqual(serve(p, home, resolving), NOT_FOUND)
 
     def test_prefix_sibling_refused(self):
-        home = self.make_home()
+        parent = self.tmpdir()
+        home = self.make_home(at=os.path.join(parent, "h"))
         p = write(os.path.join(home, "cache", "images2", "a.png"), PNG)
         self.assertEqual(serve(p, home, resolving), NOT_FOUND)
         g = write(os.path.join(home, "cache", "generated", "images2", "a.png"), PNG)
         self.assertEqual(serve(g, home, resolving), NOT_FOUND)
-        sibling = home + "x"
-        self.addCleanup(shutil.rmtree, sibling, True)
-        s = write(os.path.join(sibling, "cache", "images", "a.png"), PNG)
+        s = write(os.path.join(parent, "hx", "cache", "images", "a.png"), PNG)
         self.assertEqual(serve(s, home, resolving), NOT_FOUND)
 
     def test_link_out_of_folders_refused(self):
@@ -309,6 +337,14 @@ class FenceTest(TempCase):
             with self.subTest(exc=exc.__name__):
                 self.assertEqual(serve(p, home, raising), want)
 
+    def test_returned_name_error_500(self):
+        class Odd(str):
+            def split(self, *a, **k):
+                raise ValueError("boom")
+        home = self.make_home()
+        p = write(os.path.join(home, "cache", "images", "a.png"), PNG)
+        self.assertEqual(serve(p, home, returns(Odd(p))), INTERNAL)
+
     def test_missing_component_404(self):
         home = self.make_home()
         v = os.path.join(home, "cache", "images", "sub", "a.png")
@@ -366,7 +402,30 @@ class ReadTest(TempCase):
 
     def test_cap_plus_one_413(self):
         home, p = self.picture("a.png", PNG + b"\x00" * (65 - len(PNG)))
-        self.assertEqual(serve(p, home, resolving, cap=64), (413, "too_large", None, None))
+        with DiskReads(64) as reads:
+            result = serve(p, home, resolving, cap=64)
+        self.assertEqual(reads.calls, [], "read a file that fstat already reports over the cap")
+        self.assertEqual(result, (413, "too_large", None, None))
+
+    def test_short_disk_reads_stay_in_budget(self):
+        data = PNG + bytes(range(64 - len(PNG)))
+        home, p = self.picture("a.png", data)
+        with DiskReads(64) as reads:
+            result = serve(p, home, resolving, cap=64)
+        self.assertEqual(reads.over, [], "asked for more than the remaining cap plus one")
+        self.assertGreater(len(reads.calls), 9)
+        self.assertEqual(result, (200, None, "image/png", data))
+        grown = write(os.path.join(home, "cache", "images", "g.png"), data + b"\x00")
+        real_fstat = os.fstat
+
+        def small_fstat(fd):
+            st = real_fstat(fd)
+            return types.SimpleNamespace(st_mode=st.st_mode, st_size=min(st.st_size, 64))
+        with DiskReads(64) as reads, mock.patch.object(os, "fstat", small_fstat):
+            result = serve(grown, home, resolving, cap=64)
+        self.assertEqual(reads.over, [], "asked for more than the remaining cap plus one")
+        self.assertEqual(reads.got, 65)
+        self.assertEqual(result, (413, "too_large", None, None))
 
     def test_grows_after_fstat_413(self):
         home, p = self.picture("a.png", PNG + b"\x00" * (65 - len(PNG)))
@@ -410,8 +469,9 @@ class ReadTest(TempCase):
                 with FdTracker() as fds, mock.patch.object(os, name, raise_oserror):
                     result = serve(p, home, resolving)
                 self.assertEqual(result, (500, "internal", None, None))
-                body = json.loads(media_core.error_body(500, "internal"))
-                self.assertEqual(body["error"]["code"], "internal")
+                self.assertEqual(json.loads(media_core.error_body(result[0], result[1])),
+                                 {"error": {"code": "internal", "message": "The plugin hit an internal error."}})
+                self.assertEqual(media_core.error_body(500, "internal"), INTERNAL_BODY)
                 self.assertEqual(len(fds.opened), 4)
                 fds.assert_each_closed_once(self)
 
@@ -457,6 +517,48 @@ class ReadTest(TempCase):
                 self.assertEqual(serve(p, home, resolving), INTERNAL)
             self.assertEqual(len(fds.opened), 5)
             fds.assert_each_closed_once(self)
+        with self.subTest("last close of the final cleanup fails"):
+            real_close = os.close
+
+            def close_then_fail(fd):
+                real_close(fd)
+                raise OSError("injected")
+            # Closes: home, cache, images during the walk, then the leaf and sub in the final cleanup.
+            with FdTracker(on_close=close_then_fail, close_at=4) as fds:
+                self.assertEqual(serve(p, home, resolving), (500, "internal", None, None))
+            self.assertEqual(len(fds.closed), 5)
+            fds.assert_each_closed_once(self)
+
+    def test_interrupt_still_closes_each_once(self):
+        home, p = self.picture("a.png", PNG)
+        real_close = os.close
+
+        def interrupt(*a, **k):
+            raise KeyboardInterrupt
+
+        def close_then_interrupt(fd):
+            real_close(fd)
+            raise KeyboardInterrupt
+        # Closes: home, cache during the walk, then the leaf and images in the final cleanup.
+        for name, fds, patches in (
+                ("read interrupted", FdTracker(), [mock.patch.object(os, "read", interrupt)]),
+                ("final close interrupted", FdTracker(on_close=close_then_interrupt, close_at=2), [])):
+            with self.subTest(name):
+                try:
+                    with fds:
+                        for patch in patches:
+                            patch.start()
+                        try:
+                            with self.assertRaises(KeyboardInterrupt):
+                                media_core.serve(p, home, resolving, CAP)
+                        finally:
+                            for patch in patches:
+                                patch.stop()
+                    self.assertEqual(len(fds.opened), 4)
+                    fds.assert_each_closed_once(self)
+                finally:
+                    for fd in fds.live:
+                        real_close(fd)
 
     def test_reused_number_stays_valid(self):
         home, p = self.picture("a.png", PNG, sub=("sub",))
@@ -512,13 +614,25 @@ class ReadTest(TempCase):
 # --- body -------------------------------------------------------------------------------------------
 
 class Reader:
-    """A fake request.content.read: hands out the chunks, never more than asked, records each call."""
+    """A fake request.content.read: hands out the chunks, never more than asked, records each call.
 
-    def __init__(self, chunks, endless=None):
-        self.chunks, self.endless, self.calls = list(chunks), endless, []
+    It fails at once, inside the call, when the parser asks after max_calls calls or asks for anything
+    outside 1 to (8,193 - bytes already handed out), so a parser that keeps asking cannot hang a test."""
+
+    def __init__(self, chunks, endless=None, max_calls=16):
+        self.chunks, self.endless, self.calls, self.max_calls, self.got = list(chunks), endless, [], max_calls, 0
 
     async def __call__(self, n):
         self.calls.append(n)
+        if len(self.calls) > self.max_calls:
+            raise AssertionError("read called more than %d times" % self.max_calls)
+        if not 1 <= n <= 8193 - self.got:
+            raise AssertionError("read asked for %d bytes with %d already read" % (n, self.got))
+        chunk = self._next(n)
+        self.got += len(chunk)
+        return chunk
+
+    def _next(self, n):
         if self.endless is not None:
             return self.endless[:n]
         if not self.chunks:
@@ -578,6 +692,7 @@ class BodyTest(unittest.TestCase):
     def test_short_body_400(self):
         body = body_of("/srv/out/chart.png")
         self.assertBad(body[:-1], length=str(len(body)))
+        self.assertBad(body, length=str(len(body) + 1))
 
     def test_extra_byte_400(self):
         body = body_of("/srv/out/chart.png")
@@ -585,9 +700,9 @@ class BodyTest(unittest.TestCase):
 
     def test_reads_stop_at_8193(self):
         body = body_of("/srv/out/chart.png")
-        reader = Reader([], endless=b" " * 1000)
+        reader = Reader([], endless=b" " * 1000, max_calls=9)
         self.assertBad(body, length="8192", reader=reader)
-        self.assertLessEqual(len(reader.calls), 10)
+        self.assertEqual(len(reader.calls), 9)
         got = 0
         for n in reader.calls:
             self.assertLessEqual(n, 8193 - got)
@@ -598,13 +713,35 @@ class BodyTest(unittest.TestCase):
         body = body_of("/srv/out/chart.png")
         n = len(body)
         half = str(n)[:1] + "_" + str(n)[1:]
-        for length in (None, "8193", "+%d" % n, " %d" % n, half, "%d " % n, "-%d" % n, "", "\u0661\u0667"):
+        over = b'{"path":' + b" " * (8193 - len(body)) + body[8:]
+        self.assertEqual(len(over), 8193)
+        reader = Reader([over])
+        self.assertBad(over, length="8193", reader=reader)
+        self.assertEqual(reader.calls, [], "read a body whose declared length is over the limit")
+        for length in (None, "+%d" % n, " %d" % n, half, "%d " % n, "-%d" % n, "", "\u0661\u0667"):
             with self.subTest(length=length):
                 self.assertBad(body, length=length)
         padded = b'{"path":' + b" " * (8192 - len(body)) + body[8:]
         self.assertEqual(len(padded), 8192)
         self.assertEqual(self.accepted(padded, length="8192"), "/srv/out/chart.png")
         self.assertEqual(self.accepted(body, length="000" + str(n)), "/srv/out/chart.png")
+
+    def test_header_checks_in_order(self):
+        body = body_of("/srv/out/chart.png")
+        good = {"content-encoding": None, "content-type": "application/json", "content-length": str(len(body))}
+        for bad, seen in (({"content-encoding": "gzip"}, ["content-encoding"]),
+                          ({"content-type": "text/plain"}, ["content-encoding", "content-type"]),
+                          ({"content-length": "+1"}, ["content-encoding", "content-type", "content-length"])):
+            with self.subTest(bad=sorted(bad)):
+                values, asked, reader = dict(good, **bad), [], Reader([body])
+
+                def header(name):
+                    asked.append(name.lower())
+                    return values.get(name.lower())
+                with self.assertRaises(BodyRefused):
+                    asyncio.run(media_core.parse_body(header, reader))
+                self.assertEqual(asked, seen)
+                self.assertEqual(reader.calls, [])
 
     def test_content_encoding_rules(self):
         body = body_of("/srv/out/chart.png")
@@ -619,7 +756,8 @@ class BodyTest(unittest.TestCase):
         for ctype in (None, "text/plain", "application/json; charset=latin-1", "application/json; v=1",
                       "application/json; charset=utf-8; charset=utf-8", "application/json; charset=utf-8; v=1",
                       "application/jsonx", "application/json;", "application/json; charset",
-                      "application/json; charset=", 'application/json; charset="utf-8'):
+                      "application/json; charset=", 'application/json; charset="utf-8',
+                      'application/json; charset="utf\\-8"', 'application/json; charset="\\utf-8"'):
             with self.subTest(ctype=ctype):
                 self.assertBad(body, content_type=ctype)
 
@@ -667,19 +805,23 @@ class BodyTest(unittest.TestCase):
 
 # --- error bodies -----------------------------------------------------------------------------------
 
-SPEC_CODES = ((400, "bad_request"), (404, "file_unavailable"), (413, "too_large"), (415, "not_a_picture"),
-              (500, "internal"), (503, "unavailable"), (503, "busy"), (503, "hermes_incompatible"))
+SPEC_CODES = ((400, "bad_request", "The request is not valid."),
+              (404, "file_unavailable", "The file is not available."),
+              (413, "too_large", "The file is too large."),
+              (415, "not_a_picture", "The file is not a supported picture."),
+              (500, "internal", "The plugin hit an internal error."),
+              (503, "unavailable", "The plugin is not available right now."),
+              (503, "busy", "The plugin is busy. Try again soon."),
+              (503, "hermes_incompatible", "This Hermes version does not fit the plugin."))
 
 class ErrorBodyTest(TempCase):
     def test_every_code_fixed_body(self):
-        for status, code in SPEC_CODES:
+        for status, code, fixed in SPEC_CODES:
             with self.subTest(code=code):
                 raw = media_core.error_body(status, code)
                 self.assertIsInstance(raw, bytes)
                 body = json.loads(raw.decode("utf-8"))
-                self.assertEqual(list(body), ["error"])
-                self.assertEqual(sorted(body["error"]), ["code", "message"])
-                self.assertEqual(body["error"]["code"], code)
+                self.assertEqual(body, {"error": {"code": code, "message": fixed}})
                 message = body["error"]["message"]
                 self.assertIsInstance(message, str)
                 self.assertTrue(message and message.isascii())
@@ -687,7 +829,8 @@ class ErrorBodyTest(TempCase):
                 self.assertNotRegex(message, "[\u2010-\u2015]")
                 self.assertRegex(code, r"^[a-z0-9_]{1,64}$")
                 self.assertEqual(raw, media_core.error_body(status, code))
-        self.assertEqual(len({media_core.error_body(s, c) for s, c in SPEC_CODES}), len(SPEC_CODES))
+        self.assertEqual(len({media_core.error_body(s, c) for s, c, _m in SPEC_CODES}), len(SPEC_CODES))
+        self.assertEqual(media_core.error_body(500, "internal"), INTERNAL_BODY)
 
     def test_unknown_code_not_echoed(self):
         canary = "canary" + "q" * 20

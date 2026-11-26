@@ -107,10 +107,12 @@ def _valid_path(path):
 async def parse_body(header, read):
     """The requested path from a file request, or BodyRefused. Reads at most BODY_LIMIT + 1 bytes."""
     encoding = header("Content-Encoding")
+    if encoding is not None and _fold(encoding) != "identity":
+        raise BodyRefused(400, "bad_request")
+    if not _json_content_type(header("Content-Type")):
+        raise BodyRefused(400, "bad_request")
     length = _content_length(header("Content-Length"))
-    if ((encoding is not None and _fold(encoding) != "identity")
-            or not _json_content_type(header("Content-Type"))
-            or length is None or length > BODY_LIMIT):
+    if length is None or length > BODY_LIMIT:
         raise BodyRefused(400, "bad_request")
     raw = bytearray()
     while len(raw) <= BODY_LIMIT:
@@ -150,12 +152,24 @@ def _sniff(data):
     return None
 
 
-def _walk_and_read(real, rest, cap, own):
-    """Open real, then each name of rest by directory descriptor, and read the leaf.
+def _fence_and_read(v, home, cap, own):
+    """Check the validated name v against the two picture folders of home, open it by directory
+    descriptor and read it.
 
     own holds the descriptors this worker still owns: own[0] the current directory, then the leaf.
     A number leaves own before os.close is called on it, so it is never closed twice.
     """
+    # Raw components, before any normalization: pathlib would silently drop "." and repeated slashes.
+    parts = v.split("/")
+    names = parts[1:]
+    if parts[0] != "" or not names or any(p in ("", ".", "..") for p in names) or not _picture_name(names[-1]):
+        return _refusal("file_unavailable")
+    real = os.path.realpath(home)
+    home_names = [p for p in real.split("/") if p]
+    rest = names[len(home_names):]
+    if names[:len(home_names)] != home_names or not any(
+            tuple(rest[:len(root)]) == root and len(rest) > len(root) for root in ROOTS):
+        return _refusal("file_unavailable")
     fd = _open(real, _ROOT_FLAGS)
     if fd is None:
         return _refusal("file_unavailable")
@@ -191,7 +205,8 @@ def _walk_and_read(real, rest, cap, own):
 
 def serve(path, home, validate, cap):
     """Serve the picture validate(path) names, if it lies beneath one of the two real picture folders of
-    home. Never raises: (200, None, content_type, data) or (status, code, None, None)."""
+    home. Never raises an ordinary exception: (200, None, content_type, data) or (status, code, None, None).
+    KeyboardInterrupt and SystemExit propagate after every owned descriptor got its close."""
     try:
         v = validate(path)
     except (AttributeError, TypeError):
@@ -202,28 +217,25 @@ def serve(path, home, validate, cap):
         return _refusal("file_unavailable")
     if not isinstance(v, str):
         return _refusal("hermes_incompatible")
-    # Raw components, before any normalization: pathlib would silently drop "." and repeated slashes.
-    parts = v.split("/")
-    names = parts[1:]
-    if parts[0] != "" or not names or any(p in ("", ".", "..") for p in names) or not _picture_name(names[-1]):
-        return _refusal("file_unavailable")
     own = []
     try:
-        real = os.path.realpath(home)
-        home_names = [p for p in real.split("/") if p]
-        rest = names[len(home_names):]
-        if names[:len(home_names)] != home_names or not any(
-                tuple(rest[:len(root)]) == root and len(rest) > len(root) for root in ROOTS):
-            return _refusal("file_unavailable")
-        result = _walk_and_read(real, rest, cap, own)
+        result = _fence_and_read(v, home, cap, own)
     except Exception:
         result = _refusal("internal")
-    while own:
-        fd = own.pop()
-        try:
-            os.close(fd)
-        except Exception:
-            result = _refusal("internal")
+    finally:
+        # Every number still owned gets one close attempt, also while an interrupt unwinds; a process
+        # control exception propagates after the cleanup and never becomes an answer.
+        pending = None
+        while own:
+            fd = own.pop()
+            try:
+                os.close(fd)
+            except Exception:
+                result = _refusal("internal")
+            except BaseException as e:
+                pending = pending or e
+        if pending is not None:
+            raise pending
     return result
 
 
