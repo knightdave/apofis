@@ -588,6 +588,9 @@ class HermesApiMediaTest {
             "\uFEFF" + READY_BODY, // a byte order mark
             "\u000B" + READY_BODY, // a vertical tab is not JSON whitespace
             extra("\"x\":" + "[".repeat(DEPTH) + "]".repeat(DEPTH)), // one level above the bound
+            extra("\"note\":\"a\u0000b\""), extra("\"note\":\"a\u0001b\""), extra("\"note\":\"a\u001Fb\""), // raw controls in a string
+            extra("\"a\rb\":1"), // a raw carriage return inside a member name
+            extra("\"n\":1e+-5"), extra("\"n\":1e-+5"), // two exponent signs
         )
         val notError = bad.filter { pingOf(it) != MediaPing(AddonStatus.ERROR, null) }
         assertTrue("not ERROR: " + notError.map { JsonPrimitive(it).toString() }, notError.isEmpty())
@@ -599,6 +602,11 @@ class HermesApiMediaTest {
             " \t\r\n" + READY_BODY + "\n ", // JSON whitespace around the value
             extra("\"x\":" + "[".repeat(DEPTH - 1) + "]".repeat(DEPTH - 1)), // nesting at the bound
             extra("\"n\":[-0,0.5,1e5,1E+5,2e-3,-12.5e10]"),
+            extra("\"note\":\"a\u0020b\""), extra("\"note\":\"a\u007Fb\""), // U+0020 and U+007F are allowed raw
+            // Pretty-printed: space, line feed, tab and carriage return around colons, commas and brackets.
+            "{\r\n\t\"name\" :\t\"apofis-media\" ,\n \"protocol\" : $APP_PROTOCOL ,\r\n \"ready\"\t:\ttrue,\n" +
+                " \"max_bytes\"\r: 10485760\t, \"types\" : [ \"png\" ,\t\"jpeg\" ,\r\n\"gif\",\n\"webp\"\t]\n}",
+            extra("\"x\" : [ ]"), extra("\"y\":{ }"),
         )
         val notReady = good.filter { pingOf(it) != ready }
         assertTrue("not READY: " + notReady.map { JsonPrimitive(it).toString() }, notReady.isEmpty())
@@ -612,6 +620,8 @@ class HermesApiMediaTest {
         assertFalse(HermesApi.isJson(READY_BODY + "x"))
         assertFalse(HermesApi.isJson(READY_BODY + "{}"))
         assertTrue(HermesApi.isJson(READY_BODY + " \n"))
+        assertTrue(HermesApi.isJson("[] \n")) // whitespace after an empty container
+        assertTrue(HermesApi.isJson("{\"x\":[] ,\"y\":{} }"))
         assertTrue(HermesApi.isJson("[".repeat(DEPTH) + "]".repeat(DEPTH)))
         assertFalse(HermesApi.isJson("[".repeat(DEPTH + 1) + "]".repeat(DEPTH + 1)))
         assertFalse(HermesApi.isJson(extra("\"x\":" + "{\"a\":".repeat(DEPTH) + "1" + "}".repeat(DEPTH))))
