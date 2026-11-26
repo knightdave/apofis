@@ -50,6 +50,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import xyz.rycerz.apofis.db.AgentFileEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.settings.CredentialStore
@@ -144,6 +145,19 @@ class AppContainerTest {
         assertClosed { old.repo }
         assertClosed { old.follower }
         assertClosed { old.api }
+    }
+
+    @Test
+    fun switchToAnotherServerLeavesNoAgentFile() = runTest {
+        container.connect(A)
+        addSession("apofis-a")
+        val digest = container.imageStore.put(byteArrayOf(1, 2, 3))!!
+        db.agentFileDao().insert(AgentFileEntity("apofis-a", 1, "/srv/out/chart.png", digest))
+
+        container.connect(B)
+
+        assertEquals(emptyList<String>(), db.agentFileDao().digests()) // the row itself, not only the file
+        assertNull(container.imageStore.file(digest))
     }
 
     @Test

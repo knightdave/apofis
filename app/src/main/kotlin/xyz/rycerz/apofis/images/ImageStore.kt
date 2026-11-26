@@ -12,8 +12,9 @@ import kotlinx.coroutines.withContext
 private val NAME = Regex("[0-9a-f]{64}")
 
 /**
- * Re-encoded JPEG files named by the lowercase SHA-256 of their bytes, in one directory of the app's private
- * storage. Entries are trusted to be regular files that do not change while they are read.
+ * The app's re-encoded upload JPEGs and the agent's pictures as fetched (PNG, JPEG, GIF or WebP bytes), each named
+ * `<digest>.jpg` by the lowercase SHA-256 of its bytes, in one directory of the app's private storage. Decoders sniff
+ * the bytes, not the name. Entries are trusted to be regular files that do not change while they are read.
  */
 class ImageStore(private val dir: File, private val clock: () -> Long, internal val beforeRename: () -> Unit = {}) {
     /** Held by [put] and [collect]. Internal for the tests' observation only. */

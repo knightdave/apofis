@@ -9,8 +9,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 /** Cache of the server transcript plus the user's unsent messages. */
 @Database(
-    entities = [SessionEntity::class, MessageEntity::class, PendingSendEntity::class, ActiveRunEntity::class, ReplyOutcomeEntity::class, NoticeOutboxEntity::class, NoticeStateEntity::class, ImageBindingEntity::class],
-    version = 4,
+    entities = [SessionEntity::class, MessageEntity::class, PendingSendEntity::class, ActiveRunEntity::class, ReplyOutcomeEntity::class, NoticeOutboxEntity::class, NoticeStateEntity::class, ImageBindingEntity::class, AgentFileEntity::class],
+    version = 5,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -22,6 +22,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun noticeOutboxDao(): NoticeOutboxDao
     abstract fun noticeStateDao(): NoticeStateDao
     abstract fun imageBindingDao(): ImageBindingDao
+    abstract fun agentFileDao(): AgentFileDao
 }
 
 /**
@@ -77,8 +78,18 @@ val MIGRATION_3_4 = object : Migration(3, 4) {
     }
 }
 
+/** Version 5 adds the agent picture bindings; no row changes and nothing is backfilled. */
+val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `AgentFileEntity` (`sessionKey` TEXT NOT NULL, `messageId` INTEGER NOT NULL, `path` TEXT NOT NULL, " +
+                "`digest` TEXT NOT NULL, PRIMARY KEY(`sessionKey`, `messageId`, `path`))",
+        )
+    }
+}
+
 /** Every migration, oldest first: an upgrade from any released version keeps unsent work and runs. */
-val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
 
 /** The app's database as users get it; no destructive fallback, so a missing migration fails instead of wiping data. */
 fun openAppDatabase(context: Context, name: String = "apofis.db", migrations: Array<Migration> = ALL_MIGRATIONS): AppDatabase =
