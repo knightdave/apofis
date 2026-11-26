@@ -50,6 +50,8 @@ import xyz.rycerz.apofis.chat.ChatItem
 import xyz.rycerz.apofis.chat.Notice
 import xyz.rycerz.apofis.chat.ToolStep
 import xyz.rycerz.apofis.chat.UserMessage
+import xyz.rycerz.apofis.media.Attachment
+import xyz.rycerz.apofis.media.scanAttachments
 import xyz.rycerz.apofis.run.AnswerResult
 import xyz.rycerz.apofis.run.LiveReply
 import xyz.rycerz.apofis.ui.markdown.BlockKind
@@ -855,6 +857,10 @@ internal data class TextRow(
     val joinBelow: Boolean,
     val fenceClosed: Boolean,
 ) : Row
+/** Attachment number [index] that a stored reply's text names (spec 6.2). */
+internal data class AttachmentRow(val reply: AssistantReply, val index: Int, val attachment: Attachment) : Row {
+    override val key get() = "${reply.key}/a$index"
+}
 internal data class FooterRow(val reply: AssistantReply) : Row {
     override val key get() = reply.key + "/end"
 }
@@ -947,7 +953,9 @@ internal class ChatRows(private val zone: ZoneId) {
             is Notice -> listOf(NoticeRow(item))
             is AssistantReply -> buildList {
                 if (item.steps.isNotEmpty()) add(StepsRow(item))
-                addAll(replyRows(item.key, item.text, closeFences = !item.live))
+                val scan = if (item.live) null else scanAttachments(item.text) // `live` from the item: a live one can borrow a stored key
+                if (scan?.tagOnly != true) addAll(replyRows(item.key, item.text, closeFences = !item.live))
+                scan?.attachments?.forEachIndexed { i, a -> add(AttachmentRow(item, i, a)) }
                 add(FooterRow(item)) // every reply: live indicators, notices, Copy and Select
             }
         }
@@ -1048,6 +1056,7 @@ internal fun MessageList(
                                     TextBlock(row, onLink, source = source)
                                 }
                             }
+                            is AttachmentRow -> AttachmentView(row.reply, row.attachment)
                             is FooterRow -> ReplyFooter(
                                 row.reply, live.takeIf { row.reply.live }, notes, answering, actions,
                                 rowActions, active = active,
@@ -1148,6 +1157,7 @@ private fun rowTag(row: Row): Modifier = when (row) {
     is UserRow -> Modifier.testTag("user:${row.key}")
     is TextRow -> Modifier.testTag("reply:${row.key}")
     is NoticeRow -> Modifier.testTag("notice:${row.key}")
+    is AttachmentRow -> Modifier.testTag("attachment:${row.key}")
     else -> Modifier
 }
 
