@@ -50,6 +50,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import xyz.rycerz.apofis.db.AgentFileEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.SessionEntity
 import xyz.rycerz.apofis.settings.CredentialStore
@@ -144,6 +145,33 @@ class AppContainerTest {
         assertClosed { old.repo }
         assertClosed { old.follower }
         assertClosed { old.api }
+    }
+
+    @Test
+    fun switchToAnotherServerLeavesNoAgentFile() = runTest {
+        val requests = Collections.synchronizedList(mutableListOf<String>())
+        val serverA = recordingServer(requests)
+        val serverB = recordingServer(requests)
+        try {
+            container.connect(Credentials(serverA.url("/").toString(), "key-a"))
+            addSession("apofis-a")
+            val digest = container.imageStore.put(byteArrayOf(1, 2, 3))!!
+            db.agentFileDao().insert(AgentFileEntity("apofis-a", 1, "/srv/out/chart.png", digest))
+            withContext(Dispatchers.Default) { withTimeout(10_000) { container.startup.join() } }
+            // The collection that ends every switch drops orphaned bindings too, so look before it does: the switch's
+            // own delete must already have removed the row.
+            val seen = mutableListOf<List<String>>()
+            container.beforeImageRows = { seen += db.agentFileDao().digests() }
+
+            container.connect(Credentials(serverB.url("/").toString(), "key-b"))
+
+            assertEquals(emptyList<String>(), seen.firstOrNull())
+            assertEquals(emptyList<String>(), db.agentFileDao().digests())
+            assertNull(container.imageStore.file(digest))
+        } finally {
+            serverA.close()
+            serverB.close()
+        }
     }
 
     @Test

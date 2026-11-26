@@ -36,6 +36,7 @@ import org.robolectric.RobolectricTestRunner
 import xyz.rycerz.apofis.AppContainer
 import xyz.rycerz.apofis.CACHE_PREFS
 import xyz.rycerz.apofis.SWITCH_MARKER
+import xyz.rycerz.apofis.db.AgentFileEntity
 import xyz.rycerz.apofis.db.AppDatabase
 import xyz.rycerz.apofis.db.ImageBindingEntity
 import xyz.rycerz.apofis.db.PendingSendEntity
@@ -450,5 +451,35 @@ class ImageGcTest {
         assertFalse(exists(drafted))
         assertTrue(exists(queued))
         assertFalse(temp.exists())
+    }
+
+    private fun agentFile(key: String, id: Long, digest: String) =
+        wait { db.agentFileDao().insert(AgentFileEntity(key, id, "/srv/out/chart.png", digest)) }
+
+    @Test
+    fun gcKeepsAgentFileDigests() {
+        session("apofis-s")
+        val bound = file(1)
+        val loose = file(2)
+        agentFile("apofis-s", 1, bound)
+        wait { c.collectImages() }
+        assertTrue(exists(bound))
+        assertFalse(exists(loose))
+    }
+
+    @Test
+    fun deletedChatAgentFilesGo() {
+        session("apofis-x")
+        session("apofis-y") // a live chat: its binding and file must survive
+        val gone = file(1)
+        val kept = file(2)
+        agentFile("apofis-x", 1, gone)
+        agentFile("apofis-y", 1, kept)
+        assertEquals(setOf(gone, kept), wait { db.agentFileDao().digests() }.toSet())
+        deleteAnswers("apofis-x")
+        deleteAndAwaitItsCollection("apofis-x")
+        assertEquals(listOf(kept), wait { db.agentFileDao().digests() })
+        assertFalse(exists(gone))
+        assertTrue(exists(kept))
     }
 }

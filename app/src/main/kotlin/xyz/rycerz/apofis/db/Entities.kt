@@ -123,3 +123,7 @@ data class ImageBindingEntity(
     val messageId: Long,
     val digests: String,
 )
+
+/** A picture the agent named in a stored reply ([messageId] of the reply key), bound to the digest of the bytes the app fetched for it. */
+@Entity(primaryKeys = ["sessionKey", "messageId", "path"])
+data class AgentFileEntity(val sessionKey: String, val messageId: Long, val path: String, val digest: String)

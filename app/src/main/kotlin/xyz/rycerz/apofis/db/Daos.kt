@@ -2,6 +2,7 @@ package xyz.rycerz.apofis.db
 
 import androidx.room.Dao
 import androidx.room.Insert
+import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Update
@@ -193,6 +194,30 @@ interface ImageBindingDao {
 
     /** A binding lives as long as its chat row. */
     @Query("DELETE FROM ImageBindingEntity WHERE sessionKey NOT IN (SELECT `key` FROM SessionEntity)")
+    suspend fun deleteOrphans()
+}
+
+@Dao
+interface AgentFileDao {
+    @Query("SELECT * FROM AgentFileEntity WHERE sessionKey = :sessionKey ORDER BY messageId, path")
+    fun observe(sessionKey: String): Flow<List<AgentFileEntity>>
+
+    @Query("SELECT * FROM AgentFileEntity WHERE sessionKey = :sessionKey AND messageId = :messageId AND path = :path")
+    suspend fun get(sessionKey: String, messageId: Long, path: String): AgentFileEntity?
+
+    /** An existing binding wins: bindings are never refreshed. */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(f: AgentFileEntity)
+
+    /** Deletes the binding only while it still holds [digest]; returns the rows deleted, 0 or 1. */
+    @Query("DELETE FROM AgentFileEntity WHERE sessionKey = :sessionKey AND messageId = :messageId AND path = :path AND digest = :digest")
+    suspend fun deleteIf(sessionKey: String, messageId: Long, path: String, digest: String): Int
+
+    @Query("SELECT digest FROM AgentFileEntity")
+    suspend fun digests(): List<String>
+
+    /** A binding lives as long as its chat row. */
+    @Query("DELETE FROM AgentFileEntity WHERE sessionKey NOT IN (SELECT `key` FROM SessionEntity)")
     suspend fun deleteOrphans()
 }
 

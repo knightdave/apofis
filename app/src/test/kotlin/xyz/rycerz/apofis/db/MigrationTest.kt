@@ -5,10 +5,16 @@ import android.app.Application
 import android.app.Notification
 import android.app.NotificationManager
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -31,7 +37,7 @@ private const val NAME = "migrate.db"
 /**
  * Upgrades from every released schema, built exactly as exported in app/schemas, through the builder users get. Room
  * validates every table against the current entities when it opens a migrated file, so a migration that leaves the
- * schema different from version 4 fails here.
+ * schema different from the current version fails here.
  */
 @RunWith(RobolectricTestRunner::class)
 class MigrationTest {
@@ -114,7 +120,12 @@ class MigrationTest {
 
     @Test
     fun productionBuilderHasFullChain() = runTest {
-        for ((version, chain) in listOf(2 to arrayOf(MIGRATION_1_2), 3 to arrayOf(MIGRATION_1_2, MIGRATION_2_3))) {
+        val chains = listOf(
+            2 to arrayOf(MIGRATION_1_2),
+            3 to arrayOf(MIGRATION_1_2, MIGRATION_2_3),
+            4 to arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4),
+        )
+        for ((version, chain) in chains) {
             create(version)
             val old = openAppDatabase(app, NAME, chain) // the list before the next version
             try {
@@ -142,6 +153,7 @@ class MigrationTest {
         val hits = File("src/main").walk().filter { it.isFile && it.extension == "kt" && it.readText().contains("fallbackToDestructiveMigration") }.toList()
         assertTrue("destructive fallback in $hits", hits.isEmpty())
         assertTrue(File("schemas/xyz.rycerz.apofis.db.AppDatabase/4.json").isFile)
+        assertTrue(File("schemas/xyz.rycerz.apofis.db.AppDatabase/5.json").isFile)
     }
 
     /** Version 3 rows in every table, as a user upgrading from Milestone 3 has them. */
@@ -234,6 +246,122 @@ class MigrationTest {
             } finally {
                 db.close()
             }
+        }
+    }
+
+    /** The eight tables of version 4, each with its primary key columns. */
+    private val v4Tables = mapOf(
+        "SessionEntity" to "`key`",
+        "MessageEntity" to "sessionKey, position",
+        "PendingSendEntity" to "idempotencyKey",
+        "ActiveRunEntity" to "runId",
+        "ReplyOutcomeEntity" to "sessionKey, afterMessageId",
+        "NoticeOutboxEntity" to "generation, eventId",
+        "NoticeStateEntity" to "sessionKey",
+        "ImageBindingEntity" to "sessionKey, messageId",
+    )
+
+    /** Every row of every version 4 table, each column by name with its stored value. */
+    private fun v4Rows(query: (String) -> Cursor) = v4Tables.mapValues { (table, key) ->
+        query("SELECT * FROM $table ORDER BY $key").use { c ->
+            buildList {
+                while (c.moveToNext()) {
+                    add(
+                        (0 until c.columnCount).map { i ->
+                            c.getColumnName(i) to when (c.getType(i)) {
+                                Cursor.FIELD_TYPE_NULL -> null
+                                Cursor.FIELD_TYPE_INTEGER -> c.getLong(i)
+                                Cursor.FIELD_TYPE_FLOAT -> c.getDouble(i)
+                                Cursor.FIELD_TYPE_BLOB -> c.getBlob(i).toList()
+                                else -> c.getString(i)
+                            }
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    /** The first emission, bounded in real time: Room emits from its own threads, so a virtual clock would not do. */
+    private suspend fun <T> Flow<T>.firstWithin(): T = withContext(Dispatchers.Default) { withTimeout(10_000) { first() } }
+
+    private val d1 = "a".repeat(64)
+    private val d2 = "b".repeat(64)
+
+    /**
+     * Version 4 rows in every table: every column with a default holds another value in some row, and createStarted
+     * differs from existsOnServer in both directions, so a migration that rewrites any of them is seen.
+     */
+    private fun seedVersion4(db: SQLiteDatabase) {
+        db.execSQL("UPDATE SessionEntity SET createStarted = 0, model = 'm1', provider = 'p1', reasoning = 'high', fast = 1 WHERE `key` = 'apofis-a'")
+        db.execSQL("UPDATE MessageEntity SET droppedToolCalls = 3, shortened = 1 WHERE sessionKey = 'apofis-a'")
+        db.execSQL("UPDATE PendingSendEntity SET images = '$d1,$d2', steerOnly = 1 WHERE idempotencyKey = 'k'")
+        db.execSQL(
+            "INSERT INTO SessionEntity (`key`, currentId, lineageIds, title, pinned, archived, startedAt, messageCount, stale, existsOnServer, hidden, createStarted) " +
+                "VALUES ('apofis-n', 'apofis-n', '', NULL, 0, 0, 2.0, 0, 0, 0, 0, 1)",
+        )
+        db.execSQL("INSERT INTO ReplyOutcomeEntity (sessionKey, afterMessageId, outcome, detail) VALUES ('apofis-a', 1, 'stopped', 'why')")
+        db.execSQL(
+            "INSERT INTO NoticeOutboxEntity (eventId, sessionKey, runId, runStartedAt, notice, generation, createdAt) " +
+                "VALUES ('run:run_1', 'apofis-a', 'run_1', 9, 'FINISHED', 3, 11)",
+        )
+        db.execSQL(
+            "INSERT INTO NoticeStateEntity (sessionKey, generation, runStartedAt, runId, notice, eventId, alerted) " +
+                "VALUES ('apofis-a', 3, 8, 'run_0', 'REQUEST', 'req:1', '[\"e1\"]')",
+        )
+        db.execSQL("INSERT INTO ImageBindingEntity (sessionKey, messageId, digests) VALUES ('apofis-a', 1, '$d1,$d2')")
+    }
+
+    @Test
+    fun version4To5() = runTest {
+        var before: Map<String, List<List<Pair<String, Any?>>>> = emptyMap()
+        create(4) {
+            seedVersion4(it)
+            before = v4Rows { sql -> it.rawQuery(sql, null) }
+        }
+        assertEquals(listOf(2, 1, 1, 1, 1, 1, 1, 1), before.values.map { it.size }) // the seed reached every table
+        val db = openAppDatabase(app, NAME)
+        try {
+            assertEquals(before, v4Rows { sql -> db.openHelper.readableDatabase.query(sql) })
+            val dao = db.sessionDao()
+            assertEquals(session("apofis-a").copy(title = "Chat", messageCount = 1, model = "m1", provider = "p1", reasoning = "high", fast = true), dao.get("apofis-a"))
+            assertEquals(session("apofis-n").copy(startedAt = 2.0, existsOnServer = false, createStarted = true), dao.get("apofis-n"))
+            assertEquals(emptyList<AgentFileEntity>(), db.agentFileDao().observe("apofis-a").firstWithin()) // the new table exists, empty
+            assertEquals(emptyList<String>(), db.agentFileDao().digests())
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun agentFileBindingsRoundTrip() = runTest {
+        create(4)
+        val db = openAppDatabase(app, NAME)
+        try {
+            val dao = db.agentFileDao()
+            val path = "/srv/out/chart.png"
+            val one = AgentFileEntity("apofis-a", 1, path, d1)
+            val two = AgentFileEntity("apofis-a", 2, path, d1) // another reply naming the same picture, the same bytes
+            dao.insert(one)
+            dao.insert(two)
+            assertEquals(listOf(one, two), dao.observe("apofis-a").firstWithin())
+            assertEquals(one, dao.get("apofis-a", 1, path))
+            assertEquals(two, dao.get("apofis-a", 2, path))
+            dao.insert(one.copy(digest = "c".repeat(64)))
+            assertEquals(one, dao.get("apofis-a", 1, path)) // an existing binding wins
+            assertEquals(0, dao.deleteIf("apofis-a", 1, path, "other"))
+            assertEquals(one, dao.get("apofis-a", 1, path))
+            assertEquals(1, dao.deleteIf("apofis-a", 1, path, d1))
+            assertNull(dao.get("apofis-a", 1, path))
+            assertEquals(two, dao.get("apofis-a", 2, path)) // only the named reply's binding went
+            assertEquals(listOf(d1), dao.digests())
+            assertEquals(listOf(two), dao.observe("apofis-a").firstWithin())
+            dao.insert(AgentFileEntity("apofis-gone", 1, path, d2)) // no chat row
+            dao.deleteOrphans()
+            assertEquals(listOf(d1), dao.digests())
+            assertEquals(listOf(two), dao.observe("apofis-a").firstWithin())
+        } finally {
+            db.close()
         }
     }
 }

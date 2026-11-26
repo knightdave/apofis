@@ -195,7 +195,7 @@ internal const val CONNECTION_EPOCH = "connection_epoch"
 /** The one reader of the persisted connection epoch. */
 internal fun connectionEpoch(c: Context) = c.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).getLong(CONNECTION_EPOCH, 0)
 
-private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity", "ImageBindingEntity")
+private val CACHED_TABLES = listOf("SessionEntity", "MessageEntity", "PendingSendEntity", "ActiveRunEntity", "ReplyOutcomeEntity", "ImageBindingEntity", "AgentFileEntity")
 private val ANY_CACHED_ROW = "SELECT " + CACHED_TABLES.joinToString(" OR ") { "EXISTS(SELECT 1 FROM $it)" }
 
 /** Session metadata from the server; a failure changes nothing (no send rolled back, no history evicted). */
@@ -425,10 +425,10 @@ class AppContainer(
     }
 
     /**
-     * The one image collection: deletes every image file that no draft, unsent message, pending send or binding names,
-     * once it is ten minutes old. The composer is read first (so a send that stores its row and then empties the draft
-     * is seen in one of the two), then, in one transaction, orphaned bindings go and pending rows and bindings are read
-     * (so a confirmation moving digests from one to the other hides nothing). Under the store's lock: a second call
+     * The one image collection: deletes every image file that no draft, unsent message, pending send, binding or agent
+     * picture binding names, once it is ten minutes old. The composer is read first (so a send that stores its row and
+     * then empties the draft is seen in one of the two), then, in one transaction, orphaned bindings go and pending rows
+     * and bindings are read (so a confirmation moving digests from one to the other hides nothing). Under the store's lock: a second call
      * waits for the first, then makes its own full pass. A failure to read the references is logged and skips the run;
      * a file that cannot be listed or deleted is skipped silently and tried again by the next run. Only cancellation
      * is rethrown.
@@ -440,7 +440,8 @@ class AppContainer(
                 beforeImageRows()
                 val rows = db.withTransaction {
                     db.imageBindingDao().deleteOrphans()
-                    db.pendingSendDao().allImages() + db.imageBindingDao().allDigests()
+                    db.agentFileDao().deleteOrphans()
+                    db.pendingSendDao().allImages() + db.imageBindingDao().allDigests() + db.agentFileDao().digests()
                 }
                 rows.flatMapTo(keep) { it.split(',') } // one comma-separated list per row
             })
